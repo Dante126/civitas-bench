@@ -18,25 +18,25 @@ target_population = 30000
 [providers.arcee]
 base_url = "https://api.arcee.ai/api/v1"
 api_key_env = "ARCEE_API_KEY"
-timeout = 300
+timeout = 600
 
 [agents.mayor]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 12000    # room for the reasoning + the JSON answer
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
 
 [agents.planning]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
 
 [agents.utilities]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns

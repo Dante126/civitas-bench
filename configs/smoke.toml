@@ -7,19 +7,19 @@ months = 24
 act_every = 3
 
 [providers.arcee]
-timeout = 300
+timeout = 600
 
 [agents.mayor]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
 
 [agents.planning]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
 
 [agents.utilities]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns

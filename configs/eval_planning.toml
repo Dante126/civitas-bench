@@ -13,7 +13,7 @@ kind = "scripted"
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
-max_tokens = 12000
+max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
 
 [agents.utilities]
 kind = "scripted"
