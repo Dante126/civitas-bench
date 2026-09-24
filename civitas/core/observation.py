@@ -21,7 +21,9 @@ MAP_LEGEND = (
     "r/c/i/o/m zoned but empty  R/C/I/O/M developed zone (O = offices, M = mixed use)  P park  E coal  G gas  S solar  W wind  "
     "U water pump  V water tower  % sewage outlet  * treatment plant  K police  J jail  F fire station  A clinic  "
     "L landfill  X incinerator  Z cemetery  N elementary school  B high school  Q university (2x2)  "
-    "D library  h hospital (2x2)  : metro station  ? casino (2x2)  > airport (3x3)  @ train station  & harbour  ^ shelter  | levee  Y hydro dam  + plaza  $ stadium  ! monument.  x = column (left to right), y = row (top to bottom)."
+    "D library  h hospital (2x2)  : metro station  ? casino (2x2)  > airport (3x3)  @ train station  & harbour  ^ shelter  | levee  Y hydro dam  + plaza  $ stadium  ! monument  "
+    "u nuclear plant  z crematorium (higher tiers keep the letter).  "
+    "x = column (left to right), y = row (top to bottom)."
 )
 
 
@@ -33,12 +35,38 @@ def _cov(v) -> str:
     return "n/a (no buildings yet)" if v is None else f"{v}%"
 
 
-def _sites(lst) -> str:
+def _sites(lst, noun: str = "") -> str:
     if not lst:
         return "none"
     return ", ".join(f"({s['x']},{s['y']})" + (f" homes={s['homes_within_5']}" if "homes_within_5" in s else "")
                      + (f" need={s['need']}" if "need" in s else "")
-                     + (f" pollution={s['pollution']}" if "pollution" in s else "") for s in lst)
+                     + (f" pollution={s['pollution']}" if "pollution" in s else "")
+                     + _crowd_note(s, noun) for s in lst)
+
+
+def _crowd_note(site: dict, noun: str) -> str:
+    n = site.get("crowd", 0)
+    return f" near {n} {noun}{'s' if n > 1 else ''}" if n else ""
+
+
+def _crowd_grid(world: World, line: str) -> np.ndarray:
+    """Per tile, how many buildings (any tier) of `line`'s crowd group a new one there would crowd: the tiles whose
+    footprint gap (Chebyshev, as in World._crowd_factors) to a building is within the group radius."""
+    g = next(g for g in C.CROWD_GROUPS.values() if line in g["lines"])
+    r, n = g["radius"], np.zeros(world.struct.shape, dtype=int)
+    for st in {t["struct"] for ln in g["lines"] for t in C.TIER_LINES[ln]}:
+        for x, y in world.facilities(st):
+            fw, fh = world.footprint_at(x, y)
+            n[max(0, y - r):y + fh + r, max(0, x - r):x + fw + r] += 1
+    return n
+
+
+def _uncrowded_first(world: World, sites: list[dict], line: str, k: int = 6) -> list[dict]:
+    """The first k sites with uncrowded ones first (existing order kept), then by neighbour count; crowded ones get
+    "crowd": n. Nothing is dropped unless there are more than k sites."""
+    n = _crowd_grid(world, line)
+    ranked = sorted(sites, key=lambda s: n[s["y"], s["x"]])[:k]    # stable: keeps the order among equals
+    return [dict(s, crowd=int(n[s["y"], s["x"]])) if n[s["y"], s["x"]] else s for s in ranked]  # copies: lists share dicts
 
 
 def _candidate_sites(world: World) -> dict:
@@ -70,16 +98,23 @@ def _candidate_sites(world: World) -> dict:
     outlets = [(x, y) for x, y in world.facilities(C.OUTLET) + world.facilities(C.TREATMENT)]
     pumps = world.facilities(C.PUMP)
     # pumps: clean water, upstream (north) of every outlet; sewage: downstream (south) of every pump
-    for_pumps = sorted(banks, key=lambda b: (b["pollution"] + (0.5 if any(oy <= b["y"] for _, oy in outlets) else 0), b["y"]))[:6]
-    for_sewage = sorted(banks, key=lambda b: (any(py >= b["y"] for _, py in pumps), -b["y"]))[:6]
-    windy = sorted(sites, key=lambda t: -world.wind[t[2], t[1]])[:6]
-    return {
+    # (crowded spots last in each list: catalog.CROWD_GROUPS)
+    for_pumps = _uncrowded_first(world, sorted(banks, key=lambda b: (
+        b["pollution"] + (0.5 if any(oy <= b["y"] for _, oy in outlets) else 0), b["y"])), "pump")
+    for_sewage = _uncrowded_first(world, sorted(banks, key=lambda b: (any(py >= b["y"] for _, py in pumps), -b["y"])),
+                                  "outlet")
+    windy = _uncrowded_first(world, [{"x": x, "y": y, "wind": round(float(world.wind[y, x]), 2)}
+                                     for h, x, y in sorted(sites, key=lambda t: -world.wind[t[2], t[1]])], "wind")
+    out = {
         "far_from_homes": [{"x": x, "y": y, "homes_within_5": h} for h, x, y in far],
         "near_homes": [{"x": x, "y": y, "homes_within_5": h} for h, x, y in near],
-        "windy": [{"x": x, "y": y, "wind": round(float(world.wind[y, x]), 2)} for h, x, y in windy],
+        "windy": windy,
         "riverbank_next_to_road": for_pumps,
         "riverbank_for_sewage": for_sewage,
     }
+    if world.unlocked("water_works") or world.unlocked("advanced_treatment") or world.unlocked("nuclear"):
+        out["riverbank_2x2"] = world.site_candidates(np.ones(world.struct.shape), radius=1, k=3, riverbank=True, size=2)
+    return out
 
 
 def _river_summary(world: World) -> str:
@@ -256,6 +291,14 @@ def _police_section(world: World, site_hints: bool) -> dict:
         "inmates": round(world.stats.get("inmates", 0.0)), "jail_capacity": world.stats.get("jail_capacity", 0),
         "crime_hotspots": world.hotspots(world.crime * people),
     }
+    gap = world.downtown_gap.get("police")
+    out["downtown_uncovered"] = int(gap.sum()) if gap is not None else 0
+    stations = world.upgrade_options([C.POLICE], need=people * gap if gap is not None else None, k=3, per_pair=False)
+    over = out["inmates"] - out["jail_capacity"]
+    jails = world.upgrade_options([C.JAIL], need={xy: over for xy in world.facilities(C.JAIL)}, k=1, min_need=0,
+                                  per_pair=False)
+    # one list by need (people x downtown gap for stations, inmate overflow for jails); an overcrowded jail stays in
+    out["upgrades"] = sorted(stations[:3 - len(jails)] + jails, key=lambda o: -o.get("need", 0.0))
     if site_hints:
         out["candidate_sites"] = world.site_candidates(people * (1.0 - world.police_cov) * (0.3 + world.crime), radius=6)
         out["jail_sites"] = world.site_candidates(np.ones_like(people), radius=1, k=3, exclude=_far_from_homes(world))
@@ -268,12 +311,17 @@ def _fire_section(world: World, site_hints: bool) -> dict:
     recent = world.history[-12:]
     out = {
         "stations": world.service_info.get("fire_station", []),
-        "responses_per_station": C.SERVICES["fire_station"]["responses"],
+        "responses_per_station": C.SERVICES["fire_station"]["responses"],     # tier 1; kept for compatibility
+        "callouts_per_month": int(sum(world.facility_spec(x, y)["responses"] for x, y in world.facilities(C.FIRE))
+                                  * world.funding_eff("fire")),               # as _fire_events counts them
         "fires_last_12_months": sum(h.get("fires", 0) for h in recent),
         "buildings_lost_last_12_months": sum(h.get("fire_tiles_lost", 0) for h in recent),
         "uncovered_buildings": int((dev * (world.fire_cov < 0.3)).sum()),
         "risk_hotspots": world.hotspots(risk_left),
     }
+    gap = world.downtown_gap.get("fire")
+    out["downtown_uncovered"] = int(gap.sum()) if gap is not None else 0
+    out["upgrades"] = world.upgrade_options([C.FIRE], need=dev * gap if gap is not None else None, k=3, per_pair=False)
     nxt = next((e for e in world.schedule if e["kind"] == "flood" and 0 <= e["month"] - world.month <= 3), None)
     out["flood_warning"] = None if nxt is None else {"rows": [nxt["y1"], nxt["y2"]], "in_months": nxt["month"] - world.month}
     out["levee_tiles"] = int((world.struct == C.LEVEE).sum())
@@ -309,6 +357,11 @@ def _levee_lines(world: World, e: dict, k: int = 6) -> list[dict]:
     return runs[:k]
 
 
+GARBAGE_FILL_OFFER = 50      # landfills more than this % full get a recycling-centre offer
+GARBAGE_BUSY_LOAD = 0.85     # ... and so do landfills whose trucks carry at least this share of their capacity
+GARBAGE_BUSY_RANK = 100      # busy landfills rank above filling ones (need = this + load %)
+
+
 def _health_section(world: World, site_hints: bool) -> dict:
     res = _residents(world)
     st = world.stats
@@ -325,6 +378,26 @@ def _health_section(world: World, site_hints: bool) -> dict:
         "garbage_hotspots": world.hotspots(world.garbage),
         "soil_hotspots": world.hotspots(world.soil_level() * (world.soil_level() > 0.15)),
         "low_health_hotspots": world.hotspots(res * (1.0 - world.health)),
+    }
+    gap = world.downtown_gap.get("health")
+    out["downtown_uncovered"] = int(gap.sum()) if gap is not None else 0
+    # landfill need: fill % (offered above GARBAGE_FILL_OFFER), or GARBAGE_BUSY_RANK + load % when the trucks are busy
+    # (load >= GARBAGE_BUSY_LOAD x collection capacity), so busy landfills rank above filling ones
+    fills = {}
+    for l in world.service_info.get("landfill", []):
+        need = l.get("fill_pct", 0.0)
+        if l.get("capacity") and l.get("load", 0.0) >= GARBAGE_BUSY_LOAD * l["capacity"]:
+            need = max(need, GARBAGE_BUSY_RANK + 100 * l["load"] / l["capacity"])
+        fills[(l["x"], l["y"])] = need
+    plots = {(c["x"], c["y"]): 100 - 100 * c["plots_left"] / C.SERVICES["cemetery"]["plots"]
+             for c in world.service_info.get("cemetery", [])}
+    out["crematoria"] = world.service_info.get("crematorium", [])
+    out["upgrades"] = {
+        "care": world.upgrade_options([C.CLINIC, C.HOSPITAL], need=res * gap if gap is not None else None, k=2,
+                                      per_pair=False),
+        "garbage": world.upgrade_options([C.LANDFILL], need=fills, k=3, min_need=GARBAGE_FILL_OFFER, per_pair=False),
+        "deathcare": world.upgrade_options([C.CEMETERY], need=plots, k=2,
+                                           min_need=None if out["deceased_waiting"] > 0 else 70, per_pair=False),
     }
     if site_hints:
         out["clinic_sites"] = world.site_candidates(res * (1.0 - world.health_cov), radius=5)
@@ -353,6 +426,9 @@ def _education_section(world: World, site_hints: bool) -> dict:
         "high_schools": world.service_info.get("high_school", []),
         "libraries": world.service_info.get("library", []),
     }
+    over = {(f["x"], f["y"]): f["load"] - f["capacity"]
+            for f in world.service_info.get("elementary_school", []) + world.service_info.get("high_school", [])}
+    out["upgrades"] = world.upgrade_options([C.SCHOOL, C.HIGHSCHOOL], need=over, k=3, min_need=0, per_pair=False)
     if site_hints:
         out["school_sites"] = world.site_candidates(res * n[0].sum() / total * (1.0 - world.school_cov), radius=6)
         out["high_school_sites"] = world.site_candidates(res * n[1].sum() / total * (1.0 - world.high_cov), radius=8, k=3)
@@ -582,6 +658,7 @@ def build_observation(world: World, role: str, *, council_msgs: list[dict], memo
     }
     if role == "utilities":
         obs["networks"] = [n.to_dict() for n in world.networks if n.road_tiles > 1 or n.plants]
+        obs["upgrades"] = world.upgrade_options(C.UTILITY_TYPES)
         obs["disconnected_facilities"] = world.disconnected_plants
         zone_mask = np.isin(world.struct, C.ZONES)
         obs["sample_tiles_needing_power"] = _sample(zone_mask & world.access & ~world.powered)
@@ -656,8 +733,55 @@ def _facilities(lst: list[dict], extra=("load", "capacity")) -> str:
         for k in ("fill_pct", "plots_left"):
             if k in f:
                 bits.append(f"{k.replace('_', ' ')} {f[k]}")
-        out.append(f"({f['x']},{f['y']})" + (f" [{', '.join(bits)}]" if bits else ""))
+        out.append((f"{f['name'].replace('_', ' ')} " if _shares_struct(f) else "")
+                   + f"({f['x']},{f['y']})" + (f" [{', '.join(bits)}]" if bits else ""))
     return "; ".join(out) + (f" (+{len(lst) - 10} more)" if len(lst) > 10 else "")
+
+
+def _shares_struct(f: dict) -> bool:
+    """A facility above the lowest tier drawn with its letter (police hq, recycling centre, medical centre)."""
+    if f.get("tier", 1) <= 1 or f.get("name") not in C.TIER_BY_NAME:
+        return False
+    line, t = C.TIER_BY_NAME[f["name"]]
+    return t > C.BASE_TIER[C.TIER_LINES[line][t - 1]["struct"]]
+
+
+def _upgrades(lst: list[dict]) -> str:
+    def gain(u):
+        full = u.get("nameplate", {})
+        def note(k, v):          # the effective figure can beat the nameplate on a windy site
+            if k not in full or full[k] == v:
+                return ""
+            return f", {full[k]:g} at full output" if v < full[k] else f", nameplate {full[k]:g}"
+        return ", ".join(f"+{v:g} {k}" + note(k, v) for k, v in u["gain"].items())
+    return "; ".join(f"({u['x']},{u['y']}) {u['from'].replace('_', ' ')} -> {u['to'].replace('_', ' ')} "
+                     f"${u['cost']:,} ({gain(u)})" + (f" (+{u['similar']} similar)" if u.get("similar") else "")
+                     for u in lst)
+
+
+def _crowding(plants: list[dict]) -> str:
+    """'0.4 x20, 0.55 x8; worst clusters near (41,19), (38,24)' for a network's crowded plants ('' if none)."""
+    crowded = sorted((p for p in plants if "crowd" in p), key=lambda p: (p["crowd"], -p.get("neighbours", 0)))
+    if not crowded:
+        return ""
+    counts: dict[float, int] = {}
+    for p in crowded:
+        counts[round(p["crowd"], 2)] = counts.get(round(p["crowd"], 2), 0) + 1
+    worst = []
+    for p in crowded:
+        if all(abs(p["x"] - x) + abs(p["y"] - y) > 4 for x, y in worst):
+            worst.append((p["x"], p["y"]))
+        if len(worst) >= 3:
+            break
+    return (", ".join(f"{c:g} x{n}" for c, n in counts.items()) + "; worst clusters near "
+            + ", ".join(f"({x},{y})" for x, y in worst))
+
+
+def _downtown(d: dict, L: list[str], offers: bool = False) -> None:
+    if d.get("downtown_uncovered"):
+        L.append(f"Downtown (level 4-5) tiles without tier-2 cover: {d['downtown_uncovered']} "
+                 f"(tier-1 buildings give them only {int(C.T1_DOWNTOWN * 100)}%)"
+                 + (" - offers below are ranked by downtown need" if offers else ""))
 
 
 def _spots(lst: list[dict]) -> str:
@@ -704,8 +828,11 @@ def _render_role(obs: dict, L: list[str]) -> None:
     elif role == "police":
         L.append("## Police")
         L.append(f"Stations [people in area / capacity]: {_facilities(d['stations'])}")
+        _downtown(d, L, bool(d.get("upgrades")))
         L.append(f"Jails: {_facilities(d['jails'], ('capacity',))}; inmates {d['inmates']} / capacity {d['jail_capacity']}"
                  + (" OVERCROWDED" if d['inmates'] > d['jail_capacity'] else ""))
+        if d.get("upgrades"):
+            L.append('Tier upgrades (upgrade_facility {"module":"tier"}): ' + _upgrades(d["upgrades"]))
         L.append(f"Crime hotspots (crime x people): {_spots(d['crime_hotspots'])}")
         if "candidate_sites" in d:
             L.append(f"Suggested station sites (uncovered people nearby): {_sites(d['candidate_sites'])}")
@@ -722,7 +849,10 @@ def _render_role(obs: dict, L: list[str]) -> None:
         L.append(f"Shelters: {_facilities(d['shelters'])}" + (f"; suggested shelter sites: {_sites(d['shelter_sites'])}"
                                                                if d.get("shelter_sites") else ""))
         L.append(f"Stations [buildings in area / capacity]: {_facilities(d['stations'])}; "
-                 f"each handles {d['responses_per_station']} call-outs per month")
+                 f"call-out capacity {d['callouts_per_month']} per month (all stations, at current funding)")
+        _downtown(d, L, bool(d.get("upgrades")))
+        if d.get("upgrades"):
+            L.append('Tier upgrades (upgrade_facility {"module":"tier"}): ' + _upgrades(d["upgrades"]))
         L.append(f"Last 12 months: {d['fires_last_12_months']} fires, {d['buildings_lost_last_12_months']} buildings lost; "
                  f"buildings without fire cover: {d['uncovered_buildings']}")
         L.append(f"Uncovered fire-risk hotspots: {_spots(d['risk_hotspots'])}")
@@ -732,12 +862,17 @@ def _render_role(obs: dict, L: list[str]) -> None:
         L.append("## Health & sanitation")
         L.append(f"Clinics [residents in area / capacity]: {_facilities(d['clinics'])}")
         L.append(f"Hospitals: {_facilities(d['hospitals'])}")
+        _downtown(d, L, bool(d.get("upgrades", {}).get("care")))
         L.append(f"Garbage per month: produced {d['garbage_produced']}, collected {d['garbage_collected']}; "
                  f"uncollected stock {d['garbage_uncollected_stock']}")
         L.append(f"Landfills [garbage in area / collection capacity]: {_facilities(d['landfills'])}")
         L.append(f"Incinerators: {_facilities(d['incinerators'])}")
         L.append(f"Deathcare: {d['deaths_per_month']} deaths/month, capacity {d['deathcare_capacity']}/month, "
-                 f"waiting {d['deceased_waiting']}; cemeteries: {_facilities(d['cemeteries'], ())}")
+                 f"waiting {d['deceased_waiting']}; cemeteries: {_facilities(d['cemeteries'], ())}"
+                 + (f"; crematoria: {_facilities(d['crematoria'], ('rate',))}" if d.get("crematoria") else ""))
+        if d.get("upgrades") and any(d["upgrades"].values()):
+            L.append('Tier upgrades (upgrade_facility {"module":"tier"}): '
+                     + "; ".join(f"{k}: {_upgrades(v)}" for k, v in d["upgrades"].items() if v))
         L.append(f"Garbage hotspots: {_spots(d['garbage_hotspots'])}")
         L.append(f"Contaminated soil hotspots (clean_soil): {_spots(d['soil_hotspots'])}")
         L.append(f"Low-health hotspots: {_spots(d['low_health_hotspots'])}")
@@ -758,6 +893,8 @@ def _render_role(obs: dict, L: list[str]) -> None:
         L.append(f"Skilled jobs (high school / university) filled: {d['skilled_jobs_filled_pct']}%")
         L.append(f"Elementary schools [students in area / seats]: {_facilities(d['schools'])}")
         L.append(f"High schools: {_facilities(d['high_schools'])}; libraries: {_facilities(d['libraries'], ())}")
+        if d.get("upgrades"):
+            L.append('Tier upgrades (upgrade_facility {"module":"tier"}): ' + _upgrades(d["upgrades"]))
         if "school_sites" in d:
             L.append(f"Suggested elementary school sites: {_sites(d['school_sites'])}")
             L.append(f"Suggested high school sites: {_sites(d['high_school_sites'])}")
@@ -865,6 +1002,10 @@ def render_text(obs: dict) -> str:
             L.append(f"net {n['id']}{' [connected to highway]' if n['outside_connected'] else ''}: roads {n['road_tiles']}, "
                      f"power {n['power_supply']}/{n['power_demand']} (supply/demand), water {n['water_supply']}/{n['water_demand']}, "
                      f"sewage {n['sewage_supply']}/{n['sewage_demand']}, water quality {n['water_quality']}; facilities: {plants}")
+            if cr := _crowding(n["plants"]):
+                L.append(f"  crowded plants (output kept): {cr}")
+        if obs.get("upgrades"):
+            L.append('Tier upgrades available (upgrade_facility {"module":"tier"}): ' + _upgrades(obs["upgrades"]))
         L.append(f"River pollution by section (north -> south): {obs['river']}")
         if obs["disconnected_facilities"]:
             L.append(f"Facilities not touching any road: {obs['disconnected_facilities']}")
@@ -879,11 +1020,16 @@ def render_text(obs: dict) -> str:
             L.append("Candidate empty sites touching the highway-connected road network:")
             L.append(f"  far from homes (good for coal/gas): {_sites(cs['far_from_homes'])}")
             L.append(f"  near homes (fine for solar/wind/tower): {_sites(cs['near_homes'])}")
-            L.append("  windiest (wind turbines produce 40 x wind): " + ", ".join(f"({s['x']},{s['y']}) wind={s['wind']}"
-                                                                          for s in cs.get('windy', [])))
-            L.append("  riverbank next to a road, cleanest/upstream first (for pumps): " + (_sites(cs['riverbank_next_to_road'])
-                     if cs['riverbank_next_to_road'] else "none - ask Planning to build a road to the river"))
-            L.append("  riverbank, downstream of pumps first (for sewage): " + _sites(cs['riverbank_for_sewage']))
+            L.append("  windiest, uncrowded first (wind turbines produce 40 x wind): "
+                     + ", ".join(f"({s['x']},{s['y']}) wind={s['wind']}" + _crowd_note(s, "turbine")
+                                 for s in cs.get('windy', [])))
+            L.append("  riverbank next to a road, uncrowded then cleanest/upstream first (for pumps): "
+                     + (_sites(cs['riverbank_next_to_road'], "intake") if cs['riverbank_next_to_road']
+                        else "none - ask Planning to build a road to the river"))
+            L.append("  riverbank, uncrowded then downstream of pumps first (for sewage): "
+                     + _sites(cs['riverbank_for_sewage'], "outfall"))
+            if cs.get("riverbank_2x2"):
+                L.append("  riverbank 2x2 blocks (water works / advanced treatment / nuclear): " + _sites(cs["riverbank_2x2"]))
     _render_role(obs, L)
     pr = obs["progress"]
     L.append("")

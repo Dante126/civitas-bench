@@ -15,7 +15,15 @@ const NAMES = { ".": "empty land", "~": "river", "#": "road", "=": "bridge", H: 
   A: "clinic", h: "hospital", L: "landfill", ":": "metro station", "?": "casino", ">": "airport", m: "mixed-use zone (empty)", M: "mixed use", X: "incinerator", Z: "cemetery", N: "elementary school", B: "high school",
   Q: "university", D: "library", "|": "levee", "@": "train station", "&": "harbour", "+": "plaza", $: "stadium", "!": "monument",
   r: "residential zone (empty)", c: "commercial zone (empty)", i: "industrial zone (empty)", o: "office zone (empty)",
-  R: "residential", C: "commercial", I: "industrial", O: "offices" };
+  R: "residential", C: "commercial", I: "industrial", O: "offices", u: "nuclear plant", z: "crematorium" };
+// facilities keep their tile character as they move up a tier; the frame level is the tier (0 in old replays = base)
+// keep in step with civitas/sim/catalog.py TIER_LINES (the source of truth for tiers and their names)
+const TIER_NAMES = { E: { 2: "advanced coal plant" }, G: { 2: "combined-cycle gas plant" }, S: { 2: "solar power plant" },
+  W: { 2: "advanced wind turbine" }, U: { 2: "pumping station", 3: "water works" }, V: { 2: "inland water plant" },
+  "*": { 3: "advanced treatment plant" }, L: { 2: "recycling centre", 3: "waste processing complex" },
+  h: { 3: "medical centre" }, K: { 2: "police HQ" }, J: { 2: "prison" }, F: { 2: "fire HQ" },
+  N: { 2: "large elementary school" }, B: { 2: "large high school" } };
+const nameOf = (ch, lvl) => (TIER_NAMES[ch] && TIER_NAMES[ch][lvl]) || NAMES[ch] || ch;
 const LEVEL_NAME = { R: ["", "houses", "apartments", "high-rise", "tower", "luxury tower"], C: ["", "shops", "offices", "skyscraper", "mall tower", "megatower"],
   I: ["", "workshop", "factory", "heavy industry", "plant", "tech campus"], O: ["", "small offices", "office block", "office tower", "HQ tower", "landmark HQ"],
   M: ["", "corner shop & flat", "shop-house", "mid-rise", "high-rise", "tower"] };
@@ -508,7 +516,7 @@ const IND_TYPE = ["", "farm", "sawmill", "mine", "oil field", "high-tech"], WEAL
 const RESOURCE = ["", "fertile soil", "forest", "ore", "oil"];
 function tileTitle(t) {
   const up = t.ch.toUpperCase();
-  if (!(t.zone && t.lvl > 0)) return (NAMES[t.ch] || t.ch) + (t.ch === "." && t.resource ? ` (${RESOURCE[t.resource]})` : "");
+  if (!(t.zone && t.lvl > 0)) return nameOf(t.ch, t.lvl) + (t.ch === "." && t.resource ? ` (${RESOURCE[t.resource]})` : "");
   const kind = up === "I" && t.variant ? IND_TYPE[t.variant] : LEVEL_NAME[up][t.lvl];
   const extra = ["RM".includes(up) && t.variant ? WEALTH[t.variant] : "", t.density != null && "RCOM".includes(up) ? (t.density ? "high density" : "low density") : ""].filter(Boolean).join(", ");
   return `${NAMES[t.ch]} · ${kind} (L${t.lvl})${extra ? " · " + extra : ""}`;
@@ -558,7 +566,7 @@ const MINI = { ".": "#7fb069", "~": "#3d8fd1", "=": "#b8b3a8", "#": "#3d4148", H
   Y: "#8d8a82", "%": "#6d5f3f", "*": "#4f8f6f", K: "#1f4fa8", J: "#7d8388", F: "#c62828", "^": "#b8b39c", A: "#fafafa", h: "#eceff1", L: "#7a6a4f", X: "#5b5e62",
   ":": "#d32f2f", "?": "#8e24aa", ">": "#b0bec5", m: "#dcc9b0", M: "#a1887f",
   Z: "#6f9f5a", N: "#f3d99b", B: "#b5654a", Q: "#efe9dc", D: "#2e5b3c", "|": "#6f8f4f", "@": "#b23b3b", "&": "#f1c40f", "+": "#d8d2c4", $: "#dfe3e8", "!": "#e0b43a",
-  r: "#b4c98a", c: "#a8bfd8", i: "#d8c9a0", o: "#c9c2e6", R: "#43a85a", C: "#3f7fd6", I: "#d99a2b", O: "#7d86bd" };
+  r: "#b4c98a", c: "#a8bfd8", i: "#d8c9a0", o: "#c9c2e6", R: "#43a85a", C: "#3f7fd6", I: "#d99a2b", O: "#7d86bd", u: "#9fd3c7", z: "#6a6a6a" };
 function drawMinimap() {
   if (!S.frames.length) return;
   const cv = $("minimap"), g = cv.getContext("2d"), f = S.frames[S.idx], W = S.meta.width, H = S.meta.height, s = cv.width / Math.max(W, H);

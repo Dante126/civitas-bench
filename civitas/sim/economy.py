@@ -377,13 +377,13 @@ class TradeMixin:
                    "margin_off": float(self.margin[(s == C.OFF) & biz].mean()) if ((s == C.OFF) & biz).any() else 0.0})
 
     # --------------------------------------------------- utilities trade
-    def plant_output_factor(self, x: int, y: int, kind: str) -> float:
-        """Ageing (power plants lose output after a few years), wind strength, expansions."""
+    def plant_output_factor(self, x: int, y: int, line: str) -> float:
+        """Ageing (power plants lose output after a few years), wind strength, expansions (line: catalog.TIER_LINES)."""
         f = self.module_factor(x, y, "expansion")
-        if kind in ("coal", "gas", "solar", "wind", "hydro"):
+        if line in ("coal", "gas", "solar", "wind", "hydro"):
             age = (self.month - self.facility_state.get((x, y), {}).get("built", self.month)) / 12.0
             f *= max(C.AGEING_FLOOR, 1.0 - C.AGEING_RATE * max(0.0, age - C.AGEING_START_YEARS))
-        if kind == "wind":
+        if line == "wind":
             f *= float(self.wind[y, x])
         return f
 

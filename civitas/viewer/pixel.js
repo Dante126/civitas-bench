@@ -307,7 +307,8 @@ export class PixelScene {
       const [fw, fh] = C.size.get(i) || [1, 1];
       const k = NATIVE_SIZE.includes(ch) ? 1 : Math.min(fw, fh) * 0.92, kz = k > 1 ? 1 + (k - 1) * 0.55 : 1;
       const q = fw > 1 || fh > 1 || "YH|".includes(ch) ? 0 : ch === "&" ? this._facingWater(x, y, i, C) : this._facing(x, y, i, C);
-      return { key: `s|${ch}|${fw}|${fh}|${q}`, fw, fh, build: (b) => { b.scale(k, kz).turn(q); R.special(b, ch, i % 7, season); }, build0: ch !== "H" };
+      const lv = R.facilityTier(f, i);
+      return { key: `s|${ch}|${fw}|${fh}|${q}|${lv}`, fw, fh, build: (b) => { b.scale(k, kz).turn(q); R.special(b, ch, i % 7, season, lv); }, build0: ch !== "H" };
     }
     if (ch === "P") { const v = Math.floor(hash(i, 5) * 8); return { key: `p|${v}`, build: (b) => R.park(b, v, season) }; }
     if (ch === "#" && inside) {

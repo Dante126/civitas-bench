@@ -51,6 +51,8 @@ MIX = 37      # mixed-use zone: shops below, flats above
 METRO = 38
 CASINO = 39
 AIRPORT = 40
+NUCLEAR = 41
+CREMATORIUM = 42
 
 ZONES = (RES, COM, IND, OFF, MIX)
 ZONE_BY_LETTER = {"R": RES, "C": COM, "I": IND, "O": OFF, "M": MIX}
@@ -58,7 +60,7 @@ HOMES = (RES, MIX)            # zones people live in
 SHOPS = (COM, MIX)            # zones with commercial jobs
 LETTER_BY_ZONE = {v: k for k, v in ZONE_BY_LETTER.items()}
 
-POWER_PLANTS = {"coal": COAL, "gas": GAS, "solar": SOLAR, "wind": WIND, "hydro": DAM}
+POWER_PLANTS = {"coal": COAL, "gas": GAS, "solar": SOLAR, "wind": WIND, "hydro": DAM, "nuclear": NUCLEAR}
 WATER_PLANTS = {"pump": PUMP, "tower": TOWER}
 SEWAGE_PLANTS = {"outlet": OUTLET, "treatment": TREATMENT}
 UTILITY_TYPES = set(POWER_PLANTS.values()) | set(WATER_PLANTS.values()) | set(SEWAGE_PLANTS.values())
@@ -74,7 +76,8 @@ STRUCT_NAME = {
     CEMETERY: "cemetery", SCHOOL: "elementary_school", HIGHSCHOOL: "high_school",
     UNIVERSITY: "university", LIBRARY: "library", LEVEE: "levee", TRAIN: "train_station",
     HARBOUR: "harbour", PLAZA: "plaza", STADIUM: "stadium", MONUMENT: "monument", MIX: "mixed_use",
-    METRO: "metro_station", CASINO: "casino", AIRPORT: "airport",
+    METRO: "metro_station", CASINO: "casino", AIRPORT: "airport", NUCLEAR: "nuclear_plant",
+    CREMATORIUM: "crematorium",
 }
 
 # One character per tile for the ASCII map and for replay frames.
@@ -86,13 +89,14 @@ CHAR = {
     CLINIC: "A", HOSPITAL: "h", LANDFILL: "L", INCINERATOR: "X", CEMETERY: "Z",
     SCHOOL: "N", HIGHSCHOOL: "B", UNIVERSITY: "Q", LIBRARY: "D", LEVEE: "|",
     TRAIN: "@", HARBOUR: "&", PLAZA: "+", STADIUM: "$", MONUMENT: "!", METRO: ":", CASINO: "?", AIRPORT: ">",
+    NUCLEAR: "u", CREMATORIUM: "z",
 }
 WATER_CHAR = "~"
 BRIDGE_CHAR = "="
 FRAME_FORMAT = 3        # v2: water tower 'O' -> 'V' ('O' = offices); v3: hospital 'M' -> 'h' ('M' = mixed use)
 
 # buildings bigger than one tile: (width, height); x, y is the top-left tile
-FOOTPRINT = {HOSPITAL: (2, 2), UNIVERSITY: (2, 2), STADIUM: (2, 2), CASINO: (2, 2), AIRPORT: (3, 3)}
+FOOTPRINT = {HOSPITAL: (2, 2), UNIVERSITY: (2, 2), STADIUM: (2, 2), CASINO: (2, 2), AIRPORT: (3, 3), NUCLEAR: (2, 2)}
 
 # --- building catalog ----------------------------------------------------
 # cost: one-off build cost, upkeep: per month (paid from the treasury,
@@ -109,11 +113,12 @@ CATALOG = {
     "solar":  {"cost": 5000, "upkeep": 15, "power": 70,  "pollution": 0.0},
     "wind":   {"cost": 2500, "upkeep": 12, "power": 40,  "pollution": 0.0},
     "hydro":  {"cost": 9000, "upkeep": 45, "power": 300, "pollution": 0.0, "on_river": True},
+    "nuclear": {"cost": 40000, "upkeep": 400, "power": 2000, "pollution": 0.0, "needs_river": True, "water_use": 100},
     "pump":   {"cost": 1500, "upkeep": 25, "water": 250, "needs_river": True},
     "tower":  {"cost": 2200, "upkeep": 30, "water": 120},
     # sewage: outlets dump raw sewage into the river; treatment plants clean 80% of it
     "outlet":    {"cost": 1200, "upkeep": 15, "sewage": 250, "needs_river": True, "discharge": 1.0},
-    "treatment": {"cost": 6000, "upkeep": 55, "sewage": 220, "needs_river": True, "discharge": 0.2},
+    "treatment": {"cost": 5000, "upkeep": 50, "sewage": 700, "needs_river": True, "discharge": 0.2},
     "townhall": {"cost": 0,  "upkeep": 20},
     "levee":  {"cost": 300,  "upkeep": 1.0},
 }
@@ -149,20 +154,9 @@ SERVICES = {
     "library":           {"struct": LIBRARY, "dept": "education", "cost": 1500, "upkeep": 18, "radius": 8,
                           "capacity": 6000},
 }
-SERVICE_BY_STRUCT = {v["struct"]: k for k, v in SERVICES.items()}
 
-_UPKEEP_KEY = {
-    ROAD: "road", PARK: "park", TOWNHALL: "townhall", COAL: "coal", GAS: "gas",
-    SOLAR: "solar", WIND: "wind", PUMP: "pump", TOWER: "tower", OUTLET: "outlet", TREATMENT: "treatment",
-    DAM: "hydro", LEVEE: "levee",
-}
-
-# which department's funding level scales a structure's upkeep and effect
-DEPT_OF_STRUCT = {ROAD: "planning", PARK: "planning",
-                  **{s: "utilities" for s in (COAL, GAS, SOLAR, WIND, PUMP, TOWER, OUTLET, TREATMENT, DAM)},
-                  LEVEE: "fire",
-                  **{v["struct"]: v["dept"] for v in SERVICES.values()}, TRAIN: "transport", HARBOUR: "transport",
-                  METRO: "transport", AIRPORT: "transport", CASINO: "planning"}
+# upkeep of non-facility structures (facility upkeep comes from their tier spec: World.facility_spec)
+_UPKEEP_KEY = {ROAD: "road", PARK: "park", TOWNHALL: "townhall", LEVEE: "levee"}
 
 
 def upkeep_of(struct: int, on_water: bool = False) -> float:
@@ -182,13 +176,8 @@ def upkeep_of(struct: int, on_water: bool = False) -> float:
     if struct == AIRPORT:
         return float(AIRPORT_SPEC["upkeep"])
     lm = LANDMARK_BY_STRUCT.get(struct)
-    if lm:
-        return float(LANDMARKS[lm]["upkeep"])
-    svc = SERVICE_BY_STRUCT.get(struct)
-    return float(SERVICES[svc]["upkeep"]) if svc else 0.0
+    return float(LANDMARKS[lm]["upkeep"]) if lm else 0.0
 
-
-KIND_BY_STRUCT = {v: k for k, v in {**POWER_PLANTS, **WATER_PLANTS, **SEWAGE_PLANTS}.items()}
 
 # --- zone development ----------------------------------------------------
 MAX_LEVEL = 5
@@ -346,7 +335,7 @@ APPROVAL_TAX_SHOCK = 0.02       # approval lost per percentage point of tax incr
 RECALL_APPROVAL = 0.30
 RECALL_MONTHS = 12
 NOISE_SOURCES = {COAL: 3.0, GAS: 2.0, INCINERATOR: 2.0, LANDFILL: 1.0, JAIL: 0.5, FIRE: 0.5, AIRPORT: 4.0, CASINO: 1.5,
-                 STADIUM: 1.5}
+                 STADIUM: 1.5, NUCLEAR: 1.0}     # per tile, so bigger buildings (and 2x2 tiers) are louder
 
 
 # --- events & disasters ----------------------------------------------------
@@ -387,6 +376,150 @@ LANDMARKS = {
 LANDMARK_BY_STRUCT = {v["struct"]: k for k, v in LANDMARKS.items()}
 TOURIST_SPEND = 1.2           # city income per tourist per month (tickets, hotel tax)
 
+# --- building tiers ------------------------------------------------------------
+# Cities: Skylines style ladders. Tier 1 of each line is the existing CATALOG / SERVICES dict (the same object, so
+# "CATALOG.pump.water" overrides still apply). Tiers 2+ are copies taken at import, so a tier-1 override doesn't reach
+# them (use "TIERS.pump.2.water"). Higher tiers unlock at milestones and give more output per $ of upkeep; they are
+# bigger buildings, not always denser. A value of None means "not applicable" (fill=None: never fills), so read such
+# keys with a truthy .get(). A placed facility keeps its tier in facility_state; world.facility_spec() returns the
+# active spec. Build a tier fresh with "tier": n, or move one up with upgrade_facility {"module": "tier"}, which costs
+# the price difference x TIER_UPGRADE_PREMIUM and grows into free tiles next to the building.
+TIER_UPGRADE_PREMIUM = 1.2
+GAIN_KEYS = ("power", "water", "sewage", "capacity", "seats", "collect", "responses", "rate", "holding", "radius")
+
+
+def _base(spec: dict, name: str, struct: int, dept: str, unlock: str | None = None, footprint=(1, 1)) -> dict:
+    """Tag an existing spec as the first building of a line (or a tier that already exists, like the hospital)."""
+    spec.update(name=name, struct=struct, dept=dept, unlock=unlock, footprint=footprint)
+    return spec
+
+
+def _up(prev: dict, name: str, unlock: str, struct: int | None = None, footprint=(1, 1), **changes) -> dict:
+    """A higher tier: the previous tier's spec with changes."""
+    return {**prev, "name": name, "struct": prev["struct"] if struct is None else struct, "unlock": unlock,
+            "footprint": footprint, **changes}
+
+
+_K, _S = CATALOG, SERVICES
+_u = "utilities"
+TIER_LINES = {
+    # power
+    "coal": [_base(_K["coal"], "coal", COAL, _u),
+             _up(_K["coal"], "advanced_coal", "advanced_coal", cost=9000, upkeep=120, power=500, pollution=12.0)],
+    "gas": [_base(_K["gas"], "gas", GAS, _u),
+            _up(_K["gas"], "combined_cycle", "combined_cycle", cost=12000, upkeep=90, power=450, pollution=6.0)],
+    "solar": [_base(_K["solar"], "solar", SOLAR, _u),
+              _up(_K["solar"], "solar_plant", "solar_plant", footprint=(2, 2), cost=16000, upkeep=50, power=400)],
+    "wind": [_base(_K["wind"], "wind", WIND, _u),
+             _up(_K["wind"], "advanced_turbine", "advanced_turbine", cost=5000, upkeep=20, power=100)],
+    "hydro": [_base(_K["hydro"], "hydro", DAM, _u, unlock="hydro_dam")],
+    "nuclear": [_base(_K["nuclear"], "nuclear", NUCLEAR, _u, unlock="nuclear", footprint=(2, 2))],
+    # water
+    "pump": [_base(_K["pump"], "pump", PUMP, _u),
+             _up(_K["pump"], "pumping_station", "pumping_station", cost=4000, upkeep=45, water=650)],
+    "tower": [_base(_K["tower"], "tower", TOWER, _u),
+              _up(_K["tower"], "inland_water_plant", "inland_water_plant", cost=7000, upkeep=70, water=600)],
+    # sewage
+    "outlet": [_base(_K["outlet"], "outlet", OUTLET, _u),
+               _base(_K["treatment"], "treatment", TREATMENT, _u, unlock="treatment_plant")],
+    # garbage, deathcare, health
+    "landfill": [_base(_S["landfill"], "landfill", LANDFILL, "health")],
+    "incinerator": [_base(_S["incinerator"], "incinerator", INCINERATOR, "health", unlock="incinerator")],
+    "cemetery": [_base(_S["cemetery"], "cemetery", CEMETERY, "health")],
+    "clinic": [_base(_S["clinic"], "clinic", CLINIC, "health"),
+               _base(_S["hospital"], "hospital", HOSPITAL, "health", unlock="hospital", footprint=(2, 2))],
+    # safety
+    "police_station": [_base(_S["police_station"], "police_station", POLICE, "police")],
+    "jail": [_base(_S["jail"], "jail", JAIL, "police", unlock="jail")],
+    "fire_station": [_base(_S["fire_station"], "fire_station", FIRE, "fire")],
+    "shelter": [_base(_S["shelter"], "shelter", SHELTER, "fire")],
+    # education
+    "elementary_school": [_base(_S["elementary_school"], "elementary_school", SCHOOL, "education")],
+    "high_school": [_base(_S["high_school"], "high_school", HIGHSCHOOL, "education", unlock="high_school")],
+    "university": [_base(_S["university"], "university", UNIVERSITY, "education", unlock="university",
+                         footprint=(2, 2))],
+    "library": [_base(_S["library"], "library", LIBRARY, "education", unlock="library")],
+}
+_L = TIER_LINES
+_L["pump"].append(_up(_L["pump"][1], "water_works", "water_works", footprint=(2, 2), cost=12000, upkeep=100,
+                      water=2000, min_quality=0.85))
+_L["outlet"].append(_up(_L["outlet"][1], "advanced_treatment", "advanced_treatment", footprint=(2, 2), cost=14000,
+                        upkeep=110, sewage=2000, discharge=0.05))
+_L["landfill"] += [_up(_L["landfill"][0], "recycling_centre", "recycling_centre", cost=6000, upkeep=50, collect=900,
+                       fill=None, pollution=1.5)]
+_L["landfill"] += [_up(_L["landfill"][1], "waste_complex", "waste_complex", footprint=(2, 2), cost=20000, upkeep=150,
+                       collect=3000, power=60, pollution=5.0)]
+_L["cemetery"].append(_up(_L["cemetery"][0], "crematorium", "crematorium", struct=CREMATORIUM, cost=5000, upkeep=35,
+                          rate=120, plots=None))
+_L["clinic"].append(_up(_L["clinic"][1], "medical_centre", "medical_centre", footprint=(2, 2), cost=20000,
+                        upkeep=220, capacity=22000, radius=20))
+_L["police_station"].append(_up(_L["police_station"][0], "police_hq", "police_hq", cost=9000, upkeep=130,
+                                capacity=14000, radius=22, holding=100))
+_L["jail"].append(_up(_L["jail"][0], "prison", "prison", footprint=(2, 2), cost=14000, upkeep=120, capacity=1200))
+_L["fire_station"].append(_up(_L["fire_station"][0], "fire_hq", "fire_hq", cost=9000, upkeep=130, capacity=900,
+                              responses=15, radius=20))
+_L["elementary_school"].append(_up(_L["elementary_school"][0], "large_elementary", "large_elementary", cost=6000,
+                                   upkeep=80, seats=1200))
+_L["high_school"].append(_up(_L["high_school"][0], "large_high_school", "large_high_school", cost=11000, upkeep=130,
+                             seats=2000, radius=26))
+
+UNLOCK_POP.update({
+    "pumping_station": 1000, "advanced_turbine": 1000, "recycling_centre": 1000, "crematorium": 1000,
+    "large_elementary": 1000,
+    "inland_water_plant": 5000, "advanced_coal": 5000, "combined_cycle": 5000, "police_hq": 5000, "fire_hq": 5000,
+    "large_high_school": 5000,
+    "water_works": 10000, "advanced_treatment": 10000, "solar_plant": 10000, "nuclear": 10000, "waste_complex": 10000,
+    "medical_centre": 10000, "prison": 10000,
+})
+
+# all tier edits (appends, UNLOCK_POP keys) must come before this derivation
+TIER_BY_NAME: dict[str, tuple[str, int]] = {}   # tier name -> (line, tier); a line's name is its tier 1
+LINE_OF_STRUCT: dict[int, str] = {}             # struct -> line
+BASE_TIER: dict[int, int] = {}                  # struct -> lowest tier using it (facilities without a stored tier)
+for _line, _tiers in TIER_LINES.items():
+    for _n, _t in enumerate(_tiers, 1):
+        _t["line"], _t["tier"] = _line, _n
+        TIER_BY_NAME[_t["name"]] = (_line, _n)
+        LINE_OF_STRUCT.setdefault(_t["struct"], _line)
+        BASE_TIER.setdefault(_t["struct"], _n)
+TIERED_STRUCTS = frozenset(LINE_OF_STRUCT)
+STRUCTS_OF_DEPT: dict[str, list[int]] = {}
+for _st, _line in LINE_OF_STRUCT.items():
+    STRUCTS_OF_DEPT.setdefault(TIER_LINES[_line][0]["dept"], []).append(_st)
+del _K, _S, _u, _L, _line, _tiers, _n, _t, _st
+PRODUCER_STRUCTS = tuple(sorted(UTILITY_TYPES | {INCINERATOR, LANDFILL}))   # may make power / water / sewage
+POLLUTER_STRUCTS = (COAL, GAS, LANDFILL, INCINERATOR)
+
+# crowding: production buildings of one group within `radius` tiles of each other lose output
+CROWD_STEP, CROWD_FLOOR = 0.15, 0.4          # -15% per neighbour, at least 40% output
+CROWD_GROUPS = {
+    "river intake": {"lines": ("pump",), "radius": 4},     # pumps share this stretch of river
+    "river outfall": {"lines": ("outlet",), "radius": 4},  # outfalls overload this stretch of river
+    "aquifer": {"lines": ("tower",), "radius": 5},         # wells draw down the same groundwater
+    "wind wake": {"lines": ("wind",), "radius": 2},        # turbines steal each other's wind
+}
+# downtown: level 4-5 buildings get only this share of tier-1 police / fire / health cover
+DOWNTOWN_LEVEL = 4
+T1_DOWNTOWN = 0.6
+DOWNTOWN_LINES = ("police_station", "fire_station", "clinic")   # the lines the downtown rule applies to
+DOWNTOWN_COVERED = 0.3         # tier-2 cover below this counts as a downtown gap
+
+
+def footprint(struct: int, tier: int | None = None) -> tuple[int, int]:
+    line = LINE_OF_STRUCT.get(struct)
+    if line is None:
+        return FOOTPRINT.get(struct, (1, 1))
+    return tuple(TIER_LINES[line][(tier or BASE_TIER[struct]) - 1]["footprint"])
+
+
+def upgrade_cost(cur: dict, nxt: dict) -> int:
+    return round(max(0, nxt["cost"] - cur["cost"]) * TIER_UPGRADE_PREMIUM)
+
+
+def tier_gain(cur: dict, nxt: dict) -> dict:
+    """What moving from one tier to the next adds, e.g. {'water': 400}."""
+    return {k: nxt[k] - (cur.get(k) or 0) for k in GAIN_KEYS if nxt.get(k) and nxt[k] > (cur.get(k) or 0)}
+
 
 # --- trade, freight, businesses, utilities market ---------------------------
 FREIGHT_CAPACITY = {"highway": 1500.0, "train": 2500.0, "harbour": 4000.0}   # goods units per month
@@ -422,7 +555,8 @@ HISTORIC_TOURISTS = 6         # tourists per listed tile per month
 HISTORIC_MAX_TILES = 80
 
 # --- soil pollution --------------------------------------------------------
-# long-lived: builds up under dirty industry, landfills and polluting plants, fades 0.5% a month
+# long-lived: builds up under dirty industry, landfills and polluting plants, fades 0.5% a month. Facilities: per
+# building (spread over its tiles), scaled by its tier's `pollution` relative to tier 1 of its line
 SOIL_SOURCE = {"industry": [0.010, 0.002, 0.003, 0.020, 0.025, 0.001],   # per level, by industry type
                LANDFILL: 0.03, COAL: 0.015, GAS: 0.005, INCINERATOR: 0.01, OUTLET: 0.008}
 SOIL_DECAY = 0.995
@@ -469,17 +603,35 @@ TOURIST_SHARE = 0.03             # residents of linked cities who visit each mon
 AIRPORT_SPEC = {"cost": 25000, "upkeep": 250, "freight": 3000.0, "tourism_boost": 1.5, "noise": 4.0}
 
 
+_NESTED = ("CATALOG", "SERVICES", "LANDMARKS", "TIERS")
+
+
 def apply_overrides(overrides: dict | None) -> None:
     """Override catalog entries / constants from config, e.g.
-    {"CATALOG.coal.cost": 3000, "SERVICES.clinic.radius": 9, "TAXABLE_PER_RESIDENT": 10}."""
+    {"CATALOG.coal.cost": 3000, "SERVICES.clinic.radius": 9, "TIERS.pump.2.water": 800,
+    "TAXABLE_PER_RESIDENT": 10}."""
     if not overrides:
         return
-    g = globals()
+    flat: dict = {}
+
+    def _flatten(key, value):   # TOML / --set game.balance.CATALOG.coal.cost=3000 nest the dotted parts
+        if isinstance(value, dict) and key.split(".")[0] in _NESTED:
+            for k, v in value.items():
+                _flatten(f"{key}.{k}", v)
+        else:
+            flat[key] = value
+
     for key, value in overrides.items():
+        _flatten(key, value)
+    g = globals()
+    for key, value in flat.items():
         parts = key.split(".")
         if parts[0] in ("CATALOG", "SERVICES", "LANDMARKS") and len(parts) == 3:
             g[parts[0]][parts[1]][parts[2]] = value
-        elif parts[0] in g:
+        elif (parts[0] == "TIERS" and len(parts) == 4 and parts[1] in TIER_LINES and parts[2].isdigit()
+              and 1 <= int(parts[2]) <= len(TIER_LINES[parts[1]])):
+            TIER_LINES[parts[1]][int(parts[2]) - 1][parts[3]] = value
+        elif len(parts) == 1 and parts[0] in g and parts[0] not in _NESTED:
             g[parts[0]] = value
         else:
             raise KeyError(f"unknown balance override: {key}")

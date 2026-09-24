@@ -26,7 +26,8 @@ Where a mechanic lives in the code is noted in brackets. All numbers are in
 
 Note: the roadmap suggested `O` for the office zone, but `O` was the water tower. Water towers are now `V`
 (`catalog.FRAME_FORMAT = 2`), and the mixed-use zone took `M` from the hospital, which is now `h`
-(`FRAME_FORMAT = 3`); the viewer converts older replays.
+(`FRAME_FORMAT = 3`); the viewer converts older replays. Building tiers added `u` (nuclear plant) and `z` (crematorium)
+without a format change: other tiers reuse their line's character and the tier travels in the frame's `levels` string.
 
 ## Status by stage
 
@@ -42,6 +43,7 @@ Note: the roadmap suggested `O` for the office zone, but `O` was the water tower
 | 8 | Goods & freight, trade with the region, company profitability and closures, service imports, surplus power sales, plant ageing, wind map, facility upgrades, harbour, two-city region mode with neighbour deals [`economy.TradeMixin`, `core/region.py`] | ✅ |
 | 9 | Mixed use, historic preservation, soil pollution, wind direction, seasons, metro, multi-tile buildings [`economy.py`, `progress.HeritageMixin`, `traffic.py`, `world.place_building`] | ✅ |
 | 10 | Region of 2–6 cities: highway/rail connectors, boat and air links, inter-city trade, commuting and tourism, specialisations (mining, high tech, gambling, tourism, trade, education), casinos, airports [`core/region.py`] | ✅ |
+| 11 | Building tiers: ladders per service, upgrades in place, crowding, downtown cover, nuclear plant, crematorium [`catalog.TIER_LINES`, `world.facility_spec`, `world.upgrade_building`, `world._crowd_factors`, `services.coverage`] | ✅ |
 
 ## Details and simplifications
 
@@ -70,8 +72,8 @@ coverage minus pollution, crime, garbage, noise, polluted river.
 (landfills fill up, incinerators make power), deathcare, education (elementary, high school, university, libraries),
 shelters. ❌ Communications/post, vehicles as a separate capacity (coverage capacity stands in).
 
-**Utilities.** ✅ Power (coal, gas, solar, wind with a wind map, hydro dams), water, sewage, treatment, ageing, filters,
-expansions, overhauls, imports and surplus sales.
+**Utilities.** ✅ Power (coal, gas, solar, wind with a wind map, hydro dams, nuclear), water, sewage, treatment, ageing,
+filters, expansions, overhauls, tiers and crowding (see Tiers), imports and surplus sales.
 
 **Pollution & environment.** ✅ Air (industry by type, plants, traffic) pushed downwind by a monthly wind (prevailing
 westerly), river water (sewage + runoff, downstream flow), noise, ✅ soil (slow build-up under dirty industry, landfills,
@@ -95,6 +97,20 @@ observation lists what is locked), landmarks, region mode with two teams, shared
 power/water deals. ✅ Multi-tile footprints (2×2 hospitals, universities, stadiums, casinos; 3×3 airports).
 ✅ Region collaboration: links (highway, rail, boat, air), inter-city trade in goods and raw materials, commuting, regional
 tourism, casinos and gambling (low education, crime, tourist money) vs high tech (graduates), specialisation reports.
+
+**Tiers.** ✅ Cities: Skylines style ladders (`catalog.TIER_LINES`, tier 1 = the existing `CATALOG` / `SERVICES` dict)
+for power (coal, gas, wind, solar), water (pump, tower), sewage (outlet → treatment → advanced treatment), garbage
+(landfill → recycling centre → waste complex), deathcare (cemetery → crematorium), health (clinic → hospital → medical
+centre), police (station → HQ), jail (jail → prison), fire (station → HQ) and schools (large elementary / high school),
+unlocked at 1k / 5k / 10k. New single-tier nuclear plant (10k, riverbank 2×2, uses cooling water). The tier lives in
+`facility_state[anchor]["tier"]`; `world.facility_spec()` returns the active spec for everything that reads a placed
+building (refresh, coverage, upkeep, pollution, garbage, deathcare, modules). Build a tier fresh (`"tier": n` or a
+tier name as `kind`) or `upgrade_facility {"module": "tier"}` for the price difference × 1.2 (grows into free tiles,
+may move the anchor, swaps outlet → treatment and clinic → hospital). Pressure to move up: crowding (pumps, outlets,
+towers, turbines lose 15% per neighbour of the same group, floor 40%) and downtown cover (level 4–5 tiles get 60% of
+tier-1 police / fire / health cover; coverage is computed per radius group and a tier-2+ source gives full cover).
+Recycling centres and waste complexes never fill; crematoria have no plots. Overrides: `TIERS.<line>.<tier>.<field>`.
+🟡 Tiers don't change a building's look in the ASCII map (only the viewer draws them bigger).
 
 **Roles.** Mayor, Planning, Utilities, Transport, Police, Fire & Emergency, Health & Sanitation, Education. Turn order is
 `game.roles`; `game.simultaneous = true` makes every role see the same start-of-month state.

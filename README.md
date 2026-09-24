@@ -13,7 +13,7 @@ on the west edge connects the city to the rest of the region.
 roles:    Mayor · Planning & Housing · Utilities (power, water, sewage) · Transport
           Police · Fire & Emergency · Health & Sanitation · Education
 episode:  120 months (10 years), each agent acts once a month
-cost:     scripted run ≈ 3 s · every role on an LLM ≈ 960 model calls
+cost:     scripted run ≈ 4–5 s · every role on an LLM ≈ 960 model calls
 modes:    one city, or a region of 2-6 linked cities that trade and specialise
 ```
 
@@ -29,7 +29,7 @@ cd ~/Desktop/civitas-bench
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-pytest -q                       # ~70 tests, ~20 s (pytest -q -m "not slow" skips the 5-episode benchmark test)
+pytest -q                       # ~150 tests, ~25 s (pytest -q -m "not slow" skips the 5-episode benchmark test)
 ```
 
 (With plain pip: `python3.12 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`.)
@@ -53,8 +53,9 @@ Everything happens in the browser from here. You can:
   their highway and rail links routed from connector to connector (`T` zooms out over all of it). Both views
   show the river (a little murkier where it is polluted), bridges,
   houses, row houses and villas that become apartments and towers, offices, shop-houses,
-  factories, farms, sawmills, mines and oil fields, power plants, pumps, sewage works,
+  factories, farms, sawmills, mines and oil fields, power plants (nuclear too), pumps, sewage works,
   police and fire stations, clinics, 2×2 hospitals and universities, schools, landfills,
+  crematoria, higher-tier buildings drawn bigger or with annexes,
   bus and metro lines, casinos, airports, levees, landmarks, floods, historic plaques,
   snow in winter and orange trees in autumn. Smoke drifts with the wind.
 - **Replay or follow live.** Use the timeline to play, step or scrub. Marks on the
@@ -136,9 +137,11 @@ civitas bench -c configs/eval_planning.toml --seeds 0-4 --agent planning=llm:arc
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
 
-Baseline reference (all scripted, seeds 0–4): **city 77.3 ± 2.2**, mayor 87.4, planning
-67.9, utilities 91.6, transport 75.1, police 80.8, fire 88.7, health 90.1, education 88.6,
-population ≈ 14.0k, no bankruptcies, ~4 s per game. `noop` and `random` line-ups score 0.
+Baseline reference (all scripted, seeds 0–4): **city 77.5 ± 1.5**, mayor 88.1, planning
+68.4, utilities 89.4, transport 75.9, police 74.9, fire 85.7, health 86.6, education 83.2,
+population ≈ 14.5k, no bankruptcies, ~4–5 s per game (seeds 5–9: city 75.9 ± 0.8). `noop` and
+`random` line-ups score 0. Building tiers changed these numbers. Just before tiers were
+added, the same baseline scored city 78.1 ± 1.8 with population ≈ 14.7k.
 The scripted agents leave obvious room: they never use districts, mixed use, historic
 listings or soil clean-up, rarely use policies or funding levels, build services by simple
 coverage rules, hoard money late in the game and never make neighbour deals.
@@ -154,7 +157,7 @@ Useful switches in `[game]` (or `--set game.X=...`):
 | `seasons = true` | winter heating and snow, summer cooling and fires, seasonal tourism |
 | `region = true`, `cities = [...]` | 2–6 cities, each with its own team (see below) |
 | `team_weight` | reward = w·Δcity + (1−w)·Δrole − penalty·invalid actions |
-| `balance` | override any constant, e.g. `"CATALOG.coal.cost" = 3000` or `"SERVICES.clinic.radius" = 9` |
+| `balance` | override any constant, e.g. `"CATALOG.coal.cost" = 3000`, `"SERVICES.clinic.radius" = 9` or `"TIERS.pump.2.water" = 800` |
 
 ---
 
@@ -231,17 +234,20 @@ only appear as summaries, so agents have to talk to each other.
   or residential and commercial demand is capped.
 - **Utilities.** Every connected road network is its own grid for power, water and sewage.
   Facilities serve the network they touch, nearest buildings first. Pumps and sewage
-  facilities sit on the riverbank. Plants lose output after five years unless overhauled;
+  facilities sit on the riverbank, and clustered pumps, outlets, towers and turbines lose
+  output (see [Building tiers](#building-tiers)). Plants lose output after five years unless overhauled;
   wind output follows a wind map. Shortfalls are covered by costly imports from the region
   (the mayor can stop them) and surplus power is sold.
 - **The river** flows north to south. Sewage outlets and riverside industry pollute it
-  downstream: pumps below an outlet deliver dirty water. Treatment plants remove 80%.
+  downstream: pumps below an outlet deliver dirty water. Treatment plants remove 80% (advanced
+  treatment 95%).
 - **City services** (police, fire, clinics and hospitals, schools, garbage trucks,
   shelters) cover buildings they can reach along the road network within their radius, up
   to their capacity, scaled by the department's funding level. Crime grows with
   unemployment, density, low education and low land value; uncovered fires spread;
   uncollected garbage piles up; pollution, dirty water and garbage make people sick (sick
-  workers stay home); deaths need cemetery space; landfills fill up.
+  workers stay home); deaths need cemetery space or a crematorium; landfills fill up
+  (recycling centres don't).
 - **Traffic.** Workers commute from home to the busiest job areas along shortest road
   paths (a gravity model); trucks carry goods to the highway, train stations and the
   harbour. Load over capacity means congestion: longer commutes, noise, exhaust, and slower
@@ -281,23 +287,90 @@ only appear as summaries, so agents have to talk to each other.
 All balance numbers live in `civitas/sim/catalog.py`. You can override them per config
 with `[game.balance]`.
 
+### Building tiers
+
+Most service and utility buildings belong to a ladder, like the ones in Cities: Skylines
+(`catalog.TIER_LINES`). Higher tiers unlock at the Town (1k), City (5k) and Metropolis (10k)
+milestones. They are bigger buildings with much more output per dollar of upkeep, so a
+growing city replaces a cluster of small buildings with a few large ones. Each cell below
+shows the milestone, the main output, the build cost and the upkeep per month.
+
+| line | tier 1 | tier 2 | tier 3 |
+|---|---|---|---|
+| pump (riverbank) | water pump: 250 water, $1,500, $25 | pumping station (1k): 650, $4,000, $45 | water works (10k, 2×2): 2,000, $12,000, $100, filters dirty river water |
+| tower | water tower: 120 water, $2,200, $30 | inland water plant (5k): 600, $7,000, $70 | |
+| outlet (riverbank) | outlet: 250 sewage, raw, $1,200, $15 | treatment plant (1k): 700, removes 80%, $5,000, $50 | advanced treatment (10k, 2×2): 2,000, removes 95%, $14,000, $110 |
+| coal | coal plant: 250 power, pollution 25, $4,000, $80 | advanced coal (5k): 500, pollution 12, $9,000, $120 | |
+| gas | gas plant: 200 power, pollution 10, $6,500, $60 | combined cycle (5k): 450, pollution 6, $12,000, $90 | |
+| wind | wind turbine: 40 power, $2,500, $12 | advanced turbine (1k): 100, $5,000, $20 | |
+| solar | solar farm: 70 power, $5,000, $15 | solar plant (10k, 2×2): 400, $16,000, $50 | |
+| landfill | landfill: collects 450/mo, fills at 30,000, $2,000, $30 | recycling centre (1k): 900, never fills, $6,000, $50 | waste complex (10k, 2×2): 3,000, never fills, +60 power, $20,000, $150 |
+| cemetery | cemetery: 30/mo, 2,500 plots, $1,500, $12 | crematorium (1k): 120/mo, no plots, $5,000, $35 | |
+| clinic | clinic: capacity 2,500, radius 10, $2,000, $40 | hospital (5k, 2×2): 9,000, r14, $8,000, $120 | medical centre (10k, 2×2): 22,000, r20, $20,000, $220 |
+| police station | station: 4,000, r14, 25 cells, $2,500, $55 | police HQ (5k): 14,000, r22, 100 cells, $9,000, $130 | |
+| jail (1k) | jail: 250 inmates, $4,000, $45 | prison (10k, 2×2): 1,200, $14,000, $120 | |
+| fire station | station: capacity 260, 5 call-outs, r14, $2,500, $55 | fire HQ (5k): 900, 15 call-outs, r20, $9,000, $130 | |
+| elementary | school: 450 seats, $2,500, $45 | large elementary (1k): 1,200, $6,000, $80 | |
+| high school (1k) | school: 700 seats, r22, $5,000, $75 | large high school (5k): 2,000, r26, $11,000, $130 | |
+
+The **nuclear plant** (10k, map character `u`) is a new single-tier building. It is a 2×2
+plant on the riverbank that makes 2,000 clean power for $40,000 and $400/mo, and it draws
+100 water for cooling from its road network. The crematorium has its own character, `z`.
+Every other tier keeps its line's character, and frames carry the tier in the per-tile
+`levels` string. Hydro dams, incinerators, universities, libraries and shelters have a
+single tier.
+
+- **Build a tier directly.** Every facility build action (power, water, sewage and service
+  buildings) takes `"tier": n` (counted within the line, 1 = base), or a tier name as `kind`:
+  `{"type":"build_water","kind":"pumping_station","x":29,"y":24}`,
+  `{"type":"build_police_station","kind":"police_hq","x":14,"y":25}`,
+  `{"type":"build_cemetery","tier":2,...}`. Nuclear is `build_power_plant` with
+  `kind: "nuclear"`. `kind: "treatment"` and `build_hospital` still work; they build tier 2
+  of their lines.
+- **Upgrade in place.** `{"type":"upgrade_facility","x":..,"y":..,"module":"tier"}` moves a
+  building up one tier. It costs the price difference × 1.2 and keeps the building's age
+  and modules. A 2×2 tier grows into free tiles around the building (the top-left tile may
+  move), and the action fails with a clear message if none are free. Outlets become
+  treatment plants and clinics become hospitals. An expansion adds 50% of the current
+  tier's output.
+- **Crowding.** Production buildings of the same group lose 15% output for each neighbour
+  within the group's radius, down to a floor of 40%. A neighbour of any tier counts. The
+  groups are pumps (4 tiles), outlets (4), water towers (5) and wind turbines (2, on top of
+  the wind map). Coal, gas, solar and nuclear plants don't crowd. One water works beats
+  eight pumps on one stretch of river.
+- **Downtown.** Level 4–5 buildings get only 60% of the police, fire and health cover that
+  tier-1 buildings give. A tier-2+ building in range gives them full cover.
+- **What agents see.** The utilities section shows the crowding for each group, the
+  observation offers the best upgrades with their real gains, service sections report
+  downtown tiles without tier-2 cover, and suggested sites include riverbank spots with
+  room for a 2×2 building. The windy, pump and sewage site lists put uncrowded spots first and mark
+  crowded ones (`near 1 turbine`). `World._metrics()` records `tiers` (count per line and tier)
+  and `downtown_uncovered`.
+- **Overrides.** Use `"TIERS.<line>.<tier>.<field>"`, e.g.
+  `"TIERS.pump.2.water" = 800` in `[game.balance]`, a nested `[game.balance.TIERS.pump.2]`
+  table, or `--set game.balance.TIERS.pump.2.water=800`. Tier 1 is the same dict as the
+  `CATALOG` / `SERVICES` entry, so `"CATALOG.pump.water"` still works. Tiers 2+ are
+  copies, so a tier-1 override doesn't reach them. The crowding and downtown rules use
+  `CROWD_STEP`, `CROWD_FLOOR`, `T1_DOWNTOWN` and `DOWNTOWN_LEVEL`.
+
 ### Roles and actions
 
 | role | actions |
 |---|---|
 | mayor | `set_tax` (R/C/I %), `allocate_budget`, `set_funding` (department 50–150%), `enact_policy` / `repeal_policy` (city-wide or per district), `set_district_tax`, `accept_offer` / `decline_offer`, `set_service_imports`, `take_loan`, `repay_loan` |
 | planning | `build_road`, `zone` (R/C/I/O/M, low or high density), `dezone`, `build_park`, `build_landmark` (plaza/stadium/monument), `build_casino`, `paint_district`, `specialize_district`, `preserve_historic` / `delist_historic`, `bulldoze`, `demolish` |
-| utilities | `build_power_plant` (coal / gas / solar / wind / hydro), `build_water` (pump / tower), `build_sewage` (outlet / treatment), `upgrade_facility` (filter / expansion / overhaul), `demolish` |
+| utilities | `build_power_plant` (coal / gas / solar / wind / hydro / nuclear), `build_water` (pump / tower), `build_sewage` (outlet / treatment), `upgrade_facility` (tier / filter / expansion / overhaul), `demolish` |
 | transport | `upgrade_road` (avenue / highway), `create_bus_line`, `remove_bus_line`, `set_fare`, `build_metro_station`, `create_metro_line`, `remove_metro_line`, `build_train_station`, `build_harbour`, `build_airport`, `build_connector` (region mode), `upgrade_facility`, `demolish` |
 | police | `build_police_station`, `build_jail`, `upgrade_facility`, `demolish` |
 | fire | `build_fire_station`, `build_levee`, `build_shelter`, `upgrade_facility`, `demolish` |
-| health | `build_clinic`, `build_hospital`, `build_landfill`, `build_incinerator`, `build_cemetery`, `clean_soil`, `upgrade_facility`, `demolish` |
+| health | `build_clinic`, `build_hospital`, `build_landfill`, `build_incinerator`, `build_cemetery` (tier 2: crematorium), `clean_soil`, `upgrade_facility`, `demolish` |
 | education | `build_school` (elementary / high / university), `build_library`, `upgrade_facility`, `demolish` |
 
 Policies: recycling, neighborhood watch, smoke detectors, education boost, industry
 filters, high-rise ban, free transit. Every role can post `messages` to the council board
 (to `all` or a role) and keep `notes` for its next turn. Invalid actions are rejected with
-a helpful message and counted in the invalid-action rate.
+a helpful message and counted in the invalid-action rate. Every facility build action (power,
+water, sewage and service buildings) also takes a `tier` (see [Building tiers](#building-tiers)).
 
 ### Scores (0–100)
 
@@ -306,7 +379,7 @@ a helpful message and counted in the invalid-action rate.
 | **city** | ½ population (√ of pop / 30k) + ½ quality: happiness, finances, power/water/sewage coverage, environment, employment, safety, health, education. Quality counts only once the city has people; bankruptcy halves the total, a lost recall election cuts it by a quarter. |
 | **mayor** | revenue, solvency, net worth, happiness, approval, and how much of the money given to departments actually got spent |
 | **planning** | growth, share of zoned land that developed, demand balance, land value, road efficiency, employment |
-| **utilities** | power, water and sewage coverage, spare capacity in the 10–60% range, cost efficiency, clean-energy share, pollution near homes, water quality, river quality |
+| **utilities** | power, water and sewage coverage, spare capacity in the 10–60% range, cost efficiency, clean-energy share (solar, wind, nuclear), pollution near homes, water quality, river quality |
 | **transport** | commute time, share of congested road, bus share of trips, cost per resident |
 | **police** | crime at homes, coverage, jail space, cost per resident |
 | **fire** | buildings lost to fire, coverage, cost per resident |

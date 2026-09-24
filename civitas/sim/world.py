@@ -29,6 +29,9 @@ from .traffic import TrafficMixin
 
 POLLUTION_KERNEL = make_kernel(radius=5, falloff=2.0)
 DEPARTMENTS = ("planning", "utilities", "transport", "police", "fire", "health", "education")
+# widest / tallest building of any type or tier (bounds the anchor scan in parts())
+MAX_FOOTPRINT = max(max(f) for f in [*C.FOOTPRINT.values(), *(t["footprint"] for ts in C.TIER_LINES.values()
+                                                                for t in ts)])
 
 
 @dataclass
@@ -93,6 +96,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         self.road_labels = np.full(shape, -1, np.int32)
         self.road_key = None
         self.networks: list[Network] = []
+        self.crowd: dict[tuple[int, int], tuple[float, int]] = {}   # production building -> (output, neighbours)
 
         self.month = 0
         self.treasury = self.start_funds
@@ -188,15 +192,34 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
                         best = lab
         return best
 
-    # ----------------------------------------------- multi-tile buildings
+    # ----------------------------------------------- multi-tile buildings & tiers
+    def _anchor_of(self, x: int, y: int) -> tuple[int, int]:
+        a = int(self.anchor[y, x])
+        return (x, y) if a < 0 else (a % self.w, a // self.w)
+
+    def facility_tier(self, x: int, y: int) -> int:
+        ax, ay = self._anchor_of(x, y)
+        return self.facility_state.get((ax, ay), {}).get("tier") or C.BASE_TIER.get(int(self.struct[ay, ax]), 1)
+
+    def facility_spec(self, x: int, y: int) -> dict | None:
+        """Active tier spec of the facility covering (x, y) (see catalog.TIER_LINES), or None."""
+        ax, ay = self._anchor_of(x, y)
+        line = C.LINE_OF_STRUCT.get(int(self.struct[ay, ax]))
+        return C.TIER_LINES[line][self.facility_tier(ax, ay) - 1] if line else None
+
+    def footprint_at(self, x: int, y: int) -> tuple[int, int]:
+        ax, ay = self._anchor_of(x, y)
+        spec = self.facility_spec(ax, ay)
+        return tuple(spec["footprint"]) if spec else C.FOOTPRINT.get(int(self.struct[ay, ax]), (1, 1))
+
     def parts(self, x: int, y: int) -> list[tuple[int, int]]:
         """All tiles of the building at (x, y) (just (x, y) for one-tile buildings)."""
         a = int(self.anchor[y, x])
         if a < 0:
             return [(x, y)]
-        ax, ay = a % self.w, a // self.w
-        fw, fh = C.FOOTPRINT.get(int(self.struct[ay, ax]), (1, 1))
-        return [(ax + i, ay + j) for j in range(fh) for i in range(fw)]
+        ax, ay = a % self.w, a // self.w       # read the anchor grid, not facility_state (anchor first)
+        ys, xs = np.nonzero(self.anchor[ay:ay + MAX_FOOTPRINT, ax:ax + MAX_FOOTPRINT] == a)
+        return [(ax + i, ay + j) for j, i in zip(ys.tolist(), xs.tolist())]
 
     def building_network(self, x: int, y: int) -> int:
         """Road network touching any tile of the building at (x, y), or -1."""
@@ -207,9 +230,10 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
                 best = lab
         return best
 
-    def footprint_tiles(self, struct: int, x: int, y: int, terrain: int = C.LAND) -> list[tuple[int, int]]:
+    def footprint_tiles(self, struct: int, x: int, y: int, terrain: int = C.LAND,
+                        tier: int | None = None) -> list[tuple[int, int]]:
         """Tiles a new building would cover; raises ValueError if they are not all free."""
-        fw, fh = C.FOOTPRINT.get(struct, (1, 1))
+        fw, fh = C.footprint(struct, tier)
         tiles = [(x + i, y + j) for j in range(fh) for i in range(fw)]
         for tx, ty in tiles:
             if not self.in_bounds(tx, ty):
@@ -221,14 +245,123 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
             raise ValueError(f"({x},{y}) does not touch a road; buildings must be next to a road")
         return tiles
 
-    def place_building(self, struct: int, x: int, y: int, terrain: int = C.LAND) -> list[tuple[int, int]]:
-        tiles = self.footprint_tiles(struct, x, y, terrain)
+    def place_building(self, struct: int, x: int, y: int, terrain: int = C.LAND,
+                       tier: int | None = None) -> list[tuple[int, int]]:
+        if tier is not None and struct in C.TIERED_STRUCTS:
+            line = C.LINE_OF_STRUCT[struct]
+            tiers = C.TIER_LINES[line]
+            if not (1 <= tier <= len(tiers) and tiers[tier - 1]["struct"] == struct):
+                ok = [t["tier"] for t in tiers if t["struct"] == struct]
+                raise ValueError(f"no tier {tier} for this building (valid tiers of the {line} line: {ok})")
+        tiles = self.footprint_tiles(struct, x, y, terrain, tier)
         for tx, ty in tiles:
             self.struct[ty, tx] = struct
             self.level[ty, tx] = 0
             self.anchor[ty, tx] = y * self.w + x if len(tiles) > 1 else -1
         self.facility_state[(x, y)] = {"built": self.month}
+        if struct in C.TIERED_STRUCTS:
+            self.facility_state[(x, y)]["tier"] = tier or C.BASE_TIER[struct]
         return tiles
+
+    def next_tier(self, x: int, y: int) -> tuple[dict, dict, tuple[int, int], list[tuple[int, int]]]:
+        """(current spec, next spec, new top-left, new tiles) for moving the facility at (x, y) one tier up.
+
+        A bigger tier grows into any free block that contains the old footprint (top-left first). Raises ValueError
+        if the facility has no higher tier or there is no room."""
+        ax, ay = self._anchor_of(x, y)
+        cur = self.facility_spec(ax, ay)
+        if cur is None:
+            raise ValueError(f"no upgradable facility at ({x},{y})")
+        tiers = C.TIER_LINES[cur["line"]]
+        name = cur["name"].replace("_", " ")
+        if cur["tier"] >= len(tiers):
+            raise ValueError(f"the {name} at ({ax},{ay}) is already the top tier of its line")
+        nxt = tiers[cur["tier"]]
+        old = set(self.parts(ax, ay))
+        ow, oh = max(p[0] for p in old) - ax + 1, max(p[1] for p in old) - ay + 1
+        fw, fh = tuple(nxt["footprint"])        # tiers never shrink, so the new block only reaches up / left
+        terrain = self.terrain[ay, ax]
+        for dy in range(0, oh - fh - 1, -1):
+            for dx in range(0, ow - fw - 1, -1):
+                x0, y0 = ax + dx, ay + dy
+                tiles = [(x0 + i, y0 + j) for j in range(fh) for i in range(fw)]
+                if all(self.in_bounds(tx, ty) and ((tx, ty) in old or (self.terrain[ty, tx] == terrain
+                                                                       and self.struct[ty, tx] == C.NONE))
+                       for tx, ty in tiles):
+                    return cur, nxt, (x0, y0), tiles
+        raise ValueError(f"upgrading the {name} at ({ax},{ay}) to a {nxt['name'].replace('_', ' ')} needs a free "
+                         f"{fw}x{fh} block of {'river' if terrain == C.WATER else 'land'} tiles around it")
+
+    def upgrade_options(self, structs, need=None, k: int = 4, min_need: float | None = None,
+                        per_pair: bool = True) -> list[dict]:
+        """Unlocked tier upgrades with room to grow for facilities of these types, best first.
+
+        need: a per-tile grid (summed around each building) or {(x, y): value}; offers with need <= min_need are
+        dropped. Production offers (power / water / sewage) carry their effective gain (after crowding, ageing, wind
+        and funding; the raw figure goes in "nameplate" when it differs) and rank by gain per dollar; the rest rank
+        by need, then crowding, then cost. per_pair keeps the best offer per (from, to) and counts the rest in
+        "similar"."""
+        out = []
+        u_eff = self.funding_eff("utilities")
+        for st in structs:
+            for x, y in self.facilities(st):
+                try:
+                    cur, nxt, _, _ = self.next_tier(x, y)
+                except ValueError:
+                    continue
+                if nxt.get("unlock") and not self.unlocked(nxt["unlock"]):
+                    continue
+                o = {"x": x, "y": y, "from": cur["name"], "to": nxt["name"], "tier": nxt["tier"],
+                     "cost": C.upgrade_cost(cur, nxt), "gain": C.tier_gain(cur, nxt)}
+                cf = self.crowd.get((x, y), (1.0, 0))[0]
+                if cf < 1.0:
+                    o["crowd"] = round(cf, 2)
+                if any(nxt.get(key) for key in ("power", "water", "sewage")):
+                    f = cf * self.plant_output_factor(x, y, cur["line"]) * u_eff
+                    eff = {key: (round(v * f) if key in ("power", "water", "sewage") else v)
+                           for key, v in o["gain"].items()}
+                    if eff != o["gain"]:
+                        o["nameplate"], o["gain"] = o["gain"], eff
+                    o["per_dollar"] = sum(v for key, v in eff.items() if key in ("power", "water", "sewage")) \
+                        / max(1, o["cost"])
+                if isinstance(need, dict):
+                    o["need"] = round(float(need.get((x, y), 0.0)), 1)
+                elif need is not None:
+                    # a 14x14 window roughly centred on the building: a cheap proxy for its catchment
+                    o["need"] = round(float(need[max(0, y - 6):y + 8, max(0, x - 6):x + 8].sum()), 1)
+                if min_need is not None and o.get("need", 0.0) <= min_need:
+                    continue
+                out.append(o)
+        out.sort(key=lambda o: (-o.get("need", 0.0), -o.get("per_dollar", 0.0), o.get("crowd", 1.0), o["cost"]))
+        for o in out:
+            o.pop("per_dollar", None)
+        if per_pair:
+            best: dict[tuple[str, str], dict] = {}
+            for o in out:
+                pair = (o["from"], o["to"])
+                if pair in best:
+                    best[pair]["similar"] = best[pair].get("similar", 0) + 1
+                else:
+                    best[pair] = o
+            out = list(best.values())
+        return out[:k]
+
+    def upgrade_building(self, x: int, y: int) -> dict:
+        """Move the facility at (x, y) one tier up its line (keeps age, modules and stock). Returns the new spec.
+
+        Callers must refresh() afterwards (apply_action does)."""
+        cur, nxt, (x0, y0), tiles = self.next_tier(x, y)
+        ax, ay = self._anchor_of(x, y)
+        for tx, ty in self.parts(ax, ay):
+            self.anchor[ty, tx] = -1
+        state = self.facility_state.pop((ax, ay), None) or {"built": self.month}
+        for tx, ty in tiles:
+            self.struct[ty, tx] = nxt["struct"]
+            self.level[ty, tx] = 0
+            self.anchor[ty, tx] = y0 * self.w + x0 if len(tiles) > 1 else -1
+        state["tier"] = nxt["tier"]
+        self.facility_state[(x0, y0)] = state
+        return nxt
 
     def remove_building(self, x: int, y: int) -> None:
         tiles = self.parts(x, y)
@@ -239,6 +372,22 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
 
     def n_buildings(self, struct: int) -> int:
         return len(self.facilities(struct))
+
+    def multi_buildings(self) -> list[list[int]]:
+        """[top-left flat index, width, height] of every building bigger than one tile (for frames)."""
+        flat = np.arange(self.h * self.w).reshape(self.h, self.w)
+        ys, xs = np.nonzero(self.anchor == flat)
+        return [[int(y) * self.w + int(x), *self.footprint_at(int(x), int(y))] for y, x in zip(ys.tolist(), xs.tolist())]
+
+    def frame_levels(self) -> np.ndarray:
+        """Zone levels plus the tier of every tiered facility (the viewer draws bigger models for higher tiers)."""
+        lv = self.level.copy()
+        for st in C.TIERED_STRUCTS:
+            for x, y in self.facilities(st):
+                t = self.facility_tier(x, y)
+                for px, py in self.parts(x, y):
+                    lv[py, px] = t
+        return lv
 
     # ------------------------------------------------------ people & jobs
     def residents_grid(self) -> np.ndarray:
@@ -326,39 +475,51 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         p_need *= self.event_factor("power_demand")
         w_need *= self.event_factor("water_demand")
 
-        # producers
+        # producers: one entry per building (multi-tile plants count once)
         plants_by_net: dict[int, list] = {i: [] for i in range(n)}
-        ys, xs = np.nonzero(np.isin(s, list(C.UTILITY_TYPES) + [C.INCINERATOR]))
         u_eff = self.funding_eff("utilities")
-        for y, x in zip(ys.tolist(), xs.tolist()):
-            st = int(s[y, x])
-            net = self.adjacent_network(x, y)
-            if st == C.INCINERATOR:
-                kind, spec = "incinerator", C.SERVICES["incinerator"]
-            else:
-                kind = C.KIND_BY_STRUCT[st]
-                spec = C.CATALOG[kind]
+        self.crowd = self._crowd_factors()
+        cool = np.zeros(s.shape)                       # nuclear plants draw cooling water from the water network
+        found = []
+        self.disconnected_plants = []
+        for st in C.PRODUCER_STRUCTS:
+            for x, y in self.facilities(st):
+                spec = self.facility_spec(x, y)
+                if any(spec.get(k) for k in ("power", "water", "sewage")) or spec.get("water_use"):
+                    found.append((y, x, spec))
+        found.sort(key=lambda t: (t[0], t[1]))       # row-major, like the old per-tile scan
+        for y, x, spec in found:
+            line = spec["line"]
+            net = self.building_network(x, y)
+            if net < 0:
+                self.disconnected_plants.append({"kind": spec["name"], "x": x, "y": y})
             off = self.is_offline(x, y)
-            f = 0.0 if off else u_eff * self.plant_output_factor(x, y, kind)
-            info = {"kind": kind, "x": x, "y": y, "network": net,
-                    "power": float(spec.get("power", 0)) * f, "water": float(spec.get("water", 0)) * f}
+            cf, cn = self.crowd.get((x, y), (1.0, 0))
+            f = 0.0 if off else u_eff * self.plant_output_factor(x, y, line) * cf
+            if spec.get("water_use"):
+                # cooling water is asked for at the anchor tile and the plant runs on the previous refresh's
+                # `watered` grid (a one-refresh lag; tick() refreshes twice)
+                cool[y, x] = spec["water_use"]
+                if not self.watered[y, x]:
+                    f = 0.0
+            info = {"kind": spec["name"], "line": line, "tier": spec["tier"], "x": x, "y": y, "network": net,
+                    "power": float(spec.get("power") or 0) * f, "water": float(spec.get("water") or 0) * f}
             if off:
                 info["offline"] = True
+            if cn:
+                info["crowd"], info["neighbours"] = round(cf, 2), cn
             age = (self.month - self.facility_state.get((x, y), {}).get("built", self.month)) / 12.0
             if age >= 1:
                 info["age_years"] = round(age, 1)
-            info["sewage"] = float(spec.get("sewage", 0)) * f
-            if kind == "pump":
-                info["quality"] = round(float(max(0.2, 1.0 - 0.8 * max(self.pollution[y, x], self._river_near(x, y)))), 2)
-            elif kind == "tower":
+            info["sewage"] = float(spec.get("sewage") or 0) * f
+            if line == "pump":
+                q = max(0.2, 1.0 - 0.8 * max(self.pollution[y, x], self._river_near(x, y)))
+                info["quality"] = round(float(max(q, spec.get("min_quality") or 0.0)), 2)
+            elif line == "tower":
                 info["quality"] = 1.0
             if net >= 0:
                 plants_by_net[net].append(info)
         self.plant_list = [p for lst in plants_by_net.values() for p in lst]
-        self.disconnected_plants = [
-            {"kind": C.KIND_BY_STRUCT.get(int(s[y, x]), "incinerator"), "x": x, "y": y}
-            for y, x in zip(ys.tolist(), xs.tolist()) if self.adjacent_network(x, y) < 0
-        ]
 
         self.imports = {"power": 0.0, "water": 0.0}
         self.power_sold = 0.0
@@ -373,7 +534,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
             net.plants = [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in p.items()
                            if k != "network" and not (k in ("power", "water", "sewage") and not v)} for p in plants]
             in_net = owner == lab
-            for res_key, need, served_grid in (("power", p_need, powered), ("water", w_need, watered),
+            for res_key, need, served_grid in (("power", p_need, powered), ("water", w_need + cool, watered),
                                                ("sewage", w_need, sewered)):
                 srcs = [p for p in plants if p[res_key] > 0]
                 supply = sum(p[res_key] for p in srcs)
@@ -401,7 +562,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
                     net.sewage_supply, net.sewage_demand = supply, demand
                     handled = min(supply, demand)
                     for p in srcs:     # each facility treats its share of the collected sewage
-                        factor = C.CATALOG[p["kind"]]["discharge"]
+                        factor = self.facility_spec(p["x"], p["y"])["discharge"]
                         discharge.append((p["x"], p["y"], handled * p[res_key] / supply * factor))
                 if supply <= 0:
                     continue
@@ -431,6 +592,22 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         hx, hy = self.highway
         return int(self.road_labels[hy, hx])
 
+    def _crowd_factors(self) -> dict[tuple[int, int], tuple[float, int]]:
+        """(output factor, neighbours) per production building in a crowd group (catalog.CROWD_GROUPS)."""
+        out = {}
+        for g in C.CROWD_GROUPS.values():
+            structs = {t["struct"] for line in g["lines"] for t in C.TIER_LINES[line]}
+            boxes = []
+            for st in structs:
+                for x, y in self.facilities(st):
+                    fw, fh = self.footprint_at(x, y)
+                    boxes.append((x, y, x + fw - 1, y + fh - 1))
+            for i, (x0, y0, x1, y1) in enumerate(boxes):
+                n = sum(1 for j, (a0, b0, a1, b1) in enumerate(boxes)
+                        if j != i and max(a0 - x1, x0 - a1, 0) <= g["radius"] and max(b0 - y1, y0 - b1, 0) <= g["radius"])
+                out[(x0, y0)] = (max(C.CROWD_FLOOR, 1.0 - C.CROWD_STEP * n), n)
+        return out
+
     def _river_near(self, x: int, y: int) -> float:
         """Pollution of the river next to (x, y) (0 if not on the bank)."""
         return float(self.river_row[y]) if self.dist_water[y, x] <= 1 else 0.0
@@ -444,13 +621,12 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         if self.policies_any("industry_filters"):
             src *= np.where(self.policy_mask("industry_filters"), C.POLICIES["industry_filters"]["pollution"], 1.0)
         plant_src = np.zeros(s.shape)
-        for kind in ("coal", "gas"):
-            plant_src[s == C.POWER_PLANTS[kind]] = C.CATALOG[kind]["pollution"]
-        for kind, struct in (("landfill", C.LANDFILL), ("incinerator", C.INCINERATOR)):
-            plant_src[s == struct] = C.SERVICES[kind]["pollution"]
-        for (x, y), st in self.facility_state.items():          # filters halve plant pollution
-            if "filter" in st.get("modules", ()) and plant_src[y, x] > 0:
-                plant_src[y, x] *= C.MODULES["filter"]["pollution"]
+        for st in C.POLLUTER_STRUCTS:                        # per building, spread over its tiles; filters halve it
+            for x, y in self.facilities(st):
+                tiles = self.parts(x, y)
+                p = (self.facility_spec(x, y).get("pollution") or 0.0) * self.module_factor(x, y, "filter") / len(tiles)
+                for px, py in tiles:
+                    plant_src[py, px] = p
         src[self.complex_mask & ind] *= C.COMPLEX_POLLUTION
         src = src + C.TRAFFIC_POLLUTION * self.traffic_load
         kernel = self.pollution_kernel()                      # drifts downwind
@@ -536,15 +712,16 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         bridges = float(((s == C.ROAD) & water).sum()) * C.upkeep_of(C.ROAD, True)
         out["roads"] = (roads + bridges) * self.funding.get("transport", 1.0)
         out["parks"] = float((s == C.PARK).sum()) * C.upkeep_of(C.PARK)
-        util = [int(v) for v in s[np.isin(s, list(C.UTILITY_TYPES))].tolist()]
-        out["utilities"] = sum(C.upkeep_of(v) for v in util) * self.funding.get("utilities", 1.0)
+        spec_upkeep = lambda structs: sum(self.facility_spec(x, y)["upkeep"] for st in structs
+                                          for x, y in self.facilities(st))
+        out["utilities"] = spec_upkeep(C.UTILITY_TYPES) * self.funding.get("utilities", 1.0)
         out["landmarks"] = sum(C.upkeep_of(st) * self.n_buildings(st) for st in (*C.LANDMARK_BY_STRUCT, C.CASINO))
         out["transport"] = (self.transit_upkeep() + self.road_upgrade_upkeep()
                             + sum(C.upkeep_of(st) * self.n_buildings(st) for st in (C.TRAIN, C.HARBOUR, C.METRO, C.AIRPORT))
                             ) * self.funding.get("transport", 1.0)
         for dept in ("police", "fire", "health", "education"):
-            structs = [v["struct"] for v in C.SERVICES.values() if v["dept"] == dept] + ([C.LEVEE] if dept == "fire" else [])
-            out[dept] = sum(C.upkeep_of(st) * self.n_buildings(st) for st in structs) * self.funding.get(dept, 1.0)
+            levees = C.upkeep_of(C.LEVEE) * self.n_buildings(C.LEVEE) if dept == "fire" else 0.0
+            out[dept] = (spec_upkeep(C.STRUCTS_OF_DEPT[dept]) + levees) * self.funding.get(dept, 1.0)
         return out
 
     # ------------------------------------------------------ region mode
@@ -710,9 +887,9 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         dev = {L: int(((s == z) & (lvl > 0)).sum()) for L, z in C.ZONE_BY_LETTER.items()}
         income = sum(self.ledger["income"].values())
         expenses = sum(self.ledger["expenses"].values())
-        util_structs = s[np.isin(s, list(C.UTILITY_TYPES))].tolist()
-        clean = sum(float(C.CATALOG[C.KIND_BY_STRUCT[v]].get("power", 0)) for v in util_structs
-                    if C.KIND_BY_STRUCT[v] in ("solar", "wind"))
+        utils = [(x, y) for st in C.UTILITY_TYPES for x, y in self.facilities(st)]
+        clean = sum(float(self.facility_spec(x, y).get("power") or 0) for x, y in utils
+                    if self.facility_spec(x, y)["line"] in ("solar", "wind", "nuclear"))
         dept_total = sum(self.dept_funds.values())
         upkeep = self.dept_upkeep()
         pop = int(st["population"])
@@ -739,7 +916,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
             "demand": {k: round(v, 3) for k, v in self.demand.items()},
             "power_supply": round(power_supply, 1), "power_demand": round(power_demand, 1),
             "power_clean_capacity": clean,
-            "utility_upkeep": round(sum(C.upkeep_of(v) for v in util_structs), 2),
+            "utility_upkeep": round(sum(self.facility_spec(x, y)["upkeep"] for x, y in utils), 2),
             "water_supply": round(water_supply, 1), "water_demand": round(water_demand, 1),
             "power_coverage": round(float(p_need[self.powered].sum() / tot_p), 4) if tot_p > 0 else None,
             "water_coverage": round(float(w_need[self.watered].sum() / tot_w), 4) if tot_w > 0 else None,
@@ -837,13 +1014,28 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
             "policy_cost": round(self.ledger["expenses"].get("policies", 0.0), 2),
             "months_negative": self.months_negative,
             "bankrupt": self.bankrupt,
+            "tiers": self.tier_counts(),
+            "downtown_uncovered": dict(st.get("downtown_uncovered", {})),
         }
 
+    def tier_counts(self) -> dict[str, list[int]]:
+        """Buildings per tier for every line that has more than one tier, e.g. {'pump': [3, 1, 0]}."""
+        out: dict[str, list[int]] = {}
+        for st, line in C.LINE_OF_STRUCT.items():
+            if len(C.TIER_LINES[line]) < 2:
+                continue
+            for x, y in self.facilities(st):
+                counts = out.setdefault(line, [0] * len(C.TIER_LINES[line]))
+                counts[self.facility_tier(x, y) - 1] += 1
+        return out
+
     def _landfill_fill_pct(self) -> float | None:
-        fills = [self._fstate(x, y).get("fill", 0.0) for x, y in self.facilities(C.LANDFILL)]
-        if not fills:
+        caps = [(self._fstate(x, y).get("fill", 0.0), self.facility_spec(x, y).get("fill"))
+                for x, y in self.facilities(C.LANDFILL)]
+        caps = [(f, c) for f, c in caps if c]            # recycling centres / waste complexes never fill
+        if not caps:
             return None
-        return round(100 * sum(fills) / (len(fills) * C.SERVICES["landfill"]["fill"]), 1)
+        return round(100 * sum(f for f, _ in caps) / sum(c for _, c in caps), 1)
 
     # ---------------------------------------------------------- rendering
     def frame_layers(self) -> dict[str, np.ndarray]:

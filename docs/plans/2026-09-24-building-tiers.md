@@ -851,6 +851,13 @@ def test_recycling_centres_never_fill_and_crematoria_need_no_plots():
         return np.clip(cov, 0.0, 1.0), info
 ```
 
+**Note (fix found in review):** the code above labels each tile with its nearest source by road and applies only that
+source's radius, which leaves holes: a tile just outside a nearby tier-1 station's radius gets 0 even when a farther
+HQ with a larger radius reaches it, so building an extra station can lower coverage. The implementation therefore
+splits the sources into groups by radius, runs the single-radius computation per group (`_cover_group`, each
+`_road_field` cached on its source tiles and radius) and combines the grids with `np.maximum`, like the clinic /
+hospital passes. With a single radius (every tier-1-only city) the result is identical to the old code.
+
 3b. `_compute_services` — every `S["x"]["radius"], S["x"]["capacity"]` pair becomes `None, None` (with
 `cap_key="seats"` for schools, `cap_key="collect"` for garbage; the university keeps `None, 1e9`). Police, fire and
 health get the downtown rule:

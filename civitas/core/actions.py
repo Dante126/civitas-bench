@@ -39,7 +39,7 @@ def _int(params: dict, key: str) -> int:
         raise ActionError(f"missing parameter '{key}'")
     try:
         return int(round(float(params[key])))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ActionError(f"parameter '{key}' must be a number, got {params[key]!r}")
 
 
@@ -308,52 +308,70 @@ def bulldoze(world: World, p: dict) -> tuple[str, float]:
 
 
 # ------------------------------------------------------------ utilities
-def _place_facility(world: World, p: dict, kind: str) -> tuple[str, float]:
+POWER_LINES = tuple(C.POWER_PLANTS)
+WATER_LINES = tuple(C.WATER_PLANTS)
+SEWAGE_LINES = tuple(dict.fromkeys(C.LINE_OF_STRUCT[st] for st in C.SEWAGE_PLANTS.values()))
+
+
+def _kind_name(kind) -> str:
+    """'Pumping Station' / 'pumping-station' -> 'pumping_station'."""
+    return str(kind or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _tier_spec(world: World, kind, p: dict, lines: tuple, explicit: bool = True) -> dict:
+    """Spec for a build action: kind is a line ('pump') or a tier name ('pumping_station'); "tier" picks a tier
+    (absolute within the line). explicit=False: kind is the handler's default, so "tier" may override it freely."""
+    names = [t["name"] for line in lines for t in C.TIER_LINES[line]]
+    kind = _kind_name(kind)
+    if kind not in C.TIER_BY_NAME or C.TIER_BY_NAME[kind][0] not in lines:
+        raise ActionError(f"kind must be one of {names}")
+    line, tier = C.TIER_BY_NAME[kind]
+    tiers = C.TIER_LINES[line]
+    if p.get("tier") is not None:
+        want = _int(p, "tier")
+        if not 1 <= want <= len(tiers):
+            if len(tiers) == 1:
+                raise ActionError(f'{line} has a single tier ({tiers[0]["name"]}); drop "tier"')
+            raise ActionError(f"{line} has tiers 1-{len(tiers)}: " + ", ".join(f"{t['tier']} {t['name']}" for t in tiers))
+        if explicit and kind != line and want != tier:
+            raise ActionError(f'kind {kind} is tier {tier} of the {line} line; drop "tier" or use kind "{line}"')
+        tier = want
+    spec = tiers[tier - 1]
+    if spec.get("unlock"):
+        _require(world, spec["unlock"])
+    return spec
+
+
+def _place_facility(world: World, p: dict, spec: dict) -> tuple[str, float]:
     x, y = _point(world, p)
-    spec = C.CATALOG[kind]
-    if spec.get("on_river"):
-        if world.terrain[y, x] != C.WATER or world.struct[y, x] != C.NONE:
-            raise ActionError(f"a {kind} dam must be built on a river tile (not a bridge)")
-    elif world.terrain[y, x] != C.LAND or world.struct[y, x] != C.NONE:
-        raise ActionError(f"({x},{y}) is not an empty land tile")
-    if spec.get("needs_river") and not world.is_riverbank(x, y):
-        raise ActionError(f"a {kind} must be on the riverbank (a land tile next to water)")
-    net = world.adjacent_network(x, y)
-    if net < 0:
-        raise ActionError(f"({x},{y}) does not touch a road; facilities must be next to a road")
+    name = spec["name"].replace("_", " ")
+    terrain = C.WATER if spec.get("on_river") else C.LAND
+    try:
+        tiles = world.footprint_tiles(spec["struct"], x, y, terrain, spec["tier"])
+    except ValueError as e:
+        raise ActionError(f"{e}" + (f" (a {name} dam goes on open river, not a bridge)" if spec.get("on_river") else ""))
+    if spec.get("needs_river") and not any(world.is_riverbank(tx, ty) for tx, ty in tiles):
+        raise ActionError(f"a {name} must be on the riverbank (a land tile next to water)")
     _spend(world, "utilities", spec["cost"])
-    world.struct[y, x] = {**C.POWER_PLANTS, **C.WATER_PLANTS, **C.SEWAGE_PLANTS}[kind]
-    world.facility_state[(x, y)] = {"built": world.month}
+    world.place_building(spec["struct"], x, y, terrain, spec["tier"])
+    net = world.building_network(x, y)
     warn = "" if world.networks[net].outside_connected else \
         " WARNING: that road network is not connected to the highway"
-    res = next(k for k in ("power", "water", "sewage") if k in spec)
-    cap = f"{spec[res]} {res}"
-    return f"built {kind} at ({x},{y}) adding {cap} to network {net}{warn}", spec["cost"]
+    res = next(k for k in ("power", "water", "sewage") if spec.get(k))
+    return (f"built {name} (tier {spec['tier']}) at ({x},{y}){_size(spec)} adding {spec[res]} {res} "
+            f"to network {net}{warn}"), spec["cost"]
 
 
 def build_power_plant(world: World, p: dict) -> tuple[str, float]:
-    kind = str(p.get("kind", "")).lower()
-    if kind not in C.POWER_PLANTS:
-        raise ActionError(f"kind must be one of {list(C.POWER_PLANTS)}")
-    if kind == "hydro":
-        _require(world, "hydro_dam")
-    return _place_facility(world, p, kind)
+    return _place_facility(world, p, _tier_spec(world, p.get("kind", ""), p, POWER_LINES))
 
 
 def build_water(world: World, p: dict) -> tuple[str, float]:
-    kind = str(p.get("kind", "")).lower()
-    if kind not in C.WATER_PLANTS:
-        raise ActionError(f"kind must be one of {list(C.WATER_PLANTS)}")
-    return _place_facility(world, p, kind)
+    return _place_facility(world, p, _tier_spec(world, p.get("kind", ""), p, WATER_LINES))
 
 
 def build_sewage(world: World, p: dict) -> tuple[str, float]:
-    kind = str(p.get("kind", "")).lower()
-    if kind not in C.SEWAGE_PLANTS:
-        raise ActionError(f"kind must be one of {list(C.SEWAGE_PLANTS)}")
-    if kind == "treatment":
-        _require(world, "treatment_plant")
-    return _place_facility(world, p, kind)
+    return _place_facility(world, p, _tier_spec(world, p.get("kind", ""), p, SEWAGE_LINES))
 
 
 def demolish(world: World, p: dict, role: str = "utilities") -> tuple[str, float]:
@@ -363,7 +381,8 @@ def demolish(world: World, p: dict, role: str = "utilities") -> tuple[str, float
     if st not in owned:
         what = C.STRUCT_NAME.get(st, "nothing")
         raise ActionError(f"no {role} facility at ({x},{y}) (found {what}); you can only demolish your own buildings")
-    name = C.STRUCT_NAME[st]
+    spec = world.facility_spec(x, y)
+    name = spec["name"].replace("_", " ") if spec else C.STRUCT_NAME[st]
     world.remove_building(x, y)
     return f"demolished {name} at ({x},{y})", 0.0
 
@@ -465,8 +484,8 @@ def set_service_imports(world: World, p: dict) -> tuple[str, float]:
             f"(now ${world.service_import_price('power'):.2f}/power, ${world.service_import_price('water'):.2f}/water per unit)"), 0.0
 
 
-UPGRADE_OWNER = {**{s: "utilities" for s in C.UTILITY_TYPES}, C.INCINERATOR: "health",
-                 **{v["struct"]: v["dept"] for v in C.SERVICES.values()}, C.TRAIN: "transport", C.HARBOUR: "transport"}
+UPGRADE_OWNER = {**{st: C.TIER_LINES[line][0]["dept"] for st, line in C.LINE_OF_STRUCT.items()},
+                 C.TRAIN: "transport", C.HARBOUR: "transport"}
 
 
 def upgrade_facility(world: World, p: dict, role: str = "utilities") -> tuple[str, float]:
@@ -474,27 +493,51 @@ def upgrade_facility(world: World, p: dict, role: str = "utilities") -> tuple[st
     st_code = int(world.struct[y, x])
     if UPGRADE_OWNER.get(st_code) != role:
         raise ActionError(f"no {role} facility at ({x},{y}) (found {C.STRUCT_NAME.get(st_code, 'nothing')})")
-    module = str(p.get("module", "")).lower()
+    module = str(p.get("module") or "").strip().lower()
+    if module == "tier" or (not module and p.get("tier") is not None):
+        return _upgrade_tier(world, x, y, role, None if p.get("tier") is None else _int(p, "tier"))
     if module not in C.MODULES:
-        raise ActionError(f"module must be one of {list(C.MODULES)}")
-    kind = C.KIND_BY_STRUCT.get(st_code) or C.SERVICE_BY_STRUCT.get(st_code) or C.STRUCT_NAME[st_code]
+        raise ActionError(f"module must be 'tier' or one of {list(C.MODULES)}")
+    spec = world.facility_spec(x, y)
+    kind = spec["line"] if spec else C.STRUCT_NAME[st_code]
+    name = (spec["name"] if spec else kind).replace("_", " ")
     allowed = C.MODULES[module]["for"]
     if allowed != "any" and kind not in allowed:
-        raise ActionError(f"{module} does not apply to a {kind} (only {', '.join(allowed)})")
+        raise ActionError(f"{module} does not apply to a {name} (only {', '.join(allowed)})")
+    x, y = world._anchor_of(x, y)
     state = world.facility_state.setdefault((x, y), {"built": world.month})
     mods = set(state.get("modules", ()))
     if module in mods and module != "overhaul":
-        raise ActionError(f"the {kind} at ({x},{y}) already has a {module}")
-    base = (C.CATALOG.get(kind) or C.SERVICES.get(kind) or {"cost": C.TRAIN_STATION["cost"]})["cost"]
+        raise ActionError(f"the {name} at ({x},{y}) already has a {module}")
+    base = spec["cost"] if spec else C.TRAIN_STATION["cost"]
     cost = round(base * C.MODULES[module]["cost_share"])
     _spend(world, role, cost)
     if module == "overhaul":
         state["built"] = world.month
-        return f"overhauled the {kind} at ({x},{y}): back to full output", cost
+        return f"overhauled the {name} at ({x},{y}): back to full output", cost
     mods.add(module)
     state["modules"] = sorted(mods)
     what = "halves its pollution" if module == "filter" else "+50% capacity"
-    return f"added {module} to the {kind} at ({x},{y}) ({what})", cost
+    return f"added {module} to the {name} at ({x},{y}) ({what})", cost
+
+
+def _upgrade_tier(world: World, x: int, y: int, role: str, want: int | None = None) -> tuple[str, float]:
+    try:
+        cur, nxt, (x0, y0), _ = world.next_tier(x, y)
+    except ValueError as e:
+        raise ActionError(str(e))
+    if want is not None and want <= cur["tier"]:
+        raise ActionError(f"the {cur['name'].replace('_', ' ')} at ({x},{y}) is already tier {cur['tier']}; "
+                          "upgrades only go up")
+    if nxt.get("unlock"):
+        _require(world, nxt["unlock"])
+    cost = C.upgrade_cost(cur, nxt)
+    _spend(world, role, cost)
+    world.upgrade_building(x, y)
+    gain = ", ".join(f"+{v:g} {k}" for k, v in C.tier_gain(cur, nxt).items())
+    return (f"upgraded the {cur['name'].replace('_', ' ')} to a {nxt['name'].replace('_', ' ')} (tier {nxt['tier']}) "
+            f"at ({x0},{y0}){_size(nxt)}" + (f": {gain}" if gain else "")
+            + (" (upgrades go one tier at a time)" if want is not None and want > nxt["tier"] else "")), cost
 
 
 def build_harbour(world: World, p: dict) -> tuple[str, float]:
@@ -736,20 +779,22 @@ def specialize_district(world: World, p: dict) -> tuple[str, float]:
             + (" (needs the matching natural resource)" if ind != "hightech" else " (needs educated workers)")), 0.0
 
 
-def _build(world: World, struct: int, dept: str, cost: float, p: dict, terrain: int = C.LAND) -> tuple[int, int]:
+def _build(world: World, struct: int, dept: str, cost: float, p: dict, terrain: int = C.LAND,
+           tier: int | None = None) -> tuple[int, int]:
     """Validate the footprint, charge the budget, place the building. Returns its top-left tile."""
     x, y = _point(world, p)
     try:
-        world.footprint_tiles(struct, x, y, terrain)
+        world.footprint_tiles(struct, x, y, terrain, tier)
     except ValueError as e:
         raise ActionError(str(e))
     _spend(world, dept, cost)
-    world.place_building(struct, x, y, terrain)
+    world.place_building(struct, x, y, terrain, tier)
     return x, y
 
 
-def _size(struct: int) -> str:
-    fw, fh = C.FOOTPRINT.get(struct, (1, 1))
+def _size(what) -> str:
+    """what: a struct code or a tier spec."""
+    fw, fh = tuple(what["footprint"]) if isinstance(what, dict) else C.FOOTPRINT.get(what, (1, 1))
     return f" ({fw}x{fh} tiles from its top-left corner)" if fw * fh > 1 else ""
 
 
@@ -764,19 +809,18 @@ def build_landmark(world: World, p: dict) -> tuple[str, float]:
 
 
 # ------------------------------------------------------------ services
-SERVICE_UNLOCK = {"jail": "jail", "incinerator": "incinerator", "hospital": "hospital", "library": "library",
-                  "high_school": "high_school", "university": "university"}
-
-
-def _place_service(world: World, p: dict, kind: str) -> tuple[str, float]:
-    if kind in SERVICE_UNLOCK:
-        _require(world, SERVICE_UNLOCK[kind])
-    spec = C.SERVICES[kind]
-    x, y = _build(world, spec["struct"], spec["dept"], spec["cost"], p)
+def _place_service(world: World, p: dict, kind: str, explicit: bool = False) -> tuple[str, float]:
+    """kind: the handler's building (e.g. 'hospital'); a "kind" param naming another tier of its line wins."""
+    line = C.TIER_BY_NAME[kind][0]
+    given = _kind_name(p.get("kind"))
+    if not explicit and C.TIER_BY_NAME.get(given, ("",))[0] == line:
+        kind, explicit = given, True
+    spec = _tier_spec(world, kind, p, (line,), explicit)
+    x, y = _build(world, spec["struct"], spec["dept"], spec["cost"], p, tier=spec["tier"])
     net = world.building_network(x, y)
     warn = "" if world.networks[net].outside_connected else \
         " WARNING: that road network is not connected to the highway"
-    return f"built {kind.replace('_', ' ')} at ({x},{y}){_size(spec['struct'])}{warn}", spec["cost"]
+    return f"built {spec['name'].replace('_', ' ')} at ({x},{y}){_size(spec)}{warn}", spec["cost"]
 
 
 def _service_handler(kind: str):
@@ -787,10 +831,14 @@ SCHOOL_KINDS = {"elementary": "elementary_school", "high": "high_school", "unive
 
 
 def build_school(world: World, p: dict) -> tuple[str, float]:
-    kind = str(p.get("kind", "elementary")).lower().replace("_school", "").replace(" school", "")
-    if kind not in SCHOOL_KINDS:
-        raise ActionError(f"kind must be one of {list(SCHOOL_KINDS)}")
-    return _place_service(world, p, SCHOOL_KINDS[kind])
+    kind = _kind_name(p.get("kind") or "elementary")
+    kind = SCHOOL_KINDS.get(kind, kind)
+    if kind not in C.TIER_BY_NAME and kind.endswith("_school"):     # 'large_elementary_school', 'university_school'
+        short = kind[:-len("_school")]
+        kind = SCHOOL_KINDS.get(short, short)
+    if C.TIER_BY_NAME.get(kind, ("",))[0] not in SCHOOL_KINDS.values():
+        raise ActionError(f"kind must be one of {list(SCHOOL_KINDS)} (or a tier name such as large_elementary)")
+    return _place_service(world, p, kind, explicit=True)
 
 
 def noop(world: World, p: dict) -> tuple[str, float]:
@@ -825,14 +873,87 @@ ROLE_AWARE = {"demolish", "upgrade_facility"}
 # which structures each role may demolish
 OWNED_STRUCTS = {
     "utilities": set(C.UTILITY_TYPES),
-    **{d: {v["struct"] for v in C.SERVICES.values() if v["dept"] == d}
-       for d in ("police", "fire", "health", "education")},
+    **{d: set(C.STRUCTS_OF_DEPT[d]) for d in ("police", "fire", "health", "education")},
     "transport": {C.TRAIN, C.HARBOUR, C.METRO, C.AIRPORT},
     "planning": {*C.LANDMARK_BY_STRUCT, C.CASINO},
 }
 OWNED_STRUCTS["fire"] = OWNED_STRUCTS["fire"] | {C.LEVEE}
 
-def _svc_doc(kind: str) -> str:
+_GAIN_LABEL = {"power": "+{} power", "water": "+{} water", "sewage": "{} sewage", "capacity": "capacity {}",
+               "seats": "{} seats", "collect": "collects {}/mo", "responses": "{} call-outs/mo", "rate": "{} deceased/mo",
+               "holding": "{} cells", "radius": "radius {}"}
+
+
+def _named(spec: dict, name: str | None = None, size: bool = False) -> str:
+    """'water_works (10,000+ residents, 2x2)': a name with its unlock level (and footprint)."""
+    fw, fh = spec["footprint"]
+    tags = ([f"{C.UNLOCK_POP[spec['unlock']]:,}+ residents"] if spec.get("unlock") else []) + \
+        ([f"{fw}x{fh}"] if size and fw * fh > 1 else [])
+    return (name or spec["name"]) + (f" ({', '.join(tags)})" if tags else "")
+
+
+def _tier_extras(t: dict, base: dict) -> list[str]:
+    """What sets a tier apart beyond its numbers (read from the spec)."""
+    out = []
+    if t.get("pollution") and t["pollution"] != base.get("pollution"):
+        out.append(f"pollution {t['pollution']:g}")
+    if t.get("min_quality"):
+        out.append("filters dirty river water")
+    if t.get("discharge") is not None and t["discharge"] < 1 and t["discharge"] != base.get("discharge"):
+        out.append(f"removes {100 - round(100 * t['discharge'])}% of the pollution")
+    if base.get("fill") and not t.get("fill"):
+        out.append("never fills up")
+    if base.get("plots") and not t.get("plots"):
+        out.append("no plots to fill")
+    return out
+
+
+def _tiers_doc(line: str, start: int = 2) -> str:
+    """'2 pumping_station (1,000+ residents): $4,000, +650 water, upkeep $45/mo; ...' (tiers from `start` up)."""
+    base, out = C.TIER_LINES[line][0], []
+    for t in C.TIER_LINES[line][start - 1:]:
+        bits = [f"${t['cost']:,}"] + [_GAIN_LABEL.get(k, k + " {}").format(f"{t[k]:,}") for k in C.GAIN_KEYS
+                                       if t.get(k) and t[k] != base.get(k)]
+        bits.append(f"upkeep ${t['upkeep']}/mo")
+        out.append(f"{t['tier']} {_named(t, size=True)}: " + ", ".join(bits + _tier_extras(t, base)))
+    return "; ".join(out)
+
+
+def _higher_tiers(lines, start: int = 2) -> str:
+    lines = [line for line in lines if len(C.TIER_LINES[line]) >= start]
+    docs = [(f"{line}: " if len(lines) > 1 else "") + _tiers_doc(line, start) for line in lines]
+    return (" Tiers: " + "; ".join(docs) + ".") if docs else ""
+
+
+def _crowd_doc(*lines: str) -> str:
+    """Crowding rule for production lines, e.g. _crowd_doc("pump", "tower")."""
+    parts = [f"{line} within {g['radius']} tiles" for line in lines
+             for g in C.CROWD_GROUPS.values() if line in g["lines"]]
+    return (f" Crowding: each other {' or '.join(parts)} (any tier) cuts output {int(C.CROWD_STEP * 100)}%, "
+            f"min {int(C.CROWD_FLOOR * 100)}%.") if parts else ""
+
+
+def _downtown_doc() -> str:
+    return (f" Downtown (level {C.DOWNTOWN_LEVEL}-5 buildings) gets only {int(C.T1_DOWNTOWN * 100)}% cover from "
+            "tier-1 buildings; a tier-2+ building in range gives full cover.")
+
+
+def _plant_doc(kind: str) -> str:
+    sp = C.CATALOG[kind]
+    res = next(k for k in ("power", "water", "sewage") if sp.get(k))
+    fw, fh = sp["footprint"]
+    bits = [f"${sp['cost']:,}", f"+{sp[res]} {res}" if res != "sewage" else f"{sp[res]} sewage",
+            f"upkeep ${sp['upkeep']}/mo"]
+    if sp.get("pollution"):
+        bits.append(f"pollution {sp['pollution']:g}")
+    if fw * fh > 1:
+        bits.append(f"{fw}x{fh}")
+    if sp.get("water_use"):
+        bits.append(f"uses {sp['water_use']} water for cooling")
+    return f"{_named(sp, kind)}: " + ", ".join(bits)
+
+
+def _svc_doc(kind: str, head: bool = True) -> str:
     sp = C.SERVICES[kind]
     bits = [f"${sp['cost']:,}", f"upkeep ${sp['upkeep']}/mo"]
     if "radius" in sp and sp["radius"] < 60:
@@ -845,7 +966,11 @@ def _svc_doc(kind: str) -> str:
         bits.append(f"+{sp['power']} power")
     if sp.get("pollution"):
         bits.append(f"pollution {sp['pollution']}")
-    return f"{kind.replace('_', ' ')} next to a road: " + ", ".join(bits) + "."
+    extra = _higher_tiers((sp["line"],), sp["tier"] + 1)
+    if kind in C.DOWNTOWN_LINES:
+        extra += _downtown_doc()
+    lead = _named(sp, kind.replace("_", " ")) + (" next to a road" if head else "")
+    return f"{lead}: " + ", ".join(bits) + "." + extra
 
 
 # Human/LLM readable reference, rendered into prompts. Built on demand so that
@@ -875,18 +1000,18 @@ def action_docs() -> dict:
         "build_park": ('{"type":"build_park","x":8,"y":20}', f"Park on an empty tile (or small rectangle, max 9). ${C.CATALOG['park']['cost']}/tile. Raises land value and happiness nearby."),
         "bulldoze": ('{"type":"bulldoze","x1":3,"y1":3,"x2":4,"y2":4}', f"Clear roads/parks/zones in a rectangle. ${C.CATALOG['bulldoze']['cost']}/tile."),
         "build_power_plant": ('{"type":"build_power_plant","kind":"wind","x":14,"y":25}',
-                              "Power plant next to a road (hydro: on a river tile next to a road or bridge). " + "; ".join(
-                                  f"{k}: ${C.CATALOG[k]['cost']}, +{C.CATALOG[k]['power']} power, upkeep ${C.CATALOG[k]['upkeep']}/mo, pollution {C.CATALOG[k]['pollution']}"
-                                  for k in C.POWER_PLANTS)),
+                              "Power plant next to a road (hydro: on a river tile next to a road or bridge; nuclear: on "
+                              "the riverbank). " + "; ".join(_plant_doc(k) for k in POWER_LINES) + "."
+                              + _higher_tiers(POWER_LINES) + _crowd_doc("wind")),
         "build_water": ('{"type":"build_water","kind":"pump","x":29,"y":24}',
-                        f"Water facility next to a road. pump: ${C.CATALOG['pump']['cost']}, +{C.CATALOG['pump']['water']} water, riverbank only; "
-                        f"tower: ${C.CATALOG['tower']['cost']}, +{C.CATALOG['tower']['water']} water, anywhere."),
+                        f"Water facility next to a road. {_plant_doc('pump')}, riverbank only; {_plant_doc('tower')}, "
+                        "anywhere." + _higher_tiers(WATER_LINES) + _crowd_doc(*WATER_LINES)),
         "build_sewage": ('{"type":"build_sewage","kind":"outlet","x":29,"y":30}',
                          f"Sewage facility on the riverbank next to a road; serves its road network like water. "
-                         f"outlet: ${C.CATALOG['outlet']['cost']:,}, {C.CATALOG['outlet']['sewage']} sewage, upkeep ${C.CATALOG['outlet']['upkeep']}/mo, "
-                         f"dumps raw sewage into the river (flows SOUTH and dirties pumps downstream); "
-                         f"treatment: ${C.CATALOG['treatment']['cost']:,}, {C.CATALOG['treatment']['sewage']} sewage, upkeep ${C.CATALOG['treatment']['upkeep']}/mo, "
-                         f"removes {100 - int(100 * C.CATALOG['treatment']['discharge'])}% of the pollution."),
+                         f"{_plant_doc('outlet')}, dumps raw sewage into the river (flows SOUTH and dirties pumps "
+                         f"downstream); tier 2 {_plant_doc('treatment')}, removes "
+                         f"{100 - int(100 * C.CATALOG['treatment']['discharge'])}% of the pollution."
+                         + _higher_tiers(SEWAGE_LINES, 3) + _crowd_doc("outlet")),
         "demolish": ('{"type":"demolish","x":14,"y":25}', "Remove one of your own facilities (no refund)."),
         "upgrade_road": ('{"type":"upgrade_road","to":"avenue","x1":5,"y1":24,"x2":20,"y2":24}',
                          f"Upgrade existing road tiles on a straight/L line. avenue: ${C.ROAD_UPGRADE_COST[2]}/tile, capacity "
@@ -949,12 +1074,15 @@ def action_docs() -> dict:
                                 f"{int(C.IMPORT_SHARE_MAX * 100)}% of demand, ${C.IMPORT_PRICE['power']}/power and "
                                 f"${C.IMPORT_PRICE['water']}/water per unit, +{int(C.IMPORT_PRICE_GROWTH * 100)}% per 1,000 residents). On by default."),
         "upgrade_facility": ('{"type":"upgrade_facility","x":14,"y":25,"module":"expansion"}',
-                             "Upgrade one of your own facilities: " + "; ".join(
-                                 f"{k} ({int(v['cost_share'] * 100)}% of its build cost: " +
+                             'Upgrade one of your own facilities. Every facility build action (power, water, sewage and '
+                             'service buildings) takes "tier": n (absolute within the line, 1 = base) or a tier name as kind. module "tier": move the building one tier up '
+                             f"for the price difference x{C.TIER_UPGRADE_PREMIUM:g}; bigger tiers "
+                             "grow into free tiles around it; keeps age and modules. " + "; ".join(
+                                 f"{k} ({int(v['cost_share'] * 100)}%" + (" of its build cost" if i == 0 else "") + ": " +
                                  {"filter": "halves pollution of coal/gas plants, incinerators, landfills",
                                   "expansion": "+50% capacity / output / coverage capacity",
                                   "overhaul": "resets an ageing power plant (plants lose 5% output per year after 5 years)"}[k] + ")"
-                                 for k, v in C.MODULES.items())),
+                                 for i, (k, v) in enumerate(C.MODULES.items()))),
         "build_harbour": ('{"type":"build_harbour","x":30,"y":45}',
                           f"Harbour on an empty riverbank tile within {C.HARBOUR_ROWS} rows of the south edge (the river mouth), "
                           f"touching a road: ${C.HARBOUR_SPEC['cost']:,}, upkeep ${C.HARBOUR_SPEC['upkeep']}/mo, "
@@ -975,7 +1103,7 @@ def action_docs() -> dict:
                                f"{k}: ${v['cost']:,}, upkeep ${v['upkeep']}/mo, +{int(100 * v['land_value'])}% land value within "
                                f"{v['radius']}, {v['tourism']} tourists/mo" for k, v in C.LANDMARKS.items())),
         "build_school": ('{"type":"build_school","kind":"elementary","x":14,"y":25}',
-                         "School next to a road. " + "; ".join(f"{k}: {_svc_doc(v)}" for k, v in SCHOOL_KINDS.items())),
+                         "School next to a road. " + " ".join(f"{k}: {_svc_doc(v, head=False)}" for k, v in SCHOOL_KINDS.items())),
         "noop": ('{"type":"noop"}', "Do nothing."),
     }
 

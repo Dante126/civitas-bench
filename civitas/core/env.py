@@ -195,7 +195,7 @@ class CivitasEnv:
         return {
             "month": w.month,
             "tiles": w.tiles_string(),
-            "levels": "".join(str(int(v)) for v in w.level.ravel()),
+            "levels": "".join(str(int(v)) for v in w.frame_levels().ravel()),
             "variant": "".join(str(int(v)) for v in np.where(np.isin(w.struct, C.HOMES), w.wealth, np.where(w.struct == C.IND, w.ind_type, 0)).ravel()),
             "density": "".join(str(int(v)) for v in w.density.ravel()),
             "pollution": q(w.pollution),
@@ -214,7 +214,7 @@ class CivitasEnv:
             "turns": [{k: v for k, v in t.items() if k != "meta"} for t in (turns or [])],
             "flooded": list(getattr(w, "flooded", [])),
             "season": w.season() if w.seasons_on else None, "wind": [round(v, 2) for v in w.wind_dir()],
-            "multi": [[y * w.w + x, *C.FOOTPRINT[st]] for st in C.FOOTPRINT for x, y in w.facilities(st)],
+            "multi": w.multi_buildings(),
             "districts": "".join(str(int(v)) for v in w.district_id.ravel()) if w.districts else "",
             "district_names": {str(d["id"]): n for n, d in w.districts.items()},
             "council": [m for m in self.council.posted_in(w.month - 1)

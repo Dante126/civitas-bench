@@ -3,11 +3,14 @@ access to the World), so they can also be run as remote agents and used to
 generate demonstration data for fine-tuning LLMs."""
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from ..sim import catalog as C
 from .base import Agent
 from ..core.decision import Decision
+from ..core.observation import GARBAGE_BUSY_RANK
 from .mapview import MapView
 
 
@@ -390,8 +393,50 @@ def _runs(path):
 
 
 # ================================================================== utilities
+RESOURCES = ("power", "water", "sewage")
+
+
+class Option(NamedTuple):
+    """One way to add capacity: a tier upgrade in place or a new plant."""
+    value: float            # net output per lifetime $ (price + ScriptedUtilities.LIFE months of extra upkeep)
+    money_needed: float     # budget we want before acting (cost + reserves)
+    cost: float
+    action: dict
+    note: str
+
+
+def crowding(plants: list[dict], line: str, x: int, y: int) -> tuple[float, float]:
+    """(output factor of a new plant of `line` at (x, y), output the plants around it would lose).
+
+    plants: dicts with x, y, line, tier and (connected plants) their output and "crowd" factor."""
+    g = next((g for g in C.CROWD_GROUPS.values() if line in g["lines"]), None)
+    if g is None:
+        return 1.0, 0.0
+    n, lost = 0, 0.0
+    for p in plants:
+        if p["line"] not in g["lines"]:
+            continue
+        fw, fh = C.TIER_LINES[p["line"]][p["tier"] - 1]["footprint"]
+        if (max(p["x"] - x, x - p["x"] - fw + 1, 0) <= g["radius"]
+                and max(p["y"] - y, y - p["y"] - fh + 1, 0) <= g["radius"]):
+            n += 1
+            cf = p.get("crowd", 1.0)
+            res = next(r for r in RESOURCES if C.TIER_LINES[p["line"]][0].get(r))
+            lost += p.get(res, 0.0) / cf * max(0.0, min(C.CROWD_STEP, cf - C.CROWD_FLOOR))
+    return max(C.CROWD_FLOOR, 1.0 - C.CROWD_STEP * n), lost
+
+
 class ScriptedUtilities(Agent):
     kind = "scripted"
+    LIFE = 36               # months of upkeep counted in the price when comparing options
+    SMOG = 1.5              # units of output a point of plant pollution is worth giving up (dirty coal vs cleaner tiers)
+    RESERVE = 1000          # cash kept back after a tier upgrade or a tier-2+ build
+    COAL_MARGIN = 500       # extra cash kept back before building coal
+    SHORTAGE = 1.05         # supply below this x demand is a real shortage: build what we can afford now ...
+    GOOD_ENOUGH = 0.75      # ... as we also do when the affordable option is at least this good as the best one
+    WIND_UNKNOWN = 0.7      # wind strength assumed at sites without a wind reading
+    CLEAN_RIVER_POP = 3000  # from this population sewage options are weighed by how much they pollute the river
+    DISCHARGE_WEIGHT = 0.5  # share of an option's value lost per unit of discharge (outlet 1.0, treatment 0.2)
 
     def act(self, obs: dict) -> Decision:
         c = obs["city"]
@@ -403,67 +448,130 @@ class ScriptedUtilities(Agent):
             return Decision(thinking="no road network connected to the highway yet")
         pending_p = c["zoned_without_power"]
         pending_w = c["zoned_without_water"] + 0.5 * pending_p
-        need_p = 1.25 * net["power_demand"] + 1.0 * min(pending_p, 60) + 5
-        need_w = 1.25 * net["water_demand"] + 0.7 * min(pending_w, 60) + 5
+        need = {"power": 1.25 * net["power_demand"] + 1.0 * min(pending_p, 60) + 5,
+                "water": 1.25 * net["water_demand"] + 0.7 * min(pending_w, 60) + 5,
+                "sewage": 1.2 * net["sewage_demand"] + 5}
+        locked = set(obs.get("progress", {}).get("locked", []))
+        own = {(p["x"], p["y"]) for p in net["plants"]}
+        plants = [p for n in obs["networks"] for p in n["plants"]]
+        for f in obs.get("disconnected_facilities", []):      # they crowd their neighbours too
+            if "x" in f and "y" in f and f.get("kind") in C.TIER_BY_NAME:
+                line, tier = C.TIER_BY_NAME[f["kind"]]
+                plants.append({"x": f["x"], "y": f["y"], "line": line, "tier": tier})
         used = set()
 
-        def pick(lst):
-            for s in lst:
-                if (s["x"], s["y"]) not in used:
-                    used.add((s["x"], s["y"]))
-                    return s
+        def best(line, left=float("inf")):
+            """Highest unlocked 1x1 tier of a line we can afford (tiers above 1 keep a reserve)."""
+            for t in reversed(C.TIER_LINES[line]):
+                if (tuple(t["footprint"]) == (1, 1) and t.get("unlock") not in locked
+                        and left >= t["cost"] + (self.RESERVE if t["tier"] > 1 else 0)):
+                    return t
             return None
+
+        def new_plant(res, t, cands):
+            """(value, site) of the best candidate site for a new plant of tier t, or None."""
+            top = None
+            for s in cands:
+                if (s["x"], s["y"]) in used:
+                    continue
+                cf, lost = crowding(plants, t["line"], s["x"], s["y"])
+                wind = s.get("wind", self.WIND_UNKNOWN) if t["line"] == "wind" else 1.0
+                out = t[res] * cf * wind - lost - self.SMOG * (t.get("pollution") or 0)
+                v = out / max(1.0, t["cost"] + self.LIFE * t["upkeep"])
+                if top is None or v > top[0]:
+                    top = (v, s)
+            return top
 
         # overhaul one ageing power plant a turn (output drops 5%/year after 5 years)
         for p in net["plants"]:
-            if p.get("age_years", 0) >= 7 and p["kind"] in ("coal", "gas", "solar", "wind"):
-                cost = round(C.CATALOG[p["kind"]]["cost"] * C.MODULES["overhaul"]["cost_share"])
-                if budget >= cost + 1000:
+            if p.get("age_years", 0) >= 7 and p["line"] in ("coal", "gas", "solar", "wind"):
+                cost = round(C.TIER_LINES[p["line"]][p["tier"] - 1]["cost"] * C.MODULES["overhaul"]["cost_share"])
+                if budget >= cost + self.RESERVE:
                     acts.append({"type": "upgrade_facility", "x": p["x"], "y": p["y"], "module": "overhaul"})
                     budget -= cost
                     why.append(f"overhaul {p['kind']}")
                     break
-        if net["power_supply"] < need_p:
-            big = c["population"] > 600 and budget >= C.CATALOG["coal"]["cost"] + 500
-            kind = "coal" if big else "wind"
-            s = pick(sites.get("far_from_homes" if kind == "coal" else "windy", []) or sites.get("near_homes", []))
-            if s and budget >= C.CATALOG[kind]["cost"]:
-                acts.append({"type": "build_power_plant", "kind": kind, "x": s["x"], "y": s["y"]})
-                budget -= C.CATALOG[kind]["cost"]
-                why.append(f"power {net['power_supply']}<{need_p:.0f}: {kind}")
-            else:
-                msgs.append({"to": "mayor", "text": f"Utilities needs ${C.CATALOG['wind']['cost']:,}+ to add power "
-                                                    f"(supply {net['power_supply']}, need ~{need_p:.0f}). Please fund."})
-        if net["water_supply"] < need_w:
-            banks = [b for b in sites.get("riverbank_next_to_road", []) if b["network"] == net["id"]]
-            s = pick(banks)
-            if s and budget >= C.CATALOG["pump"]["cost"]:
-                acts.append({"type": "build_water", "kind": "pump", "x": s["x"], "y": s["y"]})
-                budget -= C.CATALOG["pump"]["cost"]
-                why.append("pump on riverbank")
-            elif not banks and budget >= C.CATALOG["tower"]["cost"]:
-                s = pick(sites.get("near_homes", []))
-                if s:
-                    acts.append({"type": "build_water", "kind": "tower", "x": s["x"], "y": s["y"]})
-                    budget -= C.CATALOG["tower"]["cost"]
-                    why.append("no riverbank road: water tower")
-                msgs.append({"to": "planning", "text": "Please run a road to the riverbank so I can build cheap pumps."})
-            else:
-                msgs.append({"to": "mayor", "text": "Utilities needs ~$1,500 for a water pump."})
 
-        need_s = 1.2 * net["sewage_demand"] + 5
-        if net["water_supply"] > 0 and net["sewage_supply"] < need_s:
-            locked = set(obs.get("progress", {}).get("locked", []))
-            kind = "treatment" if (c["population"] > 3000 and "treatment_plant" not in locked
-                                   and budget >= C.CATALOG["treatment"]["cost"] + 1000) else "outlet"
-            banks = [b for b in sites.get("riverbank_for_sewage", []) if b["network"] == net["id"]]
-            s = pick(banks)
-            if s and budget >= C.CATALOG[kind]["cost"]:
-                acts.append({"type": "build_sewage", "kind": kind, "x": s["x"], "y": s["y"]})
-                budget -= C.CATALOG[kind]["cost"]
-                why.append(f"sewage {net['sewage_supply']}<{need_s:.0f}: {kind}")
-            elif s:
-                msgs.append({"to": "mayor", "text": f"Utilities needs ${C.CATALOG[kind]['cost']:,} for sewage capacity."})
+        short = {"power": net["power_supply"] < need["power"], "water": net["water_supply"] < need["water"],
+                 "sewage": net["water_supply"] > 0 and net["sewage_supply"] < need["sewage"]}
+        asks = []           # (money, resource) for one message to the mayor
+        upgraded = False
+        for res in RESOURCES:
+            if not short[res]:
+                continue
+            supply = net[f"{res}_supply"]
+            state = f"{res} {supply:.0f}<{need[res]:.0f}"
+            opts: list[Option] = []
+            # one tier upgrade per turn: the offers were computed before this turn and may be stale after one
+            if not upgraded:
+                for u in obs.get("upgrades", []):
+                    if u["gain"].get(res, 0) > 0 and (u["x"], u["y"]) in own:
+                        cur, nxt = C.TIER_LINES[C.TIER_BY_NAME[u["to"]][0]][u["tier"] - 2:u["tier"]]
+                        smog = (nxt.get("pollution") or 0) - (cur.get("pollution") or 0)
+                        price = max(1.0, u["cost"] + self.LIFE * max(0, nxt["upkeep"] - cur["upkeep"]))
+                        opts.append(Option((u["gain"][res] - self.SMOG * smog) / price, u["cost"] + self.RESERVE,
+                                           u["cost"], {"type": "upgrade_facility", "x": u["x"], "y": u["y"],
+                                                       "module": "tier"},
+                                           f"{state}: upgrade {u['from']} -> {u['to']}"))
+            if res == "power":
+                builds = [("wind", sites.get("windy") or sites.get("near_homes", []), 0)]
+                if c["population"] > 600:
+                    builds.append(("coal", sites.get("far_from_homes") or sites.get("near_homes", []),
+                                   self.COAL_MARGIN))
+            elif res == "water":
+                banks = [b for b in sites.get("riverbank_next_to_road", []) if b["network"] == net["id"]]
+                builds = [("pump", banks, 0)] if banks else [("tower", sites.get("near_homes", []), 0)]
+            else:
+                banks = [b for b in sites.get("riverbank_for_sewage", []) if b["network"] == net["id"]]
+                builds = [("outlet", banks, 0)]
+            action = {"power": "build_power_plant", "water": "build_water", "sewage": "build_sewage"}[res]
+            for line, cands, margin in builds:
+                # the top unlocked tier, and the best one we can pay for now
+                tiers = [best(line)]
+                cheap = best(line, budget - margin)
+                if cheap is not None and cheap is not tiers[0]:
+                    tiers.append(cheap)
+                for t in tiers:
+                    o = new_plant(res, t, cands) if t else None
+                    if o is None:
+                        continue
+                    v, site = o
+                    if res == "sewage" and c["population"] > self.CLEAN_RIVER_POP:
+                        v *= 1.0 - self.DISCHARGE_WEIGHT * t["discharge"]
+                    money = t["cost"] + margin + (self.RESERVE if t["tier"] > 1 else 0)
+                    opts.append(Option(v, money, t["cost"],
+                                       {"type": action, "kind": t["name"], "x": site["x"], "y": site["y"]},
+                                       f"{state}: {t['name']}"))
+            opts = [o for o in opts if o.value > 0]
+            if not opts:
+                continue
+            top = max(opts, key=lambda o: o.value)
+            choice = top if top.money_needed <= budget else None
+            if choice is None:
+                asks.append((top.money_needed, res))
+                # skip the cheaper option this turn unless something is actually short or it is nearly as good
+                alt = max((o for o in opts if o.money_needed <= budget), key=lambda o: o.value, default=None)
+                if alt and (supply < self.SHORTAGE * net[f"{res}_demand"] or alt.value >= self.GOOD_ENOUGH * top.value):
+                    choice = alt
+            if choice is None:
+                continue
+            acts.append(choice.action)
+            budget -= choice.cost
+            why.append(choice.note)
+            if choice.action["type"] == "upgrade_facility":
+                upgraded = True
+            else:
+                used.add((choice.action["x"], choice.action["y"]))
+                if choice.action["kind"] in (t["name"] for t in C.TIER_LINES["tower"]):
+                    msgs.append({"to": "planning",
+                                 "text": "Please run a road to the riverbank so I can build cheap pumps."})
+        if asks:
+            money, res = max(asks)
+            others = [r for _, r in asks if r != res]
+            msgs.append({"to": "mayor", "text": f"Utilities needs ${money:,.0f} to add {res} (supply "
+                                                f"{net[f'{res}_supply']:.0f}, need ~{need[res]:.0f})"
+                                                + (f"; {' and '.join(others)} also short" if others else "")
+                                                + ". Please fund."})
         return Decision(actions=acts, messages=msgs, thinking="; ".join(why) or "capacity OK")
 
 
@@ -471,6 +579,7 @@ class ScriptedUtilities(Agent):
 class _ServiceAgent(Agent):
     """Shared helpers: build at the first suggested site, or ask the mayor for money."""
     kind = "scripted"
+    UPGRADE_RESERVE = 500   # cash kept back after a tier upgrade
 
     def _build(self, obs, acts, msgs, why, action: dict, cost: float, sites: list, reason: str,
                spacing: int = 5) -> bool:
@@ -484,7 +593,7 @@ class _ServiceAgent(Agent):
         spent = sum(a.get("_cost", 0) for a in acts)
         own = {"build_police_station": "K", "build_fire_station": "F", "build_clinic": "A", "build_landfill": "L",
                "build_school": {"elementary": "N", "high": "B", "university": "Q"}.get(action.get("kind"), "N"),
-               "build_library": "D", "build_cemetery": "Z", "build_hospital": "M", "build_jail": "J"}.get(action["type"])
+               "build_library": "D", "build_cemetery": "Z", "build_hospital": "h", "build_jail": "J"}.get(action["type"])
         mine = MapView(obs["map"]).find(own) if own and "map" in obs else []
         site = next((s for s in sites if all((s["x"], s["y"]) != (a.get("x"), a.get("y")) for a in acts)
                      and all(abs(s["x"] - x) + abs(s["y"] - y) >= spacing for x, y in mine)), None)
@@ -497,6 +606,28 @@ class _ServiceAgent(Agent):
         acts.append({**action, "x": site["x"], "y": site["y"], "_cost": cost})
         why.append(reason)
         return True
+
+    def _upgrade(self, obs, acts, why, ups, reason, min_need: float | None = 0.0, only=None, msgs=None) -> bool:
+        """Upgrade the most needed facility one tier (optionally only those whose current tier is in `only`).
+
+        Offers need more than min_need (None: any need). With msgs, ask the mayor for the money when the best offer is
+        out of reach."""
+        left = (obs["your_budget"] or 0.0) - sum(a.get("_cost", 0) for a in acts)
+        busy = {(a.get("x"), a.get("y")) for a in acts}
+        for u in ups or []:
+            if ((only is None or u["from"] in only) and (min_need is None or u.get("need", 0.0) > min_need)
+                    and (u["x"], u["y"]) not in busy):
+                if left >= u["cost"] + self.UPGRADE_RESERVE:
+                    acts.append({"type": "upgrade_facility", "x": u["x"], "y": u["y"], "module": "tier",
+                                 "_cost": u["cost"]})
+                    why.append(f"{reason}: {u['from']} -> {u['to']}")
+                    return True
+                if msgs is not None and not any(m["to"] == "mayor" for m in msgs):
+                    msgs.append({"to": "mayor", "text": f"{obs['role'].title()} needs "
+                                                        f"${u['cost'] + self.UPGRADE_RESERVE:,.0f} to "
+                                                        f"upgrade a {u['from'].replace('_', ' ')} ({reason})."})
+                return False
+        return False
 
     @staticmethod
     def _done(acts, msgs, why, idle="coverage OK"):
@@ -594,12 +725,17 @@ class ScriptedPolice(_ServiceAgent):
         c, d = obs["city"], obs["police"]
         acts, msgs, why = [], [], []
         S = C.SERVICES
+        if d.get("downtown_uncovered", 0) > 0:
+            self._upgrade(obs, acts, why, d.get("upgrades"), "downtown needs an HQ", only=("police_station",),
+                          msgs=msgs)
         if c["population"] >= 150 and (c["services"]["police_coverage_pct"] or 0) < 85:
             self._build(obs, acts, msgs, why, {"type": "build_police_station"}, S["police_station"]["cost"],
                         d.get("candidate_sites", []), f"police cover {c['services']['police_coverage_pct']}%")
         if c["population"] > 1500 and d["inmates"] > 0.8 * max(1, d["jail_capacity"]):
-            self._build(obs, acts, msgs, why, {"type": "build_jail"}, S["jail"]["cost"],
-                        d.get("jail_sites", []), f"jail {d['inmates']}/{d['jail_capacity']}")
+            # an overflowing jail becomes a prison once they unlock (offered only when inmates exceed capacity)
+            if not self._upgrade(obs, acts, why, d.get("upgrades"), "jail full", only=("jail",)):
+                self._build(obs, acts, msgs, why, {"type": "build_jail"}, S["jail"]["cost"],
+                            d.get("jail_sites", []), f"jail {d['inmates']}/{d['jail_capacity']}")
         return self._done(acts, msgs, why)
 
 
@@ -620,6 +756,9 @@ class ScriptedFire(_ServiceAgent):
         if c["population"] > 3000 and d.get("shelter_sites") and not d["shelters"]:
             self._build(obs, acts, msgs, why, {"type": "build_shelter"}, C.SERVICES["shelter"]["cost"],
                         d["shelter_sites"], "emergency shelter")
+        if d.get("downtown_uncovered", 0) > 0:
+            self._upgrade(obs, acts, why, d.get("upgrades"), "downtown needs a fire HQ", only=("fire_station",),
+                          msgs=msgs)
         if c["population"] >= 150 and ((c["services"]["fire_coverage_pct"] or 0) < 85 or d["uncovered_buildings"] > 40):
             self._build(obs, acts, msgs, why, {"type": "build_fire_station"}, C.SERVICES["fire_station"]["cost"],
                         d.get("candidate_sites", []), f"fire cover {c['services']['fire_coverage_pct']}%")
@@ -627,43 +766,77 @@ class ScriptedFire(_ServiceAgent):
 
 
 class ScriptedHealth(_ServiceAgent):
+    RECYCLE_FILL = 60        # a landfill more than this % full becomes a recycling centre
+    COLLECTION_SHORT = 0.9   # collecting less than this share of the garbage: busy landfills become recycling centres
+
     def act(self, obs: dict) -> Decision:
         c, d = obs["city"], obs["health"]
         sv = c["services"]
         acts, msgs, why = [], [], []
         S = C.SERVICES
         pop = c["population"]
+        ups = d.get("upgrades", {})
+        if d.get("downtown_uncovered", 0) > 0:
+            # a clinic grows into a hospital, a hospital into a medical centre: both give downtown full cover
+            self._upgrade(obs, acts, why, ups.get("care"), "downtown care", msgs=msgs)
         full = all(l.get("fill_pct", 0) > 85 for l in d["landfills"])
-        if pop >= 100 and ((sv["garbage_collection_pct"] or 0) < 80 or full or
-                           d["garbage_collected"] < 0.8 * d["garbage_produced"]):
+        # a filling landfill becomes a recycling centre (never fills, twice the collection) instead of a new landfill;
+        # so does one with busy trucks (the observation ranks those at GARBAGE_BUSY_RANK + load %) when collection
+        # falls short
+        fill = {(l["x"], l["y"]): l.get("fill_pct", 0.0) for l in d["landfills"]}
+        collect_short = ((sv["garbage_collection_pct"] or 0) >= 80
+                         and d["garbage_collected"] < self.COLLECTION_SHORT * d["garbage_produced"])
+        offers = [u for u in ups.get("garbage") or []
+                  if fill.get((u["x"], u["y"]), 0.0) > self.RECYCLE_FILL
+                  or (collect_short and u.get("need", 0.0) >= GARBAGE_BUSY_RANK)]
+        recycled = self._upgrade(obs, acts, why, offers, "landfill filling up", min_need=None, msgs=msgs)
+        if not recycled and pop >= 100 and ((sv["garbage_collection_pct"] or 0) < 80 or full or
+                                            d["garbage_collected"] < 0.8 * d["garbage_produced"]):
             self._build(obs, acts, msgs, why, {"type": "build_landfill"}, S["landfill"]["cost"],
-                        d.get("landfill_sites", []) or d.get("clinic_sites", []), f"garbage collection {sv['garbage_collection_pct']}%")
+                        d.get("landfill_sites", []) or d.get("clinic_sites", []),
+                        f"garbage collection {sv['garbage_collection_pct']}%")
         if pop >= 400 and (sv["health_coverage_pct"] or 0) < 80:
             self._build(obs, acts, msgs, why, {"type": "build_clinic"}, S["clinic"]["cost"],
                         d.get("clinic_sites", []), f"clinic cover {sv['health_coverage_pct']}%")
-        low_plots = sum(cm.get("plots_left", 0) for cm in d["cemeteries"]) < 300
-        if pop >= 300 and (d["deathcare_capacity"] < 1.3 * d["deaths_per_month"] + 1 or d["deceased_waiting"] > 10
-                           or low_plots):
+        # crematoria need no plots (and a cemetery upgraded to one leaves the cemetery list)
+        low_plots = not d.get("crematoria") and sum(cm.get("plots_left", 0) for cm in d["cemeteries"]) < 300
+        short = d["deathcare_capacity"] < 1.3 * d["deaths_per_month"] + 1 or d["deceased_waiting"] > 10
+        # a cemetery running out of plots (or too slow) becomes a crematorium
+        cremated = (low_plots or short) and self._upgrade(obs, acts, why, ups.get("deathcare"), "cemetery full",
+                                                          min_need=None)
+        if not cremated and pop >= 300 and (short or low_plots):
             self._build(obs, acts, msgs, why, {"type": "build_cemetery"}, S["cemetery"]["cost"],
                         d.get("landfill_sites", []) or d.get("clinic_sites", []), "deathcare")
         if pop >= 5000 and not d["hospitals"]:
-            self._build(obs, acts, msgs, why, {"type": "build_hospital"}, S["hospital"]["cost"],
-                        d.get("hospital_sites", []), "first hospital")
+            if not self._upgrade(obs, acts, why, ups.get("care"), "first hospital", min_need=None, only=("clinic",)):
+                self._build(obs, acts, msgs, why, {"type": "build_hospital"}, S["hospital"]["cost"],
+                            d.get("hospital_sites", []), "first hospital")
         return self._done(acts, msgs, why)
 
 
 class ScriptedEducation(_ServiceAgent):
+    SEATS_SHORT = 85   # homes in school range (%) above which low enrolment means too few seats, not too few schools
+
     def act(self, obs: dict) -> Decision:
         d = obs["education"]
         acts, msgs, why = [], [], []
         S = C.SERVICES
         e = d["enrollment_pct"]
-        if d["elementary"]["students"] > 30 and (e["elementary"] or 0) < 90:
-            self._build(obs, acts, msgs, why, {"type": "build_school", "kind": "elementary"},
-                        S["elementary_school"]["cost"], d.get("school_sites", []), f"elementary enrolment {e['elementary']}%")
-        if d["high"]["students"] > 80 and (e["high"] or 0) < 85:
-            self._build(obs, acts, msgs, why, {"type": "build_school", "kind": "high"},
-                        S["high_school"]["cost"], d.get("high_school_sites", []), f"high school enrolment {e['high']}%")
+        ups = d.get("upgrades")
+        # low enrolment with homes in range means too few seats: grow an overloaded school instead of adding one
+        el, hi = d["elementary"], d["high"]
+        if el["students"] > 30 and (e["elementary"] or 0) < 90:
+            if not ((el.get("homes_in_range_pct") or 0) >= self.SEATS_SHORT
+                    and self._upgrade(obs, acts, why, ups, "more seats", only=("elementary_school",))):
+                self._build(obs, acts, msgs, why, {"type": "build_school", "kind": "elementary"},
+                            S["elementary_school"]["cost"], d.get("school_sites", []),
+                            f"elementary enrolment {e['elementary']}%")
+        if hi["students"] > 80 and (e["high"] or 0) < 85:
+            if not ((hi.get("homes_in_range_pct") or 0) >= self.SEATS_SHORT
+                    and self._upgrade(obs, acts, why, ups, "more seats", only=("high_school",))):
+                self._build(obs, acts, msgs, why, {"type": "build_school", "kind": "high"},
+                            S["high_school"]["cost"], d.get("high_school_sites", []),
+                            f"high school enrolment {e['high']}%")
         if obs["city"]["population"] > 6000 and d["university"]["seats"] == 0:
             self._build(obs, acts, msgs, why, {"type": "build_school", "kind": "university"},
                         S["university"]["cost"], d.get("university_sites", []), "university")

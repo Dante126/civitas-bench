@@ -2,10 +2,11 @@
 import * as THREE from "./vendor/three-bundle.min.js";
 import { OrbitControls } from "./vendor/three-bundle.min.js";
 import { Life } from "./life.js";
+import { tierAnnexes, tierRank, facilityTier } from "./recipes.js";
 
 const MARGIN = 12;                       // decorative land around the playable map
 const ZONES = "rciomRCIOM";
-export const SPECIALS = "TEGSWUVHKJF^AhLXZNBQD%*Y|@&+$!:?>";
+export const SPECIALS = "TEGSWUVHKJF^AhLXZNBQD%*Y|@&+$!:?>uz";
 const NATIVE_SIZE = ">";            // models already drawn at their full footprint
 const BUS_COLORS = ["#e07bd8", "#4aa3ff", "#ffb454", "#5fd38d", "#ff6b5e", "#f5d547"];
 const hash = (i, k = 0) => {                      // integer hash -> [0, 1), no visible patterns
@@ -280,6 +281,7 @@ export class CityScene {
   setMeta(meta) {
     this.meta = meta;
     this.W = meta.width; this.H = meta.height;
+    for (const g of this.specials.values()) this._disposeSpecial(g);
     this.root.clear(); this.specials.clear();
     const W = this.W, H = this.H, full = (W + 2 * MARGIN) * (H + 2 * MARGIN), cap = W * H;
     const R = this.root;
@@ -779,15 +781,16 @@ export class CityScene {
     }
     for (let i = 0; i < T.length; i++) {
       const ch = T[i];
-      if (SPECIALS.includes(ch) && !part.has(i)) want.set(`${i}:${ch}`, { i, ch, size: size.get(i) });
+      const lv = facilityTier(frame, i);                   // in the key, so an upgrade rebuilds the model
+      if (SPECIALS.includes(ch) && !part.has(i)) want.set(`${i}:${ch}:${lv}`, { i, ch, lv, size: size.get(i) });
     }
-    for (const [k, g] of this.specials) if (!want.has(k)) { this.root.remove(g); this.specials.delete(k); }
+    for (const [k, g] of this.specials) if (!want.has(k)) { this.root.remove(g); this._disposeSpecial(g); this.specials.delete(k); }
     this.turbines = [];
     const plantEmitters = [];
-    for (const [k, { i, ch, size: sz }] of want) {
+    for (const [k, { i, ch, lv, size: sz }] of want) {
       let g = this.specials.get(k);
       if (!g) {
-        g = this._buildSpecial(ch, i);
+        g = this._buildSpecial(ch, i, lv);
         const x = i % W, y = Math.floor(i / W), [fw, fh] = sz || [1, 1];
         g.position.set(this.wx(x + (fw - 1) / 2), 0, this.wz(y + (fh - 1) / 2));
         const s = NATIVE_SIZE.includes(ch) ? 1 : Math.min(fw, fh) * 0.92;
@@ -811,6 +814,15 @@ export class CityScene {
     this._setupSmoke();
   }
 
+  _disposeSpecial(g) {            // free a removed model's geometry and its own materials (not the shared _mat cache)
+    const shared = new Set(this._mats ? this._mats.values() : []);
+    g.traverse(o => {
+      if (!o.isMesh) return;
+      o.geometry.dispose();
+      for (const m of [].concat(o.material)) if (!shared.has(m)) m.dispose();
+    });
+  }
+
   _mat(color, o = {}) {           // shared materials for unique structures
     const key = color + JSON.stringify(o);
     this._mats = this._mats || new Map();
@@ -818,7 +830,7 @@ export class CityScene {
     return this._mats.get(key);
   }
 
-  _buildSpecial(ch, i) {
+  _buildSpecial(ch, i, lv = 1) {
     const g = new THREE.Group();
     const m = (geo, color, o = {}) => { const mesh = new THREE.Mesh(geo, this._mat(color, o)); g.add(mesh); return mesh; };
     const bx = (w, h, d, x, y, z, c, o) => { const me = m(new THREE.BoxGeometry(w, h, d), c, o); me.position.set(x, y + h / 2, z); return me; };
@@ -860,12 +872,13 @@ export class CityScene {
         p.rotation.x = -0.5;
       }
     } else if (ch === "W") {                        // wind turbine
+      const adv = tierRank(ch, lv) >= 2, th = adv ? 2.6 : 2.0, bl = adv ? 1.1 : 0.85;   // advanced turbine: taller, longer blades
       bx(0.5, 0.04, 0.5, 0, 0, 0, "#b8bdb5");
-      cy(0.03, 0.06, 2.0, 0, 0, 0, "#f4f5f6", 12);
-      bx(0.1, 0.1, 0.22, 0, 1.96, 0.02, "#e8eaec");
-      const rotor = new THREE.Group(); rotor.position.set(0, 2.01, 0.14); g.add(rotor);
+      cy(0.03, adv ? 0.08 : 0.06, th, 0, 0, 0, "#f4f5f6", 12);
+      bx(adv ? 0.13 : 0.1, adv ? 0.12 : 0.1, adv ? 0.3 : 0.22, 0, th - 0.04, 0.02, "#e8eaec");
+      const rotor = new THREE.Group(); rotor.position.set(0, th + 0.01, adv ? 0.18 : 0.14); g.add(rotor);
       for (let k = 0; k < 3; k++) {
-        const b = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.85, 0.015).translate(0, 0.43, 0), new THREE.MeshStandardMaterial({ color: "#fbfbfb", roughness: 0.5 }));
+        const b = new THREE.Mesh(new THREE.BoxGeometry(0.05, bl, 0.015).translate(0, bl / 2 + 0.005, 0), new THREE.MeshStandardMaterial({ color: "#fbfbfb", roughness: 0.5 }));
         b.rotation.z = k * Math.PI * 2 / 3; rotor.add(b);
       }
       rotor.rotation.z = hash(i, 40) * 6;
@@ -1054,8 +1067,40 @@ export class CityScene {
     } else if (ch === "H") {                        // highway entrance sign
       cy(0.02, 0.02, 0.8, 0.3, 0, -0.42, "#777", 6); cy(0.02, 0.02, 0.8, -0.3, 0, -0.42, "#777", 6);
       bx(0.7, 0.22, 0.03, 0, 0.62, -0.42, "#1b7a3e");
+    } else if (ch === "u") {                        // nuclear plant (2x2): two cooling towers, reactor dome, turbine hall
+      bx(0.96, 0.03, 0.96, 0, 0, 0, "#a3a8a0");
+      const tower = [[0.2, 0], [0.16, 0.27], [0.13, 0.53], [0.15, 0.75]].map(([r, y]) => new THREE.Vector2(r, y));
+      const st = [];
+      for (const [x, z] of [[-0.24, -0.2], [0.18, -0.26]]) {
+        const t = m(new THREE.LatheGeometry(tower, 24), "#d9d6cf", { side: THREE.DoubleSide }); t.position.set(x, 0.03, z);
+        const rim = m(new THREE.TorusGeometry(0.15, 0.01, 6, 24), "#8f8b84"); rim.rotation.x = Math.PI / 2; rim.position.set(x, 0.78, z);
+        st.push({ x, y: 0.82, z, rate: 1.2, dark: 0.95 });
+      }
+      bx(0.44, 0.22, 0.24, -0.18, 0.03, 0.26, "#c9ced6");                        // turbine hall
+      bx(0.46, 0.03, 0.26, -0.18, 0.25, 0.26, "#6f7a86");
+      cy(0.14, 0.14, 0.22, 0.24, 0.03, 0.22, "#e6e3dc", 20);                     // containment
+      const dome = m(new THREE.SphereGeometry(0.14, 20, 12, 0, Math.PI * 2, 0, Math.PI / 2), "#eceae4"); dome.position.set(0.24, 0.25, 0.22);
+      bx(0.1, 0.12, 0.1, 0.4, 0.03, -0.02, "#f2c230");                             // switchyard
+      for (const x of [0.08, 0.42]) cy(0.01, 0.01, 0.28, x, 0.03, 0.4, "#8a8f96", 6);
+      g.userData.stacks = st;
+    } else if (ch === "z") {                        // crematorium: small chapel with a pitched roof and one chimney
+      bx(0.92, 0.03, 0.92, 0, 0, 0, "#8fae78");
+      bx(0.5, 0.3, 0.4, -0.06, 0.03, 0.02, "#d8d3c8");
+      const roof = m(new THREE.CylinderGeometry(0.5, 0.5, 0.56, 3), "#4e4a52"); roof.rotation.z = Math.PI / 2; roof.rotation.y = Math.PI / 2;
+      roof.scale.set(0.42, 1, 0.3); roof.position.set(-0.06, 0.41, 0.02);
+      for (let k = -1; k <= 1; k++) bx(0.05, 0.14, 0.01, -0.06 + k * 0.14, 0.1, 0.225, "#6d7f99");
+      bx(0.03, 0.14, 0.03, -0.06, 0.53, 0.02, "#e0b43a"); bx(0.1, 0.03, 0.03, -0.06, 0.61, 0.02, "#e0b43a");
+      bx(0.1, 0.68, 0.1, 0.28, 0.03, -0.24, "#7a6f66"); bx(0.12, 0.04, 0.12, 0.28, 0.71, -0.24, "#4a4440");
+      for (const [x, z] of [[-0.36, 0.36], [0.34, 0.34]]) { const c = m(new THREE.ConeGeometry(0.08, 0.3, 7), "#2f5f3a"); c.position.set(x, 0.2, z); }
+      g.userData.stacks = [{ x: 0.28, y: 0.78, z: -0.24, rate: 0.35, dark: 0.7 }];
     }
+    this._tierExtras(g, ch, lv, bx);
     return g;
+  }
+
+  // higher tiers (frame level = tier): an annex block with an accent roof, a second one at the top tier (recipes.js)
+  _tierExtras(g, ch, lv, bx) {
+    for (const [w, h, d, x, y, z, c] of tierAnnexes(ch, lv)) bx(w, h, d, x, y, z, c);
   }
 
   // -------------------------------------------------------- bus lines

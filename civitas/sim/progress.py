@@ -138,8 +138,15 @@ class HeritageMixin:
         ind = (s == C.IND) & (lvl > 0)
         src[ind] = lvl[ind] * np.array(C.SOIL_SOURCE["industry"])[self.ind_type[ind]]
         for struct, v in C.SOIL_SOURCE.items():
-            if struct != "industry":
-                src[s == struct] += v
+            if struct == "industry":
+                continue
+            for x, y in self.facilities(struct):   # per building, scaled by its tier's pollution, spread over its tiles
+                spec = self.facility_spec(x, y)
+                base = C.TIER_LINES[spec["line"]][0].get("pollution") if spec else None
+                amt = v * spec["pollution"] / base if spec and spec.get("pollution") and base else v
+                tiles = self.parts(x, y)
+                for px, py in tiles:
+                    src[py, px] += amt / len(tiles)
         soil = self.soil * C.SOIL_DECAY + src
         self.soil = (1.0 - C.SOIL_SPREAD) * soil + C.SOIL_SPREAD * box_sum(soil, 1) / 9.0
 

@@ -119,10 +119,11 @@ class EventsMixin:
         casualties = displaced * C.FLOOD_CASUALTY_RATE * float(np.mean(1.0 - self.shelter_cov[dev])) if dev.any() else 0.0
         self.level[dev] = np.maximum(0, self.level[dev].astype(int) - 2).astype(np.uint8)
         self.flooded = [int(v) for v in np.flatnonzero(zone)]
-        offline = 0
-        for y, x in zip(*np.nonzero(zone & np.isin(self.struct, list(C.UTILITY_TYPES)))):
-            self._fstate(int(x), int(y))["offline_until"] = self.month + C.FLOOD_OFFLINE_MONTHS
-            offline += 1
+        anchors = {self._anchor_of(int(x), int(y))
+                   for y, x in zip(*np.nonzero(zone & np.isin(self.struct, list(C.UTILITY_TYPES))))}
+        for ax, ay in anchors:
+            self._fstate(ax, ay)["offline_until"] = self.month + C.FLOOD_OFFLINE_MONTHS
+        offline = len(anchors)
         self.deaths_month += casualties
         self.death_backlog += casualties
         self.disaster_morale = C.DISASTER_MORALE if displaced > 0 else 0.0

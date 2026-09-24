@@ -228,9 +228,28 @@ function industry(b, vr, lv, v, hh, season) {
 
 // ------------------------------------------------------------------ special structures
 // Written for a unit tile like scene.js:_buildSpecial; bigger footprints are scaled by pixel.js via Builder.scale.
-export function special(b, ch, v = 0, season = null) {
+// Building tiers: a facility's frame level is its tier (1-3; 0 in old replays reads as 1). Higher tiers get an annex
+// with a roof in the line's accent colour (shared with scene.js). The treatment plant, hospital and crematorium are
+// already tier 2 of their lines, so their annexes start one tier later.
+export const TIER_ACCENT = { E: "#4a4c50", G: "#d9822b", S: "#1f3a73", U: "#1f8a8a", V: "#2fa3b3", "*": "#3d7a4a",
+  K: "#1f4fa8", J: "#7d8388", F: "#8e1c1c", h: "#3fd0c9", L: "#6b7a3a", N: "#f5d547", B: "#f5d547" };
+// keep in step with civitas/sim/catalog.py TIER_LINES / BASE_TIER (the source of truth): lowest tier per character
+const BASE_TIER = { "*": 2, h: 2, z: 2 };
+export const facilityTier = (frame, i) => Math.max(1, +(frame.levels[i] || 0));   // old replays have 0 on facilities
+export const tierRank = (ch, lv) => Math.max(1, (+lv || 1) - (BASE_TIER[ch] || 1) + 1);   // 1 = the line's plain look
+// annex geometry in scene.js argument order (w, h, d, x, y, z): one block at the back right, a second at tier rank 3
+export function tierAnnexes(ch, lv) {
+  const c = TIER_ACCENT[ch], r = tierRank(ch, lv);
+  if (!c || r < 2) return [];
+  const out = [[0.34, 0.22 + 0.12 * r, 0.3, 0.3, 0, -0.3, "#d9dde2", true], [0.36, 0.04, 0.32, 0.3, 0.22 + 0.12 * r, -0.3, c]];
+  if (r >= 3) out.push([0.3, 0.3 + 0.1 * r, 0.26, -0.32, 0, -0.32, "#cfd4da", true], [0.32, 0.04, 0.28, -0.32, 0.3 + 0.1 * r, -0.32, c]);
+  return out;                                      // [w, h, d, x, y, z, colour, has windows]
+}
+
+export function special(b, ch, v = 0, season = null, lv = 1) {
   const bx = (w, h, d, x, y, z, c, o) => b.box(x, z, w, d, y, h, c, o);                 // scene.js argument order
   const cy = (r1, r2, h, x, y, z, c, seg = 12, o = {}) => b.cyl(x, z, r2, y, h, c, { seg, rt: r1, ...o });
+  const rank = tierRank(ch, lv);
   if (ch === "T") {                                 // town hall
     bx(0.92, 0.12, 0.92, 0, 0, 0, "#d8d2c4");
     bx(0.78, 0.5, 0.6, 0, 0.12, -0.05, "#efe9dc", { win: WIN.house(1) });
@@ -262,10 +281,11 @@ export function special(b, ch, v = 0, season = null) {
       b.poly([[sx - 0.2, sz + 0.16, 0.08], [sx + 0.2, sz + 0.16, 0.08], [sx + 0.2, sz - 0.16, 0.2], [sx - 0.2, sz - 0.16, 0.2]], "#1f3a73", { two: true, nosnow: true });
     }
   } else if (ch === "W") {                          // wind turbine (rotor drawn by pixel.js)
+    const th = rank >= 2 ? 2.6 : 2.0;               // advanced turbine: taller mast, longer blades, bigger nacelle
     bx(0.5, 0.04, 0.5, 0, 0, 0, "#b8bdb5");
-    cy(0.03, 0.06, 2.0, 0, 0, 0, "#f4f5f6", 8);
-    bx(0.08, 0.08, 0.2, 0, 1.96, 0.02, "#e8eaec");
-    b.rotor(0, 0.13, 2.0, 0.85);
+    cy(0.03, rank >= 2 ? 0.08 : 0.06, th, 0, 0, 0, "#f4f5f6", 8);
+    bx(rank >= 2 ? 0.12 : 0.08, rank >= 2 ? 0.1 : 0.08, rank >= 2 ? 0.28 : 0.2, 0, th - 0.04, 0.02, "#e8eaec");
+    b.rotor(0, 0.13, th, rank >= 2 ? 1.1 : 0.85);
   } else if (ch === "U") {                          // water pump
     bx(0.6, 0.34, 0.5, 0, 0, 0.1, "#dfe7ea", { win: WIN.factory(4) });
     bx(0.64, 0.06, 0.54, 0, 0.34, 0.1, "#1f8a8a");
@@ -437,7 +457,28 @@ export function special(b, ch, v = 0, season = null) {
   } else if (ch === "H") {                          // highway sign gantry at the map edge
     bx(0.02, 0.8, 0.02, 0.3, 0, -0.42, "#777777"); bx(0.02, 0.8, 0.02, -0.3, 0, -0.42, "#777777");
     bx(0.7, 0.22, 0.03, 0, 0.62, -0.42, "#1b7a3e");
+  } else if (ch === "u") {                          // nuclear plant (2x2): two cooling towers, reactor dome, turbine hall
+    bx(0.96, 0.03, 0.96, 0, 0, 0, "#a3a8a0");
+    for (const [x, z] of [[-0.24, -0.2], [0.18, -0.26]]) {
+      b.lathe(x, z, [[0.2, 0.03], [0.16, 0.3], [0.13, 0.56], [0.15, 0.78]], "#d9d6cf", { seg: 14, top: "#8f8b84" });
+      b.smoke(x, z, 0.82, 1.2, 0.95);
+    }
+    bx(0.44, 0.22, 0.24, -0.18, 0.03, 0.26, "#c9ced6", { win: WIN.factory(23), top: "#6f7a86" });   // turbine hall
+    cy(0.14, 0.14, 0.22, 0.24, 0.03, 0.22, "#e6e3dc", 12);                                       // containment
+    b.dome(0.24, 0.22, 0.14, 0.25, "#eceae4");
+    bx(0.1, 0.12, 0.1, 0.4, 0.03, -0.02, "#f2c230");                                                 // switchyard
+    bx(0.02, 0.28, 0.02, 0.42, 0.03, 0.4, "#8a8f96"); bx(0.02, 0.28, 0.02, 0.08, 0.03, 0.4, "#8a8f96");
+  } else if (ch === "z") {                          // crematorium: small chapel with a pitched roof and one chimney
+    bx(0.92, 0.03, 0.92, 0, 0, 0, "#8fae78");
+    bx(0.5, 0.3, 0.4, -0.06, 0.03, 0.02, "#d8d3c8", { win: { ...WIN.house(24), w: 1, h: 3, sp: 0.12, lit: 0.3 } });
+    b.gable(-0.06, 0.02, 0.56, 0.46, 0.33, 0.2, "#4e4a52", { wall: "#d8d3c8" });
+    bx(0.03, 0.14, 0.03, -0.06, 0.53, 0.02, "#e0b43a");                                            // cross on the ridge
+    bx(0.1, 0.02, 0.03, -0.06, 0.62, 0.02, "#e0b43a");
+    bx(0.1, 0.68, 0.1, 0.28, 0.03, -0.24, "#7a6f66"); bx(0.12, 0.04, 0.12, 0.28, 0.71, -0.24, "#4a4440");
+    b.smoke(0.28, -0.24, 0.76, 0.35, 0.7);
+    for (const [x, z] of [[-0.36, 0.36], [0.34, 0.34]]) tree(b, x, z, 0.6, 0, season, v + x * 7);
   }
+  for (const [w, h, d, x, y, z, c, win] of tierAnnexes(ch, lv)) bx(w, h, d, x, y, z, c, win ? { win: WIN.factory(lv) } : undefined);
 }
 
 // ------------------------------------------------------------------ small things on tiles

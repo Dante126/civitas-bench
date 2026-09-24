@@ -22,7 +22,7 @@ const TILE = {
 // services, landmarks and other buildings added later: one colour each (fill, outline)
 for (const [ch, c] of Object.entries({ Y: "#8d8a82", "%": "#6d5f3f", "*": "#4f8f6f", K: "#1f4fa8", J: "#7d8388", F: "#c62828",
   "^": "#b8b39c", A: "#e8e8e8", h: "#cfd8dc", ":": "#d32f2f", "?": "#8e24aa", ">": "#b0bec5", L: "#7a6a4f", X: "#5b5e62", Z: "#6f9f5a", N: "#f3d99b", B: "#b5654a", Q: "#efe9dc",
-  D: "#2e5b3c", "|": "#6f8f4f", "@": "#b23b3b", "&": "#f1c40f", "+": "#d8d2c4", $: "#dfe3e8", "!": "#e0b43a" })) TILE[ch] = [c, c];
+  D: "#2e5b3c", "|": "#6f8f4f", "@": "#b23b3b", "&": "#f1c40f", "+": "#d8d2c4", $: "#dfe3e8", "!": "#e0b43a", u: "#9fd3c7", z: "#6a6a6a" })) TILE[ch] = [c, c];
 const ZONE = { R: [[120, 190, 110], [44, 150, 70]], C: [[120, 160, 230], [48, 108, 214]], I: [[232, 190, 110], [196, 132, 38]],
   O: [[190, 180, 235], [110, 100, 200]], M: [[220, 200, 176], [161, 136, 127]] };
 const NAMES = { ".": "empty land", "~": "river", "#": "road", "=": "bridge", "H": "highway", "T": "town hall", "P": "park",
@@ -31,7 +31,7 @@ const NAMES = { ".": "empty land", "~": "river", "#": "road", "=": "bridge", "H"
   "A": "clinic", "h": "hospital", ":": "metro station", "?": "casino", ">": "airport", "m": "mixed use (zoned)", "M": "mixed use", "L": "landfill", "X": "incinerator", "Z": "cemetery", "N": "elementary school", "B": "high school",
   "Q": "university", "D": "library", "|": "levee", "@": "train station", "&": "harbour", "+": "plaza", "$": "stadium", "!": "monument",
   "r": "residential (zoned)", "c": "commercial (zoned)", "i": "industrial (zoned)", "o": "offices (zoned)",
-  "R": "residential", "C": "commercial", "I": "industrial", "O": "offices" };
+  "R": "residential", "C": "commercial", "I": "industrial", "O": "offices", "u": "nuclear plant", "z": "crematorium" };
 
 function zoneColor(ch, level) {
   const up = ch.toUpperCase(); const [lo, hi] = ZONE[up];
@@ -146,7 +146,7 @@ function renderLegend() {
   else {
     const items = [["R", zoneColor("R", 3)], ["C", zoneColor("C", 3)], ["I", zoneColor("I", 3)], ["zoned, empty", zoneColor("r", 0)],
       ["road", TILE["#"][di]], ["river", TILE["~"][di]], ["park", TILE.P[di]], ["town hall", TILE.T[di]], ["coal", TILE.E[di]],
-      ["gas", TILE.G[di]], ["solar", TILE.S[di]], ["wind", TILE.W[di]], ["pump", TILE.U[di]], ["tower", TILE.O[di]]];
+      ["gas", TILE.G[di]], ["solar", TILE.S[di]], ["wind", TILE.W[di]], ["pump", TILE.U[di]], ["tower", TILE.V[di]]];
     L.innerHTML = items.map(([n, c]) => `<span><i style="background:${c}"></i>${n}</span>`).join("") + `<span class="muted">dots = building level</span>`;
   }
 }
@@ -279,7 +279,7 @@ $("map").addEventListener("mousemove", (e) => {
   const x = Math.floor((e.clientX - r.left) / px), y = Math.floor((e.clientY - r.top) / px);
   if (x < 0 || y < 0 || x >= S.meta.width || y >= S.meta.height) { $("tip").hidden = true; return; }
   const i = y * S.meta.width + x, ch = f.tiles[i], zone = "rciomRCIOM".includes(ch);
-  $("tip").innerHTML = `<b>(${x}, ${y})</b> ${NAMES[ch] || ch}${zone ? ` · level ${f.levels[i]}` : ""}<br>
+  $("tip").innerHTML = `<b>(${x}, ${y})</b> ${NAMES[ch] || ch}${zone ? ` · level ${f.levels[i]}` : +f.levels[i] > 0 ? ` · tier ${f.levels[i]}` : ""}<br>
     pollution ${f.pollution[i]}/9 · land value ${f.land_value[i]}/9${zone ? `<br>power ${f.power[i] === "1" ? "yes" : "no"} · water ${f.water[i] === "1" ? "yes" : "no"}` : ""}`;
   const tip = $("tip"); tip.hidden = false;
   const lx = e.clientX - r.left + 14, ly = e.clientY - r.top + 14;
