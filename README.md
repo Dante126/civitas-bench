@@ -1,0 +1,401 @@
+# Civitas Bench
+
+A SimCity-style city simulation built for **multi-agent AI benchmarking**.
+Each city department is played by a separate agent (an Arcee LLM, a scripted
+baseline, a remote program, or an RL policy). All of them read from one central
+city state, act only through validated actions, talk on a shared council board,
+and are scored on the city as a whole *and* on their own department.
+
+The map starts as a flat plain with a river flowing north to south. The highway
+on the west edge connects the city to the rest of the region.
+
+```
+roles:    Mayor · Planning & Housing · Utilities (power, water, sewage) · Transport
+          Police · Fire & Emergency · Health & Sanitation · Education
+episode:  120 months (10 years), each agent acts once a month
+cost:     scripted run ≈ 3 s · every role on an LLM ≈ 960 model calls
+modes:    one city, or a region of 2-6 linked cities that trade and specialise
+```
+
+---
+
+## 1. Setup (macOS)
+
+You need Python 3.10 or newer. The Python that ships with macOS is usually 3.9, so
+the simplest path is [uv](https://docs.astral.sh/uv/):
+
+```bash
+cd ~/Desktop/civitas-bench
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+pytest -q                       # ~70 tests, ~20 s (pytest -q -m "not slow" skips the 5-episode benchmark test)
+```
+
+(With plain pip: `python3.12 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"`.)
+
+## 2. Open the control center
+
+```bash
+civitas serve            # then open http://127.0.0.1:8765
+```
+
+Everything happens in the browser from here. You can:
+
+- **Watch** the city in the OpenTTD-style pixel view (the default) or in 3D (toggle with `X`
+  or the `PX`/`3D` button). The pixel view is a 2:1 isometric pixel-art map: drag to
+  scroll, zoom in steps with the wheel, rotate in quarter turns with `Q`/`E`. Buildings go
+  up behind scaffolding, cars, buses, trains, boats and planes move around, cars queue at
+  traffic lights on junctions, planes land, taxi to the terminal and take off (in region runs
+  they fly to the other cities' airports), container ships berth under the harbour crane, and night lights the windows. Around the city a distant view
+  fades into haze: fields, the river and highways running on, villages where roads leave the
+  map and, in region runs, the neighbouring cities with the rivers flowing between them and
+  their highway and rail links routed from connector to connector (`T` zooms out over all of it). Both views
+  show the river (a little murkier where it is polluted), bridges,
+  houses, row houses and villas that become apartments and towers, offices, shop-houses,
+  factories, farms, sawmills, mines and oil fields, power plants, pumps, sewage works,
+  police and fire stations, clinics, 2×2 hospitals and universities, schools, landfills,
+  bus and metro lines, casinos, airports, levees, landmarks, floods, historic plaques,
+  snow in winter and orange trees in autumn. Smoke drifts with the wind.
+- **Replay or follow live.** Use the timeline to play, step or scrub. Marks on the
+  timeline show council messages (purple), failed actions (amber), money trouble (red),
+  disasters and offers (blue) and milestones (gold). A run in progress is followed
+  automatically.
+- **See why things happen.** The Agents tab shows each month's decisions with ✓/✗
+  results. Click an action to fly the camera to where it happened. For LLM agents you
+  can expand the model's full reasoning, its raw reply and the exact prompt it saw. The
+  Events tab starts with what residents complain about this month.
+- **Inspect** any tile by clicking it: stats, services, wealth or industry type, its
+  building level over time, and which agent zoned or built it.
+- **Switch map layers** (press `V`, or `1`–`9`): pollution, land value, happiness, noise,
+  power, water, sewage, river pollution, traffic, bus coverage, police/fire/clinic/school
+  cover, crime, fire risk, health, garbage, soil pollution, historic buildings, business
+  profit, affordability, natural resources, flood risk and districts.
+- **Launch runs** with **＋ New run**: pick a config, seed, length and each role's agent
+  (scripted, LLM with any model, noop or random). Stop runs from the Runs tab, which also
+  holds the leaderboard.
+- **Browse the Charts tab**: population, scores, money, happiness and approval, demand,
+  jobs, pollution, commute and traffic, trade, service coverage, crime and health,
+  education.
+- **Region runs** get a city switch in the top bar and a **Region** tab: a map of the
+  cities with their links and the goods, commuters and tourists flowing between them,
+  plus each city's score and specialisations.
+
+Press `?` in the app for all keyboard shortcuts. `civitas run ... --serve` also opens the
+interface while a run from the terminal is playing. The old 2D viewer is still available
+at `/classic.html`.
+
+## 3. Plug in Arcee models (trinity-large-thinking)
+
+Put your key in a `.env` file in the project folder. It's gitignored and `civitas` loads
+it automatically. `export ARCEE_API_KEY=...` works too.
+
+```bash
+echo 'ARCEE_API_KEY=rcai-...' > .env
+civitas check-llm                            # one test call to trinity-large-thinking
+civitas run -c configs/smoke.toml --serve    # 2 years, 3 LLM roles acting every 3 months (~24 calls)
+civitas run -c configs/arcee.toml --serve    # 10 years, mayor/planning/utilities on the LLM, the rest scripted
+civitas run -c configs/arcee_full.toml       # 10 years, all 8 roles on the LLM (~960 calls)
+```
+
+The Arcee API is OpenAI-compatible (`https://api.arcee.ai/api/v1`). Notes on the
+thinking model:
+
+- **Token budget.** The Arcee configs give each call `max_tokens = 12000` so there's room
+  for the reasoning *and* the JSON answer. If a reply is cut off, the agent retries once,
+  hands the model the end of its own reasoning and asks for the JSON only; as a last resort
+  it recovers the action objects from the end of the reasoning. Prompts are about 3–4.5k
+  tokens per role (a system prompt with the rules and action docs, then the observation).
+- **Where the answer comes from.** The agent reads plain JSON from the reply rather than
+  using tool calling. If the final answer has no JSON, the agent checks the reasoning text.
+- **What gets logged.** The reasoning is saved in `trajectories.jsonl` along with the
+  answer, which is useful for studying or training on how the model plans.
+- **Speed.** Calls are slow, so a full game with several LLM roles can take hours. Start
+  with `smoke.toml`, or set `game.act_every` to 2–3.
+
+Any role can be switched from the CLI, and any value overridden:
+
+```bash
+civitas run -c configs/arcee.toml --agent mayor=scripted --agent police=llm:arcee/trinity-mini --set game.act_every=3
+```
+
+Other OpenAI-compatible endpoints (OpenRouter, vLLM, Ollama and so on) work the same way.
+Add a `[providers.name]` block with `base_url` and `api_key_env`, then use `llm:name/model`.
+
+## 4. Benchmark
+
+```bash
+# the same line-up across 5 seeds (maps and disaster schedules differ by seed)
+civitas bench -c configs/arcee.toml --seeds 0-4 --workers 3
+
+# role-isolated eval: only Planning is an LLM, the other roles are fixed baselines,
+# so any score difference comes from the Planning agent
+civitas bench -c configs/eval_planning.toml --seeds 0-4
+civitas bench -c configs/eval_planning.toml --seeds 0-4 --agent planning=llm:arcee/trinity-mini   # compare models
+
+civitas leaderboard            # every finished run, grouped by agent line-up
+```
+
+Baseline reference (all scripted, seeds 0–4): **city 77.3 ± 2.2**, mayor 87.4, planning
+67.9, utilities 91.6, transport 75.1, police 80.8, fire 88.7, health 90.1, education 88.6,
+population ≈ 14.0k, no bankruptcies, ~4 s per game. `noop` and `random` line-ups score 0.
+The scripted agents leave obvious room: they never use districts, mixed use, historic
+listings or soil clean-up, rarely use policies or funding levels, build services by simple
+coverage rules, hoard money late in the game and never make neighbour deals.
+
+Useful switches in `[game]` (or `--set game.X=...`):
+
+| setting | effect |
+|---|---|
+| `events = "auto"` / `"none"` | seeded floods, heatwave, recession and a factory offer (same on every line-up for a seed) |
+| `milestones = true` | buildings unlock at 1k / 5k / 10k residents |
+| `simultaneous = true` | every role sees the same start-of-month state (harder: no reacting to earlier roles) |
+| `roles = [...]` | which roles play, in turn order |
+| `seasons = true` | winter heating and snow, summer cooling and fires, seasonal tourism |
+| `region = true`, `cities = [...]` | 2–6 cities, each with its own team (see below) |
+| `team_weight` | reward = w·Δcity + (1−w)·Δrole − penalty·invalid actions |
+| `balance` | override any constant, e.g. `"CATALOG.coal.cost" = 3000` or `"SERVICES.clinic.radius" = 9` |
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph Agents
+    M[Mayor] --- P[Planning] --- U[Utilities] --- T[Transport]
+    PO[Police] --- F[Fire] --- H[Health] --- E[Education]
+  end
+  subgraph Hub["CivitasEnv (central city state)"]
+    O[role-scoped observation<br/>JSON + text prompt]
+    A[action validator<br/>budgets, permissions, unlocks]
+    B[(council board)]
+    W[(World: map, networks, services,<br/>people, traffic, economy, events)]
+    S[scores & rewards]
+  end
+  Agents -- observe --> O
+  Agents -- actions + messages --> A
+  A --> W
+  A --> B
+  W --> O
+  B --> O
+  W -- monthly tick --> S
+  S --> O
+  S --> L[runs/*: frames, trajectories, summary]
+  L --> V[web viewer / leaderboard]
+```
+
+**The central state.** `CivitasEnv` is the hub. It owns the `World` (the single source
+of truth), the council board, each role's memory (the results of its last turn and its
+notes to self) and the scores. Agents never touch the world directly. Each month every
+role observes and acts in turn order (later roles see what earlier roles just did), then
+`end_month()` simulates the month and recomputes the scores. Each role's reward is the
+change in score.
+
+Every observation is available as structured JSON (for RL policies and remote agents)
+and as a rendered text prompt (for LLMs). Everyone sees the same city summary, the top
+complaints, the finances, events, forecasts and council messages; each role also gets a
+detailed section on its own system (its buildings with load vs capacity, problem hotspots
+with coordinates, suggested sites) and, except the mayor, the ASCII map. Other systems
+only appear as summaries, so agents have to talk to each other.
+
+**Four ways to connect an agent.** All use the same action format:
+
+| kind | what it is |
+|---|---|
+| `llm` | Any OpenAI-compatible model (Arcee by default). It gets a system prompt with the rules and action docs, plus the observation text, and replies with JSON. |
+| `scripted` | Rule-based baselines. They read only the observation, so they are fair references and a source of demonstration data. |
+| `remote` | Any external process, in any language, over HTTP: `GET /api/live/turn?role=planning`, then `POST /api/live/act`. See `examples/remote_agent.py` and `configs/remote.toml`. |
+| RL | `env.reset()` / `env.step({role: Decision})` (PettingZoo-style), with `env.tensor_observation()` returning a 14×H×W grid and a feature vector. See `examples/rl_loop.py`. |
+
+### The simulation
+
+- **Zones and levels.** Residential (R), commercial (C), industrial (I) and office (O)
+  zones develop by themselves when there is demand. Each level needs more of the city:
+  L1 road access + power, L2 water, L3 sewage + garbage pickup + land value 40%, L4 a
+  school in reach (homes) or skilled workers (jobs) + land value 58%, L5 land value 75% +
+  low crime + a park nearby. Low-density zones stop at L2; high density goes to L5 (up to
+  240 residents or 140 office jobs per tile). Industry stops at L3 unless it is high-tech.
+- **People.** Residents are tracked as an age × education vector (children, teens, adults,
+  seniors × none, elementary, high school, university). Migrants fill new housing, people
+  age and die, and students only graduate when they have a school seat. Jobs need education:
+  offices and high-tech want graduates, over-educated workers take lower jobs.
+- **Wealth and households.** Homes are low, middle or high income depending on land value
+  when they are built. Wages minus rent is what households spend in shops; rich households
+  pay more tax, care more about pollution, crime and noise, and leave first when unhappy.
+- **Industry types.** Industry zoned on natural resources becomes farms (fertile soil),
+  sawmills (forest), mines (ore) or oil fields; resources run out. Educated cities attract
+  high-tech industry.
+- **Demand** depends on jobs vs. workers, taxes, happiness, commute times, household
+  spending and export demand. Big cities need a train station or harbour, and enough parks,
+  or residential and commercial demand is capped.
+- **Utilities.** Every connected road network is its own grid for power, water and sewage.
+  Facilities serve the network they touch, nearest buildings first. Pumps and sewage
+  facilities sit on the riverbank. Plants lose output after five years unless overhauled;
+  wind output follows a wind map. Shortfalls are covered by costly imports from the region
+  (the mayor can stop them) and surplus power is sold.
+- **The river** flows north to south. Sewage outlets and riverside industry pollute it
+  downstream: pumps below an outlet deliver dirty water. Treatment plants remove 80%.
+- **City services** (police, fire, clinics and hospitals, schools, garbage trucks,
+  shelters) cover buildings they can reach along the road network within their radius, up
+  to their capacity, scaled by the department's funding level. Crime grows with
+  unemployment, density, low education and low land value; uncovered fires spread;
+  uncollected garbage piles up; pollution, dirty water and garbage make people sick (sick
+  workers stay home); deaths need cemetery space; landfills fill up.
+- **Traffic.** Workers commute from home to the busiest job areas along shortest road
+  paths (a gravity model); trucks carry goods to the highway, train stations and the
+  harbour. Load over capacity means congestion: longer commutes, noise, exhaust, and slower
+  police, fire and ambulances. Avenues and highways carry more; bus lines take trips off
+  the road.
+- **Trade and businesses.** Industry makes goods and raw materials; shops need goods.
+  Surpluses are exported and shortfalls imported, limited by freight capacity. Every shop,
+  factory and office has a profit margin (customers, taxes, shortages, traffic, crime);
+  six months of losses and it closes.
+- **Happiness** is a weighted sum of 14 needs (power, water, sewage, garbage, safety,
+  health, education, commute, leisure, noise, pollution, tax, affordability, jobs). The
+  needs that cost the most happiness become the **complaints feed**. **Approval** follows
+  happiness and taxes; 12 months below 30% and the mayor loses the recall election.
+- **Mixed use** (M zones) puts shops below flats; **historic listings** freeze a
+  building's level and add land value and tourists; **soil pollution** builds up under dirty
+  industry, landfills and coal plants, fades very slowly, and hurts health, land value and
+  farms (the health department can clean it); **wind** changes every month around a
+  westerly and pushes air pollution downwind; **seasons** raise power demand in winter
+  (and slow the roads with snow), water and fire risk in summer, and move tourism.
+- **Metro**: stations serve 5 tiles around them; lines between stations carry trips
+  three times faster than driving, immune to jams. Hospitals, universities, stadiums
+  and casinos cover 2×2 tiles, airports 3×3 (x, y is the top-left tile).
+- **Casinos and airports**: a casino gives low-skill jobs and gamblers who pay a gambling
+  tax, but raises crime around it; an airport adds freight, tourists and air links.
+- **Events** come from the seed: a river flood (forecast 3 months ahead; levees protect,
+  shelters save lives), a heatwave, a recession and a factory offer the mayor must accept
+  or decline (jobs and a bonus vs. heavy pollution).
+- **Milestones** at 1k / 5k / 10k / 20k residents pay a reward and unlock buildings (high
+  density, offices, avenues, high schools... then hospitals, universities, train stations,
+  hydro dams, stadiums, the harbour... then monuments). Landmarks raise land value and
+  bring tourists.
+- **Money.** Taxes (per sector, with district modifiers), fares, trade fees, tourism and
+  power sales come in; upkeep of roads, plants and service buildings (times funding
+  levels), policies, imports and loan interest go out. Departments can only spend what the
+  mayor gives them. Twelve months in a row with a negative treasury means bankruptcy.
+
+All balance numbers live in `civitas/sim/catalog.py`. You can override them per config
+with `[game.balance]`.
+
+### Roles and actions
+
+| role | actions |
+|---|---|
+| mayor | `set_tax` (R/C/I %), `allocate_budget`, `set_funding` (department 50–150%), `enact_policy` / `repeal_policy` (city-wide or per district), `set_district_tax`, `accept_offer` / `decline_offer`, `set_service_imports`, `take_loan`, `repay_loan` |
+| planning | `build_road`, `zone` (R/C/I/O/M, low or high density), `dezone`, `build_park`, `build_landmark` (plaza/stadium/monument), `build_casino`, `paint_district`, `specialize_district`, `preserve_historic` / `delist_historic`, `bulldoze`, `demolish` |
+| utilities | `build_power_plant` (coal / gas / solar / wind / hydro), `build_water` (pump / tower), `build_sewage` (outlet / treatment), `upgrade_facility` (filter / expansion / overhaul), `demolish` |
+| transport | `upgrade_road` (avenue / highway), `create_bus_line`, `remove_bus_line`, `set_fare`, `build_metro_station`, `create_metro_line`, `remove_metro_line`, `build_train_station`, `build_harbour`, `build_airport`, `build_connector` (region mode), `upgrade_facility`, `demolish` |
+| police | `build_police_station`, `build_jail`, `upgrade_facility`, `demolish` |
+| fire | `build_fire_station`, `build_levee`, `build_shelter`, `upgrade_facility`, `demolish` |
+| health | `build_clinic`, `build_hospital`, `build_landfill`, `build_incinerator`, `build_cemetery`, `clean_soil`, `upgrade_facility`, `demolish` |
+| education | `build_school` (elementary / high / university), `build_library`, `upgrade_facility`, `demolish` |
+
+Policies: recycling, neighborhood watch, smoke detectors, education boost, industry
+filters, high-rise ban, free transit. Every role can post `messages` to the council board
+(to `all` or a role) and keep `notes` for its next turn. Invalid actions are rejected with
+a helpful message and counted in the invalid-action rate.
+
+### Scores (0–100)
+
+| score | built from |
+|---|---|
+| **city** | ½ population (√ of pop / 30k) + ½ quality: happiness, finances, power/water/sewage coverage, environment, employment, safety, health, education. Quality counts only once the city has people; bankruptcy halves the total, a lost recall election cuts it by a quarter. |
+| **mayor** | revenue, solvency, net worth, happiness, approval, and how much of the money given to departments actually got spent |
+| **planning** | growth, share of zoned land that developed, demand balance, land value, road efficiency, employment |
+| **utilities** | power, water and sewage coverage, spare capacity in the 10–60% range, cost efficiency, clean-energy share, pollution near homes, water quality, river quality |
+| **transport** | commute time, share of congested road, bus share of trips, cost per resident |
+| **police** | crime at homes, coverage, jail space, cost per resident |
+| **fire** | buildings lost to fire, coverage, cost per resident |
+| **health** | health of residents, garbage at homes, clinic coverage, landfill room, deathcare, cost |
+| **education** | enrolment, skilled jobs filled, share of adults with high school+, cost |
+
+Every score is a function of the monthly history, so the same code produces the final
+benchmark number, the live "your score" shown to agents, and dense RL rewards.
+
+### Region mode: cities that trade and specialise
+
+`configs/region.toml` (two cities) and `configs/region_trio.toml` (three) run a region:
+`[game] region = true` and `cities = [...]` from north, south, east, west, southeast,
+southwest. Every city has its own full team; roles are named `north.planning`,
+`south.mayor` and so on. Agents configured for a base role (`[agents.planning]`) play it
+in every city, `[agents."south.planning"]` sets one city.
+
+- **The river** runs through the north-south column: upstream sewage and runoff arrive
+  in the next city's water.
+- **Links.** Transport departments build `build_connector` (highway or rail) on the map
+  edge facing a neighbouring city, with a feeder road inland; the link opens when both
+  cities have built their side. Any two cities with a harbour are linked by boat, any two
+  with an airport by air. Each link type has a goods and a people capacity.
+- **Commerce.** Every month, over those links, surplus goods and raw materials go to
+  cities that are short (the seller collects part of the value; the buyer avoids costly
+  imports and shortages), unemployed workers commute to open jobs, and residents visit
+  their partners' casinos, landmarks and historic districts.
+- **Specialisation** follows from each city's land and people and is reported to every
+  agent: mining & farming (natural resources, pollutes the soil), high tech (needs
+  graduates and raw materials), gambling (casinos: little education needed, crime, tourist
+  money), tourism, trade (freight), education. Complementary cities gain the most from links.
+- **Diplomacy.** All teams share one council board (address `"south"`, `"north.mayor"` or
+  `"all"`) and mayors can agree power/water deals (`offer_deal`, `accept_deal`, `cancel_deal`).
+
+Each city is scored on its own; the region score is their average.
+
+### Output files (`runs/<run_id>/`)
+
+- `meta.json`: config, agents, map size, natural resources
+- `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council). The viewer replays these.
+- `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
+- `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
+
+`python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
+turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.
+
+---
+
+## Project layout
+
+```
+civitas/
+  sim/        catalog.py (all balance numbers) · world.py (map, networks, tick, metrics) · grid.py (numpy helpers)
+              population.py (cohorts, schooling, jobs) · services.py (coverage, crime, fire, garbage, health)
+              civics.py (needs, complaints, approval, funding, policies, districts) · traffic.py (commutes, buses)
+              economy.py (demand, levels, wealth, industry, households, trade, profits) · events.py
+              progress.py (milestones, landmarks; heritage, soil, wind, seasons)
+  core/       env.py (the hub) · region.py (2-6 linked cities) · observation.py · actions.py · council.py · roles.py · decision.py
+  agents/     llm.py · llm_client.py · prompts.py · scripted.py · remote.py · base.py (noop, random)
+  bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard)
+  viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
+              · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
+              · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
+              · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
+  cli.py      civitas run | bench | serve | leaderboard | prompt | check-llm
+configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio
+docs/         MECHANICS.md (the design roadmap and what is implemented)
+examples/     remote_agent.py · rl_loop.py · export_sft.py
+tests/
+```
+
+`civitas prompt -c configs/arcee.toml --role police` prints exactly what an LLM agent sees
+on month 0. It's the fastest way to iterate on prompts.
+
+## Adding a role
+
+1. `core/roles.py`: add the role (title, mission, allowed actions, budget line) and put it in `TURN_ORDER`.
+2. `sim/world.py`: add the department to `DEPARTMENTS` (and `catalog.FUNDED_DEPARTMENTS` if it has a funding level).
+3. `sim/`: add the mechanic, usually in a mixin (see `services.py`); record what the score needs in `World._metrics()`.
+4. `core/actions.py`: add handlers to `HANDLERS`, docs in `action_docs()`, and what it may demolish in `OWNED_STRUCTS`.
+5. `core/observation.py`: add a role section (`ROLE_SECTIONS`) and its text rendering.
+6. `bench/scoring.py`: add a KPI function to `ROLE_SCORERS`.
+7. `agents/scripted.py`: add a baseline to `SCRIPTED`, and let the scripted mayor fund it.
+8. Viewer: give new buildings a character in `catalog.CHAR`, a model in `scene.js` (`_buildSpecial`), a sprite recipe in `recipes.js` (`special`), and entries in `NAMES` / `MINI` in `app.js`; new map layers go in `World.frame_layers()` and `OVERLAYS` in `scene.js`.
+
+## Ideas for next steps
+
+- Per-agent partial maps (only the role's own layer in detail) to shrink prompts further.
+- Native tool-calling agents and an MCP server wrapping the live API.
+- Council negotiation as structured objects (budget requests the mayor approves or denies).
+- Region-level projects that need several cities to fund them (a shared university, a regional airport).
+- Training: run GRPO on `trajectories.jsonl`, using per-turn rewards as advantages.

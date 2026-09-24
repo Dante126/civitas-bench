@@ -1,0 +1,21 @@
+# All three roles played by the rule-based baselines. Free, fast (~2 s/episode).
+name = "baseline"
+
+[game]
+months = 120          # 10 years, agents act every month
+width = 48
+height = 48
+start_funds = 30000
+max_actions_per_turn = 8
+
+[scoring]
+target_population = 30000
+
+[agents.mayor]
+kind = "scripted"
+
+[agents.planning]
+kind = "scripted"
+
+[agents.utilities]
+kind = "scripted"

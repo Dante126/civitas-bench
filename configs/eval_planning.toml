@@ -1,0 +1,19 @@
+# Role-isolated evaluation: only Planning is an LLM, the other roles are the
+# scripted baselines. Differences in score are then attributable to Planning.
+# Swap the model from the CLI:  --agent planning=llm:arcee/trinity-mini
+name = "eval_planning"
+
+[game]
+months = 120
+
+[agents.mayor]
+kind = "scripted"
+
+[agents.planning]
+kind = "llm"
+provider = "arcee"
+model = "trinity-large-thinking"
+max_tokens = 12000
+
+[agents.utilities]
+kind = "scripted"

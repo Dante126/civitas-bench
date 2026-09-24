@@ -1,0 +1,17 @@
+# Three cities: north and south share the river, east is next to north. Each has its own team
+# (all scripted here). Transport departments link cities with highway / rail connectors on the facing
+# map edges (both sides must build), harbours link by boat, airports by air. Linked cities trade goods
+# and raw materials, share commuters and tourists, and can specialise (mining, high tech, gambling...).
+#   civitas run -c configs/region_trio.toml --serve
+name = "region_trio"
+
+[game]
+months = 120
+region = true
+cities = ["north", "south", "east"]
+
+[scoring]
+target_population = 30000
+
+[agents.mayor]
+kind = "scripted"

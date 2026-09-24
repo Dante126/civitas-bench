@@ -1,0 +1,163 @@
+"""Command line: civitas run | bench | serve | leaderboard | prompt | check-llm"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+
+
+def _seeds(s: str) -> list[int]:
+    out = []
+    for part in s.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out.extend(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+
+
+def _load(args):
+    from .config import apply_cli_overrides, load_config
+    cfg = load_config(args.config)
+    return apply_cli_overrides(cfg, args.agent, args.set)
+
+
+def cmd_run(args):
+    from .agents.remote import LiveHub
+    from .bench.runner import run_episode
+    cfg = _load(args)
+    hub = None
+    if args.serve:
+        from .server import serve
+        hub = LiveHub()
+        serve(args.runs_dir, args.port, hub=hub, background=True)
+    run_episode(cfg, args.seed, args.runs_dir, hub=hub, verbose=not args.quiet, run_id=args.run_id)
+    if args.serve and not args.exit:
+        print("Run finished. Viewer still running; Ctrl+C to quit.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+
+
+def cmd_bench(args):
+    from .bench.runner import run_benchmark
+    cfg = _load(args)
+    run_benchmark(cfg, _seeds(args.seeds), args.runs_dir, workers=args.workers, verbose=not args.quiet)
+
+
+def cmd_serve(args):
+    from .server import serve
+    serve(args.runs_dir, args.port, host=args.host)
+
+
+def cmd_leaderboard(args):
+    from .bench.runner import leaderboard, print_table
+    rows = leaderboard(args.runs_dir)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print_table(rows)
+
+
+def cmd_prompt(args):
+    """Print what an LLM agent would see on month 0 (system prompt + observation)."""
+    from .agents.prompts import system_prompt
+    from .config import game_config, scoring_config
+    from .core.env import CivitasEnv
+    cfg = _load(args)
+    game = game_config(cfg, args.seed)
+    env = CivitasEnv(game, scoring_config(cfg, game))
+    print("=" * 30, "SYSTEM", "=" * 30)
+    print(system_prompt(args.role, months=game.months, target_pop=env.scoring.target_population,
+                        max_actions=game.max_actions_per_turn))
+    print("=" * 30, "USER (observation)", "=" * 30)
+    print(env.observe(args.role)["text"])
+
+
+def cmd_check_llm(args):
+    from .agents.llm_client import ChatClient
+    from .config import provider_config
+    cfg = _load(args)
+    client = ChatClient(provider_config(cfg, args.provider))
+    out = client.chat(args.model, [{"role": "user", "content": 'Reply with exactly: {"ok": true}'}], max_tokens=4000)
+    if out.get("reasoning"):
+        out["reasoning"] = out["reasoning"][:500] + ("..." if len(out["reasoning"]) > 500 else "")
+    print(json.dumps(out, indent=2))
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE lines from ./.env into the environment (existing vars win)."""
+    import os
+    if not os.path.exists(path):
+        return
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.removeprefix("export ").strip()
+        os.environ.setdefault(k, v.strip().strip('"').strip("'"))
+
+
+def main(argv=None):
+    load_dotenv()
+    p = argparse.ArgumentParser(prog="civitas", description="Multi-agent city-building benchmark")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--config", "-c", default=None, help="TOML config (see configs/)")
+        sp.add_argument("--agent", action="append", default=[],
+                        help="override a role, e.g. planning=llm:arcee/trinity-mini or mayor=scripted")
+        sp.add_argument("--set", action="append", default=[], help="override a value, e.g. game.months=24")
+        sp.add_argument("--runs-dir", default="runs")
+
+    sp = sub.add_parser("run", help="play one episode")
+    common(sp)
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--serve", action="store_true", help="start the viewer + live API while running")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--exit", action="store_true", help="with --serve: exit when the run ends")
+    sp.add_argument("--quiet", action="store_true")
+    sp.add_argument("--run-id", default=None, help="name of the run folder (default: timestamp_name_seed)")
+    sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("bench", help="run several seeds and aggregate scores")
+    common(sp)
+    sp.add_argument("--seeds", default="0-4")
+    sp.add_argument("--workers", type=int, default=1)
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(fn=cmd_bench)
+
+    sp = sub.add_parser("serve", help="3D web interface: watch, replay and launch runs")
+    sp.add_argument("--runs-dir", default="runs")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.set_defaults(fn=cmd_serve)
+
+    sp = sub.add_parser("leaderboard", help="aggregate all runs by agent line-up")
+    sp.add_argument("--runs-dir", default="runs")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_leaderboard)
+
+    sp = sub.add_parser("prompt", help="print an agent's prompt for month 0")
+    common(sp)
+    sp.add_argument("--role", default="planning")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.set_defaults(fn=cmd_prompt)
+
+    sp = sub.add_parser("check-llm", help="send one test request to a provider")
+    common(sp)
+    sp.add_argument("--provider", default="arcee")
+    sp.add_argument("--model", default="trinity-large-thinking")
+    sp.set_defaults(fn=cmd_check_llm)
+
+    args = p.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

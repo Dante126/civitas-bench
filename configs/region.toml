@@ -1,0 +1,18 @@
+# Two cities on one river, each with its own team of agents (all scripted here).
+# The north city is upstream: its sewage reaches the south city's water. Both teams share the
+# council board, the mayors can trade power and water, and once their transport departments link
+# the cities (highway / rail connectors, harbours, airports) they trade goods, commuters and tourists.
+# Agents set for a base role ("planning") play it in every city; "north.planning" sets one city.
+# Up to six cities: cities = ["north", "south", "east", "west", "southeast", "southwest"].
+#   civitas run -c configs/region.toml --serve
+name = "region"
+
+[game]
+months = 120
+region = true
+
+[scoring]
+target_population = 30000
+
+[agents.mayor]
+kind = "scripted"

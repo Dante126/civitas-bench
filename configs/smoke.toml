@@ -1,0 +1,25 @@
+# Quick LLM check: 2 years, agents act every 3 months (~24 calls).
+# Mayor, Planning and Utilities on the LLM; the other departments are scripted.
+name = "smoke"
+
+[game]
+months = 24
+act_every = 3
+
+[providers.arcee]
+timeout = 300
+
+[agents.mayor]
+kind = "llm"
+model = "trinity-large-thinking"
+max_tokens = 12000
+
+[agents.planning]
+kind = "llm"
+model = "trinity-large-thinking"
+max_tokens = 12000
+
+[agents.utilities]
+kind = "llm"
+model = "trinity-large-thinking"
+max_tokens = 12000

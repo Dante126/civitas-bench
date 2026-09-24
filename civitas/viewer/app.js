@@ -1,0 +1,750 @@
+// Civitas control center: replays & live-follows runs, launches new ones. The city is drawn by the pixel view
+// (pixel.js, OpenTTD-style) or the 3D view (scene.js); both have the same interface and `scene` is the active one.
+import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } from "./scene.js";
+import { PixelScene } from "./pixel.js";
+import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
+
+const $ = (id) => document.getElementById(id);
+const app = $("app");
+const ROLE_C = { city: "#ffffff", mayor: "#b99bff", planning: "#5fd38d", utilities: "#ffb454", transport: "#e07bd8",
+  police: "#5b8cff", fire: "#ff7a59", health: "#3fd0c9", education: "#f5d547" };
+const roleColor = (r) => ROLE_C[r] || ROLE_C[String(r).split(/[./]/).pop()] || "#cccccc";
+const NAMES = { ".": "empty land", "~": "river", "#": "road", "=": "bridge", H: "highway", T: "town hall", P: "park",
+  E: "coal plant", G: "gas plant", S: "solar farm", W: "wind turbine", U: "water pump", V: "water tower", Y: "hydro dam",
+  "%": "sewage outlet", "*": "sewage treatment plant", K: "police station", J: "jail", F: "fire station", "^": "emergency shelter",
+  A: "clinic", h: "hospital", L: "landfill", ":": "metro station", "?": "casino", ">": "airport", m: "mixed-use zone (empty)", M: "mixed use", X: "incinerator", Z: "cemetery", N: "elementary school", B: "high school",
+  Q: "university", D: "library", "|": "levee", "@": "train station", "&": "harbour", "+": "plaza", $: "stadium", "!": "monument",
+  r: "residential zone (empty)", c: "commercial zone (empty)", i: "industrial zone (empty)", o: "office zone (empty)",
+  R: "residential", C: "commercial", I: "industrial", O: "offices" };
+const LEVEL_NAME = { R: ["", "houses", "apartments", "high-rise", "tower", "luxury tower"], C: ["", "shops", "offices", "skyscraper", "mall tower", "megatower"],
+  I: ["", "workshop", "factory", "heavy industry", "plant", "tech campus"], O: ["", "small offices", "office block", "office tower", "HQ tower", "landmark HQ"],
+  M: ["", "corner shop & flat", "shop-house", "mid-rise", "high-rise", "tower"] };
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const store = { get(k, d) { try { const v = localStorage.getItem("civitas." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("civitas." + k, JSON.stringify(v)); } catch { /* ignore */ } } };
+
+const S = {
+  runs: [], runId: null, meta: null, frames: [], idx: 0, status: "—", playing: false, timer: null, poll: null,
+  tab: store.get("tab", "agents"), overlay: store.get("overlay", "none"), roleFilter: new Set(), selected: -1,
+  follow: true, configs: [],
+};
+
+// ================================================================ api
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : { cache: "no-store" });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `${r.status} ${path}`);
+  return j;
+}
+function toast(msg, err = false) {
+  const t = document.createElement("div"); t.className = "toast" + (err ? " err" : ""); t.innerHTML = msg;
+  $("toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500);
+}
+
+// ================================================================ scene
+const sceneOpts = { onHover: (tile, ev) => showTooltip(tile, ev), onClick: (tile) => select(tile) };
+const scenes = {};
+const makeScene = (kind) => scenes[kind] || (scenes[kind] = kind === "3d" ? new CityScene($("viewport"), sceneOpts) : new PixelScene($("viewport"), sceneOpts));
+let viewMode = store.get("view", "pixel") === "3d" ? "3d" : "pixel";
+let scene = makeScene(viewMode);
+function setView(kind) {
+  if (kind === viewMode) return;
+  scene.setActive(false);
+  viewMode = kind; store.set("view", kind);
+  scene = makeScene(kind); scene.setActive(true);
+  if (S.meta) { scene.setMeta(S.meta); if (S.frames.length) render(null, false); }
+  scene.setOverlay(S.overlay); scene.setNight(store.get("night", false)); scene.setQuality(store.get("quality", "high"));
+  scene.setSelected(S.selected);
+  $("vMode").textContent = kind === "3d" ? "3D" : "PX";
+  $("vMode").title = kind === "3d" ? "3D view: switch to pixel view (X)" : "Pixel view: switch to 3D view (X)";
+  $("vTop").title = kind === "3d" ? "Top-down view (T)" : "Zoom out to the whole region (T)";
+  $("vRotate").title = kind === "3d" ? "Auto-rotate (O)" : "Auto-rotate in quarter turns (O)";
+}
+
+// ================================================================ runs
+async function refreshRuns() {
+  try { S.runs = await api("/api/runs"); } catch (e) { toast("Cannot reach the Civitas server: " + esc(e.message), true); return; }
+  renderRunMenu();
+  $("empty").hidden = S.runs.length > 0;
+}
+function statusPill(st) { return `<span class="pill ${st}">${st}</span>`; }
+function renderRunMenu() {
+  $("runMenu").innerHTML = S.runs.length ? S.runs.map(r => `
+    <div class="item ${r.run_id === S.runId ? "cur" : ""}" data-run="${esc(r.run_id)}">
+      <span class="ellipsis"><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
+      <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b>` : ""} ${statusPill(r.status)}</span>
+      <span class="sig">${esc(r.signature || "")}</span></div>`).join("") : `<div class="emptytab">No runs yet</div>`;
+  $("runMenu").querySelectorAll(".item").forEach(el => el.onclick = () => { $("runMenu").hidden = true; openRun(el.dataset.run); });
+}
+
+// ---------------------------------------------------------------- region mode (two cities)
+function cityMeta(meta, c) {
+  if (!meta.region) return meta;
+  const base = [...new Set(meta.roles.map(r => r.split(".").pop()))];
+  const agents = Object.fromEntries(base.map(r => [r, meta.agents[`${c}.${r}`] || meta.agents[r] || "?"]));
+  return { ...meta, roles: base, agents, resources: (meta.city_meta[c] || {}).resources, rawRoles: meta.roles };
+}
+function cityFrame(f, c) {
+  if (!f.cities) return f;
+  const cf = f.cities[c], pre = c + ".";
+  const local = (m) => ({ ...m, sender: m.sender.startsWith(pre) ? m.sender.slice(pre.length) : m.sender,
+    to: m.to.startsWith(pre) ? m.to.slice(pre.length) : m.to });
+  return { ...cf, month: f.month, council: (f.council || []).map(local), deals: f.deals, regionScores: f.scores };
+}
+function renderCitySwitch() {
+  const el = $("citySwitch");
+  $("regionTab").hidden = $("regionBtn").hidden = !(S.metaRaw && S.metaRaw.region);
+  if ($("regionBtn").hidden) $("regionModal").hidden = true;
+  if ($("regionTab").hidden && S.tab === "region") S.tab = "agents";
+  if (!S.metaRaw || !S.metaRaw.region) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = S.metaRaw.cities.map(c => `<button data-city="${c}" class="${c === S.city ? "on" : ""}">${c}</button>`).join("");
+  el.querySelectorAll("button").forEach(b => b.onclick = () => switchCity(b.dataset.city));
+}
+function switchCity(c) {
+  if (c === S.city) return;
+  S.city = c; S.meta = cityMeta(S.metaRaw, c); scene.setMeta(S.meta);
+  S.frames = S.raw.map(f => cityFrame(f, c)); S.traces = {};
+  renderCitySwitch();
+  $("agentsLine").innerHTML = `<b>${c}</b> · ` + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
+  render(null, false);
+}
+
+async function openRun(id, { month = null } = {}) {
+  stop(); clearInterval(S.poll);
+  S.runId = id; S.frames = []; S.raw = []; S.idx = 0; S.selected = -1; $("inspector").hidden = true;
+  try { S.metaRaw = await api(`/api/runs/${encodeURIComponent(id)}/meta`); } catch (e) { toast("Could not open run: " + esc(e.message), true); return; }
+  S.city = S.metaRaw.region ? S.metaRaw.cities[0] : null;
+  S.meta = cityMeta(S.metaRaw, S.city);
+  renderCitySwitch();
+  scene.setMeta(S.meta);
+  $("runLabel").textContent = `${S.meta.name} · seed ${S.meta.seed}`;
+  $("agentsLine").innerHTML = (S.city ? `<b>${S.city}</b> · ` : "") + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
+  await fetchFrames(true);
+  S.idx = month != null ? Math.min(month, S.frames.length - 1) : (S.status === "running" ? S.frames.length - 1 : S.frames.length - 1);
+  S.poll = setInterval(() => fetchFrames(false), 2000);
+  store.set("lastRun", id);
+  history.replaceState(null, "", `?run=${encodeURIComponent(id)}`);
+  renderRunMenu();
+  render(null, false);
+  if (S.status !== "running" && S.frames.length > 1 && month == null) {
+    toast(`Loaded <b>${esc(S.meta.name)}</b> (${S.frames.length - 1} months). Press <kbd>Space</kbd> to replay from the start or scrub the timeline.`);
+  }
+}
+
+async function fetchFrames(first) {
+  if (!S.runId) return;
+  let d;
+  try { d = await api(`/api/runs/${encodeURIComponent(S.runId)}/frames?since=${S.frames.length}`); } catch { return; }
+  const wasEnd = S.idx >= S.frames.length - 1;
+  const legacy = (t) => { if (!(S.meta.frame_format >= 3)) t = t.replaceAll("M", "h"); if (!(S.meta.frame_format >= 2)) t = t.replaceAll("O", "V"); return t; };
+  if (!(S.meta.frame_format >= 3)) for (const f of d.frames) {
+    if (f.tiles) f.tiles = legacy(f.tiles);
+    for (const cf of Object.values(f.cities || {})) cf.tiles = legacy(cf.tiles);
+  }
+  S.raw.push(...d.frames);
+  S.frames.push(...d.frames.map(f => cityFrame(f, S.city)));
+  const prevStatus = S.status; S.status = d.status;
+  $("statusPill").className = "pill " + d.status; $("statusPill").textContent = d.status;
+  $("slider").max = Math.max(0, S.frames.length - 1);
+  if (d.status !== "running") clearInterval(S.poll);
+  if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); }
+  if (!first && d.frames.length) {
+    drawTrackMarks();
+    if (S.follow && wasEnd && !S.playing) { const p = S.idx; S.idx = S.frames.length - 1; render(S.frames[p], S.idx === p + 1); }
+    else renderCharts();
+  }
+}
+
+// ================================================================ playback
+function play() { if (S.idx >= S.frames.length - 1) S.idx = 0; S.playing = true; $("tPlay").textContent = "❚❚"; render(null, false); tick(); }
+function stop() { S.playing = false; clearTimeout(S.timer); $("tPlay").textContent = "▶"; }
+function tick() {
+  if (!S.playing) return;
+  if (S.idx < S.frames.length - 1) { const p = S.frames[S.idx]; S.idx++; render(p, true); }
+  else if (S.status !== "running") { stop(); return; }
+  S.timer = setTimeout(tick, +$("speed").value);
+}
+function go(i, animate = false) {
+  if (!S.frames.length) return;
+  const p = S.frames[S.idx]; stop();
+  S.idx = Math.max(0, Math.min(S.frames.length - 1, i));
+  S.follow = S.idx === S.frames.length - 1 && $("follow").checked;
+  render(p, animate && S.idx === S.frames.indexOf(p) + 1);
+}
+
+// ================================================================ render
+function render(prev, animate) {
+  if (!S.frames.length) return;
+  const f = S.frames[S.idx];
+  if (scene.setRegion) scene.setRegion(S.metaRaw && S.metaRaw.region ? { meta: S.metaRaw, frame: S.raw[S.idx], city: S.city } : null);
+  scene.setFrame(f, prev, { animate });
+  $("slider").value = S.idx;
+  const arrow = f.wind ? "→↘↓↙←↖↑↗"[((Math.round(Math.atan2(f.wind[1], f.wind[0]) / (Math.PI / 4)) % 8) + 8) % 8] : "";
+  $("monthLabel").textContent = `Year ${Math.floor(f.month / 12) + 1} · M${(f.month % 12) + 1}` + (f.season ? ` · ${f.season}` : "") + (arrow ? ` ${arrow}` : "");
+  $("monthSub").textContent = `month ${f.month} / ${S.meta.months}`;
+  renderScores(f); renderKpis(f); renderDemand(f); renderUtil(f); renderServices(f); renderMoney(f);
+  renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap();
+  if (S.selected >= 0) renderInspector(S.selected);
+}
+
+const fmt$ = (v) => { const a = Math.abs(v); const s = a >= 1e6 ? (a / 1e6).toFixed(2) + "M" : a >= 1e4 ? (a / 1e3).toFixed(1) + "k" : Math.round(a).toLocaleString(); return (v < 0 ? "−$" : "$") + s; };
+const pct = (v) => v == null ? "—" : `${Math.round(100 * v)}%`;
+
+function spark(values, color, w = 70, h = 22) {
+  const v = values.filter(x => x != null); if (v.length < 2) return "";
+  const lo = Math.min(...v), hi = Math.max(...v, lo + 1e-6);
+  const pts = values.map((x, i) => `${(i / (values.length - 1) * w).toFixed(1)},${(h - 2 - (x - lo) / (hi - lo) * (h - 4)).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="1.5" points="${pts}"/></svg>`;
+}
+
+function renderScores(f) {
+  const prev = S.frames[Math.max(0, S.idx - 12)], keys = ["city", ...S.meta.roles];
+  if (f.regionScores) $("scoreCards").dataset.region = `region ${(f.regionScores.city || 0).toFixed(1)}`;
+  $("scoreCards").innerHTML = keys.map(k => {
+    const v = f.scores[k] ?? 0, d = v - (prev.scores[k] ?? 0);
+    const hist = S.frames.slice(0, S.idx + 1).map(fr => fr.scores[k] ?? 0);
+    const dtxt = Math.abs(d) < 0.05 ? "" : `<span class="delta ${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}${Math.abs(d).toFixed(1)}</span>`;
+    return `<div class="score ${k === "city" ? "city" : ""}" style="--c:${roleColor(k)}" title="${k} score (change vs 12 months ago)">
+      <div class="name"><span>${k}</span>${dtxt}</div><div class="val">${v.toFixed(1)}</div>
+      <div class="agent">${esc(k === "city" ? (f.regionScores ? `${S.city} city · region avg ${(f.regionScores.city || 0).toFixed(1)}` : "overall · 0-100") : S.meta.agents[k])}</div>${spark(hist, roleColor(k))}</div>`;
+  }).join("");
+}
+function renderKpis(f) {
+  const m = f.metrics;
+  const k = [["Population", m.population.toLocaleString()], ["Happiness", pct(m.happiness)],
+    ["Jobs C / I / O", `${m.jobs_com} <small>/ ${m.jobs_ind}${m.jobs_off != null ? " / " + m.jobs_off : ""}</small>`], ["Unemployment", pct(m.unemployment)],
+    ["Pollution @ homes", pct(m.pollution_res)], ["Land value", pct(m.land_value_dev)],
+    ["Developed / zoned", `${m.developed_total} <small>/ ${m.zoned_total}</small>`], ["Roads · parks", `${m.road_tiles} <small>· ${m.parks}</small>`]];
+  if (m.approval != null) k.splice(2, 0, ["Mayor approval", `<span style="color:${m.approval < 0.3 ? "var(--bad)" : m.approval < 0.45 ? "var(--warn)" : "inherit"}">${pct(m.approval)}</span>`],
+    ["Noise @ homes", pct(m.noise_res)]);
+  if (m.soil_res != null) k.push(["Soil pollution @ homes", pct(m.soil_res)], ["Historic · mixed use", `${m.historic_tiles} <small>· ${m.mixed_use}</small>`]);
+  if (m.metro_lines) k.push(["Metro", `${m.metro_lines} lines <small>· ${Math.round(m.metro_riders)} riders</small>`]);
+  if (m.exports != null) k.push(["Exports · imports", `${Math.round(m.exports)} <small>· ${Math.round(m.imports)} / ${Math.round(m.freight_capacity)}</small>`],
+    ["Businesses losing", `${m.businesses_losing} <small>· ${m.business_closures} closed</small>`]);
+  if (m.milestones) k.push(["Milestones", m.milestones.length ? esc(m.milestones[m.milestones.length - 1]) + ` <small>(${m.milestones.length})</small>` : "—"],
+    ["Tourists / month", Math.round(m.tourists || 0).toLocaleString()]);
+  if (m.wealth) k.push(["Homes by wealth", `${m.wealth.low} <small>/ ${m.wealth.middle} / ${m.wealth.high}</small>`],
+    ["Level 4-5 buildings", `${m.levels_4_5}`]);
+  if (m.commute_minutes != null) k.push(["Commute", `${Math.round(m.commute_minutes)} <small>min</small>`],
+    ["Jammed roads · bus", `${pct(m.congestion_index)} <small>· ${pct(m.transit_share)} ride</small>`]);
+  if (m.crime_res != null) k.push(["Crime @ homes", pct(m.crime_res)], ["Health", pct(m.health)],
+    ["Adults high school+", pct(m.education_index)], ["Fires · lost", `${m.fires} <small>· ${m.fire_tiles_lost}</small>`]);
+  $("kpis").innerHTML = k.map(([a, b]) => `<div class="kpi"><div class="k">${a}</div><div class="v">${b}</div></div>`).join("");
+}
+function renderDemand(f) {
+  const d = f.metrics.demand, C = { R: "#5fd38d", C: "#4aa3ff", I: "#ffc857", O: "#a99cf0" }, N = { R: "Residential", C: "Commercial", I: "Industrial", O: "Offices" };
+  $("demand").innerHTML = "RCIO".split("").filter(k => d[k] != null).map(k => {
+    const v = d[k], h = Math.abs(v) * 50;
+    const style = v >= 0 ? `bottom:50%;height:${h}%;background:${C[k]}` : `top:50%;height:${h}%;background:${C[k]};opacity:.45`;
+    return `<div class="dbar" title="${N[k]} demand ${v.toFixed(2)}"><div class="col"><div class="fill" style="${style}"></div></div>
+      <div class="lab"><b style="color:${C[k]}">${k}</b> ${v >= 0 ? "+" : ""}${v.toFixed(2)}</div></div>`;
+  }).join("");
+}
+function meter(label, supply, demand, color) {
+  const max = Math.max(supply, demand, 1) * 1.1, cov = demand ? Math.min(1, supply / demand) : 1;
+  const warn = supply < demand ? `<span style="color:var(--bad)">short ${Math.round(demand - supply)}</span>` : `<span class="muted">${Math.round((supply / Math.max(demand, 1e-9) - 1) * 100)}% spare</span>`;
+  return `<div class="meter"><div class="top"><span>${label} <b>${Math.round(supply)}</b> <span class="muted">/ ${Math.round(demand)} used</span></span>${demand ? warn : ""}</div>
+    <div class="bar"><i style="width:${supply / max * 100}%;background:${color};opacity:.35"></i><i style="width:${Math.min(supply, demand) / max * 100}%;background:${color}"></i>
+    ${demand > supply ? `<b style="left:${demand / max * 100}%"></b>` : ""}</div></div>`;
+}
+function renderUtil(f) {
+  const m = f.metrics;
+  $("utilBars").innerHTML = meter("⚡ Power", m.power_supply, m.power_demand, "#ffc857") + meter("💧 Water", m.water_supply, m.water_demand, "#4aa3ff") +
+    (m.sewage_supply != null ? meter("🚽 Sewage", m.sewage_supply, m.sewage_demand, "#a1887f") : "") +
+    `<div class="small muted">coverage: power ${pct(m.power_coverage)} · water ${pct(m.water_coverage)}${m.sewage_coverage !== undefined ? ` · sewage ${pct(m.sewage_coverage)}` : ""} · clean power ${m.power_supply ? Math.round(100 * (m.power_clean_capacity || 0) / m.power_supply) : 0}%` +
+    (m.river_pollution != null ? ` · river ${pct(m.river_pollution)} polluted (max ${pct(m.river_pollution_max)})` : "") + `</div>`;
+}
+function renderServices(f) {
+  const m = f.metrics, el = $("services");
+  if (m.police_coverage == null) { el.closest("section").hidden = true; return; }
+  el.closest("section").hidden = false;
+  const bar = (label, v, color, note = "") => `<div class="meter"><div class="top"><span>${label}</span><span>${pct(v)}${note ? ` <span class="muted">${note}</span>` : ""}</span></div>
+    <div class="bar"><i style="width:${Math.round(100 * (v || 0))}%;background:${color}"></i></div></div>`;
+  const e = m.enrollment || {}, sb = m.service_buildings || {};
+  el.innerHTML = bar("🚓 Police cover", m.police_coverage, ROLE_C.police, `${sb.police_station || 0} stations`) +
+    bar("🚒 Fire cover", m.fire_coverage, ROLE_C.fire, `${sb.fire_station || 0} stations`) +
+    bar("🏥 Clinic cover", m.health_coverage, ROLE_C.health, `${(sb.clinic || 0) + (sb.hospital || 0)} buildings`) +
+    bar("🗑 Garbage collection", m.garbage_coverage, "#b0916b", m.landfill_fill_pct != null ? `landfills ${Math.round(m.landfill_fill_pct)}% full` : "") +
+    bar("🏫 School enrolment", e.elementary, ROLE_C.education, `high ${pct(e.high)}`);
+}
+function renderMoney(f) {
+  const m = f.metrics, net = m.income - m.expenses;
+  const rows = [["Treasury", fmt$(m.treasury)], ...Object.entries(m.dept_funds).map(([d, v]) => [`<span style="color:${roleColor(d)}">${d}</span> budget`, fmt$(v)]),
+    ["Income / month", fmt$(m.income)], ["Expenses / month", fmt$(m.expenses)],
+    ["Net / month", `<span style="color:${net >= 0 ? "var(--ok)" : "var(--bad)"}">${net >= 0 ? "+" : ""}${fmt$(net)}</span>`],
+    ["Debt", fmt$(m.debt)], ["Taxes R / C / I", `${Math.round(m.taxes.R * 100)} / ${Math.round(m.taxes.C * 100)} / ${Math.round(m.taxes.I * 100)} %`]];
+  if (m.funding) {
+    const off = Object.entries(m.funding).filter(([, v]) => Math.abs(v - 1) > 1e-6);
+    rows.push(["Funding", off.length ? off.map(([d, v]) => `${d} ${Math.round(100 * v)}%`).join(", ") : "all 100%"]);
+  }
+  if (m.policies) rows.push(["Policies", m.policies.length ? `${m.policies.map(esc).join(", ")} <span class="muted">(${fmt$(m.policy_cost || 0)}/mo)</span>` : "none"]);
+  $("money").innerHTML = rows.map(([a, b]) => `<div class="moneyrow"><span class="muted">${a}</span><b>${b}</b></div>`).join("") +
+    (m.months_negative ? `<div class="small" style="color:var(--bad);margin-top:6px">⚠ treasury negative for ${m.months_negative} month(s)</div>` : "");
+}
+
+// ================================================================ tabs
+function actRect(a) {
+  if (a.x1 != null && a.y1 != null) return { x1: +a.x1, y1: +a.y1, x2: +(a.x2 ?? a.x1), y2: +(a.y2 ?? a.y1) };
+  if (a.x != null && a.y != null) return { x1: +a.x, y1: +a.y, x2: +a.x, y2: +a.y };
+  return null;
+}
+function actText(a) { const { type, ...rest } = a; return `<b>${esc(type)}</b> ${esc(Object.entries(rest).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" "))}`; }
+function roleChips() {
+  const roles = S.meta ? S.meta.roles : [];
+  $("tabTools").innerHTML = roles.map(r => `<button class="chip ${S.roleFilter.size === 0 || S.roleFilter.has(r) ? "on" : ""}" data-role="${r}" style="--c:${roleColor(r)}"><span class="dot"></span>${r}</button>`).join("");
+  $("tabTools").querySelectorAll(".chip").forEach(b => b.onclick = () => {
+    const r = b.dataset.role;
+    if (S.roleFilter.size === 0) { S.roleFilter = new Set(roles.filter(x => x !== r)); }
+    else if (S.roleFilter.has(r)) S.roleFilter.delete(r); else S.roleFilter.add(r);
+    if (S.roleFilter.size === roles.length) S.roleFilter.clear();
+    renderTab();
+  });
+}
+const roleOn = (r) => S.roleFilter.size === 0 || S.roleFilter.has(r);
+
+function renderTab() {
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === S.tab));
+  const body = $("tabBody");
+  if (!S.frames.length && S.tab !== "runs") { $("tabTools").innerHTML = ""; body.innerHTML = `<div class="emptytab">Open or launch a run.</div>`; return; }
+  const f = S.frames[S.idx];
+  if (S.tab === "agents") {
+    roleChips();
+    const turns = f.turns.filter(t => roleOn(t.role));
+    if (!turns.length) { body.innerHTML = `<div class="emptytab">${f.month === 0 ? "Start of the game: press ▶ or step forward to see the agents' first decisions." : "No agent turns this month (agents may act every few months)."}</div>`; return; }
+    body.innerHTML = `<div class="small muted" style="margin-bottom:8px">Decisions taken during month ${f.month - 1} → shown on the map at month ${f.month}. Click an action with 📍 to fly there.</div>` +
+      turns.map((t, ti) => `<div class="turn" style="--c:${roleColor(t.role)}">
+        <div class="who"><span style="color:${roleColor(t.role)}">${t.role}</span><span class="tag">${esc(S.meta.agents[t.role])}</span></div>
+        ${t.parse_error ? `<div class="small" style="color:var(--warn)">⚠ ${esc(t.parse_error).slice(0, 140)}</div>` : ""}
+        ${t.thinking ? `<div class="think">${esc(t.thinking)}</div>` : ""}
+        ${t.results.map((r, ri) => { const rc = actRect(r.action); return `<div class="act ${r.ok ? "ok" : "bad"} ${rc ? "loc" : ""}" data-t="${ti}" data-r="${ri}">
+          <span class="st">${r.ok ? "✓" : "✗"}</span><span><code>${actText(r.action)}</code><span class="msg">${esc(r.message)}${r.cost ? ` · ${fmt$(r.cost)}` : ""}</span></span>${rc ? `<span class="pin">📍</span>` : ""}</div>`; }).join("") || `<div class="small muted">no actions</div>`}
+        ${(t.messages || []).map(m => `<div class="msgline small"><b style="--c:${roleColor(t.role)}">→ ${esc(m.to)}</b> ${esc(m.text)}</div>`).join("")}
+        <div class="trace" data-role="${t.role}"></div>
+      </div>`).join("");
+    loadTraces(f.month - 1);
+    body.querySelectorAll(".act.loc").forEach(el => el.onclick = () => {
+      const r = turns[+el.dataset.t].results[+el.dataset.r], rc = actRect(r.action);
+      scene.highlightRect(rc); scene.flyTo((rc.x1 + rc.x2) / 2, (rc.y1 + rc.y2) / 2, 12 + Math.max(Math.abs(rc.x2 - rc.x1), Math.abs(rc.y2 - rc.y1)) * 0.6);
+    });
+  } else if (S.tab === "council") {
+    roleChips();
+    const msgs = S.frames.slice(0, S.idx + 1).flatMap(fr => fr.council || []).filter(m => roleOn(m.sender)).reverse();
+    body.innerHTML = msgs.length ? msgs.map(m => `<div class="msgline" style="--c:${roleColor(m.sender)}"><span class="tag">m${m.month}</span>
+      <b>${esc(m.sender)}</b> <span class="muted">→ ${esc(m.to)}</span><div>${esc(m.text)}</div></div>`).join("") : `<div class="emptytab">No council messages yet.</div>`;
+  } else if (S.tab === "events") {
+    $("tabTools").innerHTML = "";
+    const ev = S.frames.slice(0, S.idx + 1).flatMap(fr => {
+      const out = (fr.events || []).map(e => [fr.month, e, /BANKRUPT|negative|recall|FULL|destroyed|approval|FLOOD|HEATWAVE|RECESSION|OFFER|MILESTONE/i.test(e)]);
+      for (const t of fr.turns || []) for (const r of t.results) if (!r.ok) out.push([fr.month, `${t.role}: ${r.action.type} failed: ${r.message}`, true]);
+      return out;
+    }).reverse();
+    const comp = (f.metrics.complaints || []);
+    const head = comp.length ? `<div class="complaints"><h4>What residents complain about (month ${f.month})</h4>${comp.map(c =>
+      `<div class="complaint"><span class="bar" style="width:${Math.min(100, Math.round(c.drag * 600))}%"></span><span>${esc(c.text)}</span></div>`).join("")}</div>` : "";
+    body.innerHTML = head + (ev.length ? ev.slice(0, 300).map(([m, e, w]) => `<div class="msgline"><span class="tag ${w ? "warn" : ""}">m${m}</span> ${esc(e)}</div>`).join("") : `<div class="emptytab">Nothing notable yet.</div>`);
+  } else if (S.tab === "charts") {
+    $("tabTools").innerHTML = "";
+    renderCharts();
+  } else if (S.tab === "region") {
+    $("tabTools").innerHTML = "";
+    renderRegion();
+  } else if (S.tab === "runs") {
+    $("tabTools").innerHTML = `<button class="btn" id="rRefresh">↻ Refresh</button><button class="btn primary" id="rNew">＋ New run</button>`;
+    $("rRefresh").onclick = () => { refreshRuns().then(renderTab); };
+    $("rNew").onclick = openLaunch;
+    renderRunsTab();
+  }
+}
+
+// ---------------------------------------------------------------- region map
+// the Region tab and the full-screen region map share one renderer (region.js)
+let regionTabMap = null, regionBigMap = null;
+function pickCity(c) { switchCity(c); if (S.tab === "region") renderTab(); }
+function regionSummary(f, meta) {
+  const flows = f.flows || [], tot = (k) => Math.round(flows.reduce((s, x) => s + (k === "goods" ? x.goods + x.raw : x[k]), 0));
+  const rows = meta.cities.map(c => { const m = f.cities[c].metrics, sc = f.scores[`${c}.city`] ?? 0, spec = m.specializations || {};
+    return `<tr data-city="${c}" class="${c === S.city ? "cur" : ""}"><td><b>${c}</b></td><td>${sc.toFixed(1)}</td><td>${m.population.toLocaleString()}</td><td>${Object.entries(spec).filter(([, v]) => v >= 0.33).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<span class="spec" style="--c:${SPEC_COLOR[k]}">${k} ${Math.round(v * 100)}%</span>`).join(" ") || "—"}</td></tr>`; }).join("");
+  const links = (f.links || []).map(l => `<span class="chip">${l.kind} · ${l.a}–${l.b}</span>`).join(" ");
+  return `<div class="regionstats"><div><b>${tot("goods").toLocaleString()}</b><span>goods & raw / mo</span></div><div><b>${tot("commuters").toLocaleString()}</b><span>commuters</span></div><div><b>${tot("tourists").toLocaleString()}</b><span>tourists</span></div><div><b>${(f.scores.city || 0).toFixed(1)}</b><span>region score</span></div></div>
+    <table class="lb"><tr><th>city</th><th>score</th><th>pop</th><th>specialisations</th></tr>${rows}</table>
+    <div class="small muted" style="margin-top:8px">${links || "No links yet: cities must each build their side of a highway or rail connector."}</div>`;
+}
+function renderRegion() {
+  const f = S.raw[S.idx], meta = S.metaRaw, body = $("tabBody");
+  if (!f || !f.cities) { body.innerHTML = `<div class="emptytab">Not a region run.</div>`; return; }
+  $("tabTools").innerHTML = `<button class="btn" id="regionExpand" title="Open the full-screen region map">⤢ Expand</button>`;
+  $("regionExpand").onclick = openRegionMap;
+  body.innerHTML = `<div class="small muted">Each city at its place in the region. Highways and rail start from the connectors the cities built; dots are this month's goods, commuters and tourists. Click a city to view it.</div>
+    <canvas id="regionCanvas" class="regioncanvas"></canvas><div class="legendline">${regionLegend()}</div>${regionSummary(f, meta)}`;
+  regionTabMap = new RegionMap($("regionCanvas"), { mini: MINI, onPick: pickCity });
+  regionTabMap.set(f, meta, S.city);
+  body.querySelectorAll("tr[data-city]").forEach(el => el.onclick = () => pickCity(el.dataset.city));
+}
+function openRegionMap() {
+  $("regionModal").hidden = false;
+  const cv = $("regionBig");
+  cv.dataset.maxh = String(Math.max(300, window.innerHeight - 190));
+  regionBigMap = regionBigMap || new RegionMap(cv, { mini: MINI, onPick: (c) => { pickCity(c); $("regionModal").hidden = true; } });
+  updateRegionMap();
+}
+function updateRegionMap() {
+  const f = S.raw && S.raw[S.idx];
+  if (!f || !f.cities) return;
+  if (regionBigMap && !$("regionModal").hidden) {
+    regionBigMap.set(f, S.metaRaw, S.city);
+    $("regionSide").innerHTML = `<div class="legendline">${regionLegend()}</div>` + regionSummary(f, S.metaRaw);
+    $("regionSide").querySelectorAll("tr[data-city]").forEach(el => el.onclick = () => { pickCity(el.dataset.city); $("regionModal").hidden = true; });
+    $("regionMonth").textContent = `month ${f.month}`;
+  }
+}
+
+// full per-turn traces (what the agent saw, model reasoning, raw reply), loaded lazily
+S.traces = {};
+async function loadTraces(month) {
+  if (month < 0 || !S.runId) return;
+  const key = `${S.runId}:${month}`;
+  if (!S.traces[key]) { try { S.traces[key] = await api(`/api/runs/${encodeURIComponent(S.runId)}/turns?month=${month}`); } catch { S.traces[key] = []; } }
+  if (S.tab !== "agents" || S.frames[S.idx]?.month - 1 !== month) return;
+  for (const tr of S.traces[key]) {
+    if (S.city && !tr.role.startsWith(S.city + ".")) continue;
+    const el = document.querySelector(`.trace[data-role="${tr.role.split(".").pop()}"]`); if (!el) continue;
+    const u = tr.usage || {}, parts = [];
+    if (tr.reasoning) parts.push(["Model reasoning", tr.reasoning]);
+    if (tr.response) parts.push(["Raw reply", tr.response]);
+    if (tr.observation) parts.push(["What the agent saw (prompt)", tr.observation]);
+    const stats = [tr.latency_s ? `${tr.latency_s.toFixed(1)} s` : "", u.prompt_tokens ? `${u.prompt_tokens}→${u.completion_tokens} tokens` : "",
+      tr.finish_reason && tr.finish_reason !== "stop" ? `finish: ${tr.finish_reason}` : "", tr.reward != null ? `reward ${tr.reward >= 0 ? "+" : ""}${tr.reward.toFixed(4)}` : ""].filter(Boolean).join(" · ");
+    el.innerHTML = (stats ? `<div class="small muted" style="margin-top:6px">${esc(stats)}</div>` : "") +
+      parts.map(([t, v]) => `<details><summary>${t} <span class="muted">(${v.length.toLocaleString()} chars)</span></summary><pre class="log big">${esc(v)}</pre></details>`).join("");
+  }
+}
+
+async function renderRunsTab() {
+  const body = $("tabBody");
+  let procs = [], board = [];
+  try { [procs, board] = await Promise.all([api("/api/processes"), api("/api/leaderboard")]); } catch { /* server without launcher */ }
+  if (S.tab !== "runs") return;
+  const live = procs.filter(p => p.running);
+  body.innerHTML = `
+    ${live.length ? `<h4>Running now</h4>${live.map(p => `<div class="runrow" data-run="${esc(p.run_id)}"><span class="ellipsis"><b>${esc(p.run_id)}</b></span>
+      <button class="btn danger" data-stop="${esc(p.run_id)}">Stop</button><pre class="log">${esc(p.log_tail || "starting…")}</pre></div>`).join("")}` : ""}
+    <h4>Leaderboard <span class="muted small">(finished runs, grouped by agent line-up)</span></h4>
+    ${board.length ? `<table class="lb"><tr><th>agents</th><th>n</th><th>city</th><th>pop</th>${Object.keys(board[0].roles).map(r => `<th style="color:${roleColor(r)}">${r.slice(0, 4)}</th>`).join("")}</tr>
+      ${board.map(r => `<tr title="${esc(r.signature)}"><td class="ellipsis" style="max-width:130px">${esc(r.signature.replace(/[\w/]+=/g, ""))}</td><td>${r.n}</td>
+      <td><b>${r.city.mean.toFixed(1)}</b><span class="muted">±${r.city.std.toFixed(1)}</span></td><td>${Math.round(r.population.mean).toLocaleString()}</td>
+      ${Object.keys(r.roles).map(k => `<td>${r.roles[k].mean.toFixed(0)}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}
+    <h4 style="margin-top:14px">All runs</h4>
+    ${S.runs.map(r => `<div class="runrow" data-run="${esc(r.run_id)}"><span class="ellipsis"><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
+      <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b> ` : ""}<span class="pill ${r.status}">${r.status}</span></span><span class="sig">${esc(r.signature || "")}</span></div>`).join("")}`;
+  body.querySelectorAll(".runrow").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop) openRun(el.dataset.run); });
+  body.querySelectorAll("[data-stop]").forEach(b => b.onclick = async (e) => {
+    e.stopPropagation();
+    try { await api("/api/stop", { run_id: b.dataset.stop }); toast("Run stopped."); } catch (err) { toast(esc(err.message), true); }
+    await refreshRuns(); renderRunsTab();
+  });
+}
+
+// ================================================================ charts
+function lineChart(el, series, { yMin = null, yMax = null, yFmt = (v) => v } = {}) {
+  const w = el.clientWidth || 340, h = 110, pl = 38, pr = 6, pt = 8, pb = 16, n = Math.max(2, S.meta.months + 1);
+  const all = series.flatMap(s => s.values.filter(v => v != null));
+  let lo = yMin ?? Math.min(0, ...all), hi = yMax ?? Math.max(1, ...all); if (hi === lo) hi = lo + 1;
+  const X = (i) => pl + (w - pl - pr) * i / (n - 1), Y = (v) => pt + (h - pt - pb) * (1 - (v - lo) / (hi - lo));
+  let o = "";
+  for (const t of [lo, (lo + hi) / 2, hi]) o += `<line class="ax" x1="${pl}" x2="${w - pr}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${pl - 4}" y="${Y(t) + 3}" text-anchor="end">${yFmt(t)}</text>`;
+  const step = Math.max(1, Math.ceil(n / 12 / 6));
+  for (let yr = 0; yr * 12 < n; yr += step) o += `<text x="${X(yr * 12)}" y="${h - 3}" text-anchor="middle">y${yr}</text>`;
+  for (const s of series) {
+    const pts = s.values.map((v, i) => v == null ? null : `${X(S.frames[i]?.month ?? i).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean).join(" ");
+    o += `<polyline fill="none" stroke="${s.color}" stroke-width="${s.width || 1.7}" stroke-linejoin="round" points="${pts}"/>`;
+  }
+  const cx = X(S.frames[S.idx].month);
+  o += `<line class="cur" x1="${cx}" x2="${cx}" y1="${pt}" y2="${h - pb}"/>`;
+  el.setAttribute("viewBox", `0 0 ${w} ${h}`); el.innerHTML = o;
+  el.onclick = (e) => { const r = el.getBoundingClientRect(), m = Math.round((e.clientX - r.left - pl) / (r.width - pl - pr) * (n - 1)); go(S.frames.findIndex(f => f.month >= m)); };
+}
+function renderCharts() {
+  if (S.tab !== "charts" || !S.frames.length) return;
+  const fr = S.frames, M = (k) => fr.map(f => f.metrics[k]), cur = fr[S.idx].metrics, kf = (v) => Math.abs(v) >= 1000 ? (v / 1000).toFixed(0) + "k" : Math.round(v);
+  const defs = [
+    ["Population", cur.population.toLocaleString(), [{ values: M("population"), color: "#3ecf9e" }], { yFmt: kf }],
+    ["Scores", `city ${fr[S.idx].scores.city.toFixed(1)}`, ["city", ...S.meta.roles].map(k => ({ name: k, values: fr.map(f => f.scores[k] ?? 0), color: roleColor(k), width: k === "city" ? 2.6 : 1.4 })), { yMin: 0, yMax: 100 }],
+    ["Treasury", fmt$(cur.treasury), [{ values: M("treasury"), color: "#ffc857" }], { yFmt: kf }],
+    ["Income vs expenses", `${fmt$(cur.income)} / ${fmt$(cur.expenses)}`, [{ name: "income", values: M("income"), color: "#45d483" }, { name: "expenses", values: M("expenses"), color: "#ff6b5e" }], { yFmt: kf }],
+    ["Happiness · coverage", pct(cur.happiness), [{ name: "happiness", values: M("happiness"), color: "#b99bff" }, { name: "approval", values: M("approval"), color: "#ffffff" }, { name: "power", values: M("power_coverage"), color: "#ffc857" }, { name: "water", values: M("water_coverage"), color: "#4aa3ff" }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }],
+    ["Demand R / C / I", "", [{ name: "R", values: fr.map(f => f.metrics.demand.R), color: "#5fd38d" }, { name: "C", values: fr.map(f => f.metrics.demand.C), color: "#4aa3ff" }, { name: "I", values: fr.map(f => f.metrics.demand.I), color: "#ffc857" }], { yMin: -1, yMax: 1, yFmt: (v) => v.toFixed(1) }],
+    ["Jobs & workers", "", [{ name: "workers", values: M("workers"), color: "#e9ecef" }, { name: "commercial", values: M("jobs_com"), color: "#4aa3ff" }, { name: "industrial", values: M("jobs_ind"), color: "#ffc857" }], { yFmt: kf }],
+    ["Pollution at homes", pct(cur.pollution_res), [{ values: M("pollution_res"), color: "#ff6b5e" }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }],
+  ];
+  if (cur.commute_minutes != null) defs.push(
+    ["Commute · traffic", `${Math.round(cur.commute_minutes)} min`, [{ name: "commute (min/60)", values: fr.map(f => f.metrics.commute_minutes != null ? f.metrics.commute_minutes / 60 : null), color: ROLE_C.transport },
+      { name: "jammed roads", values: M("congestion_index"), color: "#ff6b5e" }, { name: "bus share", values: M("transit_share"), color: "#4aa3ff" }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }]);
+  if (cur.exports != null) defs.push(
+    ["Trade & freight", `${Math.round(cur.exports)} out · ${Math.round(cur.imports)} in`, [{ name: "exports", values: M("exports"), color: "#45d483" },
+      { name: "imports", values: M("imports"), color: "#ff6b5e" }, { name: "freight capacity", values: M("freight_capacity"), color: "#9aa3ad" }], { yFmt: (v) => Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + "k" : Math.round(v) }]);
+  if (cur.police_coverage != null) defs.push(
+    ["Service coverage", "", [{ name: "police", values: M("police_coverage"), color: ROLE_C.police }, { name: "fire", values: M("fire_coverage"), color: ROLE_C.fire },
+      { name: "clinics", values: M("health_coverage"), color: ROLE_C.health }, { name: "garbage", values: M("garbage_coverage"), color: "#b0916b" }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }],
+    ["Crime · health", `${pct(cur.crime_res)} · ${pct(cur.health)}`, [{ name: "crime at homes", values: M("crime_res"), color: "#ff6b5e" }, { name: "health", values: M("health"), color: ROLE_C.health }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }],
+    ["Education", pct(cur.education_index), [{ name: "adults high school+", values: M("education_index"), color: ROLE_C.education },
+      { name: "elementary enrolment", values: fr.map(f => f.metrics.enrollment ? f.metrics.enrollment.elementary : null), color: "#9ccc65" },
+      { name: "high school enrolment", values: fr.map(f => f.metrics.enrollment ? f.metrics.enrollment.high : null), color: "#4aa3ff" }], { yMin: 0, yMax: 1, yFmt: (v) => Math.round(v * 100) + "%" }]);
+  $("tabBody").innerHTML = defs.map(([t, v, ser], i) => `<div class="chart"><div class="ct"><span>${t}</span><b>${v}</b></div><svg id="ch${i}"></svg>
+    ${ser.length > 1 ? `<div class="legendline">${ser.map(s => `<span style="--c:${s.color}"><i></i>${s.name}</span>`).join("")}</div>` : ""}</div>`).join("") +
+    `<div class="small muted">Click a chart to jump to that month.</div>`;
+  defs.forEach(([, , ser, opt], i) => lineChart($(`ch${i}`), ser, opt));
+}
+
+// ================================================================ inspector & tooltip
+function tileInfo(i) {
+  const f = S.frames[S.idx], W = S.meta.width, ch = f.tiles[i];
+  const L = f.layers || {}, g = (k) => L[k] ? +L[k][i] : null;
+  return { x: i % W, y: Math.floor(i / W), ch, lvl: +f.levels[i], pol: +f.pollution[i], lv: +f.land_value[i], pw: f.power[i] === "1", wt: f.water[i] === "1", zone: "rciomRCIOM".includes(ch),
+    crime: g("crime"), health: g("health"), garbage: g("garbage"), police: g("police"), fire: g("fire"), school: g("school"), happy: g("happiness"),
+    variant: f.variant ? +f.variant[i] : 0, density: f.density ? +f.density[i] : null, resource: S.meta.resources ? +S.meta.resources[i] : 0 };
+}
+const IND_TYPE = ["", "farm", "sawmill", "mine", "oil field", "high-tech"], WEALTH = ["", "low income", "middle income", "high income"];
+const RESOURCE = ["", "fertile soil", "forest", "ore", "oil"];
+function tileTitle(t) {
+  const up = t.ch.toUpperCase();
+  if (!(t.zone && t.lvl > 0)) return (NAMES[t.ch] || t.ch) + (t.ch === "." && t.resource ? ` (${RESOURCE[t.resource]})` : "");
+  const kind = up === "I" && t.variant ? IND_TYPE[t.variant] : LEVEL_NAME[up][t.lvl];
+  const extra = ["RM".includes(up) && t.variant ? WEALTH[t.variant] : "", t.density != null && "RCOM".includes(up) ? (t.density ? "high density" : "low density") : ""].filter(Boolean).join(", ");
+  return `${NAMES[t.ch]} · ${kind} (L${t.lvl})${extra ? " · " + extra : ""}`;
+}
+function showTooltip(tile, ev) {
+  const tip = $("tooltip");
+  if (tile < 0 || !S.frames.length || !ev) { tip.hidden = true; return; }
+  const t = tileInfo(tile);
+  tip.innerHTML = `<b>${esc(tileTitle(t))}</b> <span class="muted">(${t.x}, ${t.y})</span><br>pollution ${t.pol}/9 · land value ${t.lv}/9${t.zone ? ` · ${t.pw ? "⚡" : "<span style='color:var(--bad)'>no power</span>"} ${t.wt ? "💧" : "<span style='color:var(--bad)'>no water</span>"}` : ""}`;
+  tip.hidden = false;
+  const r = app.getBoundingClientRect();
+  tip.style.left = Math.min(ev.clientX + 14, r.width - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.min(ev.clientY + 14, r.height - tip.offsetHeight - 8) + "px";
+}
+function select(tile) {
+  S.selected = tile;
+  scene.setSelected(tile);
+  if (tile < 0) { $("inspector").hidden = true; return; }
+  renderInspector(tile);
+}
+function covers(a, x, y) { const r = actRect(a); return r && x >= Math.min(r.x1, r.x2) && x <= Math.max(r.x1, r.x2) && y >= Math.min(r.y1, r.y2) && y <= Math.max(r.y1, r.y2); }
+function roadCovers(a, x, y) {   // L-shaped roads: horizontal from (x1,y1) to (x2,y1), then vertical to y2
+  if (a.type !== "build_road") return covers(a, x, y);
+  const inH = y === +a.y1 && x >= Math.min(a.x1, a.x2) && x <= Math.max(a.x1, a.x2);
+  const inV = x === +a.x2 && y >= Math.min(a.y1, a.y2) && y <= Math.max(a.y1, a.y2);
+  return inH || inV;
+}
+function renderInspector(tile) {
+  const t = tileInfo(tile), el = $("inspector");
+  const hist = S.frames.slice(0, S.idx + 1).map(f => f.tiles[tile] === t.ch ? +f.levels[tile] : 0);
+  const acts = [];
+  for (const f of S.frames.slice(0, S.idx + 1)) for (const tr of f.turns || []) for (const r of tr.results)
+    if (r.ok && roadCovers(r.action, t.x, t.y)) acts.push({ month: f.month - 1, role: tr.role, a: r.action, idx: S.frames.indexOf(f) });
+  el.innerHTML = `<div class="head"><div><b>${esc(tileTitle(t))}</b><div class="muted small">tile (${t.x}, ${t.y})</div></div><button class="btn icon" id="insClose">✕</button></div>
+    <div class="grid"><span>Pollution</span><b>${t.pol}/9</b><span>Land value</span><b>${t.lv}/9</b>
+    ${t.zone ? `<span>Power</span><b style="color:${t.pw ? "var(--ok)" : "var(--bad)"}">${t.pw ? "connected" : "none"}</b><span>Water</span><b style="color:${t.wt ? "var(--ok)" : "var(--bad)"}">${t.wt ? "connected" : "none"}</b>` : ""}
+    ${t.zone && t.crime != null ? [["Crime", t.crime], ["Health", t.health], ["Garbage", t.garbage], ["Police cover", t.police], ["Fire cover", t.fire], ["School", t.school]].map(([a, v]) => `<span>${a}</span><b>${v}/9</b>`).join("") : ""}</div>
+    ${t.zone ? `<div class="small muted" style="margin-top:6px">Building level over time</div>${spark(hist, "#3ecf9e", 260, 36)}` : ""}
+    <div class="hist">${acts.length ? acts.slice(-12).reverse().map(a => `<div data-i="${a.idx}"><span class="tag">m${a.month}</span> <b style="color:${roleColor(a.role)}">${a.role}</b> ${esc(a.a.type)}${a.a.zone ? " " + esc(a.a.zone) : ""}${a.a.kind ? " " + esc(a.a.kind) : ""}</div>`).join("") : `<span class="muted">No agent action touched this tile yet.</span>`}</div>`;
+  el.hidden = false;
+  $("insClose").onclick = () => select(-1);
+  el.querySelectorAll(".hist [data-i]").forEach(d => d.onclick = () => { go(+d.dataset.i); S.tab = "agents"; renderTab(); });
+}
+
+// ================================================================ minimap & timeline marks
+const MINI = { ".": "#7fb069", "~": "#3d8fd1", "=": "#b8b3a8", "#": "#3d4148", H: "#222", T: "#b99bff", P: "#3e8f3a", E: "#444", G: "#d9822b", S: "#1f3a73", W: "#f4f5f6", U: "#1f8a8a", V: "#2fa3b3",
+  Y: "#8d8a82", "%": "#6d5f3f", "*": "#4f8f6f", K: "#1f4fa8", J: "#7d8388", F: "#c62828", "^": "#b8b39c", A: "#fafafa", h: "#eceff1", L: "#7a6a4f", X: "#5b5e62",
+  ":": "#d32f2f", "?": "#8e24aa", ">": "#b0bec5", m: "#dcc9b0", M: "#a1887f",
+  Z: "#6f9f5a", N: "#f3d99b", B: "#b5654a", Q: "#efe9dc", D: "#2e5b3c", "|": "#6f8f4f", "@": "#b23b3b", "&": "#f1c40f", "+": "#d8d2c4", $: "#dfe3e8", "!": "#e0b43a",
+  r: "#b4c98a", c: "#a8bfd8", i: "#d8c9a0", o: "#c9c2e6", R: "#43a85a", C: "#3f7fd6", I: "#d99a2b", O: "#7d86bd" };
+function drawMinimap() {
+  if (!S.frames.length) return;
+  const cv = $("minimap"), g = cv.getContext("2d"), f = S.frames[S.idx], W = S.meta.width, H = S.meta.height, s = cv.width / Math.max(W, H);
+  g.fillStyle = "#111"; g.fillRect(0, 0, cv.width, cv.height);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, ch = f.tiles[i];
+    g.fillStyle = MINI[ch] || "#f0f";
+    if ("RCIOM".includes(ch)) g.globalAlpha = 0.5 + 0.1 * +f.levels[i];
+    g.fillRect(x * s, y * s, Math.ceil(s), Math.ceil(s)); g.globalAlpha = 1;
+  }
+  const c = scene.cameraFootprint(), r = Math.min(cv.width / 2, c.dist * s * 0.45);
+  g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.beginPath(); g.arc((c.x + 0.5) * s, (c.y + 0.5) * s, Math.max(6, r * 0.35), 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.moveTo((c.x + 0.5) * s, (c.y + 0.5) * s); g.lineTo((c.x + 0.5) * s - Math.sin(c.angle) * -r * 0.6, (c.y + 0.5) * s - Math.cos(c.angle) * -r * 0.6); g.stroke();
+  if (S.selected >= 0) { g.strokeStyle = "#ffd23f"; g.strokeRect((S.selected % W) * s - 1, Math.floor(S.selected / W) * s - 1, s + 2, s + 2); }
+}
+function drawTrackMarks() {
+  const cv = $("trackMarks"); if (!S.meta) return;
+  const w = cv.clientWidth, h = 12; cv.width = w; cv.height = h;
+  const g = cv.getContext("2d"), n = Math.max(1, S.frames.length - 1);
+  g.clearRect(0, 0, w, h);
+  S.frames.forEach((f, i) => {
+    const x = 7 + (w - 14) * i / n;
+    const bad = (f.turns || []).reduce((a, t) => a + (t.invalid || 0), 0), msgs = (f.council || []).length;
+    if ((f.events || []).some(e => /negative|BANKRUPT|recall|LOST/.test(e))) { g.fillStyle = "#ff6b5e"; g.fillRect(x - 1, 0, 2, h); }
+    else if ((f.events || []).some(e => /^(FLOOD|HEATWAVE|RECESSION|OFFER)/.test(e))) { g.fillStyle = "#4aa3ff"; g.fillRect(x - 1, 0, 3, h); }
+    else if ((f.events || []).some(e => /^MILESTONE/.test(e))) { g.fillStyle = "#ffd23f"; g.fillRect(x - 1, 0, 3, h); }
+    else if (bad) { g.fillStyle = "rgba(255,200,87,.8)"; g.fillRect(x - 1, 6, 2, 6); }
+    if (msgs) { g.fillStyle = "rgba(185,155,255,.9)"; g.fillRect(x - 1, 0, 2, 4); }
+    if (f.month && f.month % 12 === 0) { g.fillStyle = "rgba(255,255,255,.35)"; g.fillRect(x, 4, 1, 4); }
+  });
+}
+function minimapJump(e) {
+  if (!S.meta) return;
+  const cv = $("minimap"), r = cv.getBoundingClientRect(), s = r.width / Math.max(S.meta.width, S.meta.height);
+  scene.flyTo((e.clientX - r.left) / s - 0.5, (e.clientY - r.top) / s - 0.5, scene.cameraFootprint().dist);
+}
+
+// ================================================================ legend & view prefs
+function renderLegend() {
+  const L = $("legend"), o = OVERLAY_BY_ID[S.overlay];
+  if (o && o.ramp) L.innerHTML = `<span>${o.lo}</span><span class="ramp" style="background:linear-gradient(90deg,${OVERLAY_RAMPS[o.ramp].join(",")})"></span><span>${o.hi}</span>`;
+  else if (o && o.bool) L.innerHTML = `<span><i style="background:#34c759"></i>zone has ${o.id}</span><span><i style="background:#ff3b30"></i>zone without ${o.id}</span>`;
+  else if (o && o.districts) { const names = (S.frames[S.idx] || {}).district_names || {};
+    L.innerHTML = Object.keys(names).length ? Object.entries(names).map(([id, n]) => `<span><i style="background:${DISTRICT_COLORS[+id]}"></i>${esc(n)}</span>`).join("") : "<span>No districts in this run: Planning paints them with <code>paint_district</code> (the scripted planner never does)</span>"; }
+  else if (o && o.cat) L.innerHTML = Object.entries(o.cat).map(([k, c]) => `<span><i style="background:${c}"></i>${o.names[k]}</span>`).join("");
+  else L.innerHTML = "";
+}
+function buildLayerMenu() {
+  const groups = [...new Set(OVERLAYS.map(o => o.group))];
+  $("layerMenu").innerHTML = groups.map(g => `<div class="lgroup"><h4>${g}</h4>${OVERLAYS.filter(o => o.group === g).map(o =>
+    `<button class="btn" data-ov="${o.id}">${o.label}${OVERLAYS.indexOf(o) < 9 ? ` <kbd>${OVERLAYS.indexOf(o) + 1}</kbd>` : ""}</button>`).join("")}</div>`).join("");
+  $("layerMenu").querySelectorAll("button").forEach(b => b.onclick = () => { setOverlay(b.dataset.ov); $("layerMenu").hidden = true; });
+}
+function setOverlay(o) {
+  if (!OVERLAY_BY_ID[o]) o = "none";
+  S.overlay = o; store.set("overlay", o); scene.setOverlay(o);
+  document.querySelectorAll("#layerMenu button").forEach(b => b.classList.toggle("on", b.dataset.ov === o));
+  $("layerBtn").innerHTML = `◧ ${OVERLAY_BY_ID[o].label} <span class="caret">▾</span>`;
+  $("layerBtn").classList.toggle("on", o !== "none");
+  renderLegend();
+}
+function toggleBtn(id, on) { $(id).classList.toggle("on", on); }
+function setNight(on) { store.set("night", on); scene.setNight(on); toggleBtn("vNight", on); }
+function setQuality(q) { store.set("quality", q); scene.setQuality(q); $("vQuality").textContent = q === "low" ? "LQ" : "HQ"; }
+function setDocks(l, r) { app.classList.toggle("hide-left", !l); app.classList.toggle("hide-right", !r); store.set("docks", [l, r]); setTimeout(() => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); }, 300); }
+
+// ================================================================ launch modal
+async function openLaunch() {
+  try { S.configs = (await api("/api/configs")).filter(c => !c.remote && !c.error); } catch (e) { toast("Launching needs `civitas serve` from the project folder: " + esc(e.message), true); return; }
+  if (!S.configs.length) { toast("No configs found. Run `civitas serve` from the project folder (it reads configs/*.toml).", true); return; }
+  const sel = $("lConfig");
+  sel.innerHTML = S.configs.map(c => `<option value="${esc(c.file)}">${esc(c.name)} (${esc(c.file)})</option>`).join("");
+  const last = store.get("lastConfig", "baseline.toml");
+  if (S.configs.some(c => c.file === last)) sel.value = last;
+  fillLaunch();
+  $("launchModal").hidden = false;
+}
+function fillLaunch() {
+  const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
+  $("lDoc").textContent = c.doc || "";
+  $("lMonths").placeholder = c.months; $("lAct").placeholder = c.act_every;
+  $("lAgents").innerHTML = Object.keys(c.agents).map(r => {
+    const a = c.agents[r];
+    return `<div class="ar" style="--c:${roleColor(r)}"><b>${r}</b>
+      <select data-role="${r}">${["scripted", "llm", "noop", "random"].map(k => `<option ${k === a.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
+      <input data-model="${r}" placeholder="provider/model" value="${esc(a.kind === "llm" ? `${a.provider || "arcee"}/${a.model}` : "arcee/trinity-large-thinking")}" ${a.kind === "llm" ? "" : "disabled"}></div>`;
+  }).join("");
+  $("lAgents").querySelectorAll("select").forEach(s => s.onchange = () => { $("lAgents").querySelector(`[data-model=${s.dataset.role}]`).disabled = s.value !== "llm"; estimate(); });
+  $("lAgents").querySelectorAll("input").forEach(i => i.oninput = estimate);
+  estimate();
+}
+function estimate() {
+  const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
+  const months = +$("lMonths").value || c.months, every = +$("lAct").value || c.act_every;
+  const llm = [...$("lAgents").querySelectorAll("select")].filter(s => s.value === "llm").length;
+  $("lCost").textContent = llm ? `≈ ${Math.ceil(months / every) * llm} LLM calls` : "no LLM calls · finishes in seconds";
+}
+async function launch() {
+  const agents = {};
+  $("lAgents").querySelectorAll("select").forEach(s => {
+    const r = s.dataset.role, m = $("lAgents").querySelector(`[data-model=${r}]`).value.trim();
+    agents[r] = s.value === "llm" ? `llm:${m || "arcee/trinity-large-thinking"}` : s.value;
+  });
+  const body = { config: $("lConfig").value, seed: +$("lSeed").value || 0, months: $("lMonths").value, act_every: $("lAct").value, agents };
+  store.set("lastConfig", body.config);
+  $("lGo").disabled = true;
+  try {
+    const r = await api("/api/launch", body);
+    $("launchModal").hidden = true;
+    toast(`Launched <b>${esc(r.run_id)}</b>`);
+    for (let k = 0; k < 40; k++) {                // wait for the run folder
+      await new Promise(res => setTimeout(res, 500));
+      await refreshRuns();
+      if (S.runs.some(x => x.run_id === r.run_id)) { S.follow = true; $("follow").checked = true; await openRun(r.run_id); break; }
+      const procs = await api("/api/processes").catch(() => []);
+      const p = procs.find(x => x.run_id === r.run_id);
+      if (p && !p.running) { toast(`Run failed to start:<pre class="log">${esc(p.log_tail)}</pre>`, true); break; }
+    }
+  } catch (e) { toast("Launch failed: " + esc(e.message), true); }
+  $("lGo").disabled = false;
+}
+
+// ================================================================ wiring
+$("runBtn").onclick = (e) => { e.stopPropagation(); $("runMenu").hidden = !$("runMenu").hidden; if (!$("runMenu").hidden) refreshRuns(); };
+document.addEventListener("click", (e) => { if (!$("runMenu").contains(e.target)) $("runMenu").hidden = true;
+  if (!$("layerMenu").contains(e.target)) $("layerMenu").hidden = true; });
+$("newRunBtn").onclick = openLaunch; $("emptyLaunch").onclick = openLaunch;
+$("helpBtn").onclick = () => ($("helpModal").hidden = false);
+$("regionBtn").onclick = openRegionMap;
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest(".modal").hidden = true);
+document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.target === m) m.hidden = true; });
+$("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); renderTab(); });
+buildLayerMenu();
+$("layerBtn").onclick = (e) => { e.stopPropagation(); $("layerMenu").hidden = !$("layerMenu").hidden; };
+$("vReset").onclick = () => scene.resetView(); $("vTop").onclick = () => scene.topView();
+$("vMode").onclick = () => setView(viewMode === "3d" ? "pixel" : "3d");
+$("vRotate").onclick = () => { const on = !$("vRotate").classList.contains("on"); scene.setAutoRotate(on); toggleBtn("vRotate", on); };
+$("vNight").onclick = () => setNight(!$("vNight").classList.contains("on"));
+$("vQuality").onclick = () => setQuality(scene.quality === "low" ? "high" : "low");
+$("vShot").onclick = () => { const a = document.createElement("a"); a.href = scene.screenshot(); a.download = `civitas_${S.runId || "city"}_m${S.frames[S.idx]?.month ?? 0}.png`; a.click(); };
+$("vFull").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
+$("vLeft").onclick = () => setDocks(app.classList.contains("hide-left"), !app.classList.contains("hide-right"));
+$("vRight").onclick = () => setDocks(!app.classList.contains("hide-left"), app.classList.contains("hide-right"));
+$("tPlay").onclick = () => (S.playing ? stop() : play());
+$("tPrev").onclick = () => go(S.idx - 1); $("tNext").onclick = () => go(S.idx + 1, true);
+$("tFirst").onclick = () => go(0); $("tLast").onclick = () => go(S.frames.length - 1);
+$("slider").oninput = (e) => go(+e.target.value);
+$("follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) go(S.frames.length - 1); };
+$("minimap").addEventListener("click", minimapJump);
+setInterval(drawMinimap, 250);
+
+document.addEventListener("keydown", (e) => {
+  const tag = e.target.tagName;
+  if ((tag === "INPUT" && e.target.type !== "range") || tag === "SELECT" || tag === "TEXTAREA") return;
+  if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); $("runMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
+  if (!$("launchModal").hidden || !$("helpModal").hidden) return;
+  const k = e.key;
+  const map = {
+    " ": () => (S.playing ? stop() : play()),
+    ArrowRight: () => e.shiftKey ? go(S.idx + 12) : go(S.idx + 1, true), ArrowLeft: () => go(S.idx - (e.shiftKey ? 12 : 1)),
+    Home: () => go(0), End: () => go(S.frames.length - 1),
+    w: () => scene.panBy(0, 1), s: () => scene.panBy(0, -1), a: () => scene.panBy(-1, 0), d: () => scene.panBy(1, 0),
+    ArrowUp: () => scene.panBy(0, 1), ArrowDown: () => scene.panBy(0, -1),
+    q: () => scene.rotateBy(0.15), e: () => scene.rotateBy(-0.15), "+": () => scene.zoomBy(0.85), "=": () => scene.zoomBy(0.85), "-": () => scene.zoomBy(1.18),
+    "0": () => scene.resetView(), t: () => scene.topView(), o: () => $("vRotate").click(), n: () => $("vNight").click(), g: () => $("vQuality").click(),
+    p: () => $("vShot").click(), f: () => $("vFull").click(), l: () => { $("follow").checked = !$("follow").checked; $("follow").onchange({ target: $("follow") }); },
+    "[": () => $("vLeft").click(), "]": () => $("vRight").click(), r: () => $("runBtn").click(), "?": () => ($("helpModal").hidden = false),
+    v: () => $("layerBtn").click(), x: () => $("vMode").click(),
+  };
+  OVERLAYS.slice(0, 9).forEach((o, k) => { map[String(k + 1)] = () => setOverlay(o.id); });
+  const fn = map[k] || map[k.toLowerCase()];
+  if (fn) { e.preventDefault(); fn(); }
+});
+window.addEventListener("resize", () => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); });
+
+// ================================================================ boot
+(async function boot() {
+  const small = window.innerWidth < 820;
+  const [l, r] = small ? [false, false] : store.get("docks", [true, true]);
+  setDocks(l, r); setOverlay(S.overlay); setNight(store.get("night", false)); setQuality(store.get("quality", "high"));
+  $("vMode").textContent = viewMode === "3d" ? "3D" : "PX";
+  await refreshRuns();
+  const want = new URLSearchParams(location.search).get("run") || store.get("lastRun", null);
+  const pickRun = S.runs.find(x => x.run_id === want) || S.runs.find(x => x.status === "running") || S.runs[0];
+  if (pickRun) await openRun(pickRun.run_id);
+  else renderTab();
+  window.__civitas = { S, get scene() { return scene; }, setView, go, openRun };      // handy for debugging from the console
+})();

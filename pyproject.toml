@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "civitas-bench"
+version = "0.2.0"
+description = "Multi-agent city-building simulation and benchmark for LLM / RL agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "tomli>=2.0; python_version<'3.11'"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+civitas = "civitas.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["civitas*"]
+
+[tool.setuptools.package-data]
+civitas = ["viewer/*", "viewer/vendor/*"]
+
+[tool.pytest.ini_options]
+markers = ["slow: full benchmark episodes (deselect with -m 'not slow')"]

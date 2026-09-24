@@ -1,0 +1,62 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Civitas Bench is a SimCity-style city simulation used as a multi-agent benchmark. Eight city departments (mayor, planning, utilities, transport, police, fire, health, education) are each played by a separate agent: an LLM, a scripted baseline, a remote HTTP process, or an RL policy. `README.md` covers the game rules, actions, scores and output files; `docs/MECHANICS.md` tracks which SimCity/Cities: Skylines mechanics are implemented and where.
+
+## Commands
+
+```bash
+uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[dev]"   # Python >= 3.10 required
+
+pytest -q                                            # full suite (~20 s, includes 5 full benchmark episodes)
+pytest -q -m "not slow"                              # quick loop (~5 s)
+pytest tests/test_traffic.py::test_avenues_relieve_congestion   # single test
+
+civitas run -c configs/baseline.toml --seed 0        # one episode (scripted, ~3 s)
+civitas run -c configs/region.toml --seed 0          # two cities on one river (~8 s)
+civitas run -c configs/region_trio.toml --seed 0     # three linked cities (~12 s)
+civitas run -c configs/smoke.toml --serve            # short LLM run + web viewer at :8765
+civitas bench -c configs/baseline.toml --seeds 0-4 --workers 5
+civitas serve                                        # 3D viewer / run launcher only
+civitas prompt -c configs/arcee.toml --role police   # print exactly what an LLM agent sees on month 0
+civitas check-llm                                    # one test call to the Arcee API
+```
+
+Overrides work on `run`, `bench` and `prompt`: `--agent planning=llm:arcee/trinity-mini`, `--set game.act_every=3`, `--set game.balance.TRAFFIC_POLLUTION=0` (balance constants need the `game.balance.` prefix). `ARCEE_API_KEY` is loaded from `./.env`. There is no linter configured. Runs are written to `runs/<run_id>/` (gitignored).
+
+## Architecture
+
+**`CivitasEnv` (`civitas/core/env.py`) is the hub.** It owns the `World`, the `Council` message board, per-role memory and scores. Agents never touch the world. `make_env()` returns a `CivitasEnv`, or a `core/region.py:RegionEnv` (2–6 `CivitasEnv`s from `game.cities` sharing one council, roles named `north.planning` etc.; it computes links from each city's connectors / harbours / airports and sets `world.regional` flows of goods, commuters and tourists before every tick) when `game.region` is set; both expose the same interface (`roles`, `observe`, `apply`, `end_month`, `frame`, `meta`, `final_metrics`), which is all `bench/runner.py` uses. Turn order is the order of `game.roles`; `game.simultaneous` makes the runner observe every role before any applies.
+
+**`World` (`sim/world.py`) is assembled from mixins**, one per system: `population.py` (age × education cohorts, schooling, job matching), `services.py` (road-network coverage framework, crime, fire, garbage, health, deathcare), `civics.py` (needs-based happiness, complaints, approval/recall, funding levels, policies, districts), `traffic.py` (commuter gravity model on cached shortest-path trees, bus lines), `economy.py` (demand, levels 1–5, density, mixed use, wealth, industry types, households; `TradeMixin`: goods, freight, business margins, service imports, plant ageing, wind strength map, facility modules), `events.py` (seeded disasters and offers; `event_factor` also folds in seasons), `progress.py` (milestones, unlocks, landmarks, tourism incl. casinos; `HeritageMixin`: historic listings, soil pollution, monthly wind direction, seasons). `world.py` keeps the map, `refresh()` (road networks, power/water/sewage distribution, imports), environment, `tick()` ordering and `_metrics()`. A method defined on `World` itself overrides the mixins, so don't leave stubs there, and watch for attribute/method name clashes across mixins (e.g. `wind` is the strength grid, `wind_dir()` the direction). Catalog constants that are struct codes must not be reused as spec dicts (`CASINO` vs `CASINO_SPEC`).
+
+**People, jobs and buildings go through helpers**: `residents_grid()` (homes + mixed-use flats), `homes_mask()`, `shop_jobs_grid()`, `facilities(struct)` (top-left tile of each building), `n_buildings()`, `parts(x, y)`, `building_network()`, `place_building()` / `remove_building()` (multi-tile footprints from `catalog.FOOTPRINT`, tracked in `world.anchor`). Don't count `struct == X` tiles directly.
+
+**`tick()` order matters**: events → landmarks → refresh → environment → population → demand → grow → refresh → environment → cohorts → population → traffic → services → crime → fire → garbage/health → deathcare → resources → trade → profits → happiness → economy → approval → demand → milestones. Coverage, congestion and business closures computed late in one month drive growth the next.
+
+**Coverage and trees are cached per road network.** `services.coverage()` and `traffic._tree()` cache BFS fields keyed on `world.road_key` (a hash of the road mask and road classes, updated in `refresh()`). Anything that changes roads must go through `struct`/`road_class` and then `refresh()`. `World.metrics()` is cached on `world.version`, bumped by `refresh()` and `tick()`.
+
+**Data flow per turn.** `core/observation.py` builds a dict (city summary for everyone, a detailed `ROLE_SECTIONS` block for the acting role with hotspots and suggested sites, the ASCII map for all but the mayor) and renders it into the `text` prompt. The agent returns a `Decision`; `Decision.from_dict` normalizes common LLM output variants. `core/actions.py:apply_action` checks `ROLES[role]["actions"]`, dispatches through `HANDLERS` (`ROLE_AWARE` handlers also get the role), turns `ActionError` into a failed result the agent sees next turn, and calls `world.refresh()` after each success. Milestone locks are checked with `_require(world, key)`; `catalog.UNLOCK_POP` lists the keys.
+
+**Scripted baselines read only the observation** (`agents/scripted.py`), e.g. the planner parses the ASCII map with `MapView` and routes roads around other departments' buildings (`_route`). Changing observation keys can silently break them, so rerun the benchmark.
+
+**Scoring (`bench/scoring.py`)** is a pure function of the monthly metrics history: it gives the final score, the live score shown to agents and the per-turn reward. New score inputs must be recorded in `World._metrics()`.
+
+**Config (`civitas/config.py`).** TOML files in `configs/` are merged over defaults; `[game]` / `[scoring]` keys map onto the `GameConfig` / `ScoringConfig` dataclasses and unknown keys are silently dropped. `agent_spec()` resolves `north.planning` → `planning` in region mode.
+
+**Balance overrides are global state.** `sim/catalog.py:apply_overrides` mutates module globals (`CATALOG`, `SERVICES`, `LANDMARKS`, constants) in place on every `CivitasEnv` construction, so overrides persist for the life of the process. Tests that tweak catalog values restore them in `finally`. `bench` uses a `ProcessPoolExecutor`, so episodes are isolated there.
+
+**Server (`civitas/server.py`)** is a stdlib `http.server`: static viewer (`civitas/viewer/`, vanilla JS + vendored three.js, no build step), replay API over `runs/*/frames.jsonl` (JSON gzipped when large), a run launcher (`python -m civitas.cli run` subprocesses, logs in `runs/_logs/`), and the live remote-agent API. The running server does not reload Python changes; restart it after editing `server.py`.
+
+**Frames are compact strings.** `env.frame()` encodes tiles, levels, variants (wealth / industry type), density, road classes and overlay layers (`World.frame_layers()`, quantized 0–9) as flat per-tile strings; region frames nest per-city frames under `cities`. `viewer/app.js` / `scene.js` decode them (layers are declared in `OVERLAYS` in `scene.js`). Tile characters are in `catalog.CHAR`; `catalog.FRAME_FORMAT = 3` (v2: water tower `O` → `V`, `O` = offices; v3: hospital `M` → `h`, `M` = mixed use; the viewer converts older replays). Multi-tile buildings are listed in the frame's `multi` field so the viewer draws one model per building. If you change the frame format, update both sides. Moving traffic is purely cosmetic: `viewer/lifesim.js` derives cars, buses (along `bus_lines`), trains, boats and planes from the frame (road graph, traffic layer, stations) with no simulation data of its own; `life.js` draws it in 3D and `pixel.js` in 2D. `viewer/region.js` draws the region map (Region tab and the full-screen "Region map" button) from the per-city tiles, `meta.layout`, `links` and `flows`.
+
+**Two city renderers with one interface.** `viewer/pixel.js:PixelScene` (OpenTTD-style 2:1 isometric pixel art, the default) and `viewer/scene.js:CityScene` (three.js) expose the same methods (`setMeta`, `setFrame`, `setOverlay`, `setNight`, `flyTo`, `cameraFootprint`, `setActive`, ...); `app.js` keeps the active one in `scene` and `setView()` switches (`X`). The pixel view paints every sprite in code: `recipes.js` says what to draw with a `sprites.js` `Builder` (boxes, roofs, lathes, blobs in tile units, one height unit = `ZS` px) and `paint()` rotates, depth-sorts and rasterizes it without anti-aliasing. Ground tiles are baked into one canvas per frame / rotation / night / overlay; objects and vehicles are depth-sorted and blitted each animation frame from a sprite cache keyed on recipe inputs + rotation + night + season. Keep `pixel.js:_overlayColor` in step with `scene.js:_overlayColor`. Tile rules take a city context (`_makeCity`), so the same code draws neighbouring cities in the quarter-scale distant view (`_bakeFar`, fed by `setRegion()` from app.js). There neighbours sit `GAP` = 36 tiles apart (wider than the Region tab's map) and `_farPlan` makes the land between them consistent: rivers flow on into the city downstream (else meander to the horizon), each highway / rail link is routed by `_route` (A*) between the two cities' `metrics.connectors` tiles with bridges and level crossings, other edge highways leave the region past a village or join the network; every edge feature first runs straight for `MARGIN` tiles, matching `charAt` in the detailed margin; traffic lights live in `lifesim.js` (`signals`, `signal(i)`) and both renderers draw them.
+
+## Adding a role or building
+
+Follow the checklist in README ("Adding a role"). The server's role list comes from `core/roles.py:TURN_ORDER`; the viewer reads roles from run metadata, but new buildings need a character in `catalog.CHAR`, a model in `scene.js:_buildSpecial` (and `SPECIALS`), a sprite recipe in `recipes.js:special`, and `NAMES` / `MINI` entries in `app.js`.
+
+## Reference numbers
+
+Scripted baseline on seeds 0–4: city 77.3 ± 2.2, mayor 87.4, planning 67.9, utilities 91.6, transport 75.1, police 80.8, fire 88.7, health 90.1, education 88.6, population ≈ 14.0k, no bankruptcies, ~4 s per episode (three-city region ~12 s). `noop`/`random` line-ups score 0. `tests/test_benchmark.py` enforces solvency and a 60–80 mean city score. If a change to sim or balance code moves these numbers, that is a benchmark change and should be called out (and README updated).

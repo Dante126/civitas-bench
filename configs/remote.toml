@@ -1,0 +1,17 @@
+# Planning is played by an external program over HTTP (see examples/remote_agent.py).
+#   civitas run -c configs/remote.toml --serve
+#   python examples/remote_agent.py --role planning
+name = "remote"
+
+[game]
+months = 120
+
+[agents.mayor]
+kind = "scripted"
+
+[agents.planning]
+kind = "remote"
+timeout = 600
+
+[agents.utilities]
+kind = "scripted"

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Civitas Classic 2D</title>
+<link rel="stylesheet" href="classic.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo" aria-hidden="true"></span>Civitas</div>
+  <select id="runSelect" aria-label="Run"></select>
+  <span id="liveBadge" class="badge" hidden>LIVE</span>
+  <div class="transport">
+    <button id="playBtn" title="Play / pause (space)">▶</button>
+    <select id="speedSelect" aria-label="Playback speed">
+      <option value="600">0.5×</option><option value="300" selected>1×</option>
+      <option value="120">2.5×</option><option value="40">8×</option>
+    </select>
+    <input id="monthSlider" type="range" min="0" max="0" value="0" aria-label="Month">
+    <span id="monthLabel" class="mono">—</span>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="mapcol">
+    <div class="panel mappanel">
+      <div class="panelhead">
+        <h2>Map</h2>
+        <div class="seg" id="overlaySeg" role="tablist">
+          <button data-ov="none" class="on">Tiles</button>
+          <button data-ov="pollution">Pollution</button>
+          <button data-ov="land_value">Land value</button>
+          <button data-ov="power">Power</button>
+          <button data-ov="water">Water</button>
+        </div>
+      </div>
+      <div class="canvaswrap"><canvas id="map"></canvas><div id="tip" class="tip" hidden></div></div>
+      <div id="legend" class="legend"></div>
+    </div>
+    <div class="panel">
+      <div class="panelhead"><h2>City</h2></div>
+      <div id="kpis" class="kpis"></div>
+    </div>
+  </section>
+
+  <section class="sidecol">
+    <div id="scoreCards" class="scorecards"></div>
+    <div class="panel">
+      <div class="charts">
+        <div class="chart"><h3>Population</h3><svg id="chPop"></svg></div>
+        <div class="chart"><h3>Treasury</h3><svg id="chMoney"></svg></div>
+        <div class="chart"><h3>Scores</h3><svg id="chScores"></svg></div>
+        <div class="chart"><h3>Happiness · coverage</h3><svg id="chHappy"></svg></div>
+      </div>
+    </div>
+    <div class="panel grow">
+      <div class="panelhead">
+        <div class="seg" id="tabSeg">
+          <button data-tab="agents" class="on">Agents</button>
+          <button data-tab="council">Council</button>
+          <button data-tab="events">Events</button>
+          <button data-tab="board">Leaderboard</button>
+        </div>
+        <span id="tabHint" class="muted small"></span>
+      </div>
+      <div id="tabBody" class="tabbody"></div>
+    </div>
+  </section>
+</main>
+<script src="classic.js"></script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# Mayor, Planning and Utilities are played by Arcee's trinity-large-thinking; the other five
+# departments (transport, police, fire, health, education) use the scripted baselines.
+# configs/arcee_full.toml puts all eight roles on the LLM.
+# Key: put ARCEE_API_KEY=... in ./.env (gitignored) or export it in your shell.
+# 120 months x 3 roles = ~360 calls per episode. Thinking models are slow
+# (often 20-90 s per call), so a full game can take a few hours; set
+# act_every = 2 or 3 to cut calls while the simulation still runs monthly.
+name = "arcee"
+
+[game]
+months = 120
+act_every = 1
+max_actions_per_turn = 8
+
+[scoring]
+target_population = 30000
+
+[providers.arcee]
+base_url = "https://api.arcee.ai/api/v1"
+api_key_env = "ARCEE_API_KEY"
+timeout = 300
+
+[agents.mayor]
+kind = "llm"
+provider = "arcee"
+model = "trinity-large-thinking"
+temperature = 0.4
+max_tokens = 12000    # room for the reasoning + the JSON answer
+
+[agents.planning]
+kind = "llm"
+provider = "arcee"
+model = "trinity-large-thinking"
+temperature = 0.4
+max_tokens = 12000
+
+[agents.utilities]
+kind = "llm"
+provider = "arcee"
+model = "trinity-large-thinking"
+temperature = 0.4
+max_tokens = 12000
