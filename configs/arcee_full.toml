@@ -14,7 +14,7 @@ target_population = 30000
 [providers.arcee]
 base_url = "https://api.arcee.ai/api/v1"
 api_key_env = "ARCEE_API_KEY"
-timeout = 600
+timeout = 300    # a full 32k-token turn takes ~100 s; longer silence is a hung request
 
 [agents.mayor]
 kind = "llm"
