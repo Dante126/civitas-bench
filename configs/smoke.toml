@@ -7,19 +7,19 @@ months = 24
 act_every = 3
 
 [providers.arcee]
-timeout = 300    # a full 32k-token turn takes ~100 s; longer silence is a hung request
+timeout = 300    # a full 24k-token turn takes ~75 s
 
 [agents.mayor]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.planning]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.utilities]
 kind = "llm"
 model = "trinity-large-thinking"
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering

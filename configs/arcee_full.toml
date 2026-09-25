@@ -14,60 +14,60 @@ target_population = 30000
 [providers.arcee]
 base_url = "https://api.arcee.ai/api/v1"
 api_key_env = "ARCEE_API_KEY"
-timeout = 300    # a full 32k-token turn takes ~100 s; longer silence is a hung request
+timeout = 300    # a full 24k-token turn takes ~75 s
 
 [agents.mayor]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.planning]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.utilities]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.transport]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.police]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.fire]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.health]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.education]
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
 temperature = 0.4
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering

@@ -13,7 +13,7 @@ kind = "scripted"
 kind = "llm"
 provider = "arcee"
 model = "trinity-large-thinking"
-max_tokens = 32000    # Arcee key is uncapped; 12k cut off long reasoning turns
+max_tokens = 24000    # prompt + output must stay under ~32k: at 32000 the Arcee API hangs instead of answering
 
 [agents.utilities]
 kind = "scripted"
