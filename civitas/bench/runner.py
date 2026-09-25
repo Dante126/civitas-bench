@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..config import agent_spec, build_agents, game_config, scoring_config
 from ..core.env import make_env
-from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version
+from ..fleet.config import fleet_agent_config, fleet_version
 from ..fleet.report import fleet_report, turn_row
 
 
@@ -82,7 +82,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     log = RunLogger(Path(runs_dir) / run_id)
     sig = agent_signature(cfg, env.roles)
     prompts = {r: a.system for r, a in agents.items() if a.kind == "fleet"}      # logged turns refer to these
-    fv = fleet_version(cfg) if "fleet" in cfg or fleet_agents(cfg) else None
+    fv = fleet_version(cfg) if prompts else None                               # only when a role is a fleet agent
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
