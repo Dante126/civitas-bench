@@ -16,6 +16,7 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
+from .fmt import cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
 
@@ -47,7 +48,6 @@ UNLOCK_ROLES = {
     **{k: ("transport",) for k in ("avenue", "highway", "train_station", "harbour", "metro", "airport")},
 }
 REPORT_CHARS = 200
-LINE_CHARS = 120
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
@@ -83,38 +83,13 @@ TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budg
                 "mayor or another department, ask with send_message."}
 
 
-def _cut(text, n: int = LINE_CHARS) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= n else text[:n - 3].rstrip() + "..."
-
-
-def _num(v) -> str:
-    if v is None:
-        return "n/a"
-    if abs(v) >= 10000:
-        return f"{v / 1000:.1f}".removesuffix(".0") + "k"
-    return f"{v:,.0f}" if float(v).is_integer() or abs(v) >= 100 else f"{v:,.2f}"
-
-
-def _money(v) -> str:
-    return ("-" if v < 0 else "") + "$" + _num(round(abs(v)))
-
-
-def _pct(v) -> str:
-    return "n/a" if v is None else f"{v:.0f}%" if abs(v) >= 10 or v == 0 else f"{v:.1f}%"
-
-
-def _signed(v, fmt=_num) -> str:
-    return ("+" if v >= 0 else "-") + fmt(abs(v))
-
-
 def _value(key: str, v) -> str:
     if isinstance(v, dict) and "supply" in v:
-        return f"supply {_num(v['supply'])} / demand {_num(v['demand'])}, coverage {_pct(v['coverage_pct'])}"
+        return f"supply {num(v['supply'])} / demand {num(v['demand'])}, coverage {pct(v['coverage_pct'])}"
     if isinstance(v, dict):
-        fmt = (lambda x: f"{x:+.2f}") if key == "demand" else _num
+        fmt = (lambda x: f"{x:+.2f}") if key == "demand" else num
         return ", ".join(f"{k} {fmt(x)}" for k, x in v.items()) or "n/a"
-    return _pct(v) if key.endswith("_pct") else _num(v)
+    return pct(v) if key.endswith("_pct") else num(v)
 
 
 def _metric(city: dict, path: str) -> str:
@@ -136,7 +111,7 @@ def _action(e: dict) -> str:
     a = dict(e.get("action") or {})
     kind = a.pop("type", "?")
     args = json.dumps(a, separators=(",", ":"))[1:-1] if a else ""
-    return _cut(f"m{e['month']} {kind}({args}): {e.get('message', '')}")
+    return cut(f"m{e['month']} {kind}({args}): {e.get('message', '')}")
 
 
 def _listed(items: list[str], more: str) -> list[str]:
@@ -151,11 +126,11 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     fails = [_action(e) for e in d["failed_actions"]]
     L.append("- failed actions:" + ("" if fails else " none"))
     L.extend(_listed(fails, "history kind=failure"))
-    events = [_cut(t) for t in d["events"]]
+    events = [cut(t) for t in d["events"]]
     L.append("- events:" + ("" if events else " none"))
     L.extend(_listed(events, "history kind=event"))
     for f in w.forecast():
-        L.append(f"- forecast: {_cut(f)}")
+        L.append(f"- forecast: {cut(f)}")
     n = d["messages"]
     shows = f"get_messages shows the latest {MAX_ENTRIES}" if n > MAX_ENTRIES else "get_messages"
     L.append(f"- {n or 'no'} new council message{'' if n == 1 else 's'}" + (f" ({shows})" if n else ""))
@@ -185,11 +160,11 @@ def _milestone(env, role: str) -> str:
         what = (f"unlocks for you: {names}" if shown else "unlocks nothing for you") + (
             f"; and {rest} more for other roles" if rest else "")
     return (f"Next milestone: '{nm['name']}' at {nm['pop']:,} residents (now {w.metrics()['population']:,}), "
-            f"{_money(nm['reward'])} reward: {what} (see unlocks).")
+            f"{money(nm['reward'])} reward: {what} (see unlocks).")
 
 
 def _goals(goals: list[str], n: int | None = None) -> str:
-    return "; ".join(f"{i}) {_cut(g, n) if n else g}" for i, g in enumerate(goals, 1)) or "none"
+    return "; ".join(f"{i}) {cut(g, n) if n else g}" for i, g in enumerate(goals, 1)) or "none"
 
 
 def _header(env, role: str, mode: str) -> list[str]:
@@ -204,26 +179,26 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     w = env.world
     o = overview(env)
     t = o["trend"]
-    ch = lambda k, fmt=_num: f" ({_signed(t[k], fmt)})" if t else ""
+    ch = lambda k, fmt=num: f" ({signed(t[k], fmt)})" if t else ""
     L = ["## City" + (f" (change since month {t['since_month']})" if t else ""),
-         f"- population {_num(o['population'])}{ch('population')}, happiness {_pct(o['happiness_pct'])}"
-         f"{ch('happiness_pct', lambda v: f'{v:.1f} pts')}, approval {_pct(o['approval_pct'])}, "
-         f"unemployment {_pct(o['unemployment_pct'])}",
-         "- jobs: " + ", ".join(f"{k} {_num(v)}" for k, v in o["jobs"].items())
+         f"- population {num(o['population'])}{ch('population')}, happiness {pct(o['happiness_pct'])}"
+         f"{ch('happiness_pct', lambda v: f'{v:.1f} pts')}, approval {pct(o['approval_pct'])}, "
+         f"unemployment {pct(o['unemployment_pct'])}",
+         "- jobs: " + ", ".join(f"{k} {num(v)}" for k, v in o["jobs"].items())
          + " | demand: " + _value("demand", o["demand"]),
          *(f"- {k}: {_value(k, o[k])}" for k in ("power", "water", "sewage")),
-         "- coverage: " + ", ".join(f"{k} {_pct(v)}" for k, v in o["coverage_pct"].items()),
+         "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
          "", "## Finances",
-         f"- treasury {_money(o['treasury'])}{ch('treasury', _money)}, debt {_money(o['debt'])}; last month income "
-         f"{_money(o['last_month']['income'])}, expenses {_money(o['last_month']['expenses'])}"]
+         f"- treasury {money(o['treasury'])}{ch('treasury', money)}, debt {money(o['debt'])}; last month income "
+         f"{money(o['last_month']['income'])}, expenses {money(o['last_month']['expenses'])}"]
     if w.months_negative or w.low_approval_months:
         L.append(f"- WARNING: {w.months_negative} month(s) with a negative treasury ({C.BANKRUPTCY_MONTHS} = "
                  f"bankruptcy), {w.low_approval_months} month(s) of approval below {100 * C.RECALL_APPROVAL:.0f}% "
                  f"({C.RECALL_MONTHS} = recall)")
     L += [""] + _digest(env, fleet, "mayor")
     for off in w.offers:
-        L.append(f"- OPEN OFFER #{off['id']}: large factory, {off['jobs']} jobs, {_money(off['bonus'])} bonus, heavy "
+        L.append(f"- OPEN OFFER #{off['id']}: large factory, {off['jobs']} jobs, {money(off['bonus'])} bonus, heavy "
                  f"pollution (accept_offer / decline_offer before month {off['expires']})")
     p = plan_slice(fleet, "mayor")
     plan = bool(fleet.plan_versions)
@@ -231,12 +206,12 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     L += ["", "## Departments: funds, plan target, priority, latest report"]
     for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {_money(w.dept_funds[d])}" + (f", target {_money(budgets[d])}" if d in budgets else "")
-                 + (f"; priority: {_cut(priorities[d], 60)}" if priorities.get(d) else ""))
+        L.append(f"- {d}: funds {money(w.dept_funds[d])}" + (f", target {money(budgets[d])}" if d in budgets else "")
+                 + (f"; priority: {cut(priorities[d], 60)}" if priorities.get(d) else ""))
         if d in latest:
-            text = _cut(latest[d]["text"], REPORT_CHARS)
-            cut = len(" ".join(latest[d]["text"].split())) > REPORT_CHARS
-            L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if cut else ""))
+            text = cut(latest[d]["text"], REPORT_CHARS)
+            clipped = len(" ".join(latest[d]["text"].split())) > REPORT_CHARS
+            L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if clipped else ""))
     if not latest:
         L.append("- no reports yet")
     L += [""]
@@ -246,7 +221,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L += [f"## City plan (v{p['version']}, month {p['month']}; full text: get_plan)",
               f"- goals: {_goals(p['goals'], 100)}"]
         if p["notes"]:
-            L.append(f"- notes: {_cut(p['notes'], 200)}")
+            L.append(f"- notes: {cut(p['notes'], 200)}")
     return L + [""] + _memory(fleet, "mayor")
 
 
@@ -261,15 +236,15 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     else:
         target = p["budget"]
         L = [f"## Your plan slice (plan v{len(fleet.plan_versions)}, month {p['month']})",
-             f"- budget target: {_money(target) if target is not None else 'none set'}",
+             f"- budget target: {money(target) if target is not None else 'none set'}",
              f"- priority: {p['priority'] or 'none set'}", f"- city goals: {_goals(p['goals'])}"]
         if p.get("notes"):
-            L.append(f"- mayor's notes: {_cut(p['notes'], 200)}")
+            L.append(f"- mayor's notes: {cut(p['notes'], 200)}")
     spent = w.history[-1]["dept_spent"].get(dept, 0) if w.history else 0
     L += ["", "## Your budget",
-          f"- {_money(w.dept_funds[dept])} in department funds" + (f" (plan target {_money(target)})"
+          f"- {money(w.dept_funds[dept])} in department funds" + (f" (plan target {money(target)})"
                                                                    if target is not None else "")
-          + f"; spent last month {_money(spent)}"]
+          + f"; spent last month {money(spent)}"]
     city = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
                              include_map=False, site_hints=False)["city"]
     L += ["", "## Key metrics", *(_metric(city, k) for k in KEY_METRICS[role])]

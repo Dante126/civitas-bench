@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -182,10 +183,14 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
         "wall_time_s": round(time.time() - t0, 2),
     }
     if prompts:
-        report, md = fleet_report(env, summary, fleet_rows)
-        (log.dir / "fleet_report.json").write_text(json.dumps(_jsonable(report), indent=2))
-        (log.dir / "fleet_report.md").write_text(md)
-        summary["fleet"] = {"report": "fleet_report.md", "hints": len(report["hints"])}
+        try:
+            report, md = fleet_report(env, summary, fleet_rows)
+            (log.dir / "fleet_report.json").write_text(json.dumps(_jsonable(report), indent=2))
+            (log.dir / "fleet_report.md").write_text(md)
+            summary["fleet"] = {"report": "fleet_report.md", "hints": len(report["hints"])}
+        except Exception as e:                       # a report bug must not cost the run its summary
+            print(f"[{run_id}] warning: fleet report failed: {type(e).__name__}: {e}", file=sys.stderr)
+            summary["fleet"] = {"error": f"{type(e).__name__}: {e}"}
     log.summary(summary)
     log.close()
     if verbose:
