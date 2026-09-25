@@ -73,7 +73,8 @@ Everything happens in the browser from here. You can:
   cover, crime, fire risk, health, garbage, soil pollution, historic buildings, business
   profit, affordability, natural resources, flood risk and districts.
 - **Launch runs** with **＋ New run**: pick a config, seed, length and each role's agent
-  (scripted, LLM with any model, noop or random). Stop runs from the Runs tab, which also
+  (scripted, LLM with any model, fleet, noop or random); each role starts at the config's own
+  agent and only the roles you change are overridden. Stop runs from the Runs tab, which also
   holds the leaderboard.
 - **Browse the Charts tab**: population, scores, money, happiness and approval, demand,
   jobs, pollution, commute and traffic, trade, service coverage, crime and health,
@@ -447,7 +448,7 @@ tasks and money, and to let people coach it.
 
 1. **City plan**, owned by the mayor. In `update_plan`, goals (up to 5) and notes replace the old ones, while budgets and priorities merge per department. Every version is kept.
 2. **Department memory**, owned by each agent: `commitments`, `open_tasks` and `lessons`, up to 8 items of 200 characters each. It's shown in full in the agent's briefing.
-3. **History log**, written by the game: every action with its result and cost, end-of-turn reports, city events and a monthly metrics snapshot. Agents query it with `history(kind = action | failure | event | report | metrics, months up to 12)`. A department sees its own entries and the city's; the mayor sees everything.
+3. **History log**, written by the game: every action with its result and cost, end-of-turn reports, city events and a monthly metrics snapshot. Agents query it with `history(kind = action | failure | event | report | metrics | all, months up to 12)`. A department sees its own entries and the city's; the mayor sees everything.
 
 The memory lives on the env (`env.fleet`) for the length of the run. The final plan and
 lessons go into the fleet report, and every edit is in the tool traces.
@@ -515,16 +516,17 @@ Fleet and non-fleet roles mix freely, for example a fleet mayor over scripted de
 120 months, acting every 3 months (320 turns), with a default fleet playbook and one
 playbook per department. `configs/fleet_smoke.toml` is the same fleet for 12 months.
 `meta.json` records `fleet_version` and every fleet agent's system prompt once
-(`fleet_prompts`). `fleet_version` is a hash of `[fleet]` and the fleet agents' settings, so
-runs with the same coaching can be compared. The signature reads
-`role=fleet:<model> ... [mode]`.
+(`fleet_prompts`); `summary.json` records `fleet_version` too. `fleet_version` is a hash of
+`[fleet]` and the fleet agents' settings, so runs with the same coaching can be compared: the
+leaderboard groups fleet runs by signature and `fleet_version` (shown in its own column). The
+signature reads `role=fleet:<model> ... [mode]`.
 
 **Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
 next to its summary. They contain:
 
 - the scoreboard
 - the final plan and the months it changed
-- per-role stats: turns, tool calls, actions, failures, tool errors, spending, tokens, turns ended on a limit, length stops and API errors
+- per-role stats: turns, tool calls, actions, failures, tool errors, spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
 - the top failures, last reports and the lessons in memory
 - coaching hints
 
@@ -553,7 +555,7 @@ benchmark.
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
 - fleets in region mode (a fleet agent refuses a region game)
 - supervised scheduling (pause, edit the playbook, resume)
-- a viewer panel for tool traces (the Agents tab shows a fleet turn's last user and assistant messages; the full trace is in `trajectories.jsonl`)
+- a viewer panel for tool traces (the Agents tab shows a fleet turn's briefing, the model's reasoning and its end-of-turn report, or its last reply when it never called `end_turn`; the full trace is in `trajectories.jsonl`)
 
 ### Output files (`runs/<run_id>/`)
 
@@ -565,6 +567,7 @@ benchmark.
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
 turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.
+It skips fleet turns (multi-step tool-calling traces, which don't fit its one-shot format) and prints how many.
 
 ---
 
@@ -605,6 +608,7 @@ on month 0. It's the fastest way to iterate on prompts.
 6. `bench/scoring.py`: add a KPI function to `ROLE_SCORERS`.
 7. `agents/scripted.py`: add a baseline to `SCRIPTED`, and let the scripted mayor fund it.
 8. Viewer: give new buildings a character in `catalog.CHAR`, a model in `scene.js` (`_buildSpecial`), a sprite recipe in `recipes.js` (`special`), and entries in `NAMES` / `MINI` in `app.js`; new map layers go in `World.frame_layers()` and `OVERLAYS` in `scene.js`.
+9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
 
 ## Ideas for next steps
 

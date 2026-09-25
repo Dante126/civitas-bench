@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 LINE_CHARS = 120
+TOOL_MESSAGE_CHARS = 4000      # the agent cuts each tool result message to this
+REPORT_PREVIEW_CHARS = 200     # end_turn reports quoted in briefings and the fleet report
 
 
 def cut(text, n: int = LINE_CHARS) -> str:

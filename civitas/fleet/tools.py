@@ -20,14 +20,15 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import shift
+from .fmt import TOOL_MESSAGE_CHARS
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
-RESULT_CHARS = 3800          # agents truncate tool results at 4000 chars; long lists are trimmed below that
+RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
 MAX_SITES = 6
 MAX_RADIUS = 4
 MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
-REPORT_CHARS = 1000
+REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -434,8 +435,8 @@ class ToolBox:
             Tool("history", "The fleet log, newest last: " + (
                  "actions of all roles ('action', or failed ones with 'failure'), reports" if self.role == "mayor"
                  else "your department's actions ('action', or failed ones with 'failure') and reports")
-                 + ", plus city events and monthly metrics. Omit kind for everything.", self.history,
-                 {"kind": {"type": "string", "enum": list(HISTORY_KINDS)},
+                 + ", plus city events and monthly metrics. Omit kind (or \"all\") for everything.", self.history,
+                 {"kind": {"type": "string", "enum": [*HISTORY_KINDS, "all"]},
                   "months": {"type": "integer", "description": f"how many recent months (1-{MAX_MONTHS}, default 3)"}},
                  newest_last=True, trim_hint="ask for fewer months or one kind"),
         ]
@@ -597,6 +598,7 @@ class ToolBox:
         return {"ok": True, "messages": msgs[-MAX_ENTRIES:]}
 
     def history(self, kind: str | None = None, months: int = 3) -> dict:
+        kind = None if kind == "all" else kind
         months = max(1, min(MAX_MONTHS, int(months)))
         roles = None if self.role == "mayor" else (self.role, "city")    # departments: their own and the city's
         entries = self.fleet.history(kind, months, role=roles, now=self.world.month)
@@ -621,7 +623,7 @@ class ToolBox:
             per_dept = lambda t: {"type": "object", "properties": {d: {"type": t} for d in DEPARTMENTS}}
             tools.insert(2, Tool(
                 "update_plan", f"Write the city plan the departments follow. goals ({LIMITS['goals']} max) and notes "
-                "replace the old ones; budgets ($ per department for the quarter) and priorities (one line per "
+                "replace the old ones; budgets (a $ target per department) and priorities (one line per "
                 "department) merge per department, so send only the ones that change. To clear one, set its budget "
                 "to 0 or its priority to \"\" (never null). Budgets are targets: move the money with allocate_budget.",
                 self.update_plan, {"goals": strings, "budgets": per_dept("number"),
@@ -647,7 +649,7 @@ class ToolBox:
             raise ToolError(str(e))
 
     def end_turn(self, report: str) -> dict:
-        report = report.strip()[:REPORT_CHARS]
+        report = report.strip()[:REPORT_MAX_CHARS]
         self.ended, self.report = True, report
         self.fleet.reports[self.role] = report
         self.fleet.record(self.world.month, self.role, "report", text=report)

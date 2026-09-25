@@ -15,10 +15,10 @@ from ..core.decision import Decision
 from ..core.region import RegionEnv
 from .briefing import briefing, system_prompt
 from .config import FleetAgentConfig
+from .fmt import TOOL_MESSAGE_CHARS
 from .memory import FleetState
 from .tools import ToolBox
 
-RESULT_CHARS = 4000
 TRACE_CHARS = 300
 NUDGE = "Use the tools to act, then call end_turn with a short report."
 
@@ -137,10 +137,14 @@ class ToolAgent(Agent):
         if self.env is None:
             raise RuntimeError("ToolAgent.act before bind(env)")
         env, role, cfg = self.env, self.role, self.cfg
-        box = ToolBox(env, role)
-        messages = [{"role": "system", "content": self.system},
-                    {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
-        tools, trace, reasoning, finishes = box.schemas(), [], [], []
+        try:
+            box = ToolBox(env, role)
+            messages = [{"role": "system", "content": self.system},
+                        {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
+            tools = box.schemas()
+        except Exception as e:                       # a briefing bug costs the role this turn, not the run
+            return self._failed_turn(f"briefing_error: {type(e).__name__}: {e}", "briefing_error")
+        trace, reasoning, finishes = [], [], []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         nudged, error, reason, latency, step, recovered = False, None, "max_steps", 0.0, 0, 0
         while len(trace) < cfg.max_steps:
@@ -187,7 +191,7 @@ class ToolAgent(Agent):
                     trace.append({"step": step, "finish_reason": finish, "tool": name, "args": args,
                                   "result": _slim(res)})
                 messages.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": json.dumps(res, separators=(",", ":"))[:RESULT_CHARS]})
+                                 "content": json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]})
             step += 1
             if box.ended:
                 reason = "end_turn"
@@ -202,10 +206,22 @@ class ToolAgent(Agent):
         d = Decision(executed=box.executed, messages=box.messages, thinking=box.report or "(no report)")
         d.parse_error = error
         logged = [{"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{role})"}, *messages[1:]]
+        said = [m["content"] for m in messages if m["role"] == "assistant" and m.get("content")
+                and m["content"] != "(no reply)"]
         d.meta = {"model": cfg.model, "messages": logged, "tool_trace": trace, "usage": usage,
                   "steps": len(trace), "ended": box.ended, "finish_reason": reason, "finish_reasons": finishes,
                   "length_stops": finishes.count("length"), "recovered_calls": recovered,
                   "reasoning": "\n\n".join(reasoning),
-                  "response": messages[-1]["content"] if messages[-1]["role"] == "assistant" else "",
+                  "response": box.report or (said[-1] if said else ""),   # the end_turn report, else the last reply
                   "latency_s": round(latency, 3)}
+        return d
+
+    def _failed_turn(self, error: str, reason: str) -> Decision:
+        """A turn that ended before the first model call: nothing executed, the error logged."""
+        d = Decision(thinking="(no report)")
+        d.parse_error = error
+        d.meta = {"model": self.cfg.model, "messages": [], "tool_trace": [],
+                  "usage": {"prompt_tokens": 0, "completion_tokens": 0}, "steps": 0, "ended": False,
+                  "finish_reason": reason, "finish_reasons": [], "length_stops": 0, "recovered_calls": 0,
+                  "reasoning": "", "response": "", "latency_s": 0.0}
         return d

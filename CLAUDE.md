@@ -9,8 +9,8 @@ Civitas Bench is a SimCity-style city simulation used as a multi-agent benchmark
 ```bash
 uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[dev]"   # Python >= 3.10 required
 
-pytest -q                                            # full suite (~25 s, includes 5 full benchmark episodes)
-pytest -q -m "not slow"                              # quick loop (~5 s)
+pytest -q                                            # full suite (~40 s, includes 5 full benchmark episodes)
+pytest -q -m "not slow"                              # quick loop (~20 s)
 pytest tests/test_traffic.py::test_avenues_relieve_congestion   # single test
 
 civitas run -c configs/baseline.toml --seed 0        # one episode (scripted, ~4–5 s)

@@ -16,7 +16,7 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import cut, money, num, pct, signed
+from .fmt import REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
 
@@ -47,7 +47,6 @@ UNLOCK_ROLES = {
     "districts": ("planning", "mayor"),
     **{k: ("transport",) for k in ("avenue", "highway", "train_station", "harbour", "metro", "airport")},
 }
-REPORT_CHARS = 200
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
@@ -209,8 +208,8 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append(f"- {d}: funds {money(w.dept_funds[d])}" + (f", target {money(budgets[d])}" if d in budgets else "")
                  + (f"; priority: {cut(priorities[d], 60)}" if priorities.get(d) else ""))
         if d in latest:
-            text = cut(latest[d]["text"], REPORT_CHARS)
-            clipped = len(" ".join(latest[d]["text"].split())) > REPORT_CHARS
+            text = cut(latest[d]["text"], REPORT_PREVIEW_CHARS)
+            clipped = len(" ".join(latest[d]["text"].split())) > REPORT_PREVIEW_CHARS
             L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if clipped else ""))
     if not latest:
         L.append("- no reports yet")

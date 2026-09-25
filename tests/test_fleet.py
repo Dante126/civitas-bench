@@ -711,7 +711,7 @@ def test_mayor_warning_and_offer_lines():
 
 def test_briefings_stay_bounded_at_the_limits():
     from civitas.fleet.memory import LIMITS
-    from civitas.fleet.tools import MAX_ENTRIES, REPORT_CHARS
+    from civitas.fleet.tools import MAX_ENTRIES, REPORT_MAX_CHARS
     env = _env()
     w = env.world
     item = lambda tag: (tag + " ") * (LIMITS["item_chars"] // (len(tag) + 1))
@@ -724,7 +724,7 @@ def test_briefings_stay_bounded_at_the_limits():
         ToolBox(env, role).call("update_memory", {"commitments": full("MEM-C"), "open_tasks": full("MEM-T"),
                                                   "lessons": full("MEM-L")})
         if role != "mayor":
-            ToolBox(env, role).call("end_turn", {"report": "rep " * REPORT_CHARS})
+            ToolBox(env, role).call("end_turn", {"report": "rep " * REPORT_MAX_CHARS})
         for i in range(10):
             FleetState.of(env).record(0, role, "action", action={"type": "build_x", "x": i, "y": i}, ok=False,
                                       message="m" * 300, cost=0)
@@ -752,7 +752,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from civitas.agents.llm_client import LLMError
-from civitas.config import build_agents, load_config, scoring_config, game_config
+from pathlib import Path
+
+from civitas.config import apply_cli_overrides, build_agents, game_config, load_config, scoring_config
 from civitas.fleet.agent import ToolAgent
 from civitas.fleet.config import FleetAgentConfig, fleet_agent_config, fleet_version
 
@@ -1445,3 +1447,126 @@ def test_limit_hint_threshold():
     rows.append(turn_row(_rec("police", 10, [("x", True, "ok", 0)], finish="turn_tokens")))   # 3 of 11
     rep, _ = fleet_report(env, _summary(env), rows)
     assert len(_hints(rep, "limit")) == 1
+
+
+# ------------------------------------------------------------------ review fixes: launcher, leaderboard, export
+def test_history_accepts_kind_all_and_plan_budgets_are_not_quarterly():
+    env = _env()
+    box = ToolBox(env, "mayor")
+    FleetState.of(env).record(0, "police", "report", text="hello")
+    everything = box.call("history", {})
+    res = box.call("history", {"kind": "all"})
+    assert res["ok"] and res["entries"] == everything["entries"] and res["entries"]
+    assert not box.call("history", {"kind": "nonsense"})["ok"]
+    desc = {t["function"]["name"]: t["function"]["description"] for t in box.schemas()}
+    assert "quarter" not in desc["update_plan"]
+
+
+def test_tool_agent_response_is_the_report_or_the_last_reply():
+    a, env = _agent(reply=lambda m: [_call("end_turn", {"report": "all quiet"})])
+    d = a.act(env.observe("police"))
+    assert d.meta["messages"][-1]["role"] == "tool" and d.meta["response"] == "all quiet"
+    a, env = _agent(content="nothing to add")                   # never calls a tool, never ends
+    assert a.act(env.observe("police")).meta["response"] == "nothing to add"
+    a, env = _agent(content="")
+    assert a.act(env.observe("police")).meta["response"] == ""
+
+
+def test_tool_agent_turns_a_briefing_crash_into_a_no_op(monkeypatch):
+    from civitas.fleet import agent as agent_mod
+
+    def boom(*a, **k):
+        raise KeyError("population")
+    monkeypatch.setattr(agent_mod, "briefing", boom)
+    a, env = _agent(reply=lambda m: [_call("end_turn", {"report": "x"})])
+    d = a.act(env.observe("police"))
+    assert a.client.calls == [] and d.executed == [] and d.messages == []
+    assert d.parse_error == "briefing_error: KeyError: 'population'"
+    assert d.meta["finish_reason"] == "briefing_error" and d.meta["steps"] == 0 and d.meta["tool_trace"] == []
+    assert env.apply("police", d) == []
+    rec = {"role": "police", "month": 0, "agent": "fleet:fake", "results": [], "parse_error": d.parse_error,
+           **{k: d.meta[k] for k in ("usage", "steps", "finish_reason", "length_stops", "ended", "tool_trace")}}
+    renv = _report_env()
+    rep, md = fleet_report(renv, _summary(renv), [turn_row(rec)])
+    assert rep["roles"]["police"]["api_errors"] == 1 and "API / briefing errors" in md
+
+
+def test_tool_message_and_report_limits_keep_their_values():
+    from civitas.fleet import agent as agent_mod, briefing as briefing_mod, fmt, report as report_mod, tools
+    assert fmt.TOOL_MESSAGE_CHARS == 4000 and tools.RESULT_CHARS == 3800 and tools.REPORT_MAX_CHARS == 1000
+    assert fmt.REPORT_PREVIEW_CHARS == 200
+    for mod in (agent_mod, briefing_mod, report_mod, tools):
+        assert not hasattr(mod, "REPORT_CHARS")
+    assert not hasattr(agent_mod, "RESULT_CHARS")
+
+
+def test_launcher_accepts_fleet_specs_and_lists_the_fleet_config(tmp_path):
+    from civitas.server import AGENT_SPEC, Launcher
+    for ok in ("fleet", "fleet:arcee/trinity-large-thinking", "fleet:big", "llm:arcee/x", "scripted"):
+        assert AGENT_SPEC.match(ok), ok
+    for bad in ("fleet:", "fleet:x; rm -rf /", "fleetx", "remote"):
+        assert not AGENT_SPEC.match(bad), bad
+    cfgs = {c["file"]: c for c in Launcher(tmp_path, Path("configs")).configs()}
+    fleet = cfgs["fleet_smoke.toml"]
+    assert all(a["kind"] == "fleet" and a["model"] == "trinity-large-thinking" and a["fleet"]["max_steps"] == 20
+               for a in fleet["agents"].values()) and not fleet["region"]
+    base = cfgs["baseline.toml"]["agents"]["police"]
+    assert base["kind"] == "scripted" and base["fleet"]["model"] == FleetAgentConfig().model
+    assert cfgs["region.toml"]["region"]
+    # what the launcher sends for a changed fleet model, as the CLI parses it: playbooks stay
+    cfg = apply_cli_overrides(load_config("configs/fleet_smoke.toml"), ["police=fleet:ollama/small"])
+    fc = fleet_agent_config(cfg, "police")
+    assert (fc.provider, fc.model) == ("ollama", "small") and fc.playbook.strip()
+
+
+def _summary_file(d, sig, city, fv=None):
+    d.mkdir()
+    s = {"name": "x", "signature": sig, "agents": {"mayor": "m"}, "final_scores": {"city": city, "mayor": city},
+         "avg_city_score": city, "agent_stats": {"mayor": {"invalid_rate": 0.0}},
+         "final_metrics": {"population": 100}, "bankrupt": False, **({"fleet_version": fv} if fv else {})}
+    (d / "summary.json").write_text(json.dumps(s))
+
+
+def test_leaderboard_groups_fleets_by_version(tmp_path, capsys):
+    from civitas.bench.runner import leaderboard, print_table
+    sig = "mayor=fleet:trinity-large-thinking planning=fleet:trinity-large-thinking utilities=fleet:x [supervised]"
+    _summary_file(tmp_path / "a", sig, 50, "aaaaaaaaaaaa")
+    _summary_file(tmp_path / "b", sig, 52, "aaaaaaaaaaaa")
+    _summary_file(tmp_path / "c", sig, 40, "bbbbbbbbbbbb")
+    _summary_file(tmp_path / "d", "mayor=scripted", 70)
+    _summary_file(tmp_path / "e", "mayor=scripted", 72)
+    rows = leaderboard(tmp_path)
+    assert [(r["n"], r["fleet_version"]) for r in rows] == [(2, None), (2, "aaaaaaaaaaaa"), (1, "bbbbbbbbbbbb")]
+    print_table(rows)
+    out = capsys.readouterr().out.splitlines()
+    assert "fleet" in out[0] and sum("[supervised]" in ln for ln in out) == 2
+    assert any("aaaaaaaaaaaa" in ln for ln in out) and len({len(ln) for ln in out[2:]}) == 1
+    print_table([r for r in rows if r["fleet_version"] is None])
+    assert "fleet" not in capsys.readouterr().out.splitlines()[0]
+
+
+def test_fleet_runs_record_fleet_version_in_the_summary(tmp_path):
+    from civitas.bench import runner
+    with _fake_llm() as srv:
+        cfg = _fleet_cfg(srv.server_port, months=1)
+        s = runner.run_episode(cfg, 0, tmp_path, verbose=False)
+    assert s["fleet_version"] == fleet_version(cfg)
+    assert json.loads((tmp_path / s["run_id"] / "summary.json").read_text())["fleet_version"] == s["fleet_version"]
+
+
+def test_export_sft_skips_fleet_turns(tmp_path):
+    import subprocess
+    import sys
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / "meta.json").write_text(json.dumps({"months": 12}))
+    llm = {"run_id": "r1", "month": 0, "role": "police", "agent": "llm:x", "reward": 1.0, "results": [],
+           "thinking": "t", "actions": [], "messages": [],
+           "prompt": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
+    fleet = {**llm, "agent": "fleet:x", "prompt": [{"role": "system", "content": "s"}, {"role": "user", "content": "b"},
+                                                    {"role": "assistant", "content": ""}, {"role": "tool", "content": "{}"}]}
+    (run / "trajectories.jsonl").write_text("\n".join(json.dumps(r) for r in (llm, fleet, fleet)) + "\n")
+    out = tmp_path / "sft.jsonl"
+    res = subprocess.run([sys.executable, "examples/export_sft.py", str(tmp_path / "runs"), "--out", str(out)],
+                         capture_output=True, text=True, check=True)
+    assert len(out.read_text().splitlines()) == 1 and "2 fleet turns skipped" in res.stdout

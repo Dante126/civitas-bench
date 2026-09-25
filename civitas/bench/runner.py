@@ -82,11 +82,12 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     log = RunLogger(Path(runs_dir) / run_id)
     sig = agent_signature(cfg, env.roles)
     prompts = {r: a.system for r, a in agents.items() if a.kind == "fleet"}      # logged turns refer to these
+    fv = fleet_version(cfg) if "fleet" in cfg or fleet_agents(cfg) else None
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
               "config": cfg, "started": time.time(), **env.meta(),
-              **({"fleet_version": fleet_version(cfg)} if "fleet" in cfg or fleet_agents(cfg) else {}),
+              **({"fleet_version": fv} if fv else {}),
               **({"fleet_prompts": prompts} if prompts else {})})
     if hub is not None:
         hub.run_id = run_id
@@ -182,6 +183,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                           if k in final},
         "agent_stats": stats,
         "wall_time_s": round(time.time() - t0, 2),
+        **({"fleet_version": fv} if fv else {}),
     }
     if prompts:
         try:
@@ -231,7 +233,8 @@ def aggregate(summaries: list[dict]) -> dict:
     s0 = summaries[0]
     roles = list(s0["agents"])
     return {
-        "name": s0["name"], "signature": s0["signature"], "n": len(summaries),
+        "name": s0["name"], "signature": s0["signature"], "fleet_version": s0.get("fleet_version"),
+        "n": len(summaries),
         "city": _ms(s["final_scores"]["city"] for s in summaries),
         "avg_city": _ms(s["avg_city_score"] for s in summaries),
         "roles": {r: _ms(s["final_scores"][r] for s in summaries) for r in roles},
@@ -242,16 +245,22 @@ def aggregate(summaries: list[dict]) -> dict:
 
 
 def leaderboard(runs_dir="runs") -> list[dict]:
-    groups: dict[str, list] = {}
+    """Finished runs grouped by agent line-up; fleet runs also by `fleet_version` (coaching and limits)."""
+    groups: dict[tuple, list] = {}
     for p in Path(runs_dir).glob("*/summary.json"):
         try:
             s = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
-        groups.setdefault(s["signature"], []).append(s)
+        groups.setdefault((s["signature"], s.get("fleet_version")), []).append(s)
     rows = [aggregate(v) for v in groups.values()]
     rows.sort(key=lambda r: -r["city"]["mean"])
     return rows
+
+
+def _clip(text: str, n: int, tail: int = 16) -> str:
+    """Cut the middle of a long line-up so its end (a fleet's `[mode]`) stays visible."""
+    return text if len(text) <= n else text[:n - tail - 3] + "..." + text[-tail:]
 
 
 def print_table(rows: list[dict]) -> None:
@@ -259,11 +268,15 @@ def print_table(rows: list[dict]) -> None:
         print("no runs found")
         return
     roles = list(rows[0]["roles"])
-    hdr = f"{'agents':<58} {'n':>3} {'city':>12} {'pop':>8} " + " ".join(f"{r:>12}" for r in roles) + "  bankrupt"
+    fleet = any(r.get("fleet_version") for r in rows)
+    fcol = lambda v: f"{v or '-':<13}" if fleet else ""
+    hdr = (f"{'agents':<58} {fcol('fleet')}{'n':>3} {'city':>12} {'pop':>8} " + " ".join(f"{r:>12}" for r in roles)
+           + "  bankrupt")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print(f"{r['signature'][:58]:<58} {r['n']:>3} {r['city']['mean']:>6.1f}±{r['city']['std']:<5.1f} "
+        print(f"{_clip(r['signature'], 58):<58} {fcol(r.get('fleet_version'))}{r['n']:>3} "
+              f"{r['city']['mean']:>6.1f}±{r['city']['std']:<5.1f} "
               f"{r['population']['mean']:>8.0f} " +
               " ".join(f"{r['roles'][k]['mean']:>6.1f}±{r['roles'][k]['std']:<5.1f}" for k in roles) +
               f"  {r['bankruptcies']}")

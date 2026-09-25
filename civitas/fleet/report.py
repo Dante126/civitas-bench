@@ -12,17 +12,17 @@ import json
 import re
 from pathlib import Path
 
-from .fmt import cut, money
+from .fmt import REPORT_PREVIEW_CHARS, cut, money
 from .memory import DEPARTMENTS, FleetState
 from .tools import ALL_ACTIONS
 
 LIMIT_REASONS = ("max_steps", "turn_tokens")
+ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
 REPEATED_FAILURES = 3
 FUNDS_MULTIPLE, FUNDS_MONTHS, UNUSED_FLOOR = 2.0, 3, 1000.0
 IDLE_TURNS, IDLE_MONTHS = 2, 6
 LIMIT_SHARE = 0.2
 MSG_CHARS = 160
-REPORT_CHARS = 200
 
 
 def _tool_error(call: dict) -> str | None:
@@ -102,10 +102,10 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
             "completion_tokens": sum(r["completion_tokens"] for r in rows),
             "limit_turns": sum(r["finish_reason"] in LIMIT_REASONS for r in rows),
             "length_stops": sum(r["length_stops"] for r in rows),
-            "api_errors": sum(r["finish_reason"] == "api_error" for r in rows),
+            "api_errors": sum(r["finish_reason"] in ERROR_REASONS for r in rows),
             "top_failures": groups[:max(3, sum(g["count"] >= REPEATED_FAILURES for g in groups))],
             "lessons": list((fleet.memory.get(role) or {}).get("lessons", [])),
-            "last_report": cut(fleet.reports[role], REPORT_CHARS) if fleet.reports.get(role) else None}
+            "last_report": cut(fleet.reports[role], REPORT_PREVIEW_CHARS) if fleet.reports.get(role) else None}
 
 
 def _idle(turns: list[tuple[int, bool]], months: int) -> tuple[int, int, int] | None:
@@ -226,7 +226,7 @@ def markdown(rep: dict) -> str:
         L += ["", f"Notes: {_cell(plan['notes'])}"]
     L += ["", "## Roles", "",
           "| role | turns | tool calls | actions | failed | tool errors | spent | tokens (prompt / completion) "
-          "| limit turns | length stops | API errors |", "|---|" + "---:|" * 10]
+          "| limit turns | length stops | API / briefing errors |", "|---|" + "---:|" * 10]
     for r, st in rep["roles"].items():
         L.append(f"| {r} | {st['turns']} | {st['tool_calls']} | {st['actions']} | {st['failed']} | {st['tool_errors']} "
                  f"| {money(st['spent'])} | {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
