@@ -471,7 +471,8 @@ def test_role_specific_history_description_and_fresh_lookups():
 # ---------------------------------------------------------------- briefing
 import copy
 
-from civitas.fleet.briefing import KEY_METRICS, briefing, system_prompt
+from civitas.agents.prompts import GAME_RULES
+from civitas.fleet.briefing import KEY_METRICS, RULE_EDITS, UNLOCK_ROLES, briefing, system_prompt
 from civitas.fleet.config import FleetAgentConfig
 
 DEPTS = [r for r in TURN_ORDER if r != "mayor"]
@@ -507,6 +508,27 @@ def test_system_prompt_sections_in_order():
     assert "Coach's playbook" not in bare and "20 tool calls" in bare
     only_fleet = system_prompt("fire", FleetAgentConfig(fleet_playbook="FLEET-PB"), 36)
     assert "FLEET-PB" in only_fleet and "Fire" not in only_fleet.split("Coach's playbook")[1]
+
+
+def test_system_prompt_fits_the_fleet():
+    cfg = FleetAgentConfig()
+    for old, new in RULE_EDITS:
+        assert old in GAME_RULES, old                                      # a GAME_RULES edit must not no-op this
+    mayor, fire = system_prompt("mayor", cfg, 36), system_prompt("fire", cfg, 36)
+    for text in (mayor, fire):
+        assert "tile H" not in text and "get_messages" in text.split("# Game rules")[1]
+        assert "refused" in text and "autonomous = " in text and "supervised = " in text
+        assert "Each game month is one turn" in text
+    assert "find_sites" not in mayor and "x = column" not in mayor
+    assert "find_sites" in fire and "x = column" in fire
+    slow = system_prompt("fire", cfg, 36, act_every=3)
+    assert "every 3 months" in slow and "Each game month is one turn" not in slow
+
+
+def test_every_unlock_has_an_owner():
+    assert set(UNLOCK_ROLES) == set(C.UNLOCK_POP)
+    for key, roles in UNLOCK_ROLES.items():
+        assert roles and set(roles) <= set(ROLES), key
 
 
 def test_key_metrics_come_from_the_observation():
@@ -565,7 +587,7 @@ def test_mayor_briefing_lists_department_reports():
     text = briefing(env, "mayor")
     assert "HEALTH-REPORT-2" in text and "HEALTH-REPORT:" not in text     # latest per department
     fire, = [ln for ln in text.splitlines() if "FIRE-REPORT" in ln]
-    assert len(fire) < 240
+    assert len(fire) < 270
     assert "no reports yet" not in text.lower()
 
 
@@ -590,3 +612,63 @@ def test_department_briefing_digests_its_own_last_turn():
     assert fs.last_turn_month["police"] == 0                          # mark=False leaves the turn unmarked
     briefing(env, "police")
     assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == 0
+
+
+def test_briefing_dates_and_milestones():
+    env = _env()
+    police = briefing(env, "police", mark=False)
+    assert "(year 1, January, winter)" in police
+    line, = [ln for ln in police.splitlines() if ln.startswith("Next milestone")]
+    assert "jail" in line and "high density" not in line and "more" in line and "unlocks" in line
+    line, = [ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("Next milestone")]
+    assert "districts" in line and "$5,000" in line and "options" in line
+
+
+def test_mayor_warning_and_offer_lines():
+    env = _env()
+    w = env.world
+    assert "WARNING" not in briefing(env, "mayor", mark=False)
+    w.months_negative, w.low_approval_months = 3, 2
+    w.offers = [{"id": 7, "jobs": 250, "bonus": 8000, "expires": 5}]
+    text = briefing(env, "mayor", mark=False)
+    warn, = [ln for ln in text.splitlines() if "WARNING" in ln]
+    assert f"{C.BANKRUPTCY_MONTHS} = bankruptcy" in warn and f"{C.RECALL_MONTHS} = recall" in warn
+    assert f"{100 * C.RECALL_APPROVAL:.0f}%" in warn and "3 month" in warn
+    offer, = [ln for ln in text.splitlines() if "OPEN OFFER #7" in ln]
+    assert "250 jobs" in offer and "$8,000" in offer and "accept_offer" in offer and "month 5" in offer
+
+
+def test_briefings_stay_bounded_at_the_limits():
+    from civitas.fleet.memory import LIMITS
+    from civitas.fleet.tools import MAX_ENTRIES, REPORT_CHARS
+    env = _env()
+    w = env.world
+    item = lambda tag: (tag + " ") * (LIMITS["item_chars"] // (len(tag) + 1))
+    full = lambda tag: [item(tag)] * LIMITS["list_items"]
+    ToolBox(env, "mayor").call("update_plan", {"goals": [item("goal")] * LIMITS["goals"],
+                                               "budgets": {d: 12345 for d in DEPTS},
+                                               "priorities": {d: item("prio") for d in DEPTS},
+                                               "notes": "note " * LIMITS["notes_chars"]})
+    for role in TURN_ORDER:
+        ToolBox(env, role).call("update_memory", {"commitments": full("MEM-C"), "open_tasks": full("MEM-T"),
+                                                  "lessons": full("MEM-L")})
+        if role != "mayor":
+            ToolBox(env, role).call("end_turn", {"report": "rep " * REPORT_CHARS})
+        for i in range(10):
+            FleetState.of(env).record(0, role, "action", action={"type": "build_x", "x": i, "y": i}, ok=False,
+                                      message="m" * 300, cost=0)
+    for i in range(MAX_ENTRIES + 5):
+        env.council.post(0, "press", f"msg {i} " + "y" * 300, "all")
+    for i in range(12):
+        w.event(f"event {i} " + "e" * 300)
+    env.end_month()
+    for role in TURN_ORDER:
+        text = briefing(env, role, mark=False)
+        memory = text[text.index("## Your memory"):].split("\n\n")[0]
+        assert len(text) - len(memory) < 6000, (role, len(text) - len(memory))   # memory is shown in full by design
+        assert len(text) < 12000, (role, len(text))
+        assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
+        assert f"{MAX_ENTRIES + 5} new council messages (get_messages shows the latest {MAX_ENTRIES})" in text
+    mayor = briefing(env, "mayor", mark=False)
+    assert mayor.count("(full: history kind=report)") == len(DEPTS)
+
