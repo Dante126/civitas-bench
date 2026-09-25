@@ -545,10 +545,13 @@ slim result) along with the messages, reasoning, token usage and finish reasons.
 **First smoke runs** (2026-09-25, `fleet_smoke.toml`, seed 0) took 9–11 minutes for 32
 turns. Three runs (v2–v4) used revised playbooks on intermediate code, as the fixes from
 each run landed. Turns averaged 12–16 tool calls and 48–66k prompt tokens, and 21–30% of
-actions failed, mostly departments building without funds or on taken tiles. The fleet reached 1.0k–1.7k residents and a city score of 40.6–43.5. The
-scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and 43.8,
-or 916 and 45.4 acting monthly. Twelve months is too short to compare with the 120-month
-benchmark.
+actions failed, mostly departments building without funds or on taken tiles. The fleet
+reached 1.0k–1.7k residents and a city score of 40.6–43.5. A final run (v5) on the
+committed code reached 2,244 residents and 43.1: 13.8 tool calls and 53k prompt / 4.7k
+completion tokens per turn, 24% of actions failed, 7 of 32 turns ended on the step limit.
+The scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and
+43.8, or 916 and 45.4 acting monthly. Twelve months is too short to compare with the
+120-month benchmark, and single runs vary a lot.
 
 **Not built yet:**
 
