@@ -39,6 +39,7 @@ def _read_events(resp, idle: float) -> dict:
     (and the attempt is retried) rather than a truncated answer.
     """
     content, reasoning, usage, finish, done = [], [], {}, None, False
+    calls: dict[int, dict] = {}
     last = time.time()
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
@@ -57,11 +58,21 @@ def _read_events(resp, idle: float) -> dict:
             delta = ch.get("delta") or {}
             content.append(delta.get("content") or "")
             reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+            for tc in delta.get("tool_calls") or []:       # fragments keyed by index, as OpenAI streams them
+                slot = calls.setdefault(tc.get("index", 0),
+                                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                slot["id"] = tc.get("id") or slot["id"]
+                slot["type"] = tc.get("type") or slot["type"]
+                fn = tc.get("function") or {}
+                slot["function"]["name"] += fn.get("name") or ""
+                slot["function"]["arguments"] += fn.get("arguments") or ""
             finish = ch.get("finish_reason") or finish
     if finish is None and not done:
         raise ConnectionError("stream ended before the answer was finished")
-    return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning)},
-                         "finish_reason": finish}], "usage": usage}
+    message = {"content": "".join(content), "reasoning_content": "".join(reasoning)}
+    if calls:
+        message["tool_calls"] = [calls[i] for i in sorted(calls)]
+    return {"choices": [{"message": message, "finish_reason": finish}], "usage": usage}
 
 
 def _post(req: urllib.request.Request, idle: float, deadline: float) -> dict:
@@ -100,7 +111,7 @@ class ChatClient:
 
     def chat(self, model: str, messages: list[dict], *, temperature: float = 0.4,
              max_tokens: int = 1500, extra: dict | None = None) -> dict:
-        """Returns {"content", "reasoning", "usage", "latency_s", "finish_reason"}.
+        """Returns {"content", "reasoning", "tool_calls", "usage", "latency_s", "finish_reason"}.
 
         Thinking models (e.g. trinity-large-thinking) may return their chain of
         thought in `reasoning_content` or inline as <think>...</think>.
@@ -127,7 +138,8 @@ class ChatClient:
                 msg = choice.get("message") or {}
                 content = msg.get("content") or ""
                 reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
-                return {"content": content, "reasoning": reasoning, "usage": payload.get("usage") or {},
+                return {"content": content, "reasoning": reasoning, "tool_calls": msg.get("tool_calls") or [],
+                        "usage": payload.get("usage") or {},
                         "latency_s": round(time.time() - t0, 3),
                         "finish_reason": choice.get("finish_reason")}
             except urllib.error.HTTPError as e:
