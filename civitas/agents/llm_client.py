@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import threading
 import time
 import urllib.error
@@ -137,5 +138,8 @@ class ChatClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError,
                     IndexError) as e:
                 last_err = f"{type(e).__name__}: {e}"
+            if attempt < self.p.max_retries:          # visible in the run log: slow runs are otherwise opaque
+                print(f"[llm] {model}: attempt {attempt + 1} failed after {time.time() - t0:.0f} s ({last_err[:160]}); "
+                      "retrying", file=sys.stderr, flush=True)
             time.sleep(min(30.0, (2 ** attempt) + random.random()))
         raise LLMError(f"giving up after {self.p.max_retries + 1} attempts: {last_err}")
