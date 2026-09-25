@@ -64,13 +64,26 @@ def cmd_leaderboard(args):
 
 
 def cmd_prompt(args):
-    """Print what an LLM agent would see on month 0 (system prompt + observation)."""
+    """Print what an LLM agent would see on month 0 (system prompt + observation; for a fleet agent the
+    system prompt, the first briefing and the tool names)."""
     from .agents.prompts import system_prompt
-    from .config import game_config, scoring_config
+    from .config import agent_spec, build_agents, game_config, scoring_config
     from .core.env import CivitasEnv
     cfg = _load(args)
     game = game_config(cfg, args.seed)
     env = CivitasEnv(game, scoring_config(cfg, game))
+    if agent_spec(cfg, args.role).get("kind") == "fleet":
+        from .fleet.briefing import briefing
+        from .fleet.tools import ToolBox
+        agent = build_agents(cfg, [args.role], game, env.scoring)[args.role]
+        agent.bind(env)
+        print("=" * 30, "SYSTEM", "=" * 30)
+        print(agent.system)
+        print("=" * 30, "USER (briefing)", "=" * 30)
+        print(briefing(env, args.role, mode=agent.cfg.mode, mark=False))
+        print("=" * 30, "TOOLS", "=" * 30)
+        print(", ".join(ToolBox(env, args.role).tools))
+        return
     print("=" * 30, "SYSTEM", "=" * 30)
     print(system_prompt(args.role, months=game.months, target_pop=env.scoring.target_population,
                         max_actions=game.max_actions_per_turn))

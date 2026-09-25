@@ -97,6 +97,7 @@ civitas check-llm                            # one test call to trinity-large-th
 civitas run -c configs/smoke.toml --serve    # 2 years, 3 LLM roles acting every 3 months (~24 calls)
 civitas run -c configs/arcee.toml --serve    # 10 years, mayor/planning/utilities on the LLM, the rest scripted
 civitas run -c configs/arcee_full.toml       # 10 years, all 8 roles on the LLM (~960 calls)
+civitas run -c configs/fleet_smoke.toml      # 1 year, all 8 roles as a tool-calling fleet (see Agent fleets)
 ```
 
 The Arcee API is OpenAI-compatible (`https://api.arcee.ai/api/v1`). Notes on the
@@ -202,11 +203,12 @@ detailed section on its own system (its buildings with load vs capacity, problem
 with coordinates, suggested sites) and, except the mayor, the ASCII map. Other systems
 only appear as summaries, so agents have to talk to each other.
 
-**Four ways to connect an agent.** All use the same action format:
+**Five ways to connect an agent.** All use the same actions:
 
 | kind | what it is |
 |---|---|
 | `llm` | Any OpenAI-compatible model (Arcee by default). It gets a system prompt with the rules and action docs, plus the observation text, and replies with JSON. |
+| `fleet` | A tool-calling model: a short briefing, then look-up and action tools in a loop, with a city plan and memory between turns. See [Agent fleets](#agent-fleets). |
 | `scripted` | Rule-based baselines. They read only the observation, so they are fair references and a source of demonstration data. |
 | `remote` | Any external process, in any language, over HTTP: `GET /api/live/turn?role=planning`, then `POST /api/live/act`. See `examples/remote_agent.py` and `configs/remote.toml`. |
 | RL | `env.reset()` / `env.step({role: Decision})` (PettingZoo-style), with `env.tensor_observation()` returning a 14×H×W grid and a feature vector. See `examples/rl_loop.py`. |
@@ -416,12 +418,150 @@ in every city, `[agents."south.planning"]` sets one city.
 
 Each city is scored on its own; the region score is their average.
 
+### Agent fleets
+
+`kind = "fleet"` plays a role with a tool-calling agent (`civitas/fleet/`) instead of the
+one-shot JSON `llm` agent. A fleet is built to measure how well a team of agents manages
+tasks and money, and to let people coach it.
+
+- **One manager, seven departments.** The mayor manages. It writes the city plan (goals, a
+  budget target and a one-line priority per department, notes) and moves the money. The
+  seven departments carry the plan out, and each one sees only its own slice. Turn order
+  doesn't change, so the mayor acts first each month.
+- **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
+  The mayor's briefing covers the city, the finances, each department's funds, target and
+  latest report, and the plan. A department's briefing covers its plan slice, its budget,
+  its key metrics, a "since your last turn" digest (failed actions, events, new messages)
+  and its memory. Both end with the next milestone. Actions run immediately and return
+  `ok`, a message, the cost and the money left, so a failed action can be fixed in the
+  same turn. Bad arguments, unknown tools and refused actions come back as
+  `{"ok": false, "error": ...}` for the model to correct.
+
+| tools | |
+|---|---|
+| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`; not for the mayor), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
+| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only), `end_turn(report)` |
+| actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
+
+**Three memory layers.** Nothing else carries over between turns.
+
+1. **City plan**, owned by the mayor. In `update_plan`, goals (up to 5) and notes replace the old ones, while budgets and priorities merge per department. Every version is kept.
+2. **Department memory**, owned by each agent: `commitments`, `open_tasks` and `lessons`, up to 8 items of 200 characters each. It's shown in full in the agent's briefing.
+3. **History log**, written by the game: every action with its result and cost, end-of-turn reports, city events and a monthly metrics snapshot. Agents query it with `history(kind = action | failure | event | report | metrics, months up to 12)`. A department sees its own entries and the city's; the mayor sees everything.
+
+The memory lives on the env (`env.fleet`) for the length of the run. The final plan and
+lessons go into the fleet report, and every edit is in the tool traces.
+
+**Limits per turn** are set in `[fleet]` or per role:
+
+- `max_steps` tool calls (default 20)
+- `max_tokens` per model call (16,000)
+- `turn_tokens` completion tokens per turn (80,000)
+- the game's `max_actions_per_turn` successful actions
+
+A model that answers without a tool call gets one nudge, and a second one ends the turn.
+Tool calls a model leaves as text (`<tool_call>` blocks in its reasoning, which
+trinity-large-thinking sometimes does) still run, and the trajectory counts them in
+`recovered_calls`.
+On a limit or an API error the turn ends, and completed actions stay. Every turn records
+why it ended: `end_turn`, `max_steps`, `turn_tokens`, `no_tool_calls` or `api_error`.
+
+**Coaching with playbooks.** The system prompt starts with a fixed part: how to play, the
+role's mission and the game rules. Then comes the coach's playbook: the fleet playbook
+(`[fleet].playbook`, shared by every role) and the role's own (`[agents.<role>].playbook`).
+Coaches can steer strategy this way but can't change the rules or the tools.
+`civitas prompt -c configs/fleet_trinity.toml --role planning` prints a fleet agent's
+system prompt, its first briefing and its tool names.
+
+**Modes.** `mode = "autonomous"` fixes the instructions at month 0 and the fleet plays to the
+end on its own; this is the standard eval track. `"supervised"` means the coach may revise
+the playbooks between sessions. For now both modes run the same way. The mode is recorded
+in the run (the signature ends in `[autonomous]` or `[supervised]`) and shown in briefings,
+but there's no pause / resume yet. All fleet agents in a run share one mode.
+
+**Config.**
+
+```toml
+[game]
+act_every = 3                  # the city runs monthly; the fleet plans by the quarter
+
+[fleet]                        # every fleet agent; any key can be overridden per role
+mode = "autonomous"
+provider = "arcee"
+model = "trinity-large-thinking"
+max_steps = 20
+max_tokens = 16000
+turn_tokens = 80000
+temperature = 0.4
+extra_body = {}                # extra request fields (a role's extra_body replaces this one)
+playbook = """
+- Keep a treasury reserve; utilities first, then services as the city grows ...
+"""
+
+[agents.mayor]
+kind = "fleet"
+playbook = """
+- First turn: write the plan, then fund it ...
+"""
+
+[agents.health]
+kind = "fleet"
+model = "trinity-mini"         # a cheaper model for one department
+max_steps = 12
+```
+
+Fleet and non-fleet roles mix freely, for example a fleet mayor over scripted departments.
+`configs/fleet_trinity.toml` is the full fleet: all eight roles on trinity-large-thinking for
+120 months, acting every 3 months (320 turns), with a default fleet playbook and one
+playbook per department. `configs/fleet_smoke.toml` is the same fleet for 12 months.
+`meta.json` records `fleet_version` and every fleet agent's system prompt once
+(`fleet_prompts`). `fleet_version` is a hash of `[fleet]` and the fleet agents' settings, so
+runs with the same coaching can be compared. The signature reads
+`role=fleet:<model> ... [mode]`.
+
+**Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
+next to its summary. They contain:
+
+- the scoreboard
+- the final plan and the months it changed
+- per-role stats: turns, tool calls, actions, failures, tool errors, spending, tokens, turns ended on a limit, length stops and API errors
+- the top failures, last reports and the lessons in memory
+- coaching hints
+
+A hint fires on any of these:
+
+- 3 or more similar failures
+- a department holding more than 2× its plan budget for 3+ months
+- a department with no successful action for 2+ turns spanning 6+ months
+- a negative treasury
+- a role ending more than 20% of its turns on a limit
+
+`summary.json` gets a `fleet` entry with the report name and the number of hints. In
+`trajectories.jsonl`, each fleet turn carries its full `tool_trace` (tool, arguments and a
+slim result) along with the messages, reasoning, token usage and finish reasons.
+
+**First smoke runs** (2026-09-25, `fleet_smoke.toml`, seed 0, three runs with the current
+playbooks) took 9–11 minutes for 32 turns. Turns averaged 12–16 tool calls and 43–66k prompt
+tokens, and 21–30% of actions failed, mostly departments building without funds or on
+taken tiles. The fleet reached 1.0k–1.7k residents and a city score of 40.6–43.5. The
+scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and 43.8,
+or 916 and 45.4 acting monthly. Twelve months is too short to compare with the 120-month
+benchmark.
+
+**Not built yet:**
+
+- a scripted fleet that plays through the tools (the scripted baselines still read the observation)
+- fleets in region mode (a fleet agent refuses a region game)
+- supervised scheduling (pause, edit the playbook, resume)
+- a viewer panel for tool traces (the Agents tab shows a fleet turn's last user and assistant messages; the full trace is in `trajectories.jsonl`)
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
 - `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council). The viewer replays these.
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
+- `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets))
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
 turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.
@@ -440,12 +580,13 @@ civitas/
   core/       env.py (the hub) · region.py (2-6 linked cities) · observation.py · actions.py · council.py · roles.py · decision.py
   agents/     llm.py · llm_client.py · prompts.py · scripted.py · remote.py · base.py (noop, random)
   bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard)
+  fleet/      agent.py (ToolAgent tool loop) · tools.py · briefing.py · memory.py (plan, memory, history) · config.py · report.py · fmt.py
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
               · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
   cli.py      civitas run | bench | serve | leaderboard | prompt | check-llm
-configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio
+configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
 docs/         MECHANICS.md (the design roadmap and what is implemented)
 examples/     remote_agent.py · rl_loop.py · export_sft.py
 tests/
@@ -468,7 +609,7 @@ on month 0. It's the fastest way to iterate on prompts.
 ## Ideas for next steps
 
 - Per-agent partial maps (only the role's own layer in detail) to shrink prompts further.
-- Native tool-calling agents and an MCP server wrapping the live API.
+- An MCP server wrapping the live API (the fleet tools are a ready-made tool set).
 - Council negotiation as structured objects (budget requests the mayor approves or denies).
 - Region-level projects that need several cities to fund them (a shared university, a regional airport).
 - Training: run GRPO on `trajectories.jsonl`, using per-turn rewards as advantages.

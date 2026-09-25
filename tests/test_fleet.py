@@ -225,7 +225,9 @@ def test_tool_schemas_cover_every_action():
     mayor = {s["function"]["name"]: s["function"] for s in ToolBox(env, "mayor").schemas()}
     assert mayor["set_service_imports"]["parameters"]["properties"]["enabled"]["type"] == "boolean"
     transport = {s["function"]["name"]: s["function"] for s in ToolBox(env, "transport").schemas()}
-    assert transport["create_bus_line"]["parameters"]["properties"]["stops"] == {"type": "array", "items": {}}
+    pairs = {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}   # [[x, y], ...]
+    assert transport["create_bus_line"]["parameters"]["properties"]["stops"] == pairs
+    assert transport["create_metro_line"]["parameters"]["properties"]["stations"] == pairs
 
 
 def test_action_tool_builds_and_records():
@@ -287,7 +289,8 @@ def test_inspect_clips_radius_and_names_tiers():
     w.place_building(C.POLICE, x, y, tier=2)
     w.refresh()
     res = ToolBox(env, "police").call("inspect", {"x": x, "y": y, "radius": 99})
-    assert res["ok"] and res["radius"] == 4
+    assert res["ok"] and res["radius"] == 4 and "clipped to 4" in res["note"]
+    assert "note" not in ToolBox(env, "police").call("inspect", {"x": x, "y": y, "radius": 4})
     tiles = res["tiles"]
     assert all(abs(t["x"] - x) <= 4 and abs(t["y"] - y) <= 4 for t in tiles)
     hq, = [t for t in tiles if (t["x"], t["y"]) == (x, y)]
@@ -329,6 +332,42 @@ def test_find_sites_on_a_fresh_world():
     _check_sites(env)
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "metro_station"})
     assert res["sites"] == [] and "10,000" in res["note"]
+
+
+def test_riverbank_sites_say_a_road_must_reach_the_river():
+    env = _env()
+    w = env.world
+    box = ToolBox(env, "utilities")
+    res = box.call("find_sites", {"purpose": "pump"})
+    assert res["sites"] == [] and "ask planning" in res["note"] and "inspect the map" not in res["note"]
+    ys = np.nonzero((w.struct == C.ROAD).any(axis=1))[0]
+    cols = np.nonzero((w.terrain[ys.min():ys.max() + 1] == C.WATER).any(axis=0))[0]
+    assert f"x {cols.min()}-{cols.max()} in rows {ys.min()}-{ys.max()}" in res["note"]
+    y = int(ys.max())
+    x_end = int(np.nonzero(w.struct[y] == C.ROAD)[0].max())
+    bank = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 1
+    w.dept_funds["planning"] = 1000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": x_end, "y1": y, "x2": bank, "y2": y}).ok
+    res = box.call("find_sites", {"purpose": "pump"})
+    assert res["sites"] and "note" not in res
+
+
+def test_empty_site_lists_point_to_planning_not_a_map_scan():
+    env = _env()
+    w = env.world
+    ys, xs = np.nonzero(w.struct == C.ROAD)
+    for x, y in zip(xs.tolist(), ys.tolist()):          # every roadside tile taken
+        for nx, ny in ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)):
+            if w.in_bounds(nx, ny) and w.struct[ny, nx] == C.NONE and w.terrain[ny, nx] != C.WATER:
+                w.struct[ny, nx] = C.PARK
+    w.refresh()
+    span = f"the roads span x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}"
+    res = ToolBox(env, "education").call("find_sites", {"purpose": "school"})
+    assert res["sites"] == [] and "ask planning" in res["note"] and span in res["note"]
+    res = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})
+    assert res["sites"] == [] and "road_extension" in res["note"] and "ask planning" not in res["note"]
+    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})
+    assert not res["ok"] and "for the departments" in res["error"]
 
 
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
@@ -1027,6 +1066,31 @@ def test_build_agents_and_signature_for_fleets():
         build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))
 
 
+@pytest.mark.parametrize("path, months", [("configs/fleet_trinity.toml", 120), ("configs/fleet_smoke.toml", 12)])
+def test_example_fleet_configs(path, months):
+    cfg = load_config(path)
+    game = game_config(cfg, 0)
+    assert (game.months, game.act_every) == (months, 3)
+    agents = build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))     # no network needed
+    assert all(isinstance(a, ToolAgent) for a in agents.values()) and set(agents) == set(TURN_ORDER)
+    for role, a in agents.items():
+        assert a.cfg.model == "trinity-large-thinking" and a.cfg.mode == "autonomous"
+        assert a.provider.api_key_env == "ARCEE_API_KEY"
+        assert a.cfg.fleet_playbook.strip() and a.cfg.playbook.strip(), role
+        assert "\\" not in a.cfg.fleet_playbook + a.cfg.playbook          # TOML line continuations resolved
+    big = load_config("configs/fleet_trinity.toml")
+    assert cfg["fleet"] == big["fleet"] and cfg["agents"] == big["agents"]          # the same fleet
+    assert fleet_version(cfg) == fleet_version(big)
+
+
+def test_prompt_command_prints_the_fleet_prompt(capsys):
+    from civitas.cli import main
+    main(["prompt", "-c", "configs/fleet_smoke.toml", "--role", "police"])
+    out = capsys.readouterr().out
+    assert "# How to play" in out and "## Police" in out and "# Police" in out and "find_sites" in out
+    assert out.index("USER (briefing)") < out.index("TOOLS") and "build_police_station" in out
+
+
 def test_tool_agent_sanitises_malformed_calls():
     raw = ["", "{bad", {"x": 20, "y": 20}, "[1, 2]"]
     calls = [{"id": f"c{i}", "function": {"name": "inspect" if i else "city_overview", "arguments": a}}
@@ -1043,6 +1107,31 @@ def test_tool_agent_sanitises_malformed_calls():
     assert "unknown tool 'invalid_tool'" in tr[4]["result"]["error"]
     assert len(tr[4]["result"]["error"]) <= 300
     assert d.meta["finish_reason"] == "end_turn"
+
+
+def test_tool_agent_runs_tool_calls_left_in_the_reasoning():
+    xml = ("Let me look.\n<tool_call>\n<function=find_sites>\n<parameter=purpose>\nstation\n</parameter>\n"
+           "<parameter=near_x>\n20\n</parameter>\n<parameter=near_y>\n20\n</parameter>\n</function>\n</tool_call>\n"
+           '<tool_call>{"name": "send_message", "arguments": {"to": "mayor", "text": "hi"}}</tool_call>\n'
+           "<tool_call>not a call</tool_call>")
+    replies = iter([(xml, []), ("done", [_call("end_turn", {"report": "r"})])])
+
+    class Client(FakeClient):
+        def chat(self, model, messages, **kw):
+            self.calls.append({"messages": [dict(m) for m in messages]})
+            reasoning, calls = next(replies)
+            return {"content": "", "reasoning": reasoning, "tool_calls": calls, "finish_reason": "stop",
+                    "usage": {}, "latency_s": 0.0}
+    a, env = _agent()
+    a.client = Client(None)
+    d = a.act(env.observe("police"))
+    tr = d.meta["tool_trace"]
+    assert [c["tool"] for c in tr] == ["find_sites", "send_message", "end_turn"] and all(c["result"]["ok"] for c in tr)
+    assert json.loads(tr[0]["args"]) == {"purpose": "station", "near_x": 20, "near_y": 20}
+    assert d.meta["recovered_calls"] == 2 and d.meta["finish_reason"] == "end_turn"
+    asst = a.client.calls[1]["messages"][2]
+    assert [c["id"] for c in asst["tool_calls"]] == ["call_0_0", "call_0_1"]
+    assert d.messages == [{"to": "mayor", "text": "hi"}]
 
 
 def test_tool_agent_keeps_actions_when_the_client_crashes():

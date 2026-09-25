@@ -59,6 +59,7 @@ SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": 
                 "high_school": ("high_school",), "university": ("university",)}
 SITE_NOTES = {"levee": "no flood is forecast within 3 months; riverbank stretches to protect appear with a flood warning",
               "congested_roads": "no road is congested right now"}
+RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -183,13 +184,24 @@ def _coerce(name: str, v, spec: dict):
     return v
 
 
+def _items_schema(example: list) -> dict:
+    """Item schema from a doc example, e.g. stops [[5, 24], ...] -> arrays of integers (models sent {"x", "y"}
+    objects to an untyped list)."""
+    if not example:
+        return {}
+    first = example[0]
+    if isinstance(first, list):
+        return {"type": "array", "items": _items_schema(first) or {}}
+    return {"type": _JSON_TYPE[type(first)]}
+
+
 def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     example, text = doc
     props = {}
     for k, v in json.loads(example).items():
         if k != "type":
             t = "number" if (name, k) in NUMBER_PARAMS else _JSON_TYPE[type(v)]
-            props[k] = {"type": t, **({"items": {}} if isinstance(v, list) else {})}
+            props[k] = {"type": t, **({"items": _items_schema(v)} if isinstance(v, list) else {})}
     lines = _BUILD_LINES.get(name) or ((C.TIER_BY_NAME[name[6:]][0],) if name[6:] in C.TIER_BY_NAME else ())
     if name.startswith("build_") and any(len(C.TIER_LINES[ln]) > 1 for ln in lines):
         props["tier"] = dict(_TIER_PARAM)
@@ -208,6 +220,23 @@ def _site(s, near) -> dict:
         cy = min(max(ny, s.get("y1", s["y"])), s.get("y2", s["y"])) if "y2" in s else s["y"]
         s["distance"] = abs(cx - nx) + abs(cy - ny)
     return s
+
+
+def _road_span(w) -> str:
+    ys, xs = np.nonzero(w.struct == C.ROAD)
+    if not len(xs):
+        return "no roads yet"
+    return f"the roads span x {int(xs.min())}-{int(xs.max())}, y {int(ys.min())}-{int(ys.max())}"
+
+
+def _river_span(w) -> str:
+    """Where the river runs, within the rows the roads span (the whole map before there are roads)."""
+    road_rows = np.nonzero((w.struct == C.ROAD).any(axis=1))[0]
+    y0, y1 = (int(road_rows.min()), int(road_rows.max())) if len(road_rows) else (0, w.h - 1)
+    cols = np.nonzero((w.terrain[y0:y1 + 1] == C.WATER).any(axis=0))[0]
+    if not len(cols):
+        return "no river on the map"
+    return f"the river runs at x {int(cols.min())}-{int(cols.max())} in rows {y0}-{y1}"
 
 
 def _plant(p: dict) -> dict:
@@ -286,6 +315,9 @@ class ToolBox:
             if tool is None:
                 if name == "update_plan":
                     raise ToolError("update_plan is for the mayor only; send the mayor a message instead")
+                if name == "find_sites" and self.role == "mayor":
+                    raise ToolError("find_sites is for the departments, which place buildings; the mayor funds "
+                                    "them (allocate_budget) and sets their priorities (update_plan)")
                 if name == "noop":
                     raise ToolError("there is no noop tool; to do nothing, call end_turn")
                 if name in ALL_ACTIONS:
@@ -432,8 +464,11 @@ class ToolBox:
                     if fw * fh > 1:
                         b["size"] = f"{fw}x{fh}"
                     buildings.append(b)
-        return {"ok": True, "x": x, "y": y, "radius": r, "window": [x0, y0, x1, y1],
-                "tiles": buildings + zones + ground, "empty_land": empty}
+        out = {"ok": True, "x": x, "y": y, "radius": r, "window": [x0, y0, x1, y1],
+               "tiles": buildings + zones + ground, "empty_land": empty}
+        if r != int(round(radius)):          # models ask for 10 or 20 to see more; say they got less
+            out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); inspect several points to see more"
+        return out
 
     def find_sites(self, purpose: str, near_x: int | None = None, near_y: int | None = None) -> dict:
         if (near_x is None) != (near_y is None):
@@ -452,9 +487,17 @@ class ToolBox:
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             out["note"] = "locked: " + w.unlock_note(min(keys, key=C.UNLOCK_POP.get))
-        elif not sites:
-            out["note"] = SITE_NOTES.get(purpose, "no suggested sites right now (no free land by a connected road "
-                                                  "where this is needed); inspect the map to pick one yourself")
+        elif not sites and purpose in RIVERBANK_PURPOSES:
+            out["note"] = ("no free riverbank tile next to a road: a road has to reach the river first ("
+                           + _river_span(w) + "); ask planning (send_message) for a road to the riverbank, and "
+                           "build what doesn't need the river meanwhile")
+        elif not sites and purpose in SITE_NOTES:
+            out["note"] = SITE_NOTES[purpose]
+        elif not sites:                  # models told to "inspect the map" scanned it blindly for whole turns
+            fix = ("extend a road first (find_sites road_extension)" if self.role == "planning" else
+                   "ask planning (send_message) to extend a road or leave an empty lot by a road")
+            out["note"] = (f"no suggested sites right now: no free land by a road connected to the highway where "
+                           f"this is needed ({_road_span(w)}); {fix}. Inspect only to check a specific spot.")
         return out
 
     def my_facilities(self) -> dict:

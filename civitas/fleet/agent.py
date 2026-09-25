@@ -7,6 +7,7 @@ act on the state left by the roles before them.
 from __future__ import annotations
 
 import json
+import re
 
 from ..agents.base import Agent
 from ..agents.llm_client import ChatClient, ProviderConfig
@@ -34,6 +35,39 @@ def _norm_call(c: dict, step: int, i: int) -> tuple[dict, str]:
         ok = False
     return ({"id": c.get("id") or f"call_{step}_{i}", "type": "function",
              "function": {"name": fn.get("name") or "invalid_tool", "arguments": raw if ok else "{}"}}, raw)
+
+
+_TEXT_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+_XML_FN = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.S)
+_XML_PARAM = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.S)
+
+
+def _text_calls(text: str) -> list[dict]:
+    """Tool calls written out as text: `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`
+    or a JSON {"name", "arguments"} inside <tool_call>. trinity-large-thinking sometimes leaves its calls in the
+    reasoning and stops without parsed `tool_calls`; the agent runs them rather than losing the step."""
+    calls = []
+    for body in _TEXT_CALL.findall(text or ""):
+        fn = _XML_FN.search(body)
+        if fn:
+            args = {}
+            for k, v in _XML_PARAM.findall(fn.group(2)):
+                try:
+                    args[k] = json.loads(v.strip())
+                except ValueError:
+                    args[k] = v.strip()
+            name = fn.group(1)
+        else:
+            try:
+                obj = json.loads(body)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or not obj.get("name"):
+                continue
+            name, args = str(obj["name"]), obj.get("arguments") or {}
+        calls.append({"type": "function", "function": {
+            "name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}})
+    return calls
 
 
 def _slim(res: dict) -> dict:
@@ -80,7 +114,7 @@ class ToolAgent(Agent):
                     {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
         tools, trace, reasoning, finishes = box.schemas(), [], [], []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        nudged, error, reason, latency, step = False, None, "max_steps", 0.0, 0
+        nudged, error, reason, latency, step, recovered = False, None, "max_steps", 0.0, 0, 0
         while len(trace) < cfg.max_steps:
             try:
                 out = self.client.chat(cfg.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
@@ -97,7 +131,11 @@ class ToolAgent(Agent):
                 reasoning.append(f"[step {step}] {out['reasoning']}")
             finish = out.get("finish_reason")
             finishes.append(finish)
-            pairs = [_norm_call(c, step, i) for i, c in enumerate(out.get("tool_calls") or [])]
+            raw_calls = out.get("tool_calls") or []
+            if not raw_calls:
+                raw_calls = _text_calls(f"{out.get('content') or ''}\n{out.get('reasoning') or ''}")
+                recovered += len(raw_calls)
+            pairs = [_norm_call(c, step, i) for i, c in enumerate(raw_calls)]
             calls, raws = [c for c, _ in pairs], [r for _, r in pairs]
             messages.append({"role": "assistant", "content": out.get("content") or ("" if calls else "(no reply)"),
                              **({"tool_calls": calls} if calls else {})})
@@ -137,7 +175,7 @@ class ToolAgent(Agent):
         logged = [{"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{role})"}, *messages[1:]]
         d.meta = {"model": cfg.model, "messages": logged, "tool_trace": trace, "usage": usage,
                   "steps": len(trace), "ended": box.ended, "finish_reason": reason, "finish_reasons": finishes,
-                  "length_stops": finishes.count("length"),
+                  "length_stops": finishes.count("length"), "recovered_calls": recovered,
                   "reasoning": "\n\n".join(reasoning),
                   "response": messages[-1]["content"] if messages[-1]["role"] == "assistant" else "",
                   "latency_s": round(latency, 3)}
