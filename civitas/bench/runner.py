@@ -79,11 +79,13 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg['name']}_s{seed}_{os.getpid() % 1000:03d}"
     log = RunLogger(Path(runs_dir) / run_id)
     sig = agent_signature(cfg, env.roles)
+    prompts = {r: a.system for r, a in agents.items() if a.kind == "fleet"}      # logged turns refer to these
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
               "config": cfg, "started": time.time(), **env.meta(),
-              **({"fleet_version": fleet_version(cfg)} if "fleet" in cfg or fleet_agents(cfg) else {})})
+              **({"fleet_version": fleet_version(cfg)} if "fleet" in cfg or fleet_agents(cfg) else {}),
+              **({"fleet_prompts": prompts} if prompts else {})})
     if hub is not None:
         hub.run_id = run_id
     log.frame(env.frame())

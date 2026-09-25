@@ -105,10 +105,11 @@ def provider_config(cfg: dict, name: str) -> ProviderConfig:
 def agent_spec(cfg: dict, role: str) -> dict:
     """Agent settings for a role; in region mode "north.planning" falls back to "planning"."""
     agents = cfg["agents"]
-    if role in agents:
-        return dict(agents[role])
-    base = role.split(".", 1)[-1]
-    return dict(agents.get(base, {"kind": "scripted"}))
+    key = role if role in agents else role.split(".", 1)[-1]
+    spec = agents.get(key, {"kind": "scripted"})
+    if not isinstance(spec, dict):
+        raise ValueError(f"[agents.{key}] must be a table such as {{kind = \"scripted\"}}, got {spec!r}")
+    return dict(spec)
 
 
 def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: ScoringConfig, hub=None) -> dict:

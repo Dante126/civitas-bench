@@ -1,7 +1,8 @@
 """Fleet config: per-agent coaching (playbooks), model and limits.
 
 A run config's `[fleet]` table holds fleet-wide settings (`playbook` is the fleet playbook) and every
-`[agents.<role>]` with `kind = "fleet"` can override any of them (its `playbook` is the role's playbook).
+`[agents.<role>]` with `kind = "fleet"` can override any of them (its `playbook` is the role's playbook; its
+`extra_body` replaces `[fleet].extra_body` as a whole).
 """
 from __future__ import annotations
 
@@ -26,19 +27,28 @@ class FleetAgentConfig:
     extra_body: dict = field(default_factory=dict)
 
 
+def _table(v, name: str) -> dict:
+    if not isinstance(v, dict):
+        raise ValueError(f"[{name}] must be a table of settings, got {type(v).__name__} {v!r}")
+    return v
+
+
 def _role_spec(cfg: dict, role: str) -> dict:
     agents = cfg.get("agents") or {}
-    return dict(agents.get(role) or agents.get(role.split(".", 1)[-1]) or {})
+    key = role if role in agents else role.split(".", 1)[-1]
+    return dict(_table(agents[key], f"agents.{key}")) if key in agents else {}
 
 
 def fleet_agent_config(cfg: dict, role: str) -> FleetAgentConfig:
     """`[fleet]` merged with `[agents.<role>]`; unknown keys are dropped like everywhere else in the config."""
-    fleet = dict(cfg.get("fleet") or {})
+    fleet = dict(_table(cfg.get("fleet") or {}, "fleet"))
     merged = {"fleet_playbook": fleet.pop("playbook", ""), **fleet, **_role_spec(cfg, role)}
     known = {f.name: f for f in fields(FleetAgentConfig)}
     out = FleetAgentConfig(**{k: v for k, v in merged.items() if k in known})
     for k in ("max_steps", "max_tokens", "turn_tokens"):
         setattr(out, k, int(getattr(out, k)))
+        if getattr(out, k) < 1:
+            raise ValueError(f"agents.{role}: fleet {k} must be at least 1, got {getattr(out, k)}")
     out.temperature = float(out.temperature)
     out.extra_body = dict(out.extra_body or {})
     if out.mode not in MODES:
@@ -47,10 +57,10 @@ def fleet_agent_config(cfg: dict, role: str) -> FleetAgentConfig:
 
 
 def fleet_agents(cfg: dict) -> dict:
-    return {r: a for r, a in (cfg.get("agents") or {}).items() if a.get("kind") == "fleet"}
+    return {r: a for r, a in (cfg.get("agents") or {}).items() if _table(a, f"agents.{r}").get("kind") == "fleet"}
 
 
 def fleet_version(cfg: dict) -> str:
     """Short hash of the fleet's coaching and limits: `[fleet]` plus the fleet agents' specs."""
-    obj = {"fleet": cfg.get("fleet") or {}, "agents": fleet_agents(cfg)}
+    obj = {"fleet": _table(cfg.get("fleet") or {}, "fleet"), "agents": fleet_agents(cfg)}
     return hashlib.sha1(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]

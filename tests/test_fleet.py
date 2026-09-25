@@ -760,6 +760,7 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
         srv.shutdown()
     env, = envs
     d = tmp_path / s["run_id"]
+    start = real(runner.game_config(_fleet_cfg(0), 0)).world.dept_funds["utilities"]
     traj = [json.loads(x) for x in (d / "trajectories.jsonl").read_text().splitlines()]
     assert len(traj) == 16 and all("tool_trace" in t and "steps" in t and "ended" in t for t in traj)
     assert all(t["ended"] and t["finish_reason"] == "end_turn" for t in traj)
@@ -770,6 +771,14 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
     util = [t for t in traj if t["role"] == "utilities"][0]
     assert util["actions"][0]["type"] == "build_power_plant" and util["results"][0]["ok"], util["results"]
     assert util["usage"]["completion_tokens"] == 30 and util["steps"] == 3
+    allocs = [r for t in traj if t["role"] == "mayor" for r in t["results"] if r["ok"]]
+    builds = [r for t in traj if t["role"] == "utilities" for r in t["results"] if r["ok"]]
+    assert len(allocs) == 2 and builds and all(r["cost"] == 2500 for r in builds)
+    assert env.world.dept_funds["utilities"] == pytest.approx(start + 3000 * len(allocs) - 2500 * len(builds))
+    assert util["tool_trace"][1]["result"]["budget_left"] == pytest.approx(start + 500)
+    slim = {"ok", "error", "message", "cost", "budget_left"}
+    assert all(set(c["result"]) <= slim and c["finish_reason"] == "tool_calls" for t in traj for c in t["tool_trace"])
+    assert "sites" not in util["tool_trace"][0]["result"]
     assert env.world.facilities(C.WIND)
     assert env.fleet.plan["budgets"] == {"utilities": 3000}
     assert s["agent_stats"]["utilities"]["actions"] == 2 and s["agent_stats"]["utilities"]["invalid"] == 0
@@ -777,6 +786,10 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
     assert s["signature"].count("[autonomous]") == 1
     meta = json.loads((d / "meta.json").read_text())
     assert meta["fleet_version"] == fleet_version(_fleet_cfg(srv.server_port))
+    assert set(meta["fleet_prompts"]) == set(TURN_ORDER) and "Fund utilities first." in meta["fleet_prompts"]["mayor"]
+    assert all(t["prompt"][0] == {"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{t['role']})"}
+               for t in traj)
+    assert FakeToolLLM.requests[0]["messages"][0]["content"] == meta["fleet_prompts"]["mayor"]
     assert meta["agents"]["police"] == "fleet:fake"
     first = FakeToolLLM.requests[0]
     assert first["model"] == "fake" and {t["function"]["name"] for t in first["tools"]} >= {"end_turn", "update_plan"}
@@ -794,20 +807,20 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
 class FakeClient:
     """Stands in for ChatClient: `reply(messages)` gives the tool calls (or raises)."""
 
-    def __init__(self, reply, tokens: int = 10):
-        self.reply, self.tokens, self.calls = reply, tokens, []
+    def __init__(self, reply, tokens: int = 10, content: str = "thinking aloud", finish: str = "stop"):
+        self.reply, self.tokens, self.content, self.finish, self.calls = reply, tokens, content, finish, []
 
     def chat(self, model, messages, *, temperature=0.4, max_tokens=1500, extra=None):
         self.calls.append({"messages": [dict(m) for m in messages], "extra": extra, "max_tokens": max_tokens})
         calls = self.reply(messages)
-        return {"content": "thinking aloud", "reasoning": "secret", "tool_calls": calls, "finish_reason": "stop",
+        return {"content": self.content, "reasoning": "secret", "tool_calls": calls, "finish_reason": self.finish,
                 "usage": {"prompt_tokens": 5, "completion_tokens": self.tokens}, "latency_s": 0.01}
 
 
-def _agent(role="police", reply=lambda m: [], tokens=10, **cfg):
+def _agent(role="police", reply=lambda m: [], tokens=10, content="thinking aloud", finish="stop", **cfg):
     env = _env()
     a = ToolAgent(role, cfg=FleetAgentConfig(model="fake", **cfg))
-    a.client = FakeClient(reply, tokens)
+    a.client = FakeClient(reply, tokens, content, finish)
     a.bind(env)
     return a, env
 
@@ -819,6 +832,11 @@ def test_tool_agent_ends_after_one_nudge_without_tool_calls():
     assert "Use the tools" in a.client.calls[1]["messages"][-1]["content"]
     assert d.meta["finish_reason"] == "no_tool_calls" and not d.meta["ended"] and d.meta["steps"] == 0
     assert d.executed == [] and d.thinking == "(no report)"
+    assert d.meta["messages"][2]["content"] == "thinking aloud"
+    a, env = _agent(content="")
+    d = a.act(env.observe("police"))
+    asst = [m for m in d.meta["messages"] if m["role"] == "assistant"]
+    assert [m["content"] for m in asst] == ["(no reply)", "(no reply)"]
 
 
 def test_tool_agent_stops_a_looping_model_at_max_steps():
@@ -827,6 +845,11 @@ def test_tool_agent_stops_a_looping_model_at_max_steps():
     assert len(d.meta["tool_trace"]) == 3 and d.meta["finish_reason"] == "max_steps"
     assert len(a.client.calls) == 3
     assert a.usage["tool_calls"] == 3 and a.usage["calls"] == 3
+    assert d.meta["finish_reasons"] == ["stop"] * 3 and d.meta["length_stops"] == 0
+    assert [c["finish_reason"] for c in d.meta["tool_trace"]] == ["stop"] * 3
+    a, env = _agent(reply=lambda m: [_call("city_overview", {})], finish="length", max_steps=2)
+    d = a.act(env.observe("police"))
+    assert d.meta["length_stops"] == 2 and d.meta["finish_reasons"] == ["length", "length"]
 
 
 def test_tool_agent_caps_parallel_calls_and_skips_calls_after_end_turn():
@@ -871,7 +894,7 @@ def test_tool_agent_turn_tokens_and_api_errors():
         return [_call("city_overview", {})]
     a, env = _agent(reply=boom)
     d = a.act(env.observe("police"))
-    assert d.meta["finish_reason"] == "api_error" and d.parse_error == "api_error: HTTP 500"
+    assert d.meta["finish_reason"] == "api_error" and d.parse_error == "api_error: LLMError: HTTP 500"
     assert d.meta["steps"] == 1 and a.usage["api_errors"] == 1
 
 
@@ -883,6 +906,9 @@ def test_tool_agent_prompt_and_request_settings():
     d = a.act(env.observe("mayor"))
     call = a.client.calls[0]
     assert call["max_tokens"] == 777 and call["extra"]["top_p"] == 0.9 and call["extra"]["tools"]
+    a.cfg.extra_body = {"tools": [], "top_p": 0.5}                     # extra_body cannot replace the tool schemas
+    a.act(env.observe("mayor"))
+    assert a.client.calls[-1]["extra"]["tools"] == call["extra"]["tools"] and a.client.calls[-1]["extra"]["top_p"] == 0.5
     system, user = call["messages"][0]["content"], call["messages"][1]["content"]
     assert "Keep a reserve." in system and "every 3 months" in system
     assert "mode: supervised" in user
@@ -911,6 +937,21 @@ def test_fleet_agent_config_merges_fleet_and_role():
     cfg["fleet"]["mode"] = "wild"
     with pytest.raises(ValueError, match="mode"):
         fleet_agent_config(cfg, "police")
+    cfg["fleet"]["mode"] = "autonomous"
+    cfg["fleet"]["extra_body"] = {"top_p": 0.9, "seed": 1}
+    cfg["agents"]["mayor"]["extra_body"] = {"top_k": 5}
+    assert fleet_agent_config(cfg, "mayor").extra_body == {"top_k": 5}       # replaces, does not merge
+    assert fleet_agent_config(cfg, "police").extra_body == {"top_p": 0.9, "seed": 1}
+    for k in ("max_steps", "max_tokens", "turn_tokens"):
+        bad = {**cfg, "agents": {"police": {"kind": "fleet", k: 0}}}
+        with pytest.raises(ValueError, match=k):
+            fleet_agent_config(bad, "police")
+    bad = {**cfg, "agents": {"police": "fleet"}}
+    for fn in (lambda: fleet_agent_config(bad, "police"), lambda: fleet_version(bad)):
+        with pytest.raises(ValueError, match=r"agents\.police.*table"):
+            fn()
+    with pytest.raises(ValueError, match=r"agents\.police.*table"):
+        build_agents(bad, ["police"], GameConfig(), scoring_config(bad, GameConfig()))
 
 
 def test_fleet_version_tracks_fleet_settings():
@@ -949,3 +990,33 @@ def test_build_agents_and_signature_for_fleets():
     cfg["agents"]["health"]["mode"] = "supervised"
     with pytest.raises(ValueError, match="mode"):
         build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))
+
+
+def test_tool_agent_sanitises_malformed_calls():
+    raw = ["", "{bad", {"x": 20, "y": 20}, "[1, 2]"]
+    calls = [{"id": f"c{i}", "function": {"name": "inspect" if i else "city_overview", "arguments": a}}
+             for i, a in enumerate(raw)] + [{"id": "c9", "function": {"name": "", "arguments": "{}"}}]
+    a, env = _agent(reply=lambda m: calls if len(m) == 2 else [_call("end_turn", {"report": "r"})])
+    d = a.act(env.observe("police"))
+    sent = a.client.calls[1]["messages"][2]["tool_calls"]
+    assert [c["function"]["arguments"] for c in sent] == ["{}", "{}", '{"x": 20, "y": 20}', "{}", "{}"]
+    assert [c["function"]["name"] for c in sent] == ["city_overview", "inspect", "inspect", "inspect", "invalid_tool"]
+    tr = d.meta["tool_trace"]
+    assert [c["args"] for c in tr[:5]] == ["", "{bad", '{"x": 20, "y": 20}', "[1, 2]", "{}"]
+    assert tr[0]["result"]["ok"] and tr[2]["result"]["ok"]
+    assert "not valid JSON" in tr[1]["result"]["error"] and "JSON object" in tr[3]["result"]["error"]
+    assert "unknown tool 'invalid_tool'" in tr[4]["result"]["error"]
+    assert len(tr[4]["result"]["error"]) <= 300
+    assert d.meta["finish_reason"] == "end_turn"
+
+
+def test_tool_agent_keeps_actions_when_the_client_crashes():
+    def reply(m):
+        if len(m) > 2:
+            raise ConnectionResetError("socket gone")
+        return [_call("allocate_budget", {"department": "health", "amount": 1000})]
+    a, env = _agent(role="mayor", reply=reply)
+    d = a.act(env.observe("mayor"))
+    assert d.meta["finish_reason"] == "api_error" and "ConnectionResetError: socket gone" in d.parse_error
+    assert len(d.executed) == 1 and d.executed[0]["ok"]
+    assert env.apply("mayor", d) == d.executed and env.world.dept_funds["health"] == 1000

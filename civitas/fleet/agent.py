@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from ..agents.base import Agent
-from ..agents.llm_client import ChatClient, LLMError, ProviderConfig
+from ..agents.llm_client import ChatClient, ProviderConfig
 from ..core.decision import Decision
 from ..core.region import RegionEnv
 from .briefing import briefing, system_prompt
@@ -18,16 +18,31 @@ from .memory import FleetState
 from .tools import ToolBox
 
 RESULT_CHARS = 4000
+TRACE_CHARS = 300
 NUDGE = "Use the tools to act, then call end_turn with a short report."
 
 
-def _norm_call(c: dict, step: int, i: int) -> dict:
+def _norm_call(c: dict, step: int, i: int) -> tuple[dict, str]:
+    """(call for the history, raw arguments). Servers such as vLLM parse the arguments of past tool calls, so the
+    history gets "{}" for arguments that are not a JSON object; the tool still sees the raw text and can say why."""
     fn = c.get("function") or {}
-    args = fn.get("arguments")
-    if not isinstance(args, str):
-        args = json.dumps(args if args is not None else {})
-    return {"id": c.get("id") or f"call_{step}_{i}", "type": "function",
-            "function": {"name": fn.get("name") or "", "arguments": args}}
+    raw = fn.get("arguments")
+    raw = raw if isinstance(raw, str) else json.dumps(raw if raw is not None else {})
+    try:
+        ok = isinstance(json.loads(raw), dict)
+    except ValueError:
+        ok = False
+    return ({"id": c.get("id") or f"call_{step}_{i}", "type": "function",
+             "function": {"name": fn.get("name") or "invalid_tool", "arguments": raw if ok else "{}"}}, raw)
+
+
+def _slim(res: dict) -> dict:
+    out = {"ok": res.get("ok")}
+    for k in ("error", "message"):
+        if res.get(k):
+            out[k] = str(res[k])[:TRACE_CHARS]
+    out.update({k: res[k] for k in ("cost", "budget_left") if k in res})
+    return out
 
 
 class ToolAgent(Agent):
@@ -63,16 +78,16 @@ class ToolAgent(Agent):
         box = ToolBox(env, role)
         messages = [{"role": "system", "content": self.system},
                     {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
-        tools, trace, reasoning = box.schemas(), [], []
+        tools, trace, reasoning, finishes = box.schemas(), [], [], []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         nudged, error, reason, latency, step = False, None, "max_steps", 0.0, 0
         while len(trace) < cfg.max_steps:
             try:
                 out = self.client.chat(cfg.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-                                       extra={"tools": tools, **cfg.extra_body})
-            except LLMError as e:
+                                       extra={**cfg.extra_body, "tools": tools})
+            except Exception as e:                   # completed actions stay; the turn just ends
                 self.usage["api_errors"] += 1
-                error, reason = f"api_error: {e}", "api_error"
+                error, reason = f"api_error: {type(e).__name__}: {e}", "api_error"
                 break
             self.usage["calls"] += 1
             latency += out.get("latency_s") or 0.0
@@ -80,8 +95,11 @@ class ToolAgent(Agent):
                 usage[k] += int((out.get("usage") or {}).get(k) or 0)
             if out.get("reasoning"):
                 reasoning.append(f"[step {step}] {out['reasoning']}")
-            calls = [_norm_call(c, step, i) for i, c in enumerate(out.get("tool_calls") or [])]
-            messages.append({"role": "assistant", "content": out.get("content") or "",
+            finish = out.get("finish_reason")
+            finishes.append(finish)
+            pairs = [_norm_call(c, step, i) for i, c in enumerate(out.get("tool_calls") or [])]
+            calls, raws = [c for c, _ in pairs], [r for _, r in pairs]
+            messages.append({"role": "assistant", "content": out.get("content") or ("" if calls else "(no reply)"),
                              **({"tool_calls": calls} if calls else {})})
             if not calls:
                 if nudged:
@@ -91,15 +109,16 @@ class ToolAgent(Agent):
                 messages.append({"role": "user", "content": NUDGE})
                 step += 1
                 continue
-            for c in calls:
-                name, args = c["function"]["name"], c["function"]["arguments"]
+            for c, args in zip(calls, raws):
+                name = c["function"]["name"]
                 if box.ended:
                     res = {"ok": False, "error": "not run: the turn already ended (end_turn)"}
                 elif len(trace) >= cfg.max_steps:
                     res = {"ok": False, "error": f"not run: tool-call limit reached ({cfg.max_steps} per turn)"}
                 else:
                     res = box.call(name, args)
-                    trace.append({"step": step, "tool": name, "args": args, "result": res})
+                    trace.append({"step": step, "finish_reason": finish, "tool": name, "args": args,
+                                  "result": _slim(res)})
                 messages.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": json.dumps(res, separators=(",", ":"))[:RESULT_CHARS]})
             step += 1
@@ -115,8 +134,10 @@ class ToolAgent(Agent):
         self.usage["latency_s"] = round(self.usage["latency_s"] + latency, 3)
         d = Decision(executed=box.executed, messages=box.messages, thinking=box.report or "(no report)")
         d.parse_error = error
-        d.meta = {"model": cfg.model, "messages": messages, "tool_trace": trace, "usage": usage,
-                  "steps": len(trace), "ended": box.ended, "finish_reason": reason,
+        logged = [{"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{role})"}, *messages[1:]]
+        d.meta = {"model": cfg.model, "messages": logged, "tool_trace": trace, "usage": usage,
+                  "steps": len(trace), "ended": box.ended, "finish_reason": reason, "finish_reasons": finishes,
+                  "length_stops": finishes.count("length"),
                   "reasoning": "\n\n".join(reasoning),
                   "response": messages[-1]["content"] if messages[-1]["role"] == "assistant" else "",
                   "latency_s": round(latency, 3)}
