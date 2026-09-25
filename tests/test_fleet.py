@@ -249,7 +249,7 @@ def test_failing_action_is_reported_and_logged():
     env.world.dept_funds["utilities"] = 0
     box = ToolBox(env, "utilities")
     res = box.call("build_power_plant", {"kind": "wind", "x": 0, "y": 0})
-    assert res["ok"] is False and res["message"] and res["cost"] == 0
+    assert res["ok"] is False and res["message"] and res["error"] == res["message"] and res["cost"] == 0
     assert box.executed[-1]["message"] == res["message"]
     fail, = FleetState.of(env).history(kind="failure", role="utilities")
     assert fail["message"] == res["message"]
@@ -302,10 +302,20 @@ def test_inspect_clips_radius_and_names_tiers():
     assert len(hosp) == 1 and (hosp[0]["x"], hosp[0]["y"]) == (spot["x"], spot["y"]) and hosp[0]["size"] == "2x2"
 
 
+CONDITIONAL_SITES = {"riverbank_2x2", "casino", "metro_station", "levee"}   # lists only there once unlocked / forecast
+
+
 def _check_sites(env):
+    from civitas.core.observation import build_observation
     for role, purposes in SITE_PURPOSES.items():
         box = ToolBox(env, role)
-        for purpose in purposes:
+        obs = build_observation(env.world, role, council_msgs=[], memory={}, scores={}, months_total=24,
+                                include_map=False, site_hints=True)
+        for purpose, path in purposes.items():
+            found = obs
+            for key in path:
+                found = found.get(key) if isinstance(found, dict) else None
+            assert isinstance(found, list) or purpose in CONDITIONAL_SITES, (role, purpose, path)
             res = box.call("find_sites", {"purpose": purpose, "near_x": 10, "near_y": 10})
             assert res["ok"], (role, purpose, res)
             assert len(res["sites"]) <= 6 and all(isinstance(s["x"], int) and isinstance(s["y"], int)
@@ -409,3 +419,50 @@ def test_float_handler_params_are_numbers():
         role = next(r for r, spec in ROLES.items() if name in spec["actions"])
         tool = {s["function"]["name"]: s["function"] for s in ToolBox(env, role).schemas()}[name]
         assert tool["parameters"]["properties"][k]["type"] == "number"
+
+
+def test_type_argument_cannot_switch_the_action():
+    env = _env()
+    w = env.world
+    box = ToolBox(env, "mayor")
+    debt = w.debt
+    res = box.call("set_tax", {"type": "take_loan", "amount": 5000, "sector": "R", "rate": 8})
+    assert res["ok"] is False and "kind" in res["error"] and w.debt == debt and box.executed == []
+    assert box.call("set_tax", {"type": "set_tax", "sector": "R", "rate": 8})["ok"]
+    assert box.executed[-1]["action"]["type"] == "set_tax"
+    res = ToolBox(env, "utilities").call("build_water", {"type": "pump", "x": 3, "y": 3})
+    assert res["ok"] is False and "did you mean kind" in res["error"]
+    res = box.call("noop", {})
+    assert res["ok"] is False and "end_turn" in res["error"]
+
+
+def test_trimming_keeps_the_newest_log_entries_and_messages():
+    env = _env()
+    fs = FleetState.of(env)
+    for i in range(40):
+        fs.record(0, "fire", "action", action={"type": "build_fire_station", "i": i}, ok=False,
+                  message="x" * 300, cost=0)
+    res = ToolBox(env, "fire").call("history", {})
+    assert res["entries"][-1]["action"]["i"] == 39 and len(res["entries"]) < 20
+    assert "older" in res["truncated"] and "fewer months" in res["truncated"]
+    for i in range(20):
+        env.council.post(0, "mayor", f"{i} " + "y" * 400, "all")
+    res = ToolBox(env, "fire").call("get_messages", {})
+    assert res["messages"][-1]["text"].startswith("19 ") and "older" in res["truncated"]
+    assert "radius" not in res["truncated"] and "months" not in res["truncated"]
+    res = ToolBox(env, "fire").call("inspect", {"x": 24, "y": 24, "radius": 4})
+    assert "truncated" not in res or "radius" in res["truncated"]
+
+
+def test_role_specific_history_description_and_fresh_lookups():
+    env = _env()
+    desc = lambda role: next(s["function"]["description"] for s in ToolBox(env, role).schemas()
+                             if s["function"]["name"] == "history")
+    assert "all roles" in desc("mayor") and "your department" in desc("police")
+    for role in TURN_ORDER:
+        box = ToolBox(env, role)
+        for name in ("city_overview", "my_facilities", "unlocks", "history", "get_plan", "get_messages"):
+            res = box.call(name, {})
+            assert res["ok"], (role, name, res)
+            json.dumps(res)
+    assert ToolBox(env, "mayor").call("city_overview", {})["trend"] is None

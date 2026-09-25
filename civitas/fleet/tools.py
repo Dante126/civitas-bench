@@ -90,6 +90,8 @@ class Tool:
     properties: dict = field(default_factory=dict)
     required: tuple = ()
     strict: bool = True           # reject unknown arguments (action tools pass them to the handler)
+    newest_last: bool = False     # trimming keeps the tail of long lists (logs, messages)
+    trim_hint: str = ""           # how to ask for less when a result is trimmed
 
     def schema(self) -> dict:
         params = {"type": "object", "properties": self.properties}
@@ -119,8 +121,9 @@ def _size(v) -> int:
     return len(json.dumps(v))
 
 
-def _fit(res: dict, limit: int = RESULT_CHARS) -> dict:
-    """Drop items from the end of the biggest lists until the JSON fits; counts them in "truncated"."""
+def _fit(res: dict, limit: int = RESULT_CHARS, newest_last: bool = False, hint: str = "") -> dict:
+    """Drop items from the biggest lists until the JSON fits (from the end, or from the front for newest-last
+    lists); counts them in "truncated"."""
     dropped = 0
     while _size(res) > limit:
         lists = []
@@ -135,10 +138,14 @@ def _fit(res: dict, limit: int = RESULT_CHARS) -> dict:
             break
         big = max(lists, key=_size)
         n = max(1, len(big) // 10)
-        del big[-n:]
+        if newest_last:
+            del big[:n]
+        else:
+            del big[-n:]
         dropped += n
     if dropped:
-        res["truncated"] = f"{dropped} list items left out; narrow the query (smaller radius, fewer months)"
+        res["truncated"] = f"{dropped} {'older' if newest_last else 'more'} list items left out" + (
+            f"; {hint}" if hint else "")
     return res
 
 
@@ -237,12 +244,17 @@ class ToolBox:
             if tool is None:
                 if name == "update_plan":
                     raise ToolError("update_plan is for the mayor only; send the mayor a message instead")
+                if name == "noop":
+                    raise ToolError("there is no noop tool; to do nothing, call end_turn")
                 if name in ALL_ACTIONS:
                     raise ToolError(f"the {self.role} role cannot use '{name}'")
                 raise ToolError(f"unknown tool {name!r}; available: {', '.join(self.tools)}")
             args = self._parse(arguments)
             res = tool.fn(**self._check(tool, args))
-            return _fit(_py(res))
+            res = _fit(_py(res), newest_last=tool.newest_last, hint=tool.trim_hint)
+            if res.get("ok") is False and "error" not in res:
+                res["error"] = res.get("message", "failed")
+            return res
         except ToolError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:                           # never let a tool crash the agent loop
@@ -285,7 +297,10 @@ class ToolBox:
         cap = self.env.cfg.max_actions_per_turn
         if sum(r["ok"] for r in self.executed) >= cap:
             raise ToolError(f"action limit reached for this turn ({cap} successful actions); call end_turn")
-        res = apply_action(w, self.role, {"type": name, **args}).to_dict()
+        t = args.pop("type", None)
+        if t is not None and t != name:
+            raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
+        res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
@@ -305,7 +320,7 @@ class ToolBox:
                  "river), plus power / water / pollution for zones; empty land is counted. x = column, y = row.",
                  self.inspect, {"x": {"type": "integer"}, "y": {"type": "integer"},
                                 "radius": {"type": "integer", "description": f"0-{MAX_RADIUS}, default 2"}},
-                 ("x", "y")),
+                 ("x", "y"), trim_hint="use a smaller radius"),
             Tool("my_facilities", "Your department's buildings (load, capacity, tier) and the tier upgrades on offer "
                  "for them (run one with upgrade_facility)." if self.role != "mayor" else
                  "Your levers: service funding levels, policies, service imports and department upkeep.",
@@ -315,12 +330,15 @@ class ToolBox:
             Tool("get_plan", "The mayor's city plan" + (" (goals, department budgets and priorities, notes)."
                  if self.role == "mayor" else ": the city goals and your department's budget target and priority."),
                  self.get_plan),
-            Tool("get_messages", f"Council messages you can see from the last {self.env.cfg.council_window} months.",
-                 self.get_messages),
-            Tool("history", "The fleet log, newest last: your actions ('action', or failed ones with 'failure'), "
-                 "reports, city events and monthly metrics. Omit kind for everything.", self.history,
+            Tool("get_messages", f"Council messages you can see from the last {self.env.cfg.council_window} months, "
+                 "newest last.", self.get_messages, newest_last=True),
+            Tool("history", "The fleet log, newest last: " + (
+                 "actions of all roles ('action', or failed ones with 'failure'), reports" if self.role == "mayor"
+                 else "your department's actions ('action', or failed ones with 'failure') and reports")
+                 + ", plus city events and monthly metrics. Omit kind for everything.", self.history,
                  {"kind": {"type": "string", "enum": list(HISTORY_KINDS)},
-                  "months": {"type": "integer", "description": f"how many recent months (1-{MAX_MONTHS}, default 3)"}}),
+                  "months": {"type": "integer", "description": f"how many recent months (1-{MAX_MONTHS}, default 3)"}},
+                 newest_last=True, trim_hint="ask for fewer months or one kind"),
         ]
         if purposes:
             tools.insert(2, Tool(
@@ -437,15 +455,15 @@ class ToolBox:
                                                      "metro_lines", "freight")},
                     "airports": [{"x": x, "y": y} for x, y in w.facilities(C.AIRPORT)]}
         if role == "planning":
-            return {"ok": True, "landmarks": {k: [[x, y] for x, y in w.facilities(v["struct"])]
-                                              for k, v in C.LANDMARKS.items() if w.facilities(v["struct"])},
+            marks = {k: [[x, y] for x, y in w.facilities(v["struct"])] for k, v in C.LANDMARKS.items()}
+            return {"ok": True, "landmarks": {k: v for k, v in marks.items() if v},
                     "casinos": [[x, y] for x, y in w.facilities(C.CASINO)], "historic": obs["historic"]}
         facilities = {}
         for st in C.STRUCTS_OF_DEPT.get(role, []):
             lst = [dict(f) for f in w.service_info.get(C.STRUCT_NAME[st], [])]
             for f in lst:
-                if "name" not in f and w.facility_spec(f["x"], f["y"]):
-                    sp = w.facility_spec(f["x"], f["y"])
+                sp = None if "name" in f else w.facility_spec(f["x"], f["y"])
+                if sp:
                     f.update(name=sp["name"], tier=sp["tier"])
             if lst:
                 facilities[C.STRUCT_NAME[st]] = lst
