@@ -466,3 +466,127 @@ def test_role_specific_history_description_and_fresh_lookups():
             assert res["ok"], (role, name, res)
             json.dumps(res)
     assert ToolBox(env, "mayor").call("city_overview", {})["trend"] is None
+
+
+# ---------------------------------------------------------------- briefing
+import copy
+
+from civitas.fleet.briefing import KEY_METRICS, briefing, system_prompt
+from civitas.fleet.config import FleetAgentConfig
+
+DEPTS = [r for r in TURN_ORDER if r != "mayor"]
+
+
+def _words(text: str) -> int:
+    return len(text.split())
+
+
+@pytest.fixture(scope="module")
+def env12():
+    env = CivitasEnv(GameConfig(seed=0, months=24))
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(12):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    return env
+
+
+def test_system_prompt_sections_in_order():
+    cfg = FleetAgentConfig(fleet_playbook="FLEET-PB: grow first", playbook="ROLE-PB: stations by homes", max_steps=17)
+    for role in TURN_ORDER:
+        text = system_prompt(role, cfg, 36, max_actions=5)
+        marks = ["How to play", ROLES[role]["title"], ROLES[role]["mission"][:40], "36 months", "Coach's playbook",
+                 "FLEET-PB", "ROLE-PB"]
+        pos = [text.find(m) for m in marks]
+        assert -1 not in pos and pos == sorted(pos), (role, list(zip(marks, pos)))
+        assert "end_turn" in text and "17 tool calls" in text and "5 successful actions" in text
+        assert "{" not in text.replace("{}", "")                         # every placeholder filled
+    assert ("update_plan" in system_prompt("mayor", cfg, 36)) and "update_plan" not in system_prompt("fire", cfg, 36)
+    bare = system_prompt("fire", FleetAgentConfig(), 36)
+    assert "Coach's playbook" not in bare and "20 tool calls" in bare
+    only_fleet = system_prompt("fire", FleetAgentConfig(fleet_playbook="FLEET-PB"), 36)
+    assert "FLEET-PB" in only_fleet and "Fire" not in only_fleet.split("Coach's playbook")[1]
+
+
+def test_key_metrics_come_from_the_observation():
+    from civitas.core.observation import build_observation
+    env = _env()
+    city = build_observation(env.world, "police", council_msgs=[], memory={}, scores={}, months_total=12,
+                             include_map=False, site_hints=False)["city"]
+    assert set(KEY_METRICS) == set(DEPTS)
+    for role, paths in KEY_METRICS.items():
+        assert 5 <= len(paths) <= 8, role
+        for path in paths:
+            v = city
+            for k in path.split("."):
+                v = v[k]
+
+
+@pytest.mark.parametrize("grown", [False, True])
+def test_briefings_render_for_every_role(grown, env12):
+    env = copy.deepcopy(env12) if grown else CivitasEnv(GameConfig(seed=0, months=24))
+    w = env.world
+    for role in TURN_ORDER:
+        text = briefing(env, role, mark=False)
+        assert _words(text) < 700, (role, _words(text))
+        if role == "planning":
+            dev, = [ln for ln in text.splitlines() if "developed tiles" in ln]
+            assert "R " in dev and "+" not in dev                        # counts, not signed demand values
+        assert f"{24 - w.month} months left" in text and "autonomous" in text
+        if role == "mayor":
+            assert "no plan yet" in text and "update_plan" in text and "treasury" in text
+        else:
+            assert "No city plan yet" in text and "budget" in text.lower()
+    assert FleetState.of(env).history("metrics") or not grown          # the briefing synced the month's snapshot
+    w.dept_funds["police"] = 1234
+    box = ToolBox(env, "mayor")
+    assert box.call("update_plan", {"goals": ["reach 5k residents"], "notes": "save for bridges",
+                                    "budgets": {d: 1000 + i for i, d in enumerate(DEPTS)},
+                                    "priorities": {d: f"PRIORITY-{d}" for d in DEPTS}})["ok"]
+    for i, role in enumerate(DEPTS):
+        text = briefing(env, role, mode="supervised", mark=False)
+        assert f"PRIORITY-{role}" in text and "reach 5k residents" in text and "save for bridges" in text
+        assert f"${1000 + i:,}" in text                                  # budget target
+        assert "PRIORITY-" + ("fire" if role != "fire" else "police") not in text
+        assert "supervised" in text and _words(text) < 700
+    assert "$1,234" in briefing(env, "police", mark=False)
+    mayor = briefing(env, "mayor", mark=False)
+    assert "reach 5k residents" in mayor and "PRIORITY-health" in mayor and "no plan yet" not in mayor
+
+
+def test_mayor_briefing_lists_department_reports():
+    env = _env()
+    assert "no reports yet" in briefing(env, "mayor").lower()
+    ToolBox(env, "health").call("end_turn", {"report": "HEALTH-REPORT: built a clinic, need $3k"})
+    ToolBox(env, "fire").call("end_turn", {"report": "FIRE-REPORT " + "z" * 600})
+    env.end_month()
+    ToolBox(env, "health").call("end_turn", {"report": "HEALTH-REPORT-2: all good"})
+    text = briefing(env, "mayor")
+    assert "HEALTH-REPORT-2" in text and "HEALTH-REPORT:" not in text     # latest per department
+    fire, = [ln for ln in text.splitlines() if "FIRE-REPORT" in ln]
+    assert len(fire) < 240
+    assert "no reports yet" not in text.lower()
+
+
+def test_department_briefing_digests_its_own_last_turn():
+    env = _env()
+    fs = FleetState.of(env)
+    briefing(env, "police")
+    assert fs.last_turn_month["police"] == 0
+    env.world.dept_funds["police"] = 0
+    bad = ToolBox(env, "police").call("build_police_station", {"x": 0, "y": 0})
+    theirs = ToolBox(env, "fire").call("build_fire_station", {"x": 1, "y": 1, "kind": "FIRE-KIND"})
+    assert not bad["ok"] and not theirs["ok"]
+    env.council.post(0, "mayor", "police: cover downtown", "police")
+    env.world.event("A tornado hit")
+    env.end_month()
+    assert "failed actions: none" in briefing(env, "health", mark=False)
+    text = briefing(env, "police", mark=False)
+    assert "build_police_station" in text and bad["message"][:40] in text and "failed actions: none" not in text
+    assert "events: none" not in text
+    assert "build_fire_station" not in text and "FIRE-KIND" not in text
+    assert "A tornado hit" in text and "1 new council message" in text
+    assert fs.last_turn_month["police"] == 0                          # mark=False leaves the turn unmarked
+    briefing(env, "police")
+    assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == 0

@@ -214,6 +214,48 @@ def _plant(p: dict) -> dict:
     return {k: v for k, v in p.items() if k not in ("line", "neighbours")}
 
 
+def overview(env) -> dict:
+    """Headline metrics, finances and scores, with the change over the last 3 months (`trend`, None early on)."""
+    w = env.world
+    m = w.metrics()
+    last = w.history[-1] if w.history else m
+    pct = lambda v: None if v is None else round(100 * v, 1)
+    out = {"ok": True, "month": w.month, "months_left": env.cfg.months - w.month,
+           "population": m["population"], "happiness_pct": pct(m["happiness"]),
+           "approval_pct": pct(m["approval"]), "unemployment_pct": pct(m["unemployment"]),
+           "jobs": {"commercial": m["jobs_com"], "industrial": m["jobs_ind"], "offices": m["jobs_off"]},
+           "treasury": round(w.treasury), "debt": round(w.debt),
+           "last_month": {"income": round(last["income"]), "expenses": round(last["expenses"])},
+           "department_funds": {k: round(v) for k, v in w.dept_funds.items()},
+           "tax_pct": {k: round(100 * v, 1) for k, v in w.taxes.items()},
+           "demand": {k: round(v, 2) for k, v in (w.demand or {}).items()},
+           **{k: {"supply": m[f"{k}_supply"], "demand": m[f"{k}_demand"], "coverage_pct": pct(m[f"{k}_coverage"])}
+              for k in ("power", "water", "sewage")},
+           "coverage_pct": {k: pct(m[f"{k}_coverage"]) for k in ("police", "fire", "health", "garbage", "school")},
+           "scores": {k: round(v, 1) for k, v in env.last_scores.items()}}
+    past = next((h for h in w.history if h["month"] >= w.month - 3), None)
+    out["trend"] = None if past is None else {
+        "since_month": past["month"], "population": m["population"] - past["population"],
+        "treasury": round(w.treasury - past["treasury"]),
+        "happiness_pct": round(100 * (m["happiness"] - past["happiness"]), 1)}
+    return out
+
+
+def plan_slice(fleet: FleetState, role: str) -> dict:
+    """The whole plan for the mayor; goals, notes and the role's budget target and priority for a department."""
+    p = fleet.plan
+    if not fleet.plan_versions:
+        return {"ok": True, "plan": None, "note": "no plan yet" + (" - write one with update_plan"
+                                                                  if role == "mayor" else "")}
+    if role == "mayor":
+        return {"ok": True, "version": len(fleet.plan_versions), **p}
+    out = {"ok": True, "month": p["month"], "goals": p["goals"], "budget": p["budgets"].get(role),
+           "priority": p["priorities"].get(role)}
+    if p["notes"]:
+        out["notes"] = p["notes"]
+    return out
+
+
 # ------------------------------------------------------------------ toolbox
 class ToolBox:
     def __init__(self, env, role: str):
@@ -349,29 +391,7 @@ class ToolBox:
         return tools
 
     def city_overview(self) -> dict:
-        w, env = self.world, self.env
-        m = w.metrics()
-        last = w.history[-1] if w.history else m
-        pct = lambda v: None if v is None else round(100 * v, 1)
-        out = {"ok": True, "month": w.month, "months_left": env.cfg.months - w.month,
-               "population": m["population"], "happiness_pct": pct(m["happiness"]),
-               "approval_pct": pct(m["approval"]), "unemployment_pct": pct(m["unemployment"]),
-               "jobs": {"commercial": m["jobs_com"], "industrial": m["jobs_ind"], "offices": m["jobs_off"]},
-               "treasury": round(w.treasury), "debt": round(w.debt),
-               "last_month": {"income": round(last["income"]), "expenses": round(last["expenses"])},
-               "department_funds": {k: round(v) for k, v in w.dept_funds.items()},
-               "tax_pct": {k: round(100 * v, 1) for k, v in w.taxes.items()},
-               "demand": {k: round(v, 2) for k, v in (w.demand or {}).items()},
-               **{k: {"supply": m[f"{k}_supply"], "demand": m[f"{k}_demand"], "coverage_pct": pct(m[f"{k}_coverage"])}
-                  for k in ("power", "water", "sewage")},
-               "coverage_pct": {k: pct(m[f"{k}_coverage"]) for k in ("police", "fire", "health", "garbage", "school")},
-               "scores": {k: round(v, 1) for k, v in env.last_scores.items()}}
-        past = next((h for h in w.history if h["month"] >= w.month - 3), None)
-        out["trend"] = None if past is None else {
-            "since_month": past["month"], "population": m["population"] - past["population"],
-            "treasury": round(w.treasury - past["treasury"]),
-            "happiness_pct": round(100 * (m["happiness"] - past["happiness"]), 1)}
-        return out
+        return overview(self.env)
 
     def inspect(self, x: int, y: int, radius: int = 2) -> dict:
         w = self.world
@@ -483,17 +503,7 @@ class ToolBox:
                 "locked_by_population": locked, "next_milestone": w.next_milestone()}
 
     def get_plan(self) -> dict:
-        p = self.fleet.plan
-        if not self.fleet.plan_versions:
-            return {"ok": True, "plan": None, "note": "no plan yet" + (" - write one with update_plan"
-                                                                      if self.role == "mayor" else "")}
-        if self.role == "mayor":
-            return {"ok": True, "version": len(self.fleet.plan_versions), **p}
-        out = {"ok": True, "month": p["month"], "goals": p["goals"], "budget": p["budgets"].get(self.role),
-               "priority": p["priorities"].get(self.role)}
-        if p["notes"]:
-            out["notes"] = p["notes"]
-        return out
+        return plan_slice(self.fleet, self.role)
 
     def get_messages(self) -> dict:
         env = self.env
