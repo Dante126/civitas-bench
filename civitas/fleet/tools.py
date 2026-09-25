@@ -16,7 +16,7 @@ from typing import Callable
 import numpy as np
 
 from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, action_docs, apply_action
-from ..core.observation import build_observation
+from ..core.observation import MAP_LEGEND, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import shift
@@ -29,6 +29,7 @@ MAX_RADIUS = 4
 MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
+RIVER_BANDS = 4              # row bands the Map block describes the river in
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -265,6 +266,97 @@ def _river_span(w) -> str | None:
     return f"the river runs at x {int(cols.min())}-{int(cols.max())} in rows {y0}-{y1}"
 
 
+def _box(mask) -> tuple[list[int], list[int]] | None:
+    ys, xs = np.nonzero(mask)
+    return None if not len(xs) else ([int(xs.min()), int(xs.max())], [int(ys.min()), int(ys.max())])
+
+
+def _edge(w, x: int, y: int) -> str:
+    return "west" if x == 0 else "east" if x == w.w - 1 else "north" if y == 0 else "south" if y == w.h - 1 else "inner"
+
+
+def map_facts(w) -> dict:
+    """Orientation for the briefing's Map block and map_overview: size, highway entries, the river's columns per
+    row band ([x0, x1, y0, y1], up to RIVER_BANDS), the highway-connected roads' extent and the built-up box."""
+    hw = [{"x": int(x), "y": int(y), "edge": _edge(w, x, y)} for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
+    water = w.terrain == C.WATER
+    rows = np.nonzero(water.any(axis=1))[0]
+    river = []
+    for band in np.array_split(rows, min(RIVER_BANDS, len(rows))) if len(rows) else ():
+        cols = np.nonzero(water[band].any(axis=0))[0]
+        b = [int(cols.min()), int(cols.max()), int(band[0]), int(band[-1])]
+        if river and river[-1][:2] == b[:2]:
+            river[-1][3] = b[3]
+        else:
+            river.append(b)
+    roads = _connected_roads(w)
+    zoned = np.isin(w.struct, list(C.ZONES))
+    built = (w.struct != C.NONE) & (w.struct != C.ROAD) & (w.struct != C.HIGHWAY)
+    flat = np.arange(w.h * w.w).reshape(w.h, w.w)
+    anchors = built & ~zoned & ((w.anchor < 0) | (w.anchor == flat))       # multi-tile buildings count once
+    rb, bb = _box(roads), _box(built)
+    return {"size": [w.w, w.h], "highway": hw, "river": river,
+            "roads": rb and {"x": rb[0], "y": rb[1], "tiles": int(roads.sum())},
+            "built": bb and {"x": bb[0], "y": bb[1], "zoned": int(zoned.sum()),
+                             "developed": int((zoned & (w.level > 0)).sum()), "buildings": int(anchors.sum())}}
+
+
+def map_lines(f: dict) -> list[str]:
+    W, H = f["size"]
+    span = lambda a, b: str(a) if a == b else f"{a}-{b}"
+    L = [f"- {W}x{H} tiles: x = column 0-{W - 1} (0 = west), y = row 0-{H - 1} (0 = north)",
+         "- highway entry: " + (", ".join(f"({h['x']},{h['y']}) on the {h['edge']} edge" for h in f["highway"])
+                                or "none"),
+         "- river: " + ", ".join(f"x {span(a, b)} in rows {span(c, d)}" for a, b, c, d in f["river"])
+         if f["river"] else "- no river"]
+    r, b = f["roads"], f["built"]
+    L.append(f"- highway-connected roads: x {span(*r['x'])}, y {span(*r['y'])} ({r['tiles']} tiles)" if r else
+             "- no roads connected to the highway")
+    L.append(f"- built-up area: x {span(*b['x'])}, y {span(*b['y'])} ({b['zoned']} zoned tiles, {b['developed']} "
+             f"developed, {b['buildings']} building{'s' * (b['buildings'] != 1)})" if b else "- built-up area: none yet")
+    return L
+
+
+def _legend(chars: set) -> str:
+    """MAP_LEGEND cut to the characters on the map."""
+    items = MAP_LEGEND.removeprefix("Legend: ").split("  ")
+    return "Legend: " + "  ".join(i for i in items if set(i.split(" ", 1)[0].split("/")) & chars)
+
+
+def _ascii(w, k: int) -> str:
+    """world.ascii_map() (column rulers, row numbers), or one character per k x k block: the highway entry, else
+    its most common feature, river only where the block has nothing else."""
+    if k == 1:
+        return w.ascii_map()
+    xs, ys = range(0, w.w, k), range(0, w.h, k)
+    rows = ["    " + "".join(str((x // 10) % 10) for x in xs), "    " + "".join(str(x % 10) for x in xs)]
+    for y in ys:
+        line = []
+        for x in xs:
+            block = [w.tile_char(tx, ty) for ty in range(y, min(y + k, w.h)) for tx in range(x, min(x + k, w.w))]
+            main = ([c for c in block if c == "H"] or [c for c in block if c not in ".~"]
+                    or [c for c in block if c == "~"] or ["."])
+            line.append(max(set(main), key=main.count))
+        rows.append(f"{y:>3} " + "".join(line))
+    return "\n".join(rows)
+
+
+def map_overview(w, limit: int = RESULT_CHARS) -> dict:
+    """The whole map as ASCII with the map_facts summary, downsampled until the result fits `limit` (at full size
+    the summary goes first: the briefing's Map block has it)."""
+    summary = "\n".join(map_lines(map_facts(w)))
+    for k, full in [(1, True), (1, False)] + [(k, True) for k in range(2, max(w.w, w.h) + 1)]:
+        grid = _ascii(w, k)
+        body = {c for row in grid.split("\n")[2:] for c in row[4:]}
+        res = {"ok": True, "summary": summary if full else "see the Map block in your briefing",
+               "legend": _legend(body), "map": grid, "read": "top two lines: x (tens, units); each row starts with y"}
+        if k > 1:
+            res["scale"] = f"each character is a {k}x{k} block, shown at its top-left x, y; inspect for detail"
+        if _size(res) <= limit:
+            break
+    return res
+
+
 def _plant(p: dict) -> dict:
     return {k: v for k, v in p.items() if k not in ("line", "neighbours")}
 
@@ -415,6 +507,9 @@ class ToolBox:
             Tool("city_overview", "Headline numbers: population, happiness, jobs, money, taxes, demand, utilities "
                  "supply vs demand, service coverage, scores and the change over the last 3 months.",
                  self.city_overview),
+            Tool("map_overview", "The whole city as an ASCII map with rulers and a legend, plus where the "
+                 "highway, river, roads and built-up area are. Use it once to orient yourself; inspect for details.",
+                 self.map_overview),
             Tool("inspect", f"Look at the map around (x, y) within `radius` tiles (0-{MAX_RADIUS}, default 2): every "
                  "non-empty tile with what is there (zone letter + level such as R3, a building's tier name, road, "
                  "river), plus power / water / pollution for zones; empty land is counted. x = column, y = row.",
@@ -441,7 +536,7 @@ class ToolBox:
                  newest_last=True, trim_hint="ask for fewer months or one kind"),
         ]
         if purposes:
-            tools.insert(2, Tool(
+            tools.insert(3, Tool(
                 "find_sites", f"Up to {MAX_SITES} suggested sites for a purpose (ranked; crowded spots last), sorted "
                 "by distance to (near_x, near_y) when given. Rectangles and lines also carry x1, y1, x2, y2.",
                 self.find_sites, {"purpose": {"type": "string", "enum": purposes},
@@ -495,6 +590,9 @@ class ToolBox:
         if r != int(round(radius)):          # models ask for 10 or 20 to see more; say they got less
             out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); inspect several points to see more"
         return out
+
+    def map_overview(self) -> dict:
+        return map_overview(self.world)
 
     def find_sites(self, purpose: str, near_x: int | None = None, near_y: int | None = None) -> dict:
         if (near_x is None) != (near_y is None):

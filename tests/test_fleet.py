@@ -402,6 +402,84 @@ def test_road_span_ignores_unconnected_roads_and_no_river_maps():
     assert ToolBox(env, "utilities")._no_sites_note("pump") == "this map has no river"
 
 
+def test_map_facts_on_a_fresh_world():
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    f = map_facts(w)
+    assert f["size"] == [48, 48]
+    (hx, hy), = [(int(x), int(y)) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
+    assert hx == 0 and f["highway"] == [{"x": 0, "y": hy, "edge": "west"}]
+    assert 1 < len(f["river"]) <= 4
+    for x0, x1, y0, y1 in f["river"]:
+        cols = np.nonzero((w.terrain[y0:y1 + 1] == C.WATER).any(axis=0))[0]
+        assert (x0, x1) == (cols.min(), cols.max())
+    assert f["river"][0][2] == 0 and f["river"][-1][3] == 47
+    ys, xs = np.nonzero((w.struct == C.ROAD) | (w.struct == C.HIGHWAY))        # only the starter road
+    assert f["roads"] == {"x": [0, int(xs.max())], "y": [hy, hy], "tiles": len(xs)}
+    tx, ty = w.facilities(C.TOWNHALL)[0]
+    assert f["built"] == {"x": [tx, tx], "y": [ty, ty], "zoned": 0, "developed": 0, "buildings": 1}
+    lines = map_lines(f)
+    text = "\n".join(lines)
+    assert len(lines) <= 6 and len(text) <= 400, (len(lines), len(text))
+    assert f"(0,{hy}) on the west edge" in text and "x = column 0-47" in text
+    assert f"x {f['river'][0][0]}-{f['river'][0][1]} in rows 0-" in text
+
+
+def test_map_facts_grow_and_without_a_river(grown_env):
+    from civitas.fleet.tools import map_facts, map_lines
+    fresh, grown = map_facts(_env().world), map_facts(grown_env.world)
+    assert grown["roads"]["tiles"] > fresh["roads"]["tiles"]
+    r = grown["roads"]
+    assert r["x"][1] - r["x"][0] >= fresh["roads"]["x"][1] - fresh["roads"]["x"][0] and r["y"][0] < r["y"][1]
+    b = grown["built"]
+    assert b["zoned"] > 0 and b["developed"] > 0 and b["buildings"] > 1 and b["x"][0] < b["x"][1]
+    assert len("\n".join(map_lines(grown))) <= 400
+    env = _env()
+    env.world.terrain[env.world.terrain == C.WATER] = C.LAND
+    f = map_facts(env.world)
+    assert f["river"] == [] and "- no river" in map_lines(f)
+
+
+def _map_body(res):
+    return [row[4:] for row in res["map"].split("\n")[2:]]
+
+
+def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
+    from civitas.fleet.tools import RESULT_CHARS, map_facts, map_lines
+    for role in TURN_ORDER:
+        res = ToolBox(grown_env, role).call("map_overview", {})
+        assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS, (role, len(json.dumps(res)))
+        assert "scale" not in res and "truncated" not in res                     # 48x48 fits at full size
+    rows = res["map"].split("\n")
+    assert rows[0].strip() == "".join(str(x // 10) for x in range(48))
+    assert rows[1].strip() == "".join(str(x % 10) for x in range(48))
+    assert rows[2].startswith("  0 ") and rows[-1].startswith(" 47 ") and len(rows) == 50
+    assert _map_body(res) == [grown_env.world.ascii_map().split("\n")[y + 2][4:] for y in range(48)]
+    assert res["legend"].startswith("Legend: ")
+    keys = {c for item in res["legend"][8:].split("  ") for c in item.split(" ", 1)[0].split("/")}
+    used = set("".join(_map_body(res)))
+    assert used <= keys and {"#", "~", "H", "T", "R"} <= used
+    assert "E coal" not in res["legend"] or "E" in used                       # only what is on the map
+    assert res["summary"] == "\n".join(map_lines(map_facts(grown_env.world)))
+    from civitas.fleet.tools import map_overview
+    tight = map_overview(grown_env.world, limit=len(json.dumps(res)) - 1)     # a full legend: summary goes first
+    assert "briefing" in tight["summary"] and tight["map"] == res["map"] and "scale" not in tight
+
+
+def test_map_overview_downsamples_big_maps():
+    from civitas.fleet.tools import RESULT_CHARS
+    env = CivitasEnv(GameConfig(seed=0, months=12, width=96, height=80))
+    res = ToolBox(env, "planning").call("map_overview", {})
+    assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS and "truncated" not in res
+    k = int(res["scale"].split("x")[0].split()[-1])
+    assert k >= 2 and "inspect" in res["scale"]
+    rows = res["map"].split("\n")
+    assert rows[2].startswith("  0 ") and rows[3].startswith(f"{k:>3} ")
+    assert len(rows) - 2 == -(-80 // k) and len(rows[2]) - 4 == -(-96 // k)
+    assert "~" in res["map"] and "H" in res["map"]
+
+
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
     env = grown_env
     _check_sites(env)
@@ -592,6 +670,7 @@ def test_system_prompt_fits_the_fleet():
         assert "Each game month is one turn" in text
     assert "find_sites" not in mayor and "x = column" not in mayor
     assert "find_sites" in fire and "x = column" in fire
+    assert all("map_overview" in t and "map_overview once to orient yourself" in t for t in (mayor, fire))
     slow = system_prompt("fire", cfg, 36, act_every=3)
     assert "every 3 months" in slow and "Each game month is one turn" not in slow
 
@@ -618,6 +697,7 @@ def test_key_metrics_come_from_the_observation():
 
 @pytest.mark.parametrize("grown", [False, True])
 def test_briefings_render_for_every_role(grown, env12):
+    from civitas.fleet.tools import map_facts, map_lines
     env = copy.deepcopy(env12) if grown else CivitasEnv(GameConfig(seed=0, months=24))
     w = env.world
     for role in TURN_ORDER:
@@ -627,6 +707,7 @@ def test_briefings_render_for_every_role(grown, env12):
             dev, = [ln for ln in text.splitlines() if "developed tiles" in ln]
             assert "R " in dev and "+" not in dev                        # counts, not signed demand values
         assert f"{24 - w.month} months left" in text and "autonomous" in text
+        assert "\n## Map\n" + "\n".join(map_lines(map_facts(w))) + "\n" in text     # every role, mayor included
         if role == "mayor":
             assert "no plan yet" in text and "update_plan" in text and "treasury" in text
         else:

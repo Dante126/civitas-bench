@@ -18,7 +18,7 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
+from .tools import MAX_ENTRIES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -60,7 +60,8 @@ HOW_TO_PLAY = """\
 You are the {title} in a fleet of AI agents that runs a city. The mayor is the manager: it sets the city plan \
 (goals, a budget target and a priority per department) and moves the money; the departments ({depts}) carry the \
 plan out. {cadence}, and you start each turn from a short briefing.
-- Each turn you work by calling tools. Look things up before acting ({lookups}).{coords}
+- Each turn you work by calling tools. Look things up before acting ({lookups}). Use map_overview once to \
+orient yourself; inspect for details.{coords}
 - Action tools run immediately and report success or failure, the cost and the money left. When an action fails, \
 read the error and fix the cause (another site, a cheaper option, wait for an unlock) instead of repeating it.
 - {budget}
@@ -72,7 +73,8 @@ lessons) and the game's history log. Write down what you learn.
 {actions}
 - The mode in your briefing header: autonomous = no coach will intervene during the game; supervised = your coach \
 may revise the playbook between sessions."""
-LOOKUPS = ("city_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan", "get_messages", "history")
+LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan",
+           "get_messages", "history")
 
 BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month, so keep a reserve when you move money "
                    "to departments (allocate_budget) or cut taxes.",
@@ -142,6 +144,10 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] == role else m['to']}: "
              f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
     return L
+
+
+def _map(w) -> list[str]:
+    return ["## Map"] + map_lines(map_facts(w))
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -229,7 +235,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
               f"- goals: {_goals(p['goals'], 100)}"]
         if p["notes"]:
             L.append(f"- notes: {cut(p['notes'], 200)}")
-    return L + [""] + _memory(fleet, "mayor")
+    return L + [""] + _map(w) + [""] + _memory(fleet, "mayor")
 
 
 def _department(env, fleet: FleetState, role: str) -> list[str]:
@@ -256,7 +262,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                              include_map=False, site_hints=False)["city"]
     L += ["", "## Key metrics", *(_metric(city, k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _memory(fleet, role)
+    return L + [""] + _map(w) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: int = 1,
