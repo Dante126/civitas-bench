@@ -78,6 +78,7 @@ class CivitasEnv:
         self.turns: list[dict] = []           # turns taken in the month in progress
         self.last_scores = {k: 0.0 for k in ["city", *self.roles]}
         self.invalid_counts = {r: 0 for r in self.roles}
+        self.fleet = None                     # civitas.fleet.memory.FleetState, set by FleetState.of(env)
         self.done = False
         return {r: self.observe(r) for r in self.roles}
 
@@ -151,6 +152,8 @@ class CivitasEnv:
             bad = sum(t["invalid"] for t in self.turns if t["role"] == r)
             rewards[r] = round(tw * d_city + (1 - tw) * d_role - self.cfg.invalid_action_penalty * 0.01 * bad, 6)
         self.last_scores = scores
+        if self.fleet is not None:
+            self.fleet.sync(self)
         terminated = self.world.bankrupt or self.world.recalled
         truncated = self.world.month >= self.cfg.months
         self.done = terminated or truncated

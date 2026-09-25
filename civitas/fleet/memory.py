@@ -2,7 +2,7 @@
 
 Everything lives in one `FleetState` stored on the env (`env.fleet`). Tools write the plan and memory
 (`update_plan`, `update_memory`), action tools and `end_turn` `record()` into the log, `sync(env)` copies the
-world's metrics snapshot and events into it once per month, and briefings read `history()` / `digest()`.
+world's metrics snapshot and events into it (every month, from `CivitasEnv.end_month`), and briefings read `history()` / `digest()`.
 """
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import copy
 import math
 from dataclasses import dataclass, field
 
-DEPARTMENTS = ("planning", "utilities", "transport", "police", "fire", "health", "education")
+from ..core.roles import TURN_ORDER
+
+DEPARTMENTS = tuple(r for r in TURN_ORDER if r != "mayor")
 LIMITS = {"goals": 5, "item_chars": 200, "notes_chars": 1500, "list_items": 8}
 PLAN_FIELDS = ("goals", "budgets", "priorities", "notes")
 MEMORY_FIELDS = ("commitments", "open_tasks", "lessons")
@@ -59,6 +61,7 @@ class FleetState:
     log: list = field(default_factory=list)
     reports: dict = field(default_factory=dict)
     last_turn_month: dict = field(default_factory=dict)
+    seen_messages: dict = field(default_factory=dict)   # {role: council messages visible to it at its last turn}
     synced_month: int | None = None
 
     @classmethod
@@ -111,7 +114,8 @@ class FleetState:
         self.log.append({"month": month, "role": role, "kind": kind, **data})
 
     def sync(self, env) -> None:
-        """Log the latest monthly metrics snapshot and last month's world events, once per simulated month."""
+        """Log the latest monthly metrics snapshot and last month's world events. `CivitasEnv.end_month` calls this
+        every month once `env.fleet` exists; calling it again in the same month does nothing."""
         w = env.world
         if not w.history or self.synced_month == w.month:
             return
@@ -138,18 +142,23 @@ class FleetState:
         out.sort(key=lambda e: e["month"])
         return out[-MAX_HISTORY:]
 
-    def mark_turn(self, role: str, month: int) -> None:
-        """Remember that `role` took a turn in `month`; call after building the turn's digest."""
+    def mark_turn(self, role: str, month: int, council=None) -> None:
+        """Remember that `role` took a turn in `month` (and how many council messages it could see then);
+        call after building the turn's digest."""
         self.last_turn_month[role] = month
+        if council is not None:
+            self.seen_messages[role] = len(council.visible_to(role, since_month=0))
 
     def digest(self, role: str, now: int, council=None) -> dict:
-        """Since the role's previous turn (inclusive of that month): its failed actions, world events and the
-        number of council messages from others it can see. `since` is None before its first turn (all months)."""
+        """Since the role's previous turn (inclusive of that month): its failed actions and world events, plus the
+        number of council messages from others posted after that turn was marked. `since` is None before its
+        first turn (all months)."""
         since = self.last_turn_month.get(role)
         span = None if since is None else now - since + 1
         msgs = 0
         if council is not None:
-            msgs = sum(1 for m in council.visible_to(role, since_month=since or 0) if m["sender"] != role)
+            new = council.visible_to(role, since_month=0)[self.seen_messages.get(role, 0):]
+            msgs = sum(1 for m in new if m["sender"] != role)
         return {"since": since,
                 "failed_actions": self.history("failure", span, role=role, now=now),
                 "events": [e["text"] for e in self.history("event", span, now=now)],

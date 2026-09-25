@@ -1,4 +1,6 @@
 """Agent fleets: tool-using manager + departments."""
+import pytest
+
 from civitas.core.actions import apply_action
 from civitas.core.decision import Decision
 from civitas.core.env import CivitasEnv, GameConfig
@@ -35,8 +37,6 @@ def test_agents_get_bound_to_the_env():
 
 
 # ------------------------------------------------------------------ memory
-import pytest
-
 from civitas.fleet.memory import FleetState
 
 
@@ -138,29 +138,43 @@ def test_digest_covers_only_this_role_since_its_last_turn():
     env = _env()
     fs = FleetState.of(env)
     fs.record(0, "fire", "action", action={"type": "a"}, ok=False, message="old", cost=0)
-    fs.mark_turn("fire", 0)
+    env.council.post(0, "mayor", "seen at month 0", "fire")
+    fs.mark_turn("fire", 0, env.council)
     env.world.event("Flood")
     env.end_month()
-    fs.sync(env)
+    env.council.post(1, "mayor", "seen at month 1", "all")
     fs.record(1, "fire", "action", action={"type": "b"}, ok=False, message="blocked", cost=0)
     fs.record(1, "fire", "action", action={"type": "c"}, ok=True, message="", cost=5)
     fs.record(1, "police", "action", action={"type": "d"}, ok=False, message="theirs", cost=0)
-    fs.mark_turn("fire", 1)
+    fs.mark_turn("fire", 1, env.council)
     env.council.post(1, "mayor", "fire: build a station", "fire")
     env.council.post(1, "police", "hello all", "all")
     env.council.post(1, "mayor", "police only", "police")
     env.council.post(1, "fire", "my own", "all")
-    env.council.post(0, "mayor", "before", "fire")
     env.world.event("Fire downtown")
     env.end_month()
-    fs.sync(env)
     d = fs.digest("fire", 2, council=env.council)
     assert d["since"] == 1
     assert [e["message"] for e in d["failed_actions"]] == ["blocked"]
     assert d["events"] == ["Fire downtown"]
     assert d["messages"] == 2
     assert fs.digest("police", 2)["since"] is None and fs.digest("police", 2)["messages"] == 0
+    assert fs.digest("police", 2, council=env.council)["messages"] == 3   # never marked: all from others
     assert fs.digest("fire", 2)["failed_actions"] == d["failed_actions"]
     first = FleetState()
     first.record(0, "fire", "event", text="x")
     assert first.digest("fire", 1)["since"] is None
+
+
+def test_end_month_syncs_the_fleet_every_month():
+    env = _env(act_every=3)
+    assert env.fleet is None
+    fs = FleetState.of(env)
+    for month in range(5):
+        env.world.event(f"event {month}")
+        env.end_month()                                  # no agent turns at all
+    assert [e["month"] for e in fs.history(kind="metrics", months=None)] == [1, 2, 3, 4, 5]
+    assert [(e["month"], e["text"]) for e in fs.history(kind="event", months=None)
+            if e["text"].startswith("event ")] == [(m, f"event {m}") for m in range(5)]
+    env.reset()
+    assert env.fleet is None and FleetState.of(env) is not fs
