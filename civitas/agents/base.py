@@ -17,6 +17,9 @@ class Agent:
     def reset(self, seed: int = 0) -> None:
         pass
 
+    def bind(self, env) -> None:
+        """Called once by the runner before the episode (tool agents act on the env directly)."""
+
     def act(self, obs: dict) -> Decision:  # pragma: no cover - interface
         raise NotImplementedError
 

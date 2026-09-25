@@ -69,6 +69,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     agents = build_agents(cfg, env.roles, game, scoring, hub=hub)
     for a in agents.values():
         a.reset(seed)
+        a.bind(env)
 
     run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg['name']}_s{seed}_{os.getpid() % 1000:03d}"
     log = RunLogger(Path(runs_dir) / run_id)

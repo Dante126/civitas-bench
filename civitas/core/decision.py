@@ -27,6 +27,7 @@ class Decision:
     thinking: str = ""                # short rationale (logged + shown in viewer)
     parse_error: str | None = None    # set when an LLM reply could not be parsed
     meta: dict = field(default_factory=dict)  # prompt/response/tokens/latency
+    executed: list[dict] = field(default_factory=list)  # results of actions an agent already ran (tool agents)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Decision":

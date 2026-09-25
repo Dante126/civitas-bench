@@ -117,7 +117,7 @@ class CivitasEnv:
         if self.done:
             raise RuntimeError("episode is over; call reset()")
         w = self.world
-        results = []
+        results = list(decision.executed)
         actions = decision.actions[: self.cfg.max_actions_per_turn]
         for a in actions:
             results.append(apply_action(w, role, a).to_dict())
