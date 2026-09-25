@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +26,31 @@ class ProviderConfig:
 
 class LLMError(RuntimeError):
     pass
+
+
+def _post(req: urllib.request.Request, timeout: float) -> bytes:
+    """POST and read the whole body, giving up after `timeout` seconds of wall clock.
+
+    urllib's own timeout only fires when the socket is silent; a provider that holds a request open
+    while trickling bytes (seen with Arcee) would otherwise block a run for many minutes.
+    """
+    box: dict = {}
+
+    def work():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                box["body"] = resp.read()
+        except BaseException as e:           # re-raised in the caller's thread
+            box["err"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"no complete response after {timeout:.0f} s")
+    if "err" in box:
+        raise box["err"]
+    return box["body"]
 
 
 class ChatClient:
@@ -53,8 +79,7 @@ class ChatClient:
             t0 = time.time()
             try:
                 req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.p.timeout) as resp:
-                    payload = json.loads(resp.read().decode())
+                payload = json.loads(_post(req, self.p.timeout).decode())
                 choice = payload["choices"][0]
                 msg = choice.get("message") or {}
                 content = msg.get("content") or ""

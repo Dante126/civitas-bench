@@ -198,3 +198,46 @@ def test_actions_recovered_from_cut_off_reasoning():
             '{"type": "build_road", "x1": 19, "y1": 24, "x2": 30, "y2": 24}.')
     d = LLMAgent._parse({"content": "", "reasoning": text, "finish_reason": "length"})
     assert [a["type"] for a in d["actions"]] == ["zone", "build_road"]
+
+
+class _DripThenAnswer(BaseHTTPRequestHandler):
+    """First request: headers, then one body byte every 0.2 s (never silent long enough for a socket
+    timeout, like a hung API call). Later requests: a normal answer."""
+    calls = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        type(self).calls += 1
+        out = json.dumps({"choices": [{"message": {"content": '{"actions": []}'}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out) + 1000))
+        self.end_headers()
+        if type(self).calls == 1:
+            try:
+                for _ in range(100):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except OSError:
+                pass
+            return
+        self.wfile.write(out + b" " * 1000)
+
+
+def test_chat_client_gives_up_on_a_hung_request_and_retries():
+    from civitas.agents.llm_client import ChatClient
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _DripThenAnswer)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key_env="",
+                                       timeout=1.0, max_retries=1))
+    t0 = time.time()
+    out = client.chat("fake", [{"role": "user", "content": "hi"}])
+    assert out["content"] == '{"actions": []}'
+    assert _DripThenAnswer.calls == 2
+    assert time.time() - t0 < 6          # the drip would take 20 s; the deadline cuts it at ~1 s
+    srv.shutdown()
