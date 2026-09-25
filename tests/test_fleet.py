@@ -352,22 +352,54 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     assert res["sites"] and "note" not in res
 
 
-def test_empty_site_lists_point_to_planning_not_a_map_scan():
-    env = _env()
-    w = env.world
+def _fill_roadside(w):
     ys, xs = np.nonzero(w.struct == C.ROAD)
-    for x, y in zip(xs.tolist(), ys.tolist()):          # every roadside tile taken
-        for nx, ny in ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)):
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        for nx, ny in ((x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)):
             if w.in_bounds(nx, ny) and w.struct[ny, nx] == C.NONE and w.terrain[ny, nx] != C.WATER:
                 w.struct[ny, nx] = C.PARK
     w.refresh()
-    span = f"the roads span x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}"
+
+
+def test_empty_site_lists_say_whether_land_or_need_is_missing():
+    env = _env()                                       # free land, nobody living there yet: nothing needs a clinic
+    res = ToolBox(env, "health").call("find_sites", {"purpose": "clinic"})
+    assert res["sites"] == [] and "nothing needs this right now" in res["note"] and "planning" not in res["note"]
+    res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
+    assert res["sites"] == [] and "too few homes" in res["note"]
+    env = CivitasEnv(GameConfig(seed=0, months=12))    # residents, but every roadside tile taken
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(6):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    w = env.world
+    assert w.metrics()["population"] > 0
+    _fill_roadside(w)
+    from civitas.fleet.tools import _connected_roads
+    ys, xs = np.nonzero(_connected_roads(w))
+    span = f"the highway-connected roads span x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}"
     res = ToolBox(env, "education").call("find_sites", {"purpose": "school"})
     assert res["sites"] == [] and "ask planning" in res["note"] and span in res["note"]
     res = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})
-    assert res["sites"] == [] and "road_extension" in res["note"] and "ask planning" not in res["note"]
+    assert res["sites"] == [] and "find_sites road_extension" in res["note"] and "ask planning" not in res["note"]
+    note = ToolBox(env, "planning")._no_sites_note("road_extension")
+    assert "find_sites" not in note and "build_road" in note                   # not circular
     res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})
     assert not res["ok"] and "for the departments" in res["error"]
+
+
+def test_road_span_ignores_unconnected_roads_and_no_river_maps():
+    from civitas.fleet.tools import _river_span, _road_span
+    env = _env()
+    w = env.world
+    before = _road_span(w)
+    w.struct[2, 44] = w.struct[2, 45] = C.ROAD           # a stray road far from the network
+    w.refresh()
+    assert _road_span(w) == before and "x 44" not in before
+    w.terrain[w.terrain == C.WATER] = C.LAND
+    assert _river_span(w) is None
+    assert ToolBox(env, "utilities")._no_sites_note("pump") == "this map has no river"
 
 
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
@@ -1109,29 +1141,78 @@ def test_tool_agent_sanitises_malformed_calls():
     assert d.meta["finish_reason"] == "end_turn"
 
 
-def test_tool_agent_runs_tool_calls_left_in_the_reasoning():
-    xml = ("Let me look.\n<tool_call>\n<function=find_sites>\n<parameter=purpose>\nstation\n</parameter>\n"
-           "<parameter=near_x>\n20\n</parameter>\n<parameter=near_y>\n20\n</parameter>\n</function>\n</tool_call>\n"
-           '<tool_call>{"name": "send_message", "arguments": {"to": "mayor", "text": "hi"}}</tool_call>\n'
-           "<tool_call>not a call</tool_call>")
-    replies = iter([(xml, []), ("done", [_call("end_turn", {"report": "r"})])])
+def _xml_call(name, **params):
+    ps = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+    return f"<tool_call>\n<function={name}>\n{ps}</function>\n</tool_call>"
 
-    class Client(FakeClient):
-        def chat(self, model, messages, **kw):
-            self.calls.append({"messages": [dict(m) for m in messages]})
-            reasoning, calls = next(replies)
-            return {"content": "", "reasoning": reasoning, "tool_calls": calls, "finish_reason": "stop",
-                    "usage": {}, "latency_s": 0.0}
-    a, env = _agent()
-    a.client = Client(None)
-    d = a.act(env.observe("police"))
+
+class _ScriptedClient(FakeClient):
+    """Replies are (content, reasoning, tool_calls[, finish_reason]) tuples, one per model call."""
+
+    def __init__(self, replies):
+        super().__init__(None)
+        self.replies = iter(replies)
+
+    def chat(self, model, messages, **kw):
+        self.calls.append({"messages": [dict(m) for m in messages]})
+        content, reasoning, calls, *finish = next(self.replies)
+        return {"content": content, "reasoning": reasoning, "tool_calls": calls,
+                "finish_reason": finish[0] if finish else "stop", "usage": {}, "latency_s": 0.0}
+
+
+def _run_scripted(replies, role="police", **cfg):
+    a, env = _agent(role=role, **cfg)
+    a.client = _ScriptedClient(replies)
+    return a, a.act(env.observe(role))
+
+
+END = ("done", "", [_call("end_turn", {"report": "r"})])
+
+
+def test_tool_agent_runs_tool_calls_left_in_the_reasoning():
+    xml = ("Let me look.\n" + _xml_call("find_sites", purpose="station", near_x=20, near_y=20) + "\n"
+           + '<tool_call>{"name": "send_message", "arguments": {"to": "mayor", "text": "hi"}}</tool_call>\n')
+    a, d = _run_scripted([("", xml, []), END])
     tr = d.meta["tool_trace"]
     assert [c["tool"] for c in tr] == ["find_sites", "send_message", "end_turn"] and all(c["result"]["ok"] for c in tr)
-    assert json.loads(tr[0]["args"]) == {"purpose": "station", "near_x": 20, "near_y": 20}
+    assert json.loads(tr[0]["args"]) == {"purpose": "station", "near_x": "20", "near_y": "20"}   # coerced by schema
     assert d.meta["recovered_calls"] == 2 and d.meta["finish_reason"] == "end_turn"
-    asst = a.client.calls[1]["messages"][2]
-    assert [c["id"] for c in asst["tool_calls"]] == ["call_0_0", "call_0_1"]
+    assert [c["id"] for c in a.client.calls[1]["messages"][2]["tool_calls"]] == ["call_0_0", "call_0_1"]
     assert d.messages == [{"to": "mayor", "text": "hi"}]
+
+
+def test_text_calls_prefer_content_dedupe_and_skip_native_replies():
+    call = _xml_call("city_overview")
+    a, d = _run_scripted([(call + "\n" + call, call + "\n" + _xml_call("unlocks"), []), END])
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["city_overview", "end_turn"]   # content only, once
+    assert d.meta["recovered_calls"] == 1
+    a, d = _run_scripted([("", _xml_call("unlocks"), [_call("city_overview", {})]), END])
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["city_overview", "end_turn"]   # native calls win
+    assert d.meta["recovered_calls"] == 0
+
+
+def test_text_calls_only_the_trailing_run_and_not_truncated_replies():
+    drafted = _xml_call("send_message", to="mayor", text="draft") + "\nOn second thought, no.\n"
+    a, d = _run_scripted([("", drafted + _xml_call("unlocks") + "\n  ", []), END])
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["unlocks", "end_turn"] and d.messages == []
+    a, d = _run_scripted([("", drafted, []), ("", "", []), END])            # nothing after the draft but prose
+    assert d.meta["tool_trace"] == [] and d.meta["finish_reason"] == "no_tool_calls"
+    a, d = _run_scripted([("", _xml_call("unlocks"), [], "length"), ("", "", []), END])
+    assert d.meta["tool_trace"] == [] and d.meta["recovered_calls"] == 0
+
+
+def test_text_calls_are_strings_for_the_schema_and_tolerate_broken_tags():
+    a, d = _run_scripted([("", _xml_call("send_message", to="mayor", text="true")
+                           + _xml_call("end_turn", report="null"), [])])
+    assert d.messages == [{"to": "mayor", "text": "true"}] and d.thinking == "null"
+    broken = ("<tool_call>\n<function=city_overview>\n</tool_call>"         # no </function>
+              "<tool_call>\n<function=unlocks>\n"                            # never closed
+              + _xml_call("end_turn", report="ok"))
+    a, d = _run_scripted([("", broken, [])])
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["city_overview", "unlocks", "end_turn"]
+    assert d.meta["recovered_calls"] == 3
+    a, d = _run_scripted([("", _xml_call("city_overview") + _xml_call("unlocks"), [])], max_steps=1)
+    assert len(d.meta["tool_trace"]) == 1 and d.meta["recovered_calls"] == 1   # only calls that ran count
 
 
 def test_tool_agent_keeps_actions_when_the_client_crashes():

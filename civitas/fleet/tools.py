@@ -19,6 +19,7 @@ from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES,
 from ..core.observation import build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
+from ..sim.grid import shift
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = 3800          # agents truncate tool results at 4000 chars; long lists are trimmed below that
@@ -58,7 +59,9 @@ SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": 
                 "harbour": ("harbour",), "metro_station": ("metro",), "jail": ("jail",), "hospital": ("hospital",),
                 "high_school": ("high_school",), "university": ("university",)}
 SITE_NOTES = {"levee": "no flood is forecast within 3 months; riverbank stretches to protect appear with a flood warning",
-              "congested_roads": "no road is congested right now"}
+              "congested_roads": "no road is congested right now",
+              "bus_stops": "too few homes and job centres on the highway-connected roads yet to suggest stops; "
+                           "bus lines pay off once the city is bigger (~1,500 residents)"}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
@@ -222,20 +225,42 @@ def _site(s, near) -> dict:
     return s
 
 
+def _connected_roads(w) -> np.ndarray:
+    """Road tiles on networks connected to the highway."""
+    labels = [i for i, n in enumerate(w.networks) if n.outside_connected]
+    return np.isin(w.road_labels, labels) if labels else np.zeros(w.struct.shape, bool)
+
+
+def _free_roadside(w) -> int:
+    """Empty land tiles touching a highway-connected road (8-neighbourhood, as `adjacent_network` and the build
+    actions use): where a new building could go."""
+    road = _connected_roads(w)
+    touch = np.zeros_like(road)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx or dy:
+                touch |= shift(road, dy, dx, False)
+    return int((touch & (w.struct == C.NONE) & (w.terrain == C.LAND)).sum())
+
+
 def _road_span(w) -> str:
-    ys, xs = np.nonzero(w.struct == C.ROAD)
+    ys, xs = np.nonzero(_connected_roads(w))
     if not len(xs):
-        return "no roads yet"
-    return f"the roads span x {int(xs.min())}-{int(xs.max())}, y {int(ys.min())}-{int(ys.max())}"
+        return "no roads connected to the highway yet"
+    return f"the highway-connected roads span x {int(xs.min())}-{int(xs.max())}, y {int(ys.min())}-{int(ys.max())}"
 
 
-def _river_span(w) -> str:
-    """Where the river runs, within the rows the roads span (the whole map before there are roads)."""
-    road_rows = np.nonzero((w.struct == C.ROAD).any(axis=1))[0]
+def _river_span(w) -> str | None:
+    """Where the river runs, within the rows the connected roads span (the whole map before there are roads);
+    None without a river."""
+    road_rows = np.nonzero(_connected_roads(w).any(axis=1))[0]
     y0, y1 = (int(road_rows.min()), int(road_rows.max())) if len(road_rows) else (0, w.h - 1)
     cols = np.nonzero((w.terrain[y0:y1 + 1] == C.WATER).any(axis=0))[0]
     if not len(cols):
-        return "no river on the map"
+        cols = np.nonzero((w.terrain == C.WATER).any(axis=0))[0]
+        y0, y1 = 0, w.h - 1
+    if not len(cols):
+        return None
     return f"the river runs at x {int(cols.min())}-{int(cols.max())} in rows {y0}-{y1}"
 
 
@@ -487,18 +512,35 @@ class ToolBox:
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             out["note"] = "locked: " + w.unlock_note(min(keys, key=C.UNLOCK_POP.get))
-        elif not sites and purpose in RIVERBANK_PURPOSES:
-            out["note"] = ("no free riverbank tile next to a road: a road has to reach the river first ("
-                           + _river_span(w) + "); ask planning (send_message) for a road to the riverbank, and "
-                           "build what doesn't need the river meanwhile")
         elif not sites and purpose in SITE_NOTES:
             out["note"] = SITE_NOTES[purpose]
         elif not sites:                  # models told to "inspect the map" scanned it blindly for whole turns
-            fix = ("extend a road first (find_sites road_extension)" if self.role == "planning" else
-                   "ask planning (send_message) to extend a road or leave an empty lot by a road")
-            out["note"] = (f"no suggested sites right now: no free land by a road connected to the highway where "
-                           f"this is needed ({_road_span(w)}); {fix}. Inspect only to check a specific spot.")
+            out["note"] = self._no_sites_note(purpose)
         return out
+
+    def _no_sites_note(self, purpose: str) -> str:
+        """Why a site list is empty and what to do: no free roadside land (roads must grow), or nothing needs the
+        building yet (the lists only rank spots near uncovered homes / jobs)."""
+        w = self.world
+        if purpose == "road_extension":
+            return ("no straight extension from a dead end into open land; build_road from any road tile into free "
+                    f"land (L-shaped roads work, bridges cross the river; {_road_span(w)})")
+        if purpose in RIVERBANK_PURPOSES:
+            river = _river_span(w)
+            if river is None:
+                return "this map has no river"
+            return (f"no free riverbank tile next to a highway-connected road: a road has to reach the river first "
+                    f"({river}); ask planning (send_message) for a road to the riverbank, and build what doesn't "
+                    "need the river meanwhile")
+        free = _free_roadside(w)
+        if self.role == "planning":
+            return (f"no free strip along a highway-connected road ({_road_span(w)}, {free} free roadside tiles); "
+                    "extend the roads first (find_sites road_extension lists dead ends to build from)")
+        if not free:
+            return (f"no free land next to a highway-connected road ({_road_span(w)}); ask planning (send_message) "
+                    "to extend a road or leave an empty lot by one")
+        return (f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
+                "(check coverage in city_overview / my_facilities before building)")
 
     def my_facilities(self) -> dict:
         w, role = self.world, self.role

@@ -540,10 +540,10 @@ A hint fires on any of these:
 `trajectories.jsonl`, each fleet turn carries its full `tool_trace` (tool, arguments and a
 slim result) along with the messages, reasoning, token usage and finish reasons.
 
-**First smoke runs** (2026-09-25, `fleet_smoke.toml`, seed 0, three runs with the current
-playbooks) took 9–11 minutes for 32 turns. Turns averaged 12–16 tool calls and 43–66k prompt
-tokens, and 21–30% of actions failed, mostly departments building without funds or on
-taken tiles. The fleet reached 1.0k–1.7k residents and a city score of 40.6–43.5. The
+**First smoke runs** (2026-09-25, `fleet_smoke.toml`, seed 0) took 9–11 minutes for 32
+turns. Three runs (v2–v4) used revised playbooks on intermediate code, as the fixes from
+each run landed. Turns averaged 12–16 tool calls and 48–66k prompt tokens, and 21–30% of
+actions failed, mostly departments building without funds or on taken tiles. The fleet reached 1.0k–1.7k residents and a city score of 40.6–43.5. The
 scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and 43.8,
 or 916 and 45.4 acting monthly. Twelve months is too short to compare with the 120-month
 benchmark.

@@ -32,8 +32,8 @@ playbook = """
 - Grow first, then add quality. Population is half the city score; happiness, finances, utility coverage, \
 safety, health and education are the other half.
 - The order that works: roads from the highway and zones (planning), then power, water and sewage on the same \
-road network (utilities), then services once people live there (garbage and fire / police from ~150 residents, \
-a clinic from ~400, a school when children arrive). Transport matters once the city has ~1,500 residents.
+road network (utilities), then services once people live there (a landfill from ~100 residents, fire and police \
+from ~150, a clinic from ~400, a school when children arrive). Transport matters once the city has ~1,500 residents.
 - Never let the treasury go negative (bankruptcy halves the score and ends the game). Upkeep is paid monthly \
 from the treasury, so every building also costs money every month.
 - Money sitting in a department's funds does nothing: spend it on what the plan asks for, or tell the mayor you \

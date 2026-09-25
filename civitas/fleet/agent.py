@@ -37,37 +37,65 @@ def _norm_call(c: dict, step: int, i: int) -> tuple[dict, str]:
              "function": {"name": fn.get("name") or "invalid_tool", "arguments": raw if ok else "{}"}}, raw)
 
 
-_TEXT_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
-_XML_FN = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.S)
+_OPEN, _CLOSE = "<tool_call>", "</tool_call>"
+_XML_FN = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|\Z)", re.S)
 _XML_PARAM = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.S)
+
+
+def _blocks(text: str) -> list[str]:
+    """Bodies of the trailing run of <tool_call> blocks: only whitespace after the last one and between them, so
+    calls drafted earlier and then abandoned don't run. A block ends at </tool_call>, at the next <tool_call>
+    (an unclosed block doesn't swallow the next call) or at the end of the text."""
+    spans, i = [], text.find(_OPEN)
+    while i >= 0:
+        body_start = i + len(_OPEN)
+        nxt, close = text.find(_OPEN, body_start), text.find(_CLOSE, body_start)
+        if close >= 0 and (nxt < 0 or close < nxt):
+            spans.append((i, body_start, close, close + len(_CLOSE)))
+        else:
+            stop = nxt if nxt >= 0 else len(text)
+            spans.append((i, body_start, stop, stop))
+        i = nxt
+    run = []
+    tail = len(text)
+    for start, body_start, body_end, end in reversed(spans):
+        if text[end:tail].strip():
+            break
+        run.append(text[body_start:body_end])
+        tail = start
+    return run[::-1]
 
 
 def _text_calls(text: str) -> list[dict]:
     """Tool calls written out as text: `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`
     or a JSON {"name", "arguments"} inside <tool_call>. trinity-large-thinking sometimes leaves its calls in the
-    reasoning and stops without parsed `tool_calls`; the agent runs them rather than losing the step."""
-    calls = []
-    for body in _TEXT_CALL.findall(text or ""):
+    reasoning and stops without parsed `tool_calls`; the agent runs them rather than losing the step. XML values
+    stay strings (ToolBox coerces them by the tool's schema); identical calls are kept once."""
+    calls, seen = [], set()
+    for body in _blocks(text or ""):
         fn = _XML_FN.search(body)
         if fn:
-            args = {}
-            for k, v in _XML_PARAM.findall(fn.group(2)):
-                try:
-                    args[k] = json.loads(v.strip())
-                except ValueError:
-                    args[k] = v.strip()
-            name = fn.group(1)
+            name, args = fn.group(1), {k: v.strip() for k, v in _XML_PARAM.findall(fn.group(2))}
         else:
             try:
-                obj = json.loads(body)
+                obj = json.loads(body.strip())
             except ValueError:
                 continue
             if not isinstance(obj, dict) or not obj.get("name"):
                 continue
             name, args = str(obj["name"]), obj.get("arguments") or {}
-        calls.append({"type": "function", "function": {
-            "name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}})
+        raw = args if isinstance(args, str) else json.dumps(args, sort_keys=True)
+        if (name, raw) not in seen:
+            seen.add((name, raw))
+            calls.append({"type": "function", "function": {"name": name, "arguments": raw}})
     return calls
+
+
+def _recover(out: dict) -> list[dict]:
+    """Text tool calls from the reply's content, else from its reasoning; none from a truncated reply."""
+    if out.get("finish_reason") == "length":
+        return []
+    return _text_calls(out.get("content") or "") or _text_calls(out.get("reasoning") or "")
 
 
 def _slim(res: dict) -> dict:
@@ -132,9 +160,9 @@ class ToolAgent(Agent):
             finish = out.get("finish_reason")
             finishes.append(finish)
             raw_calls = out.get("tool_calls") or []
-            if not raw_calls:
-                raw_calls = _text_calls(f"{out.get('content') or ''}\n{out.get('reasoning') or ''}")
-                recovered += len(raw_calls)
+            from_text = not raw_calls
+            if from_text:
+                raw_calls = _recover(out)
             pairs = [_norm_call(c, step, i) for i, c in enumerate(raw_calls)]
             calls, raws = [c for c, _ in pairs], [r for _, r in pairs]
             messages.append({"role": "assistant", "content": out.get("content") or ("" if calls else "(no reply)"),
@@ -155,6 +183,7 @@ class ToolAgent(Agent):
                     res = {"ok": False, "error": f"not run: tool-call limit reached ({cfg.max_steps} per turn)"}
                 else:
                     res = box.call(name, args)
+                    recovered += from_text
                     trace.append({"step": step, "finish_reason": finish, "tool": name, "args": args,
                                   "result": _slim(res)})
                 messages.append({"role": "tool", "tool_call_id": c["id"],
