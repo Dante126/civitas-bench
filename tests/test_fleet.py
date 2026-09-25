@@ -357,3 +357,55 @@ def test_turn_control_tools():
     assert rep["text"] == "built nothing"
     env.apply("fire", Decision(messages=box.messages))
     assert ToolBox(env, "mayor").call("get_messages", {})["messages"][-1]["text"] == "need $2k"
+
+
+def test_history_filters_by_several_roles_before_the_cap():
+    fs = FleetState()
+    fs.record(0, "fire", "action", action={"type": "a"}, ok=True, message="", cost=0)
+    for i in range(45):
+        fs.record(0, "police", "action", action={"type": "b"}, ok=True, message="", cost=0)
+    assert [e["role"] for e in fs.history(role=("fire", "city"))] == ["fire"]
+    assert len(fs.history(role={"fire", "police"})) == 40
+
+
+def test_department_history_keeps_its_own_entries():
+    env = _env()
+    fs = FleetState.of(env)
+    fs.record(0, "fire", "action", action={"type": "build_fire_station"}, ok=False, message="no road", cost=0)
+    for i in range(45):
+        fs.record(0, "police", "action", action={"type": "build_police_station"}, ok=True, message="", cost=0)
+    entries = ToolBox(env, "fire").call("history", {})["entries"]
+    assert [e["message"] for e in entries] == ["no road"]
+    assert len(ToolBox(env, "mayor").call("history", {})["entries"]) == 20
+
+
+def test_successful_actions_are_capped_per_turn():
+    env = _env(max_actions_per_turn=2)
+    box = ToolBox(env, "mayor")
+    assert box.call("set_tax", {"sector": "R", "rate": 8})["ok"]
+    assert not box.call("set_tax", {"sector": "Q", "rate": 8})["ok"]      # failures don't count
+    assert box.call("set_tax", {"sector": "C", "rate": 8.5})["ok"]
+    res = box.call("set_tax", {"sector": "I", "rate": 8})
+    assert res["ok"] is False and "limit" in res["error"] and "end_turn" in res["error"]
+    assert len(box.executed) == 3 and env.world.taxes["I"] != 0.08
+    assert box.call("city_overview", {})["ok"] and box.call("end_turn", {"report": "taxes"})["ok"]
+    assert ToolBox(env, "mayor").call("set_tax", {"sector": "I", "rate": 8})["ok"]     # a new turn
+
+
+def test_float_handler_params_are_numbers():
+    import inspect as pyinspect
+    import re
+    from civitas.core.actions import HANDLERS, action_docs
+    from civitas.fleet.tools import NUMBER_PARAMS
+    env = _env()
+    docs = action_docs()
+    floats = set()
+    for name, fn in HANDLERS.items():
+        for k in re.findall(r'_num\(p, "(\w+)"\)', pyinspect.getsource(fn)):
+            if isinstance(json.loads(docs[name][0]).get(k), int):
+                floats.add((name, k))
+    assert floats == NUMBER_PARAMS
+    for name, k in NUMBER_PARAMS:
+        role = next(r for r, spec in ROLES.items() if name in spec["actions"])
+        tool = {s["function"]["name"]: s["function"] for s in ToolBox(env, role).schemas()}[name]
+        assert tool["parameters"]["properties"][k]["type"] == "number"

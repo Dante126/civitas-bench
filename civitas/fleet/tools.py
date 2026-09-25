@@ -61,6 +61,9 @@ SITE_NOTES = {"levee": "no flood is forecast within 3 months; riverbank stretche
               "congested_roads": "no road is congested right now"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
+# int in the doc example, but the handler reads a float (actions._num)
+NUMBER_PARAMS = {("set_tax", "rate"), ("set_funding", "percent"), ("allocate_budget", "amount"),
+                 ("take_loan", "amount"), ("repay_loan", "amount"), ("set_fare", "fare"), ("set_district_tax", "delta")}
 _JSON_TYPE = {int: "integer", float: "number", str: "string", bool: "boolean", list: "array", dict: "object"}
 # build actions -> the tier lines their "kind" can name
 _BUILD_LINES = {"build_power_plant": POWER_LINES, "build_water": WATER_LINES, "build_sewage": SEWAGE_LINES,
@@ -178,7 +181,8 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     props = {}
     for k, v in json.loads(example).items():
         if k != "type":
-            props[k] = {"type": _JSON_TYPE[type(v)], **({"items": {}} if isinstance(v, list) else {})}
+            t = "number" if (name, k) in NUMBER_PARAMS else _JSON_TYPE[type(v)]
+            props[k] = {"type": t, **({"items": {}} if isinstance(v, list) else {})}
     lines = _BUILD_LINES.get(name) or ((C.TIER_BY_NAME[name[6:]][0],) if name[6:] in C.TIER_BY_NAME else ())
     if name.startswith("build_") and any(len(C.TIER_LINES[ln]) > 1 for ln in lines):
         props["tier"] = dict(_TIER_PARAM)
@@ -278,6 +282,9 @@ class ToolBox:
     # ------------------------------------------------------------- actions
     def _act(self, name: str, /, **args) -> dict:
         w = self.world
+        cap = self.env.cfg.max_actions_per_turn
+        if sum(r["ok"] for r in self.executed) >= cap:
+            raise ToolError(f"action limit reached for this turn ({cap} successful actions); call end_turn")
         res = apply_action(w, self.role, {"type": name, **args}).to_dict()
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
@@ -478,9 +485,8 @@ class ToolBox:
 
     def history(self, kind: str | None = None, months: int = 3) -> dict:
         months = max(1, min(MAX_MONTHS, int(months)))
-        entries = self.fleet.history(kind, months, now=self.world.month)
-        if self.role != "mayor":                         # departments: their own entries and the city's
-            entries = [e for e in entries if e["role"] in (self.role, "city")]
+        roles = None if self.role == "mayor" else (self.role, "city")    # departments: their own and the city's
+        entries = self.fleet.history(kind, months, role=roles, now=self.world.month)
         return {"ok": True, "months": months, "entries": entries[-MAX_ENTRIES:]}
 
     # --------------------------------------------------------- turn control

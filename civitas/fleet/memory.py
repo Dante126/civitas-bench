@@ -126,17 +126,19 @@ class FleetState:
         for text in w.last_events:
             self.record(w.month - 1, "city", "event", text=text)
 
-    def history(self, kind: str | None = None, months: int | None = 3, role: str | None = None,
+    def history(self, kind: str | None = None, months: int | None = 3, role=None,
                 now: int | None = None) -> list[dict]:
         """Log entries from months `> now - months` (`now` defaults to the newest logged month), newest last,
-        at most the 40 newest. `kind="failure"` selects failed actions; `months=None` means all months."""
+        at most the 40 newest. `role` is one role or a collection of roles (filtered before the cap);
+        `kind="failure"` selects failed actions; `months=None` means all months."""
+        roles = None if role is None else {role} if isinstance(role, str) else set(role)
         if kind is not None and kind not in HISTORY_KINDS:
             raise ValueError(f"unknown history kind {kind!r}; valid: {', '.join(HISTORY_KINDS)}")
         if now is None:
             now = max((e["month"] for e in self.log), default=0)
         out = [e for e in self.log
                if (months is None or e["month"] > now - months)
-               and (role is None or e["role"] == role)
+               and (roles is None or e["role"] in roles)
                and (kind is None or e["kind"] == kind
                     or (kind == "failure" and e["kind"] == "action" and not e.get("ok", True)))]
         out.sort(key=lambda e: e["month"])
