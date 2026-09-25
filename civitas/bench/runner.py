@@ -11,6 +11,7 @@ from pathlib import Path
 from ..config import agent_spec, build_agents, game_config, scoring_config
 from ..core.env import make_env
 from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version
+from ..fleet.report import fleet_report, turn_row
 
 
 def _jsonable(o):
@@ -94,7 +95,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
 
     stats = {r: {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0,
                  "parse_errors": 0, "reward": 0.0} for r in env.roles}
-    city_scores, t0 = [], time.time()
+    city_scores, fleet_rows, t0 = [], [], time.time()
     while not env.done:
         pending = []
         acting = [r for r in env.roles if env.acts_this_month(r)]
@@ -123,10 +124,13 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                 rec["finish_reason"] = decision.meta.get("finish_reason")
                 rec["usage"] = decision.meta.get("usage")
                 rec["latency_s"] = decision.meta.get("latency_s")
-                rec.update({k: decision.meta[k] for k in ("tool_trace", "steps", "ended") if k in decision.meta})
+                rec.update({k: decision.meta[k] for k in ("tool_trace", "steps", "ended", "finish_reasons", "length_stops")
+                            if k in decision.meta})
             elif log_observations:
                 rec["observation_text"] = obs["text"]
             pending.append(rec)
+            if agents[role].kind == "fleet":
+                fleet_rows.append(turn_row(rec))       # slim: whole records hold every turn's messages
         info = env.end_month()
         for rec in pending:
             rec["reward"] = info["rewards"][rec["role"]]
@@ -177,6 +181,11 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
         "agent_stats": stats,
         "wall_time_s": round(time.time() - t0, 2),
     }
+    if prompts:
+        report, md = fleet_report(env, summary, fleet_rows)
+        (log.dir / "fleet_report.json").write_text(json.dumps(_jsonable(report), indent=2))
+        (log.dir / "fleet_report.md").write_text(md)
+        summary["fleet"] = {"report": "fleet_report.md", "hints": len(report["hints"])}
     log.summary(summary)
     log.close()
     if verbose:

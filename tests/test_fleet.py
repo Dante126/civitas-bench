@@ -802,6 +802,19 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
     police = [t for t in traj if t["role"] == "police"][0]
     ids = [c["id"] for m in police["prompt"] if m["role"] == "assistant" for c in m.get("tool_calls", [])]
     assert ids and ids == [m["tool_call_id"] for m in police["prompt"] if m["role"] == "tool"]
+    assert all(t["finish_reasons"] and t["length_stops"] == 0 for t in traj)
+    assert mayor["finish_reasons"] == ["tool_calls"] * 3
+    # end-of-run fleet report
+    rep = json.loads((d / "fleet_report.json").read_text())
+    md = (d / "fleet_report.md").read_text()
+    assert {"scoreboard", "plan", "roles", "hints"} <= set(rep)
+    assert all(r in md for r in TURN_ORDER) and list(rep["roles"]) == list(TURN_ORDER)
+    assert s["run_id"] in md and rep["plan"]["versions"] == 2 and rep["plan"]["budgets"] == {"utilities": 3000}
+    assert rep["roles"]["utilities"]["tool_calls"] == 6 and rep["roles"]["utilities"]["actions"] == 2
+    assert rep["roles"]["mayor"]["completion_tokens"] == 60 and rep["scoreboard"]["city"] == s["final_scores"]["city"]
+    assert s["fleet"] == {"report": "fleet_report.md", "hints": len(rep["hints"])}
+    rebuilt, _ = fleet_report(env, s, rows_from_trajectories(d / "trajectories.jsonl"))
+    assert json.loads(json.dumps(rebuilt)) == rep
 
 
 class FakeClient:
@@ -1020,3 +1033,154 @@ def test_tool_agent_keeps_actions_when_the_client_crashes():
     assert d.meta["finish_reason"] == "api_error" and "ConnectionResetError: socket gone" in d.parse_error
     assert len(d.executed) == 1 and d.executed[0]["ok"]
     assert env.apply("mayor", d) == d.executed and env.world.dept_funds["health"] == 1000
+
+
+# ------------------------------------------------------------------ end-of-run report
+from civitas.fleet.report import fleet_report, rows_from_trajectories, turn_row
+
+
+def _rec(role, month, results=(), finish="end_turn", steps=3, tokens=(100, 20), trace=(), length_stops=0):
+    return {"role": role, "month": month, "agent": "fleet:fake", "prompt": [{"role": "user", "content": "x" * 999}],
+            "results": [{"action": {"type": t}, "ok": ok, "message": msg, "cost": cost} for t, ok, msg, cost in results],
+            "usage": {"prompt_tokens": tokens[0], "completion_tokens": tokens[1]}, "steps": steps,
+            "finish_reason": finish, "finish_reasons": ["tool_calls"], "length_stops": length_stops, "ended": True,
+            "tool_trace": list(trace), "parse_error": None}
+
+
+def _report_env(months=12, funds=500.0, treasury=20000.0, budget=1000.0):
+    env = _env()
+    fs = FleetState.of(env)
+    fs.update_plan(0, goals=["grow"], budgets={d: budget for d in DEPTS})
+    env.world.month = months
+    env.world.history = [{"month": m + 1, "population": 100 * m, "treasury": treasury,
+                          "dept_funds": {d: funds for d in DEPTS}} for m in range(months)]
+    return env
+
+
+def _clean_rows(months=12):
+    return [turn_row(_rec(r, m, [("noop", True, "ok", 10)])) for m in range(months) for r in TURN_ORDER]
+
+
+def _summary(env):
+    return {"run_id": "r1", "seed": 0, "signature": "sig", "months_played": env.world.month, "bankrupt": False,
+            "final_scores": {"city": 50.0, **{r: 40.0 for r in TURN_ORDER}}, "avg_city_score": 45.0,
+            "final_metrics": {"population": 1234, "treasury": 5678.0}}
+
+
+def _hints(rep, kind):
+    return [h for h in rep["hints"] if h["kind"] == kind]
+
+
+def test_turn_row_is_slim():
+    trace = [{"tool": "inspect", "result": {"ok": False, "error": "bad args"}},
+             {"tool": "zone", "result": {"ok": False, "error": "no land", "message": "no land"}},
+             {"tool": "city_overview", "result": {"ok": True}}]
+    row = turn_row(_rec("police", 3, [("build_service", False, "tile (3,4) is occupied", 0)], trace=trace,
+                        length_stops=2))
+    assert row == {"role": "police", "month": 3, "prompt_tokens": 100, "completion_tokens": 20, "steps": 3,
+                   "finish_reason": "end_turn", "length_stops": 2, "ended": True, "parse_error": None,
+                   "results": [{"type": "build_service", "ok": False, "message": "tile (3,4) is occupied", "cost": 0}],
+                   "tool_errors": ["bad args"]}
+
+
+def test_fleet_report_on_a_clean_run_has_no_hints():
+    env = _report_env()
+    env.fleet.update_memory("police", lessons=["check roads first"])
+    rep, md = fleet_report(env, _summary(env), _clean_rows())
+    assert rep["hints"] == [] and "No coaching hints" in md
+    pol = rep["roles"]["police"]
+    assert pol == {**pol, "turns": 12, "tool_calls": 36, "actions": 12, "failed": 0, "spent": 120,
+                   "prompt_tokens": 1200, "completion_tokens": 240, "limit_turns": 0, "length_stops": 0,
+                   "api_errors": 0, "top_failures": [], "lessons": ["check roads first"]}
+    assert rep["scoreboard"] == {"city": 50.0, "roles": {r: 40.0 for r in TURN_ORDER}, "avg_city": 45.0,
+                                 "population": 1234, "treasury": 5678.0, "bankrupt": False}
+    assert rep["plan"]["goals"] == ["grow"] and rep["plan"]["versions"] == 1
+    assert all(r in md for r in TURN_ORDER) and "check roads first" in md and "r1" in md
+
+
+def test_fleet_report_repeated_failure_hint():
+    env = _report_env()
+    rows = _clean_rows()
+    fails = [("build_service", False, f"tile ({x},{x + 3}) is occupied by road; pick an empty tile", 0)
+             for x in (3, 14, 27, 5)]
+    rows.append(turn_row(_rec("police", 4, fails + [("build_service", False, "costs $9,000 but the police "
+                                                     "budget only has $500; ask the mayor", 0)])))
+    rows.append(turn_row(_rec("fire", 4, fails[:2])))            # two alike: below the threshold
+    rep, md = fleet_report(env, _summary(env), rows)
+    h, = _hints(rep, "repeated_failures")
+    assert h["role"] == "police" and h["count"] == 4 and "occupied by road" in h["text"] and h["text"] in md
+    pol = rep["roles"]["police"]
+    assert pol["failed"] == 5 and pol["top_failures"][0]["count"] == 4
+    assert pol["top_failures"] == [{"message": fails[0][2], "count": 4}, {"message": "costs $9,000 but the police "
+                                   "budget only has $500; ask the mayor", "count": 1}]
+
+
+def test_fleet_report_tool_errors_count_towards_repeated_failures():
+    env = _report_env()
+    trace = [{"tool": "noop", "result": {"ok": False, "error": "there is no noop tool; to do nothing, call end_turn"}}]
+    rows = _clean_rows() + [turn_row(_rec("health", m, trace=trace)) for m in (1, 2, 3)]
+    rep, _ = fleet_report(env, _summary(env), rows)
+    h, = _hints(rep, "repeated_failures")
+    assert h["role"] == "health" and h["count"] == 3 and "no noop tool" in h["text"]
+    assert rep["roles"]["health"]["tool_errors"] == 3 and rep["roles"]["health"]["failed"] == 0
+
+
+def test_fleet_report_unused_money_hint():
+    env = _report_env(funds=1500.0)                  # below 2x the 1000 budget everywhere
+    hist = env.world.history
+    for m in (3, 4, 5):                               # three months in a row above 2x for police
+        hist[m]["dept_funds"] = {**hist[m]["dept_funds"], "police": 2500.0}
+    for m in (3, 4, 6):                               # fire: not consecutive
+        hist[m]["dept_funds"] = {**hist[m]["dept_funds"], "fire": 2500.0}
+    rep, _ = fleet_report(env, _summary(env), _clean_rows())
+    h, = _hints(rep, "unused_money")
+    assert h["role"] == "police" and h["months"] == 3 and "$2,500" in h["text"] and "$1,000" in h["text"]
+
+
+def test_unused_money_uses_the_plan_in_effect_and_skips_depts_without_a_target():
+    env = _env()
+    fs = FleetState.of(env)
+    fs.update_plan(0, budgets={"police": 1000})
+    fs.update_plan(5, budgets={"police": 5000})      # later version raises the target: no longer unused
+    env.world.month = 10
+    env.world.history = [{"month": m + 1, "treasury": 100.0,
+                          "dept_funds": {d: 3000.0 for d in DEPTS}} for m in range(10)]
+    rep, _ = fleet_report(env, _summary(env), _clean_rows(10))
+    h, = _hints(rep, "unused_money")                 # months 1-5 under the 1000 target; no other dept has one
+    assert h["role"] == "police" and h["months"] == 5
+
+
+def test_fleet_report_idle_department_hint():
+    env = _report_env()
+    rows = [r for r in _clean_rows() if not (r["role"] == "fire" and 1 <= r["month"] <= 8)]
+    rows += [turn_row(_rec("fire", m, [("build_service", False, "nope", 0)])) for m in (2, 5)]   # failures don't count
+    rows = [r for r in rows if not (r["role"] == "mayor" and r["month"] > 0)]                    # mayor isn't a dept
+    rows = [r for r in rows if not (r["role"] == "health" and 7 <= r["month"] <= 11)]            # 5 months: too short
+    rep, _ = fleet_report(env, _summary(env), rows)
+    h, = _hints(rep, "idle")
+    assert h["role"] == "fire" and h["months"] == 8 and "months 1-8" in h["text"]
+
+
+def test_fleet_report_negative_treasury_hint():
+    env = _report_env()
+    env.world.history[4]["treasury"] = -2500.0
+    env.world.history[7]["treasury"] = -100.0
+    rep, _ = fleet_report(env, _summary(env), _clean_rows())
+    h, = _hints(rep, "negative_treasury")
+    assert h["months"] == 2 and "-$2,500" in h["text"] and "month 5" in h["text"]
+
+
+def test_fleet_report_limit_hint():
+    env = _report_env()
+    rows = [r for r in _clean_rows() if r["role"] not in ("police", "fire")]
+    finishes = ["max_steps", "turn_tokens", "end_turn", "end_turn", "end_turn", "end_turn", "end_turn", "end_turn",
+                "end_turn", "end_turn", "end_turn", "end_turn"]
+    rows += [turn_row(_rec("police", m, [("x", True, "ok", 0)], finish=f)) for m, f in enumerate(finishes)]
+    rows += [turn_row(_rec("police", 0, [("x", True, "ok", 0)], finish="max_steps"))]             # 3 of 13 > 20%
+    rows += [turn_row(_rec("fire", m, [("x", True, "ok", 0)], finish="api_error" if m < 6 else "end_turn",
+                           length_stops=1)) for m in range(12)]                                 # not limit turns
+    rep, _ = fleet_report(env, _summary(env), rows)
+    h, = _hints(rep, "limit")
+    assert h["role"] == "police" and "3 of 13" in h["text"]
+    assert rep["roles"]["police"]["limit_turns"] == 3
+    assert rep["roles"]["fire"]["api_errors"] == 6 and rep["roles"]["fire"]["length_stops"] == 12
