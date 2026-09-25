@@ -234,10 +234,90 @@ def test_chat_client_gives_up_on_a_hung_request_and_retries():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _DripThenAnswer)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     client = ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key_env="",
-                                       timeout=1.0, max_retries=1))
+                                       timeout=5.0, deadline=1.0, max_retries=1))
     t0 = time.time()
     out = client.chat("fake", [{"role": "user", "content": "hi"}])
     assert out["content"] == '{"actions": []}'
     assert _DripThenAnswer.calls == 2
     assert time.time() - t0 < 6          # the drip would take 20 s; the deadline cuts it at ~1 s
+    srv.shutdown()
+
+
+class _StreamingLLM(BaseHTTPRequestHandler):
+    """Answers with server-sent events, as Arcee does for "stream": true."""
+    bodies = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        type(self).bodies.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        chunks = [{"choices": [{"delta": {"reasoning_content": "think "}}]},
+                  {"choices": [{"delta": {"reasoning_content": "more"}}]},
+                  {"choices": [{"delta": {"content": '{"actions": '}}]},
+                  {"choices": [{"delta": {"content": "[]}"}, "finish_reason": "stop"}]},
+                  {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 5}}]
+        for c in chunks:
+            self.wfile.write(b"data: " + json.dumps(c).encode() + b"\n\n")
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+def test_chat_client_streams_and_reassembles_the_answer():
+    from civitas.agents.llm_client import ChatClient
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _StreamingLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key_env=""))
+    out = client.chat("fake", [{"role": "user", "content": "hi"}], max_tokens=100)
+    assert out["content"] == '{"actions": []}' and out["reasoning"] == "think more"
+    assert out["finish_reason"] == "stop" and out["usage"]["completion_tokens"] == 5
+    assert _StreamingLLM.bodies[0]["stream"] is True
+    srv.shutdown()
+
+
+class _FlakyStream(BaseHTTPRequestHandler):
+    """1st request: one data chunk, then only keep-alive pings (a stalled generation).
+    2nd: a stream that stops without a finish reason. 3rd: a complete answer."""
+    calls = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        type(self).calls += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        send = lambda c: (self.wfile.write(b"data: " + json.dumps(c).encode() + b"\n\n"), self.wfile.flush())
+        try:
+            send({"choices": [{"delta": {"reasoning_content": "hmm"}}]})
+            if type(self).calls == 1:
+                for _ in range(100):
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+                return
+            if type(self).calls == 2:
+                return
+            send({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})
+            self.wfile.write(b"data: [DONE]\n\n")
+        except OSError:
+            pass
+
+
+def test_chat_client_retries_stalled_and_truncated_streams():
+    from civitas.agents.llm_client import ChatClient
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FlakyStream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key_env="",
+                                       timeout=1.0, max_retries=2))
+    t0 = time.time()
+    out = client.chat("fake", [{"role": "user", "content": "hi"}])
+    assert out["content"] == "done" and out["finish_reason"] == "stop"
+    assert _FlakyStream.calls == 3
+    assert time.time() - t0 < 12         # the ping stream would last 20 s; it is cut after ~1 s of no data
     srv.shutdown()

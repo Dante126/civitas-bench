@@ -19,38 +19,77 @@ from dataclasses import dataclass
 class ProviderConfig:
     base_url: str = "https://api.arcee.ai/api/v1"
     api_key_env: str = "ARCEE_API_KEY"
-    timeout: float = 300.0
+    timeout: float = 300.0        # give up when no data arrives for this long
     max_retries: int = 5
     extra_headers: dict | None = None
+    stream: bool = True           # stream the answer: long reasoning turns never go quiet on the wire
+    deadline: float = 1800.0      # wall-clock limit per attempt, however the server behaves
 
 
 class LLMError(RuntimeError):
     pass
 
 
-def _post(req: urllib.request.Request, timeout: float) -> bytes:
-    """POST and read the whole body, giving up after `timeout` seconds of wall clock.
+def _read_events(resp, idle: float) -> dict:
+    """Reassemble a server-sent-events answer into the shape of a non-streamed one.
 
-    urllib's own timeout only fires when the socket is silent; a provider that holds a request open
-    while trickling bytes (seen with Arcee) would otherwise block a run for many minutes.
+    Keep-alive comments reset the socket timeout, so a stream whose generation has stalled is caught
+    here: no data line for `idle` seconds, or a stream that ends without a finish reason, is an error
+    (and the attempt is retried) rather than a truncated answer.
+    """
+    content, reasoning, usage, finish, done = [], [], {}, None, False
+    last = time.time()
+    for raw in resp:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            if time.time() - last > idle:
+                raise TimeoutError(f"stream stalled: no data for {idle:.0f} s")
+            continue
+        last = time.time()
+        data = line[5:].strip()
+        if data == "[DONE]":
+            done = True
+            break
+        chunk = json.loads(data)
+        usage = chunk.get("usage") or usage
+        for ch in chunk.get("choices") or []:
+            delta = ch.get("delta") or {}
+            content.append(delta.get("content") or "")
+            reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+            finish = ch.get("finish_reason") or finish
+    if finish is None and not done:
+        raise ConnectionError("stream ended before the answer was finished")
+    return {"choices": [{"message": {"content": "".join(content), "reasoning_content": "".join(reasoning)},
+                         "finish_reason": finish}], "usage": usage}
+
+
+def _post(req: urllib.request.Request, idle: float, deadline: float) -> dict:
+    """POST and return the parsed answer (streamed or plain JSON).
+
+    `idle` is urllib's socket timeout (fires only when no data arrives); `deadline` caps the whole
+    attempt, because a non-streamed request can be held open for a very long time without an answer
+    (seen with Arcee on generations longer than ~100 s).
     """
     box: dict = {}
 
     def work():
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                box["body"] = resp.read()
+            with urllib.request.urlopen(req, timeout=idle) as resp:
+                if "event-stream" in (resp.headers.get("Content-Type") or ""):
+                    box["payload"] = _read_events(resp, idle)
+                else:                        # providers / test servers that ignore "stream"
+                    box["payload"] = json.loads(resp.read().decode())
         except BaseException as e:           # re-raised in the caller's thread
             box["err"] = e
 
     t = threading.Thread(target=work, daemon=True)
     t.start()
-    t.join(timeout)
+    t.join(deadline)
     if t.is_alive():
-        raise TimeoutError(f"no complete response after {timeout:.0f} s")
+        raise TimeoutError(f"no complete response after {deadline:.0f} s")
     if "err" in box:
         raise box["err"]
-    return box["body"]
+    return box["payload"]
 
 
 class ChatClient:
@@ -69,6 +108,9 @@ class ChatClient:
             raise LLMError(f"environment variable {self.p.api_key_env} is not set")
         body = {"model": model, "messages": messages, "temperature": temperature,
                 "max_tokens": max_tokens, **(extra or {})}
+        if self.p.stream:
+            body.setdefault("stream", True)
+            body.setdefault("stream_options", {"include_usage": True})
         data = json.dumps(body).encode()
         headers = {"Content-Type": "application/json", **(self.p.extra_headers or {})}
         if self.api_key:
@@ -79,7 +121,7 @@ class ChatClient:
             t0 = time.time()
             try:
                 req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-                payload = json.loads(_post(req, self.p.timeout).decode())
+                payload = _post(req, self.p.timeout, self.p.deadline)
                 choice = payload["choices"][0]
                 msg = choice.get("message") or {}
                 content = msg.get("content") or ""
@@ -92,7 +134,8 @@ class ChatClient:
                 last_err = f"HTTP {e.code}: {detail}"
                 if e.code not in (408, 409, 429, 500, 502, 503, 504):
                     raise LLMError(last_err) from e
-            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError) as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError,
+                    IndexError) as e:
                 last_err = f"{type(e).__name__}: {e}"
             time.sleep(min(30.0, (2 ** attempt) + random.random()))
         raise LLMError(f"giving up after {self.p.max_retries + 1} attempts: {last_err}")
