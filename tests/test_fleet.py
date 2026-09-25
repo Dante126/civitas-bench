@@ -687,6 +687,7 @@ def test_department_briefing_digests_its_own_last_turn():
 
 
 def test_briefing_lists_new_council_messages_for_this_role():
+    from civitas.fleet.tools import MAX_ENTRIES
     env = _env()
     c = env.council
     c.post(0, "mayor", "OLD-MSG before the last turn", "planning")
@@ -703,13 +704,15 @@ def test_briefing_lists_new_council_messages_for_this_role():
     assert "  - m0 mayor -> all: TO-ALL keep the treasury positive" in msgs
     assert msgs.index("TO-PLANNING") < msgs.index("TO-ALL")                 # newest last
     assert "TO-POLICE" not in msgs and "OWN-POST" not in msgs and "OLD-MSG" not in text
-    assert "more: get_messages" not in msgs
+    assert "older" not in msgs
     for i in range(6):
         c.post(1, "health", f"REQ-{i} clinic lot please", "all")
     text = briefing(env, "planning", mark=False)
     msgs = text[text.index("new council messages"):].split("\n\n")[0]
     assert [f"REQ-{i}" in msgs for i in range(6)] == [False] + [True] * 5
-    assert "TO-PLANNING" not in msgs and "(3 more: get_messages)" in msgs
+    assert "TO-PLANNING" not in msgs and "(3 older: get_messages)" in msgs
+    env.cfg.council_window = 0                                              # the older ones are out of get_messages' reach
+    assert f"(3 older; get_messages shows only the latest {MAX_ENTRIES})" in briefing(env, "planning", mark=False)
     assert "- m1 health -> all: REQ-5" in briefing(env, "mayor", mark=False)
 
 
@@ -767,7 +770,7 @@ def test_briefings_stay_bounded_at_the_limits():
         assert len(text) - len(memory) < 7500, (role, len(text) - len(memory))   # memory is shown in full by design
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
-        assert f"({MAX_ENTRIES} more: get_messages)" in text and f"msg {MAX_ENTRIES + 4} " in text
+        assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
     assert mayor.count("(full: history kind=report)") == len(DEPTS)
 

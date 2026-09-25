@@ -18,7 +18,7 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import SITE_PURPOSES, overview, plan_slice
+from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -133,9 +133,13 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
         L.append(f"- forecast: {cut(f)}")
     msgs = [env._local(m) for m in d["messages"]]
     L.append("- new council messages (newest last):" if msgs else "- no new council messages")
-    if len(msgs) > MAX_MESSAGES:
-        L.append(f"  - ({len(msgs) - MAX_MESSAGES} more: get_messages)")
-    L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] != 'all' else 'all'}: "
+    older = msgs[:-MAX_MESSAGES]
+    if older:
+        reach = (len(older) <= MAX_ENTRIES - MAX_MESSAGES
+                 and older[0]["month"] >= w.month - env.cfg.council_window)     # what get_messages returns
+        L.append(f"  - ({len(older)} older" + (": get_messages)" if reach else
+                                                f"; get_messages shows only the latest {MAX_ENTRIES})"))
+    L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] == role else m['to']}: "
              f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
     return L
 
