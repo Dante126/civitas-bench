@@ -47,7 +47,8 @@ stay. A crashed turn is logged and becomes a no-op.
 - `inspect(x, y, radius)` — small tile window: building, tier, level, coverage, pollution (replaces the ASCII map).
 - `find_sites(purpose, near?)` — ranked candidate sites (e.g. `clinic`, `pump`, `2x2 riverbank`), crowding-aware.
 - `my_facilities()` — the department's buildings with load, capacity, tier, available upgrades.
-- `get_plan()`, `get_messages()`, `history(query)` — memory layers.
+- `get_plan()`, `get_messages()`, `history(kind, months)` — memory layers (structured query: failures, actions,
+  events, reports, metrics).
 - `unlocks()` — locked options and when they unlock.
 
 **Actions:** existing actions exposed as functions with JSON schemas, executed through `apply_action` (same
@@ -63,7 +64,7 @@ error the model can correct.
 2. **Department memory** — `commitments`, `open_tasks`, `lessons`; size-capped; edited via `update_memory`; shown
    in full in the briefing. In autonomous mode this is how strategy adapts.
 3. **Automatic history** — every action with result/cost, monthly metric snapshots, events, department reports.
-   Queried via `history(query)`; briefings include a "since your last turn" digest.
+   Queried via `history(kind, months)`; briefings include a "since your last turn" digest.
 
 All three live in the game state (survive between days, appear in replays).
 
@@ -103,8 +104,8 @@ N months and resuming with an edited config; the daily server comes later.
 - Unit tests per tool (look-ups and actions, error paths).
 - Fake OpenAI-compatible server replaying scripted tool calls: the full manager → departments loop in CI with
   no API key.
-- A **scripted fleet** that plays through the same tools (not observations): proves the tools are sufficient
-  and keeps the benchmark near the current ~77.
+- Deferred: a scripted fleet playing through the tools. The scripted baselines stay as they are (benchmark
+  unchanged); tool coverage is proven by unit tests and an end-to-end fleet run against a fake tool-calling server.
 - A short trinity smoke run (autonomous, e.g. 12–24 months) checking tool-call validity, failures, tokens.
 
 ## Out of scope (later)

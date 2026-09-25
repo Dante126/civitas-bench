@@ -17,6 +17,8 @@ from .agents.remote import RemoteAgent
 from .agents.scripted import SCRIPTED
 from .bench.scoring import ScoringConfig
 from .core.env import GameConfig
+from .fleet.agent import ToolAgent
+from .fleet.config import fleet_agent_config
 
 DEFAULT_PROVIDERS = {
     "arcee": {"base_url": "https://api.arcee.ai/api/v1", "api_key_env": "ARCEE_API_KEY"},
@@ -103,14 +105,16 @@ def provider_config(cfg: dict, name: str) -> ProviderConfig:
 def agent_spec(cfg: dict, role: str) -> dict:
     """Agent settings for a role; in region mode "north.planning" falls back to "planning"."""
     agents = cfg["agents"]
-    if role in agents:
-        return dict(agents[role])
-    base = role.split(".", 1)[-1]
-    return dict(agents.get(base, {"kind": "scripted"}))
+    key = role if role in agents else role.split(".", 1)[-1]
+    spec = agents.get(key, {"kind": "scripted"})
+    if not isinstance(spec, dict):
+        raise ValueError(f"[agents.{key}] must be a table such as {{kind = \"scripted\"}}, got {spec!r}")
+    return dict(spec)
 
 
 def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: ScoringConfig, hub=None) -> dict:
     agents = {}
+    modes = set()
     for role in roles:
         spec = agent_spec(cfg, role)
         base = role.split(".", 1)[-1]
@@ -136,6 +140,14 @@ def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: Scoring
                 extra_body=spec.pop("extra_body", None),
                 months=game.months, target_pop=scoring.target_population,
                 max_actions=game.max_actions_per_turn)
+        elif kind == "fleet":
+            if city:
+                raise ValueError("fleet agents support single-city games only")
+            fc = fleet_agent_config(cfg, role)
+            modes.add(fc.mode)
+            agents[role] = ToolAgent(base, cfg=fc, provider=provider_config(cfg, fc.provider))
         else:
-            raise ValueError(f"agents.{role}: unknown kind {kind!r} (scripted|llm|remote|noop|random)")
+            raise ValueError(f"agents.{role}: unknown kind {kind!r} (scripted|llm|fleet|remote|noop|random)")
+    if len(modes) > 1:
+        raise ValueError(f"fleet agents must share one mode, got {', '.join(sorted(modes))}")
     return agents

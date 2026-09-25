@@ -9,8 +9,8 @@ Civitas Bench is a SimCity-style city simulation used as a multi-agent benchmark
 ```bash
 uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e ".[dev]"   # Python >= 3.10 required
 
-pytest -q                                            # full suite (~25 s, includes 5 full benchmark episodes)
-pytest -q -m "not slow"                              # quick loop (~5 s)
+pytest -q                                            # full suite (~40 s, includes 5 full benchmark episodes)
+pytest -q -m "not slow"                              # quick loop (~20 s)
 pytest tests/test_traffic.py::test_avenues_relieve_congestion   # single test
 
 civitas run -c configs/baseline.toml --seed 0        # one episode (scripted, ~4–5 s)
@@ -42,6 +42,8 @@ Overrides work on `run`, `bench` and `prompt`: `--agent planning=llm:arcee/trini
 **Data flow per turn.** `core/observation.py` builds a dict (city summary for everyone, a detailed `ROLE_SECTIONS` block for the acting role with hotspots and suggested sites, the ASCII map for all but the mayor) and renders it into the `text` prompt. The agent returns a `Decision`; `Decision.from_dict` normalizes common LLM output variants. `core/actions.py:apply_action` checks `ROLES[role]["actions"]`, dispatches through `HANDLERS` (`ROLE_AWARE` handlers also get the role), turns `ActionError` into a failed result the agent sees next turn, and calls `world.refresh()` after each success. Milestone locks are checked with `_require(world, key)`; `catalog.UNLOCK_POP` lists the keys.
 
 **Scripted baselines read only the observation** (`agents/scripted.py`), e.g. the planner parses the ASCII map with `MapView` and routes roads around other departments' buildings (`_route`). Changing observation keys can silently break them, so rerun the benchmark.
+
+**Fleets (`civitas/fleet/`)** are tool-calling agents (`kind = "fleet"`, README "Agent fleets"): `agent.py:ToolAgent` runs a tool loop per turn (limits `max_steps` / `max_tokens` / `turn_tokens`, one nudge, finish reason logged), `tools.py:ToolBox` exposes look-ups (built on `build_observation`), turn control and one tool per role action (schemas from `actions.action_docs()`, run through `apply_action`), `briefing.py` builds the system prompt (fixed rules, then the coach's playbooks) and the per-turn briefing, `memory.py:FleetState` (on `env.fleet`) holds the plan, department memory and history log, `config.py` merges `[fleet]` with `[agents.<role>]`, and `report.py` writes `fleet_report.{json,md}`. Two hooks connect them to the core: `Agent.bind(env)` (called by `run_episode` after `reset`; the fleet agent keeps the env, since its tools read and act on it directly) and `Decision.executed` (results of actions the agent already ran inside `act()`; `CivitasEnv.apply` logs them without re-applying). `CivitasEnv.end_month` calls `env.fleet.sync(env)` every month once a fleet state exists. Fleets are single-city only. Changing tool results or briefings changes what fleet agents see, so smoke-test them with `configs/fleet_smoke.toml`.
 
 **Scoring (`bench/scoring.py`)** is a pure function of the monthly metrics history: it gives the final score, the live score shown to agents and the per-turn reward. New score inputs must be recorded in `World._metrics()`.
 

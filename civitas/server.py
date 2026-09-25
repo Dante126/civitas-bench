@@ -28,7 +28,8 @@ from urllib.parse import parse_qs, urlparse
 
 VIEWER_DIR = Path(__file__).parent / "viewer"
 STALE_AFTER_S = 45 * 60      # a run with no new frame for this long is "incomplete"
-AGENT_SPEC = re.compile(r"^(scripted|noop|random|llm(:[A-Za-z0-9._/-]+)?)$")
+# kind[:provider/model], as `--agent role=...` takes it; fleet without a model keeps the config's
+AGENT_SPEC = re.compile(r"^(scripted|noop|random|(llm|fleet)(:[A-Za-z0-9._/-]+)?)$")
 from .core.roles import TURN_ORDER as ROLES  # noqa: E402
 
 
@@ -43,6 +44,7 @@ class Launcher:
 
     def configs(self) -> list[dict]:
         from .config import load_config
+        from .fleet.config import fleet_agent_config
         out = []
         if not self.configs_dir.is_dir():
             return out
@@ -57,6 +59,16 @@ class Launcher:
                 a = cfg["agents"].get(r, {"kind": "scripted"})
                 agents[r] = {"kind": a.get("kind", "scripted"), "model": a.get("model"),
                              "provider": a.get("provider", "arcee")}
+                # what a fleet agent in this role runs: [fleet] + [agents.<role>] for a fleet role; a role
+                # switched to fleet in the launcher drops its old spec (like `--agent role=fleet`), so [fleet] only
+                src = cfg if agents[r]["kind"] == "fleet" else {"fleet": cfg.get("fleet") or {}}
+                try:
+                    fc = fleet_agent_config(src, r)
+                    agents[r]["fleet"] = {"model": fc.model, "provider": fc.provider, "max_steps": fc.max_steps}
+                except ValueError:
+                    pass
+                if agents[r]["kind"] == "fleet" and "fleet" in agents[r]:
+                    agents[r].update(model=agents[r]["fleet"]["model"], provider=agents[r]["fleet"]["provider"])
             doc = ""
             try:
                 first = [ln[1:].strip() for ln in p.read_text().splitlines() if ln.startswith("#")]
@@ -65,7 +77,8 @@ class Launcher:
                 pass
             out.append({"file": p.name, "name": cfg["name"], "doc": doc, "agents": agents,
                         "months": cfg["game"].get("months", 120), "act_every": cfg["game"].get("act_every", 1),
-                        "remote": any(a["kind"] == "remote" for a in agents.values())})
+                        "remote": any(a["kind"] == "remote" for a in agents.values()),
+                        "region": bool(cfg["game"].get("region"))})
         return out
 
     def launch(self, body: dict) -> dict:
@@ -212,8 +225,9 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                     if t.get("month") != month:
                                         continue
                                     prompt = t.get("prompt") or []
-                                    user = next((m["content"] for m in reversed(prompt) if m.get("role") == "user"),
-                                                t.get("observation_text", ""))
+                                    fleet = str(t.get("agent", "")).startswith("fleet:")   # briefing = 1st user msg
+                                    user = next((m["content"] for m in (prompt if fleet else reversed(prompt))
+                                                 if m.get("role") == "user"), t.get("observation_text", ""))
                                     out.append({"role": t["role"], "agent": t.get("agent"), "reward": t.get("reward"),
                                                 "response": (t.get("response") or "")[:20000],
                                                 "reasoning": (t.get("reasoning") or "")[:40000],

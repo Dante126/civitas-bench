@@ -114,3 +114,8 @@ Recycling centres and waste complexes never fill; crematoria have no plots. Over
 
 **Roles.** Mayor, Planning, Utilities, Transport, Police, Fire & Emergency, Health & Sanitation, Education. Turn order is
 `game.roles`; `game.simultaneous = true` makes every role see the same start-of-month state.
+Agents: `llm` (one JSON reply per turn), `scripted`, `remote`, RL, and `fleet` (`civitas/fleet/`): tool-calling agents
+where the mayor manages a city plan and budgets and the departments carry it out. Each turn is a tool loop over look-ups,
+the role's actions (run at once through `apply_action`) and memory tools, with a plan, per-department memory and a
+history log between turns, coach playbooks in the system prompt and an end-of-run `fleet_report`. 🟡 Single-city only;
+the supervised mode isn't scheduled yet (no pause / resume) and there is no scripted fleet.

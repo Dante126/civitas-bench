@@ -4,12 +4,15 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from ..config import agent_spec, build_agents, game_config, scoring_config
 from ..core.env import make_env
+from ..fleet.config import fleet_agent_config, fleet_version
+from ..fleet.report import fleet_report, turn_row
 
 
 def _jsonable(o):
@@ -57,7 +60,11 @@ def agent_signature(cfg: dict, roles: list[str]) -> str:
         a = agent_spec(cfg, r)
         k = a.get("kind", "scripted")
         r = base if "." in r and agent_spec(cfg, f"north.{base}") == agent_spec(cfg, f"south.{base}") else r
-        parts.append(f"{r}={k}:{a['model']}" if k == "llm" else f"{r}={k}")
+        parts.append(f"{r}={k}:{a['model']}" if k == "llm" else
+                     f"{r}={k}:{fleet_agent_config(cfg, r).model}" if k == "fleet" else f"{r}={k}")
+    fleet = [r for r in roles if agent_spec(cfg, r).get("kind") == "fleet"]
+    if fleet:
+        parts.append(f"[{fleet_agent_config(cfg, fleet[0]).mode}]")
     return " ".join(parts)
 
 
@@ -69,14 +76,19 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     agents = build_agents(cfg, env.roles, game, scoring, hub=hub)
     for a in agents.values():
         a.reset(seed)
+        a.bind(env)
 
     run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg['name']}_s{seed}_{os.getpid() % 1000:03d}"
     log = RunLogger(Path(runs_dir) / run_id)
     sig = agent_signature(cfg, env.roles)
+    prompts = {r: a.system for r, a in agents.items() if a.kind == "fleet"}      # logged turns refer to these
+    fv = fleet_version(cfg) if prompts else None                               # only when a role is a fleet agent
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
-              "config": cfg, "started": time.time(), **env.meta()})
+              "config": cfg, "started": time.time(), **env.meta(),
+              **({"fleet_version": fv} if fv else {}),
+              **({"fleet_prompts": prompts} if prompts else {})})
     if hub is not None:
         hub.run_id = run_id
     log.frame(env.frame())
@@ -85,7 +97,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
 
     stats = {r: {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0,
                  "parse_errors": 0, "reward": 0.0} for r in env.roles}
-    city_scores, t0 = [], time.time()
+    city_scores, fleet_rows, t0 = [], [], time.time()
     while not env.done:
         pending = []
         acting = [r for r in env.roles if env.acts_this_month(r)]
@@ -104,7 +116,8 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
             st["parse_errors"] += 1 if decision.parse_error and decision.parse_error != "recovered_after_retry" else 0
             rec = {"run_id": run_id, "seed": seed, "month": obs["month"], "role": role,
                    "agent": agents[role].describe(), "thinking": decision.thinking,
-                   "actions": decision.actions, "messages": decision.messages, "notes": decision.notes,
+                   "actions": [r["action"] for r in decision.executed] + decision.actions,
+                   "messages": decision.messages, "notes": decision.notes,
                    "results": results, "parse_error": decision.parse_error}
             if "messages" in decision.meta:
                 rec["prompt"] = decision.meta["messages"]
@@ -113,9 +126,14 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                 rec["finish_reason"] = decision.meta.get("finish_reason")
                 rec["usage"] = decision.meta.get("usage")
                 rec["latency_s"] = decision.meta.get("latency_s")
+                rec.update({k: decision.meta[k] for k in ("tool_trace", "steps", "ended", "finish_reasons",
+                                                          "length_stops", "recovered_calls")
+                            if k in decision.meta})
             elif log_observations:
                 rec["observation_text"] = obs["text"]
             pending.append(rec)
+            if agents[role].kind == "fleet":
+                fleet_rows.append(turn_row(rec))       # slim: whole records hold every turn's messages
         info = env.end_month()
         for rec in pending:
             rec["reward"] = info["rewards"][rec["role"]]
@@ -165,7 +183,17 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                           if k in final},
         "agent_stats": stats,
         "wall_time_s": round(time.time() - t0, 2),
+        **({"fleet_version": fv} if fv else {}),
     }
+    if prompts:
+        try:
+            report, md = fleet_report(env, summary, fleet_rows)
+            (log.dir / "fleet_report.json").write_text(json.dumps(_jsonable(report), indent=2))
+            (log.dir / "fleet_report.md").write_text(md)
+            summary["fleet"] = {"report": "fleet_report.md", "hints": len(report["hints"])}
+        except Exception as e:                       # a report bug must not cost the run its summary
+            print(f"[{run_id}] warning: fleet report failed: {type(e).__name__}: {e}", file=sys.stderr)
+            summary["fleet"] = {"error": f"{type(e).__name__}: {e}"}
     log.summary(summary)
     log.close()
     if verbose:
@@ -205,7 +233,8 @@ def aggregate(summaries: list[dict]) -> dict:
     s0 = summaries[0]
     roles = list(s0["agents"])
     return {
-        "name": s0["name"], "signature": s0["signature"], "n": len(summaries),
+        "name": s0["name"], "signature": s0["signature"], "fleet_version": s0.get("fleet_version"),
+        "n": len(summaries),
         "city": _ms(s["final_scores"]["city"] for s in summaries),
         "avg_city": _ms(s["avg_city_score"] for s in summaries),
         "roles": {r: _ms(s["final_scores"][r] for s in summaries) for r in roles},
@@ -216,16 +245,22 @@ def aggregate(summaries: list[dict]) -> dict:
 
 
 def leaderboard(runs_dir="runs") -> list[dict]:
-    groups: dict[str, list] = {}
+    """Finished runs grouped by agent line-up; fleet runs also by `fleet_version` (coaching and limits)."""
+    groups: dict[tuple, list] = {}
     for p in Path(runs_dir).glob("*/summary.json"):
         try:
             s = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
-        groups.setdefault(s["signature"], []).append(s)
+        groups.setdefault((s["signature"], s.get("fleet_version")), []).append(s)
     rows = [aggregate(v) for v in groups.values()]
     rows.sort(key=lambda r: -r["city"]["mean"])
     return rows
+
+
+def _clip(text: str, n: int, tail: int = 16) -> str:
+    """Cut the middle of a long line-up so its end (a fleet's `[mode]`) stays visible."""
+    return text if len(text) <= n else text[:n - tail - 3] + "..." + text[-tail:]
 
 
 def print_table(rows: list[dict]) -> None:
@@ -233,11 +268,15 @@ def print_table(rows: list[dict]) -> None:
         print("no runs found")
         return
     roles = list(rows[0]["roles"])
-    hdr = f"{'agents':<58} {'n':>3} {'city':>12} {'pop':>8} " + " ".join(f"{r:>12}" for r in roles) + "  bankrupt"
+    fleet = any(r.get("fleet_version") for r in rows)
+    fcol = lambda v: f"{v or '-':<13}" if fleet else ""
+    hdr = (f"{'agents':<58} {fcol('fleet')}{'n':>3} {'city':>12} {'pop':>8} " + " ".join(f"{r:>12}" for r in roles)
+           + "  bankrupt")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print(f"{r['signature'][:58]:<58} {r['n']:>3} {r['city']['mean']:>6.1f}±{r['city']['std']:<5.1f} "
+        print(f"{_clip(r['signature'], 58):<58} {fcol(r.get('fleet_version'))}{r['n']:>3} "
+              f"{r['city']['mean']:>6.1f}±{r['city']['std']:<5.1f} "
               f"{r['population']['mean']:>8.0f} " +
               " ".join(f"{r['roles'][k]['mean']:>6.1f}±{r['roles'][k]['std']:<5.1f}" for k in roles) +
               f"  {r['bankruptcies']}")

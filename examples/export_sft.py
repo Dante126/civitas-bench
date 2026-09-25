@@ -6,6 +6,11 @@ action results and the per-turn reward. This script keeps the best turns and
 writes {"messages": [system, user, assistant]} lines, ready for SFT or as the
 starting point for preference / GRPO-style training.
 
+Fleet turns (agent "fleet:...") are skipped: they are multi-step tool-calling
+conversations whose actions ran inside the loop, so they don't fit the
+one-shot {system, user, assistant-JSON} format. Their full traces stay in
+trajectories.jsonl (prompt + tool_trace).
+
     python examples/export_sft.py runs/ --role planning --min-reward 0 --out planning_sft.jsonl
 """
 from __future__ import annotations
@@ -26,13 +31,16 @@ def main():
     ap.add_argument("--out", default="sft.jsonl")
     args = ap.parse_args()
 
-    n_in = n_out = 0
+    n_in = n_out = n_fleet = 0
     with open(args.out, "w") as out:
         for f in Path(args.runs_dir).glob("*/trajectories.jsonl"):
             meta = json.loads((f.parent / "meta.json").read_text())
             for line in f.open():
                 t = json.loads(line)
                 n_in += 1
+                if str(t.get("agent", "")).startswith("fleet:"):
+                    n_fleet += 1
+                    continue
                 if args.role and t["role"] != args.role:
                     continue
                 if t["reward"] < args.min_reward or (args.skip_failed and any(not r["ok"] for r in t["results"])):
@@ -50,7 +58,8 @@ def main():
                 out.write(json.dumps({"messages": msgs, "reward": t["reward"], "role": t["role"],
                                       "run_id": t["run_id"], "month": t["month"]}) + "\n")
                 n_out += 1
-    print(f"kept {n_out}/{n_in} turns -> {args.out}")
+    print(f"kept {n_out}/{n_in} turns -> {args.out}"
+          + (f" ({n_fleet} fleet turns skipped: tool-calling traces don't fit this format)" if n_fleet else ""))
 
 
 if __name__ == "__main__":

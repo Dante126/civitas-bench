@@ -407,6 +407,14 @@ function updateRegionMap() {
   }
 }
 
+// leaderboard line-up without role names; fleet runs lead with their mode and fleet_version (grouped by both)
+function boardLabel(r) {
+  const sig = r.signature.replace(/[\w/]+=/g, "");
+  if (!r.fleet_version) return sig;
+  const mode = (sig.match(/\[(\w+)\]\s*$/) || [])[1] || "fleet";
+  return `[${mode} ${r.fleet_version.slice(0, 6)}] ` + sig.replace(/\s*\[\w+\]\s*$/, "");
+}
+
 // full per-turn traces (what the agent saw, model reasoning, raw reply), loaded lazily
 S.traces = {};
 async function loadTraces(month) {
@@ -439,7 +447,7 @@ async function renderRunsTab() {
       <button class="btn danger" data-stop="${esc(p.run_id)}">Stop</button><pre class="log">${esc(p.log_tail || "starting…")}</pre></div>`).join("")}` : ""}
     <h4>Leaderboard <span class="muted small">(finished runs, grouped by agent line-up)</span></h4>
     ${board.length ? `<table class="lb"><tr><th>agents</th><th>n</th><th>city</th><th>pop</th>${Object.keys(board[0].roles).map(r => `<th style="color:${roleColor(r)}">${r.slice(0, 4)}</th>`).join("")}</tr>
-      ${board.map(r => `<tr title="${esc(r.signature)}"><td class="ellipsis" style="max-width:130px">${esc(r.signature.replace(/[\w/]+=/g, ""))}</td><td>${r.n}</td>
+      ${board.map(r => `<tr title="${esc(r.signature + (r.fleet_version ? `\nfleet_version ${r.fleet_version}` : ""))}"><td class="ellipsis" style="max-width:130px">${esc(boardLabel(r))}</td><td>${r.n}</td>
       <td><b>${r.city.mean.toFixed(1)}</b><span class="muted">±${r.city.std.toFixed(1)}</span></td><td>${Math.round(r.population.mean).toLocaleString()}</td>
       ${Object.keys(r.roles).map(k => `<td>${r.roles[k].mean.toFixed(0)}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}
     <h4 style="margin-top:14px">All runs</h4>
@@ -644,31 +652,48 @@ async function openLaunch() {
   fillLaunch();
   $("launchModal").hidden = false;
 }
+// launcher: the config's own agent per role; only roles the user changes are sent as overrides
+const DEFAULT_MODEL = "arcee/trinity-large-thinking";
+const MODEL_KINDS = ["llm", "fleet"];
+function roleDefault(a, kind) {          // provider/model shown for `kind` in a role whose config entry is `a`
+  if (kind === a.kind && a.model) return `${a.provider || "arcee"}/${a.model}`;
+  if (kind === "fleet" && a.fleet) return `${a.fleet.provider || "arcee"}/${a.fleet.model}`;
+  return DEFAULT_MODEL;
+}
 function fillLaunch() {
   const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
   $("lDoc").textContent = c.doc || "";
   $("lMonths").placeholder = c.months; $("lAct").placeholder = c.act_every;
+  const kinds = ["scripted", "llm", ...(c.region ? [] : ["fleet"]), "noop", "random"];   // fleets are single-city
   $("lAgents").innerHTML = Object.keys(c.agents).map(r => {
-    const a = c.agents[r];
+    const a = c.agents[r], opts = kinds.includes(a.kind) ? kinds : [a.kind, ...kinds];
     return `<div class="ar" style="--c:${roleColor(r)}"><b>${r}</b>
-      <select data-role="${r}">${["scripted", "llm", "noop", "random"].map(k => `<option ${k === a.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
-      <input data-model="${r}" placeholder="provider/model" value="${esc(a.kind === "llm" ? `${a.provider || "arcee"}/${a.model}` : "arcee/trinity-large-thinking")}" ${a.kind === "llm" ? "" : "disabled"}></div>`;
+      <select data-role="${r}">${opts.map(k => `<option ${k === a.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
+      <input data-model="${r}" placeholder="provider/model" value="${esc(roleDefault(a, a.kind))}" ${MODEL_KINDS.includes(a.kind) ? "" : "disabled"}></div>`;
   }).join("");
-  $("lAgents").querySelectorAll("select").forEach(s => s.onchange = () => { $("lAgents").querySelector(`[data-model=${s.dataset.role}]`).disabled = s.value !== "llm"; estimate(); });
+  $("lAgents").querySelectorAll("select").forEach(s => s.onchange = () => {
+    const i = $("lAgents").querySelector(`[data-model=${s.dataset.role}]`);
+    i.disabled = !MODEL_KINDS.includes(s.value); i.value = roleDefault(c.agents[s.dataset.role], s.value); estimate(); });
   $("lAgents").querySelectorAll("input").forEach(i => i.oninput = estimate);
   estimate();
 }
 function estimate() {
   const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
-  const months = +$("lMonths").value || c.months, every = +$("lAct").value || c.act_every;
-  const llm = [...$("lAgents").querySelectorAll("select")].filter(s => s.value === "llm").length;
-  $("lCost").textContent = llm ? `≈ ${Math.ceil(months / every) * llm} LLM calls` : "no LLM calls · finishes in seconds";
+  const months = +$("lMonths").value || c.months, every = +$("lAct").value || c.act_every, turns = Math.ceil(months / every);
+  const sel = [...$("lAgents").querySelectorAll("select")];
+  const llm = sel.filter(s => s.value === "llm").length, fleet = sel.filter(s => s.value === "fleet");
+  const steps = Math.max(0, ...fleet.map(s => (c.agents[s.dataset.role].fleet || {}).max_steps || 20));
+  const parts = [llm ? `≈ ${turns * llm} LLM calls` : "",
+    fleet.length ? `${turns * fleet.length} fleet turns (up to ${steps} model calls each)` : ""].filter(Boolean);
+  $("lCost").textContent = parts.length ? parts.join(" + ") : "no LLM calls · finishes in seconds";
 }
 async function launch() {
-  const agents = {};
+  const c = S.configs.find(x => x.file === $("lConfig").value), agents = {};
   $("lAgents").querySelectorAll("select").forEach(s => {
-    const r = s.dataset.role, m = $("lAgents").querySelector(`[data-model=${r}]`).value.trim();
-    agents[r] = s.value === "llm" ? `llm:${m || "arcee/trinity-large-thinking"}` : s.value;
+    const r = s.dataset.role, a = c.agents[r], m = $("lAgents").querySelector(`[data-model=${r}]`).value.trim();
+    const modelChanged = MODEL_KINDS.includes(s.value) && m && m !== roleDefault(a, s.value);
+    if (s.value === a.kind && !modelChanged) return;           // untouched: the config decides
+    agents[r] = s.value === "llm" ? `llm:${m || DEFAULT_MODEL}` : s.value === "fleet" && modelChanged ? `fleet:${m}` : s.value;
   });
   const body = { config: $("lConfig").value, seed: +$("lSeed").value || 0, months: $("lMonths").value, act_every: $("lAct").value, agents };
   store.set("lastConfig", body.config);

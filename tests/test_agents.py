@@ -321,3 +321,46 @@ def test_chat_client_retries_stalled_and_truncated_streams():
     assert _FlakyStream.calls == 3
     assert time.time() - t0 < 12         # the ping stream would last 20 s; it is cut after ~1 s of no data
     srv.shutdown()
+
+
+class _ToolCallLLM(BaseHTTPRequestHandler):
+    """Streams a tool call split across chunks, as OpenAI-style servers do."""
+    stream = True
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        assert body["tools"][0]["function"]["name"] == "get_budget"
+        chunks = [{"choices": [{"delta": {"content": "checking", "tool_calls": [
+                      {"index": 0, "id": "call_1", "type": "function", "function": {"name": "get_budget", "arguments": ""}}]}}]},
+                  {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"dep'}}]}}]},
+                  {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'artment":"health"}'}}]},
+                                "finish_reason": "tool_calls"}]}]
+        if type(self).stream:
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            for c in chunks:
+                self.wfile.write(b"data: " + json.dumps(c).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+        else:
+            out = json.dumps({"choices": [{"message": {"content": "checking", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "get_budget", "arguments": '{"department":"health"}'}}]},
+                "finish_reason": "tool_calls"}], "usage": {}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+
+
+def test_chat_client_returns_tool_calls_streamed_and_plain():
+    from civitas.agents.llm_client import ChatClient
+    tools = [{"type": "function", "function": {"name": "get_budget", "parameters": {"type": "object", "properties": {}}}}]
+    for stream in (True, False):
+        _ToolCallLLM.stream = stream
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _ToolCallLLM)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        c = ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key_env="", stream=stream))
+        out = c.chat("fake", [{"role": "user", "content": "hi"}], extra={"tools": tools})
+        assert out["finish_reason"] == "tool_calls"
+        assert out["tool_calls"] == [{"id": "call_1", "type": "function",
+                                      "function": {"name": "get_budget", "arguments": '{"department":"health"}'}}]
+        srv.shutdown()
