@@ -378,7 +378,7 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     _fill_roadside(w)
     from civitas.fleet.tools import _connected_roads
     ys, xs = np.nonzero(_connected_roads(w))
-    span = f"the highway-connected roads span x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}"
+    span = f"highway-connected roads: x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}, {len(xs)} tiles"
     res = ToolBox(env, "education").call("find_sites", {"purpose": "school"})
     assert res["sites"] == [] and "ask planning" in res["note"] and span in res["note"]
     res = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})
@@ -390,13 +390,13 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
-    from civitas.fleet.tools import _river_span, _road_span
+    from civitas.fleet.tools import _river_span, _roads, _roads_text
     env = _env()
     w = env.world
-    before = _road_span(w)
+    before = _roads_text(_roads(w))
     w.struct[2, 44] = w.struct[2, 45] = C.ROAD           # a stray road far from the network
     w.refresh()
-    assert _road_span(w) == before and "x 44" not in before
+    assert _roads_text(_roads(w)) == before and "x 44" not in before
     w.terrain[w.terrain == C.WATER] = C.LAND
     assert _river_span(w) is None
     assert ToolBox(env, "utilities")._no_sites_note("pump") == "this map has no river"
@@ -410,11 +410,14 @@ def test_map_facts_on_a_fresh_world():
     assert f["size"] == [48, 48]
     (hx, hy), = [(int(x), int(y)) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
     assert hx == 0 and f["highway"] == [{"x": 0, "y": hy, "edge": "west"}]
-    assert 1 < len(f["river"]) <= 4
-    for x0, x1, y0, y1 in f["river"]:
-        cols = np.nonzero((w.terrain[y0:y1 + 1] == C.WATER).any(axis=0))[0]
-        assert (x0, x1) == (cols.min(), cols.max())
-    assert f["river"][0][2] == 0 and f["river"][-1][3] == 47
+    assert len(f["river"]) == 3
+    for band in f["river"]:
+        for x0, x1, y in band:                                                 # the real columns at the band's ends
+            cols = np.nonzero(w.terrain[y] == C.WATER)[0]
+            assert (x0, x1) == (cols.min(), cols.max())
+    ends = [e[2] for band in f["river"] for e in band]
+    assert ends[0] == 0 and ends[-1] == 47 and ends == sorted(ends)
+    assert all(b[0][2] == a[1][2] + 1 for a, b in zip(f["river"], f["river"][1:]))   # bands tile the rows
     ys, xs = np.nonzero((w.struct == C.ROAD) | (w.struct == C.HIGHWAY))        # only the starter road
     assert f["roads"] == {"x": [0, int(xs.max())], "y": [hy, hy], "tiles": len(xs)}
     tx, ty = w.facilities(C.TOWNHALL)[0]
@@ -423,7 +426,22 @@ def test_map_facts_on_a_fresh_world():
     text = "\n".join(lines)
     assert len(lines) <= 6 and len(text) <= 400, (len(lines), len(text))
     assert f"(0,{hy}) on the west edge" in text and "x = column 0-47" in text
-    assert f"x {f['river'][0][0]}-{f['river'][0][1]} in rows 0-" in text
+    (a0, a1, _), (b0, b1, by) = f["river"][0]
+    assert f"river: x {a0}-{a1} at row 0 to x {b0}-{b1} at row {by}," in text
+    assert f"highway-connected roads: x 0-{int(xs.max())}, y {hy}, {len(xs)} tiles" in text
+
+
+def test_map_facts_on_an_empty_map():
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    w.struct[:] = C.NONE
+    w.anchor[:] = -1
+    w.refresh()
+    f = map_facts(w)
+    assert f["highway"] == [] and f["roads"] is None and f["built"] is None
+    assert map_lines(f)[1:] == ["- highway entry: none", map_lines(f)[2], "- no roads connected to the highway yet",
+                                "- built-up area: none yet"]
 
 
 def test_map_facts_grow_and_without_a_river(grown_env):
@@ -442,7 +460,7 @@ def test_map_facts_grow_and_without_a_river(grown_env):
 
 
 def _map_body(res):
-    return [row[4:] for row in res["map"].split("\n")[2:]]
+    return [row[4:] for row in res["map"][2:]]
 
 
 def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
@@ -451,7 +469,7 @@ def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
         res = ToolBox(grown_env, role).call("map_overview", {})
         assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS, (role, len(json.dumps(res)))
         assert "scale" not in res and "truncated" not in res                     # 48x48 fits at full size
-    rows = res["map"].split("\n")
+    rows = res["map"]
     assert rows[0].strip() == "".join(str(x // 10) for x in range(48))
     assert rows[1].strip() == "".join(str(x % 10) for x in range(48))
     assert rows[2].startswith("  0 ") and rows[-1].startswith(" 47 ") and len(rows) == 50
@@ -461,10 +479,11 @@ def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
     used = set("".join(_map_body(res)))
     assert used <= keys and {"#", "~", "H", "T", "R"} <= used
     assert "E coal" not in res["legend"] or "E" in used                       # only what is on the map
-    assert res["summary"] == "\n".join(map_lines(map_facts(grown_env.world)))
+    assert res["summary"] == [ln[2:] for ln in map_lines(map_facts(grown_env.world))]
+    assert "higher tiers keep the letter" in res["read"] and "higher tiers" not in res["legend"]
     from civitas.fleet.tools import map_overview
     tight = map_overview(grown_env.world, limit=len(json.dumps(res)) - 1)     # a full legend: summary goes first
-    assert "briefing" in tight["summary"] and tight["map"] == res["map"] and "scale" not in tight
+    assert "briefing" in tight["summary"][0] and tight["map"] == res["map"] and "scale" not in tight
 
 
 def test_map_overview_downsamples_big_maps():
@@ -474,10 +493,22 @@ def test_map_overview_downsamples_big_maps():
     assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS and "truncated" not in res
     k = int(res["scale"].split("x")[0].split()[-1])
     assert k >= 2 and "inspect" in res["scale"]
-    rows = res["map"].split("\n")
+    rows = res["map"]
     assert rows[2].startswith("  0 ") and rows[3].startswith(f"{k:>3} ")
     assert len(rows) - 2 == -(-80 // k) and len(rows[2]) - 4 == -(-96 // k)
-    assert "~" in res["map"] and "H" in res["map"]
+    assert any("~" in r for r in rows) and any("H" in r for r in rows)
+
+
+def test_downsampled_blocks_break_ties_by_reading_order():
+    from civitas.fleet.tools import _ascii
+    w = _env().world
+    w.struct[0, 0] = w.struct[1, 1] = C.COM                    # c r / r c: a 2-2 tie, 'c' comes first
+    w.struct[0, 1] = w.struct[1, 0] = C.RES
+    w.struct[0, 2] = w.struct[0, 3] = C.ROAD                   # # # / . c: the road wins 2-1
+    w.struct[1, 3] = C.COM
+    assert _ascii(w, 2)[2][4:6] == "c#"
+    w.struct[0, 0], w.struct[0, 1] = C.RES, C.COM              # r c / r c: now 'r' comes first
+    assert _ascii(w, 2)[2][4] == "r"
 
 
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
