@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..config import agent_spec, build_agents, game_config, scoring_config
 from ..core.env import make_env
+from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version
 
 
 def _jsonable(o):
@@ -57,7 +58,11 @@ def agent_signature(cfg: dict, roles: list[str]) -> str:
         a = agent_spec(cfg, r)
         k = a.get("kind", "scripted")
         r = base if "." in r and agent_spec(cfg, f"north.{base}") == agent_spec(cfg, f"south.{base}") else r
-        parts.append(f"{r}={k}:{a['model']}" if k == "llm" else f"{r}={k}")
+        parts.append(f"{r}={k}:{a['model']}" if k == "llm" else
+                     f"{r}={k}:{fleet_agent_config(cfg, r).model}" if k == "fleet" else f"{r}={k}")
+    fleet = [r for r in roles if agent_spec(cfg, r).get("kind") == "fleet"]
+    if fleet:
+        parts.append(f"[{fleet_agent_config(cfg, fleet[0]).mode}]")
     return " ".join(parts)
 
 
@@ -77,7 +82,8 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
-              "config": cfg, "started": time.time(), **env.meta()})
+              "config": cfg, "started": time.time(), **env.meta(),
+              **({"fleet_version": fleet_version(cfg)} if "fleet" in cfg or fleet_agents(cfg) else {})})
     if hub is not None:
         hub.run_id = run_id
     log.frame(env.frame())
@@ -105,7 +111,8 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
             st["parse_errors"] += 1 if decision.parse_error and decision.parse_error != "recovered_after_retry" else 0
             rec = {"run_id": run_id, "seed": seed, "month": obs["month"], "role": role,
                    "agent": agents[role].describe(), "thinking": decision.thinking,
-                   "actions": decision.actions, "messages": decision.messages, "notes": decision.notes,
+                   "actions": [r["action"] for r in decision.executed] + decision.actions,
+                   "messages": decision.messages, "notes": decision.notes,
                    "results": results, "parse_error": decision.parse_error}
             if "messages" in decision.meta:
                 rec["prompt"] = decision.meta["messages"]
@@ -114,6 +121,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                 rec["finish_reason"] = decision.meta.get("finish_reason")
                 rec["usage"] = decision.meta.get("usage")
                 rec["latency_s"] = decision.meta.get("latency_s")
+                rec.update({k: decision.meta[k] for k in ("tool_trace", "steps", "ended") if k in decision.meta})
             elif log_observations:
                 rec["observation_text"] = obs["text"]
             pending.append(rec)

@@ -672,3 +672,280 @@ def test_briefings_stay_bounded_at_the_limits():
     mayor = briefing(env, "mayor", mark=False)
     assert mayor.count("(full: history kind=report)") == len(DEPTS)
 
+
+
+# ------------------------------------------------------------------ tool agent + fleet configs
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from civitas.agents.llm_client import LLMError
+from civitas.config import build_agents, load_config, scoring_config, game_config
+from civitas.fleet.agent import ToolAgent
+from civitas.fleet.config import FleetAgentConfig, fleet_agent_config, fleet_version
+
+TITLES = {spec["title"]: r for r, spec in ROLES.items()}
+
+
+def _call(name, args, cid="auto"):
+    return {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+def _script(role: str, messages: list[dict]) -> list[dict]:
+    """The fake model's tool calls for this role at this step (step = assistant messages so far)."""
+    step = sum(m["role"] == "assistant" for m in messages)
+    if role == "mayor":
+        seq = [_call("update_plan", {"budgets": {"utilities": 3000}, "goals": ["power the city"]}),
+               _call("allocate_budget", {"department": "utilities", "amount": 3000}),
+               _call("end_turn", {"report": "plan set"})]
+        return [{**seq[step], "id": f"m{step}"}] if step < len(seq) else []
+    if role == "utilities":
+        if step == 0:
+            return [_call("find_sites", {"purpose": "wind"}, "u0")]
+        if step == 1:
+            last = json.loads([m for m in messages if m["role"] == "tool"][-1]["content"])
+            s = last["sites"][0]
+            return [_call("build_power_plant", {"kind": "wind", "x": s["x"], "y": s["y"]}, "u1")]
+        return [_call("end_turn", {"report": "built wind"}, "u2")] if step == 2 else []
+    return [_call("end_turn", {"report": "nothing to do"}, None)] if step == 0 else []   # no id: agent fills one in
+
+
+class FakeToolLLM(BaseHTTPRequestHandler):
+    requests: list[dict] = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeToolLLM.requests.append(body)
+        title = re.search(r"You are the (.+?) in a fleet", body["messages"][0]["content"]).group(1)
+        calls = _script(TITLES[title], body["messages"])
+        msg = {"role": "assistant", "content": "", "reasoning_content": "hmm, let me think"}
+        if calls:
+            msg["tool_calls"] = calls
+        out = json.dumps({"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
+                          "usage": {"prompt_tokens": 50, "completion_tokens": 10}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+
+def _fleet_cfg(port: int, months: int = 2) -> dict:
+    cfg = load_config(None)
+    cfg["name"] = "fleet_fake"
+    cfg["game"]["months"] = months
+    cfg["providers"]["fake"] = {"base_url": f"http://127.0.0.1:{port}/v1", "api_key_env": "", "stream": False,
+                                "max_retries": 0}
+    cfg["fleet"] = {"mode": "autonomous", "provider": "fake", "model": "fake", "max_steps": 6,
+                    "playbook": "Grow steadily."}
+    cfg["agents"] = {r: {"kind": "fleet"} for r in TURN_ORDER}
+    cfg["agents"]["mayor"]["playbook"] = "Fund utilities first."
+    return cfg
+
+
+def test_fleet_episode_over_http(tmp_path, monkeypatch):
+    from civitas.bench import runner
+    envs = []
+    real = runner.make_env
+    monkeypatch.setattr(runner, "make_env", lambda *a, **k: envs.append(real(*a, **k)) or envs[-1])
+    FakeToolLLM.requests = []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeToolLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        s = runner.run_episode(_fleet_cfg(srv.server_port), 0, tmp_path, verbose=False)
+    finally:
+        srv.shutdown()
+    env, = envs
+    d = tmp_path / s["run_id"]
+    traj = [json.loads(x) for x in (d / "trajectories.jsonl").read_text().splitlines()]
+    assert len(traj) == 16 and all("tool_trace" in t and "steps" in t and "ended" in t for t in traj)
+    assert all(t["ended"] and t["finish_reason"] == "end_turn" for t in traj)
+    mayor = [t for t in traj if t["role"] == "mayor"][0]
+    assert [c["tool"] for c in mayor["tool_trace"]] == ["update_plan", "allocate_budget", "end_turn"]
+    assert mayor["actions"] == [{"type": "allocate_budget", "department": "utilities", "amount": 3000}]
+    assert mayor["results"][0]["ok"] and mayor["thinking"] == "plan set"
+    util = [t for t in traj if t["role"] == "utilities"][0]
+    assert util["actions"][0]["type"] == "build_power_plant" and util["results"][0]["ok"], util["results"]
+    assert util["usage"]["completion_tokens"] == 30 and util["steps"] == 3
+    assert env.world.facilities(C.WIND)
+    assert env.fleet.plan["budgets"] == {"utilities": 3000}
+    assert s["agent_stats"]["utilities"]["actions"] == 2 and s["agent_stats"]["utilities"]["invalid"] == 0
+    assert "fleet:fake" in s["signature"] and s["signature"].endswith("[autonomous]")
+    assert s["signature"].count("[autonomous]") == 1
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["fleet_version"] == fleet_version(_fleet_cfg(srv.server_port))
+    assert meta["agents"]["police"] == "fleet:fake"
+    first = FakeToolLLM.requests[0]
+    assert first["model"] == "fake" and {t["function"]["name"] for t in first["tools"]} >= {"end_turn", "update_plan"}
+    assert "Fund utilities first." in first["messages"][0]["content"] and "Grow steadily." in first["messages"][0]["content"]
+    for body in FakeToolLLM.requests:
+        for m in body["messages"]:
+            if m["role"] == "assistant":
+                assert set(m) <= {"role", "content", "tool_calls"}
+                assert all(c["id"] for c in m.get("tool_calls", []))
+    police = [t for t in traj if t["role"] == "police"][0]
+    ids = [c["id"] for m in police["prompt"] if m["role"] == "assistant" for c in m.get("tool_calls", [])]
+    assert ids and ids == [m["tool_call_id"] for m in police["prompt"] if m["role"] == "tool"]
+
+
+class FakeClient:
+    """Stands in for ChatClient: `reply(messages)` gives the tool calls (or raises)."""
+
+    def __init__(self, reply, tokens: int = 10):
+        self.reply, self.tokens, self.calls = reply, tokens, []
+
+    def chat(self, model, messages, *, temperature=0.4, max_tokens=1500, extra=None):
+        self.calls.append({"messages": [dict(m) for m in messages], "extra": extra, "max_tokens": max_tokens})
+        calls = self.reply(messages)
+        return {"content": "thinking aloud", "reasoning": "secret", "tool_calls": calls, "finish_reason": "stop",
+                "usage": {"prompt_tokens": 5, "completion_tokens": self.tokens}, "latency_s": 0.01}
+
+
+def _agent(role="police", reply=lambda m: [], tokens=10, **cfg):
+    env = _env()
+    a = ToolAgent(role, cfg=FleetAgentConfig(model="fake", **cfg))
+    a.client = FakeClient(reply, tokens)
+    a.bind(env)
+    return a, env
+
+
+def test_tool_agent_ends_after_one_nudge_without_tool_calls():
+    a, env = _agent()
+    d = a.act(env.observe("police"))
+    assert len(a.client.calls) == 2
+    assert "Use the tools" in a.client.calls[1]["messages"][-1]["content"]
+    assert d.meta["finish_reason"] == "no_tool_calls" and not d.meta["ended"] and d.meta["steps"] == 0
+    assert d.executed == [] and d.thinking == "(no report)"
+
+
+def test_tool_agent_stops_a_looping_model_at_max_steps():
+    a, env = _agent(reply=lambda m: [_call("city_overview", {}, None)], max_steps=3)
+    d = a.act(env.observe("police"))
+    assert len(d.meta["tool_trace"]) == 3 and d.meta["finish_reason"] == "max_steps"
+    assert len(a.client.calls) == 3
+    assert a.usage["tool_calls"] == 3 and a.usage["calls"] == 3
+
+
+def test_tool_agent_caps_parallel_calls_and_skips_calls_after_end_turn():
+    a, env = _agent(reply=lambda m: [_call("city_overview", {}, None)] * 5, max_steps=3)
+    d = a.act(env.observe("police"))
+    tools = [m for m in d.meta["messages"] if m["role"] == "tool"]
+    assert len(d.meta["tool_trace"]) == 3 and len(tools) == 5 and "not run" in tools[-1]["content"]
+    assert len({m["tool_call_id"] for m in tools}) == 5
+    a, env = _agent(reply=lambda m: [_call("end_turn", {"report": "done"}), _call("city_overview", {})])
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "end_turn" and [c["tool"] for c in d.meta["tool_trace"]] == ["end_turn"]
+    assert len(a.client.calls) == 1 and d.thinking == "done"
+
+
+def test_tool_agent_messages_ids_and_truncation():
+    a, env = _agent(reply=lambda m: [_call("inspect", {"x": 20, "y": 20, "radius": 4}, None),
+                                     _call("send_message", {"to": "mayor", "text": "need funds"}, "")]
+                    if len(m) == 2 else [_call("end_turn", {"report": "r"}, "x9")])
+    d = a.act(env.observe("police"))
+    asst = [m for m in d.meta["messages"] if m["role"] == "assistant"]
+    assert all(set(m) == {"role", "content", "tool_calls"} for m in asst)
+    ids = [c["id"] for m in asst for c in m["tool_calls"]]
+    assert ids == ["call_0_0", "call_0_1", "x9"]
+    assert ids == [m["tool_call_id"] for m in d.meta["messages"] if m["role"] == "tool"]
+    assert all(len(m["content"]) <= 4000 and ": " not in m["content"][:20]
+               for m in d.meta["messages"] if m["role"] == "tool")
+    assert d.messages == [{"to": "mayor", "text": "need funds"}]
+    assert d.meta["finish_reason"] == "end_turn" and d.meta["reasoning"] == "[step 0] secret\n\n[step 1] secret"
+    assert d.meta["usage"] == {"prompt_tokens": 10, "completion_tokens": 20}
+    env.apply("police", d)
+    assert env.council.messages[-1].to == "mayor"
+
+
+def test_tool_agent_turn_tokens_and_api_errors():
+    a, env = _agent(reply=lambda m: [_call("city_overview", {})], tokens=600, turn_tokens=1000)
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "turn_tokens" and len(a.client.calls) == 2
+
+    def boom(m):
+        if len(m) > 2:
+            raise LLMError("HTTP 500")
+        return [_call("city_overview", {})]
+    a, env = _agent(reply=boom)
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "api_error" and d.parse_error == "api_error: HTTP 500"
+    assert d.meta["steps"] == 1 and a.usage["api_errors"] == 1
+
+
+def test_tool_agent_prompt_and_request_settings():
+    a, env = _agent(role="mayor", reply=lambda m: [_call("end_turn", {"report": "ok"})], max_tokens=777,
+                    extra_body={"top_p": 0.9}, mode="supervised", playbook="Keep a reserve.")
+    env.cfg.act_every = 3
+    a.bind(env)
+    d = a.act(env.observe("mayor"))
+    call = a.client.calls[0]
+    assert call["max_tokens"] == 777 and call["extra"]["top_p"] == 0.9 and call["extra"]["tools"]
+    system, user = call["messages"][0]["content"], call["messages"][1]["content"]
+    assert "Keep a reserve." in system and "every 3 months" in system
+    assert "mode: supervised" in user
+    assert a.describe() == "fleet:fake" and d.meta["model"] == "fake"
+
+
+def test_tool_agent_refuses_region_envs():
+    from civitas.core.region import RegionEnv
+    a = ToolAgent("mayor", cfg=FleetAgentConfig())
+    with pytest.raises(ValueError, match="single-city"):
+        a.bind(RegionEnv(GameConfig(seed=0, months=2, region=True)))
+    with pytest.raises(RuntimeError, match="bind"):
+        ToolAgent("mayor", cfg=FleetAgentConfig()).act({})
+
+
+def test_fleet_agent_config_merges_fleet_and_role():
+    cfg = load_config(None)
+    cfg["fleet"] = {"mode": "supervised", "playbook": "fleet book", "model": "m1", "max_steps": 9, "temperature": 0.1}
+    cfg["agents"] = {"mayor": {"kind": "fleet", "playbook": "mayor book", "model": "m2", "max_tokens": 500},
+                     "police": {"kind": "fleet"}}
+    m = fleet_agent_config(cfg, "mayor")
+    assert (m.mode, m.fleet_playbook, m.playbook, m.model, m.max_steps, m.max_tokens, m.temperature) == \
+        ("supervised", "fleet book", "mayor book", "m2", 9, 500, 0.1)
+    p = fleet_agent_config(cfg, "police")
+    assert (p.playbook, p.model, p.provider, p.turn_tokens) == ("", "m1", "arcee", 80000)
+    cfg["fleet"]["mode"] = "wild"
+    with pytest.raises(ValueError, match="mode"):
+        fleet_agent_config(cfg, "police")
+
+
+def test_fleet_version_tracks_fleet_settings():
+    v = fleet_version(_fleet_cfg(1))
+    assert re.fullmatch(r"[0-9a-f]{12}", v) and fleet_version(_fleet_cfg(1)) == v
+    other = _fleet_cfg(1)
+    other["game"]["months"] = 99                                     # not part of the fleet
+    other["providers"]["fake"]["base_url"] = "http://elsewhere/v1"
+    assert fleet_version(other) == v
+    other["agents"]["mayor"]["playbook"] = "changed"
+    assert fleet_version(other) != v
+    other = _fleet_cfg(1)
+    other["fleet"]["max_steps"] = 7
+    assert fleet_version(other) != v
+    other = _fleet_cfg(1)
+    other["agents"]["planning"] = {"kind": "scripted"}               # the fleet's line-up changed
+    assert fleet_version(other) != v
+
+
+def test_build_agents_and_signature_for_fleets():
+    from civitas.bench.runner import agent_signature
+    cfg = load_config("configs/baseline.toml")
+    cfg["fleet"] = {"model": "big", "provider": "ollama"}
+    cfg["agents"]["mayor"] = {"kind": "fleet"}
+    cfg["agents"]["health"] = {"kind": "fleet", "model": "small"}
+    game = game_config(cfg, 0)
+    agents = build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))
+    assert isinstance(agents["mayor"], ToolAgent) and agents["health"].cfg.model == "small"
+    assert agents["mayor"].provider.base_url.startswith("http://localhost:11434")
+    sig = agent_signature(cfg, list(TURN_ORDER))
+    assert "mayor=fleet:big" in sig and "health=fleet:small" in sig and "planning=scripted" in sig
+    assert sig.endswith(" [autonomous]") and sig.count("[") == 1
+    assert "[" not in agent_signature(load_config("configs/baseline.toml"), list(TURN_ORDER))
+    with pytest.raises(ValueError, match="single-city"):
+        build_agents(cfg, ["north.mayor"], game, scoring_config(cfg, game))
+    cfg["agents"]["health"]["mode"] = "supervised"
+    with pytest.raises(ValueError, match="mode"):
+        build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))
