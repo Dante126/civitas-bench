@@ -16,9 +16,9 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
+from .tools import SITE_PURPOSES, overview, plan_slice
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -49,6 +49,7 @@ UNLOCK_ROLES = {
 }
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
+MAX_MESSAGES = 5         # new council messages quoted per briefing
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -130,9 +131,12 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     L.extend(_listed(events, "history kind=event"))
     for f in w.forecast():
         L.append(f"- forecast: {cut(f)}")
-    n = d["messages"]
-    shows = f"get_messages shows the latest {MAX_ENTRIES}" if n > MAX_ENTRIES else "get_messages"
-    L.append(f"- {n or 'no'} new council message{'' if n == 1 else 's'}" + (f" ({shows})" if n else ""))
+    msgs = [env._local(m) for m in d["messages"]]
+    L.append("- new council messages (newest last):" if msgs else "- no new council messages")
+    if len(msgs) > MAX_MESSAGES:
+        L.append(f"  - ({len(msgs) - MAX_MESSAGES} more: get_messages)")
+    L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] != 'all' else 'all'}: "
+             f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
     return L
 
 

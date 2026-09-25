@@ -157,9 +157,9 @@ def test_digest_covers_only_this_role_since_its_last_turn():
     assert d["since"] == 1
     assert [e["message"] for e in d["failed_actions"]] == ["blocked"]
     assert d["events"] == ["Fire downtown"]
-    assert d["messages"] == 2
-    assert fs.digest("police", 2)["since"] is None and fs.digest("police", 2)["messages"] == 0
-    assert fs.digest("police", 2, council=env.council)["messages"] == 3   # never marked: all from others
+    assert [m["text"] for m in d["messages"]] == ["fire: build a station", "hello all"]
+    assert fs.digest("police", 2)["since"] is None and fs.digest("police", 2)["messages"] == []
+    assert len(fs.digest("police", 2, council=env.council)["messages"]) == 3   # never marked: all from others
     assert fs.digest("fire", 2)["failed_actions"] == d["failed_actions"]
     first = FleetState()
     first.record(0, "fire", "event", text="x")
@@ -679,10 +679,38 @@ def test_department_briefing_digests_its_own_last_turn():
     assert "build_police_station" in text and bad["message"][:40] in text and "failed actions: none" not in text
     assert "events: none" not in text
     assert "build_fire_station" not in text and "FIRE-KIND" not in text
-    assert "A tornado hit" in text and "1 new council message" in text
+    assert "A tornado hit" in text and "- m0 mayor -> you: police: cover downtown" in text
     assert fs.last_turn_month["police"] == 0                          # mark=False leaves the turn unmarked
     briefing(env, "police")
-    assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == 0
+    assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == []
+    assert "no new council messages" in briefing(env, "police", mark=False)
+
+
+def test_briefing_lists_new_council_messages_for_this_role():
+    env = _env()
+    c = env.council
+    c.post(0, "mayor", "OLD-MSG before the last turn", "planning")
+    briefing(env, "planning")
+    c.post(0, "utilities", "TO-PLANNING need road access at the river " + "r" * 300, "planning")
+    c.post(0, "mayor", "TO-ALL keep the treasury positive", "all")
+    c.post(0, "fire", "TO-POLICE share the corner lot", "police")
+    c.post(0, "planning", "OWN-POST zoning the east side", "all")
+    env.end_month()
+    text = briefing(env, "planning", mark=False)
+    msgs = text[text.index("new council messages"):].split("\n\n")[0]
+    line, = [ln for ln in msgs.splitlines() if "TO-PLANNING" in ln]
+    assert line.startswith("  - m0 utilities -> you: ") and line.endswith("...") and len(line) < 240
+    assert "  - m0 mayor -> all: TO-ALL keep the treasury positive" in msgs
+    assert msgs.index("TO-PLANNING") < msgs.index("TO-ALL")                 # newest last
+    assert "TO-POLICE" not in msgs and "OWN-POST" not in msgs and "OLD-MSG" not in text
+    assert "more: get_messages" not in msgs
+    for i in range(6):
+        c.post(1, "health", f"REQ-{i} clinic lot please", "all")
+    text = briefing(env, "planning", mark=False)
+    msgs = text[text.index("new council messages"):].split("\n\n")[0]
+    assert [f"REQ-{i}" in msgs for i in range(6)] == [False] + [True] * 5
+    assert "TO-PLANNING" not in msgs and "(3 more: get_messages)" in msgs
+    assert "- m1 health -> all: REQ-5" in briefing(env, "mayor", mark=False)
 
 
 def test_briefing_dates_and_milestones():
@@ -736,10 +764,10 @@ def test_briefings_stay_bounded_at_the_limits():
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 6000, (role, len(text) - len(memory))   # memory is shown in full by design
-        assert len(text) < 12000, (role, len(text))
+        assert len(text) - len(memory) < 7500, (role, len(text) - len(memory))   # memory is shown in full by design
+        assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
-        assert f"{MAX_ENTRIES + 5} new council messages (get_messages shows the latest {MAX_ENTRIES})" in text
+        assert f"({MAX_ENTRIES} more: get_messages)" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
     assert mayor.count("(full: history kind=report)") == len(DEPTS)
 
