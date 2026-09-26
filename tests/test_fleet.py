@@ -928,8 +928,8 @@ def test_role_specific_history_description_and_fresh_lookups():
 
 
 # ---------------------------------------------------------------- guards
-CUT_OFF = ("this would cut 17 road tiles (e.g. around (3,24)) off the highway, disconnecting the city; build a new "
-           "link first or pick tiles that aren't on the only route; to do it anyway repeat with confirm: true")
+CUT_OFF = ("this would cut 17 road tiles (e.g. around (3,24)) off the highway; build a new link first or pick tiles "
+           "that aren't on the only route; to do it anyway repeat with confirm: true")
 UNCONNECTED = "- roads not connected to the highway: 17 tiles (x 3-19, y 24) - reconnect them"
 
 
@@ -987,31 +987,36 @@ def test_bulldozing_a_dead_end_or_a_building_is_not_refused():
     assert res["ok"] and "demolished" in res["message"], res
 
 
-def test_zoning_the_last_riverbank_lot_warns_while_there_is_no_pump_or_outlet():
+def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing():
     env = _env()
     w = env.world
     taken = _bridge_and_take_the_bank(env)
     w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
+    warning = (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
+               "{} - dezone one near ({},{})")
+
+    def free(*lots):
+        for tx, ty in lots:
+            w.struct[ty, tx] = C.NONE
+        w.refresh()
 
     def zone(x, y):
         return ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
 
-    (x, y), (x2, y2) = taken[:2]
-    for tx, ty in ((x, y), (x2, y2)):
-        w.struct[ty, tx] = C.NONE
-    w.refresh()
+    (x, y), (x2, y2), (x3, y3) = taken[:3]
+    free((x, y), (x2, y2))
     res = zone(x, y)                                     # one free lot left: no warning
     assert res["ok"] and "WARNING" not in res["message"], res
-    res = zone(x2, y2)                                   # the last one
-    assert res["ok"] and res["message"].endswith(
-        " WARNING: that zoned the last free riverbank lot(s) beside roads; utilities needs one for its pump and "
-        f"sewage outlet - dezone one near ({x2},{y2})"), res
+    res = zone(x2, y2)                                   # the last one, with neither pump nor outlet
+    assert res["ok"] and res["message"].endswith(warning.format("pump and sewage outlet", x2, y2)), res
     assert "WARNING" not in FleetState.of(env).history(kind="action", role="planning")[-1]["message"]   # result only
-    for tx, ty in ((x, y), (x2, y2)):                    # free two again; a pump takes one
-        w.struct[ty, tx] = C.NONE
-    w.refresh()
+    free((x, y), (x2, y2))                               # a pump takes one: the outlet still needs the other
     assert apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": x, "y": y}).ok
     res = zone(x2, y2)
+    assert res["ok"] and res["message"].endswith(warning.format("sewage outlet", x2, y2)), res
+    free((x2, y2), (x3, y3))                             # an outlet takes one: nothing left to warn about
+    assert apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": x2, "y": y2}).ok
+    res = zone(x3, y3)
     assert res["ok"] and "WARNING" not in res["message"], res
 
 

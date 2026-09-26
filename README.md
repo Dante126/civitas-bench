@@ -452,8 +452,8 @@ tasks and money, and to let people coach it.
   refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
   action, still a tool call), naming how many tiles and where; the agent can build a new link
   first or repeat with `confirm: true`. A `zone` that takes the last free riverbank lot
-  beside the connected roads while the city has neither a pump nor a sewage outlet /
-  treatment plant succeeds, with a warning to dezone one for utilities.
+  beside the connected roads while the city still lacks a pump or a sewage outlet /
+  treatment plant succeeds, with a warning naming what utilities still needs the bank for.
 
 | tools | |
 |---|---|

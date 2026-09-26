@@ -854,9 +854,8 @@ class ToolBox:
         ys, xs = np.nonzero(lost)
         gone = [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
-        return (f"this would cut {len(xs)} road tiles (e.g. around ({xs[i]},{ys[i]})) off the highway, disconnecting "
-                "the city; build a new link first or pick tiles that aren't on the only route; to do it anyway repeat "
-                "with confirm: true")
+        return (f"this would cut {len(xs)} road tiles (e.g. around ({xs[i]},{ys[i]})) off the highway; build a new link "
+                "first or pick tiles that aren't on the only route; to do it anyway repeat with confirm: true")
 
     def _free_bank(self) -> np.ndarray:
         """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
@@ -864,16 +863,17 @@ class ToolBox:
 
     def _bank_warning(self, before: np.ndarray) -> str:
         """A warning for a zone action that took the last free riverbank lots beside roads (`before`: _free_bank()
-        before it) while the city has neither a pump nor a sewage outlet / treatment plant."""
+        before it) while the city still lacks a pump or a sewage outlet / treatment plant (both need the bank)."""
         w = self.world
-        if not before.any() or self._free_bank().any() or any(w.facilities(s) for s in (C.PUMP, C.OUTLET,
-                                                                                        C.TREATMENT)):
+        missing = [name for name, structs in (("pump", (C.PUMP,)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
+                   if not any(w.facilities(s) for s in structs)]
+        if not missing or not before.any() or self._free_bank().any():
             return ""
         ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))
         if not len(xs):                                   # not taken by this zoning: someone else's doing
             return ""
-        return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities needs one for its pump "
-                f"and sewage outlet - dezone one near ({xs[0]},{ys[0]})")
+        return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
+                f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:
