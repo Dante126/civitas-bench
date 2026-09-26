@@ -53,7 +53,7 @@ MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
 # the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
-GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 70, 40, 150
+GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -249,7 +249,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     f = funding_gaps(env, fleet)
     clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
-    L += ["", "## Departments: funds, plan target, priority, latest report"
+    L += ["", "## Departments"
           + (" (cut reports: history kind=report)" if clipped else "")]
     for d in (r for r in DEPARTMENTS if r in env.roles):
         L.append(f"- {d}: funds {money(w.dept_funds[d])}"

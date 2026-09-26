@@ -17,11 +17,11 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, action_docs, apply_action
+from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _rect, action_docs, apply_action
 from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
-from ..sim.grid import shift
+from ..sim.grid import label_components, shift
 from .fmt import TOOL_MESSAGE_CHARS, money
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
@@ -37,6 +37,9 @@ RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' 
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
+ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolish takes buildings, never roads)
+CONFIRM_PARAM = {"type": "boolean", "description": "true only to repeat a bulldoze refused for cutting roads off the "
+                 "highway, once you are sure"}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -235,6 +238,8 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     if name.startswith("build_") and any(len(C.TIER_LINES[ln]) > 1 for ln in lines):
         props["tier"] = dict(_TIER_PARAM)
     props.update(_EXTRA_PARAMS.get(name, {}))
+    if name in ROAD_REMOVERS:
+        props["confirm"] = dict(CONFIRM_PARAM)
     return Tool(name, text, fn, props, strict=False)
 
 
@@ -264,6 +269,33 @@ def _connected_roads(w) -> np.ndarray:
     """Road tiles on networks connected to the highway."""
     labels = [i for i, n in enumerate(w.networks) if n.outside_connected]
     return np.isin(w.road_labels, labels) if labels else np.zeros(w.struct.shape, bool)
+
+
+def _outside_labels(w, labels: np.ndarray) -> set[int]:
+    """The road components linked to the region, as World.refresh() finds them: those holding a highway tile, and
+    those next to (8-neighbourhood) a train station, harbour or airport."""
+    out = {int(labels[y, x]) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))} - {-1}
+    for x, y in w.facilities(C.TRAIN) + w.facilities(C.HARBOUR) + w.facilities(C.AIRPORT):
+        for px, py in w.parts(x, y):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if w.in_bounds(px + dx, py + dy) and labels[py + dy, px + dx] >= 0:
+                        out.add(int(labels[py + dy, px + dx]))
+    return out
+
+
+def cut_off(w, tiles) -> np.ndarray:
+    """The highway-connected road tiles (the removed ones excluded) that removing the road tiles among `tiles` would
+    cut off the highway: the road network relabelled without them as World.refresh() labels it (4-neighbour
+    components, linked by a highway tile or a station / harbour / airport)."""
+    before = _connected_roads(w)
+    gone = np.zeros(before.shape, bool)
+    for x, y in tiles:
+        gone[y, x] = w.struct[y, x] == C.ROAD
+    if not (gone & before).any():
+        return np.zeros_like(before)
+    labels, _ = label_components(((w.struct == C.ROAD) | (w.struct == C.HIGHWAY)) & ~gone)
+    return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels)))
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -355,7 +387,8 @@ def _edge(w, x: int, y: int) -> str:
 def map_facts(w) -> dict:
     """Orientation for the briefing's Map block and map_overview: size, highway entries, the river per row band
     (RIVER_BANDS; each [[x0, x1, first row], [x0, x1, last row]], the columns at the band's ends), the
-    highway-connected roads' extent and the built-up box."""
+    highway-connected roads' extent, the road tiles off the highway network (None when there are none) and the
+    built-up box."""
     hw = [{"x": int(x), "y": int(y), "edge": _edge(w, x, y)} for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
     water = w.terrain == C.WATER
     rows = np.nonzero(water.any(axis=1))[0]
@@ -367,7 +400,10 @@ def map_facts(w) -> dict:
     flat = np.arange(w.h * w.w).reshape(w.h, w.w)
     anchors = built & ~zoned & ((w.anchor < 0) | (w.anchor == flat))       # multi-tile buildings count once
     bb = _box(built)
+    loose = (w.struct == C.ROAD) & ~_connected_roads(w)
+    lb = _box(loose)
     return {"size": [w.w, w.h], "highway": hw, "river": river, "roads": _roads(w),
+            "unconnected": lb and {"x": lb[0], "y": lb[1], "tiles": int(loose.sum())},
             "built": bb and {"x": bb[0], "y": bb[1], "zoned": int(zoned.sum()),
                              "developed": int((zoned & (w.level > 0)).sum()), "buildings": int(anchors.sum())}}
 
@@ -382,6 +418,8 @@ def map_lines(f: dict) -> list[str]:
             "- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
             if f["river"] else "- no river",
             "- " + _roads_text(f["roads"]),
+            *([f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y {_span(*u['y'])}) "
+               "- reconnect them"] if (u := f.get("unconnected")) else []),
             f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, {b['developed']} "
             f"developed, {b['buildings']} building{'s' * (b['buildings'] != 1)})" if b else "- built-up area: none yet"]
 
@@ -685,7 +723,9 @@ class ToolBox:
         """Run one tool call. An identical repeat (same tool, same arguments after coercion) of a look-up returns
         the earlier result marked "repeat", and one of an action that failed is refused ("refused": "repeat")
         without running, until something changes: a successful action (or plan update) for look-ups, a
-        successful action for failed actions; a failed action only refreshes `history`, which lists it."""
+        successful action for failed actions; a failed action only refreshes `history`, which lists it. A bulldoze
+        that would cut roads off the highway is refused before it runs ("refused": "disconnect"; not executed,
+        logged or remembered as a failure) unless it passes confirm: true."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -712,7 +752,7 @@ class ToolBox:
             if res.get("ok"):
                 self._seen.clear()
                 self._failed.clear()
-            else:
+            elif "refused" not in res:               # a guard refusal ran nothing: an identical repeat is refused again
                 self._failed[key] = (self.n_calls, str(res.get("error"))[:REPEAT_ERROR_CHARS])
                 if len(self.executed) > executed:         # logged as a failure: history shows it
                     self._seen = {k: v for k, v in self._seen.items() if k[0] != "history"}
@@ -785,13 +825,55 @@ class ToolBox:
         t = args.pop("type", None)
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
+        if not args.pop("confirm", False) and name in ROAD_REMOVERS:
+            refusal = self._disconnect_refusal(args)
+            if refusal:
+                return {"ok": False, "refused": "disconnect", "error": refusal}
+        bank = self._free_bank() if name == "zone" else None
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
         dept = ROLES[self.role]["budget"]
-        return {"ok": res["ok"], "message": res["message"], "cost": res["cost"],
+        msg = res["message"] + (self._bank_warning(bank) if bank is not None and res["ok"] else "")
+        return {"ok": res["ok"], "message": msg, "cost": res["cost"],
                 "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
+
+    def _disconnect_refusal(self, args: dict) -> str | None:
+        """Why a bulldoze with these arguments must not run: it would cut highway-connected road tiles off the
+        highway (seed 1, v7: planning cleared the 2-tile link to the highway and the city emptied). None when it
+        wouldn't, or when the arguments are bad (the action reports those)."""
+        w = self.world
+        try:
+            tiles = _rect(w, args)
+        except Exception:
+            return None
+        lost = cut_off(w, tiles)
+        if not lost.any():
+            return None
+        ys, xs = np.nonzero(lost)
+        gone = [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
+        i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
+        return (f"this would cut {len(xs)} road tiles (e.g. around ({xs[i]},{ys[i]})) off the highway, disconnecting "
+                "the city; build a new link first or pick tiles that aren't on the only route; to do it anyway repeat "
+                "with confirm: true")
+
+    def _free_bank(self) -> np.ndarray:
+        """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
+        return _riverbank_by_roads(self.world)[0] & _empty_land(self.world)
+
+    def _bank_warning(self, before: np.ndarray) -> str:
+        """A warning for a zone action that took the last free riverbank lots beside roads (`before`: _free_bank()
+        before it) while the city has neither a pump nor a sewage outlet / treatment plant."""
+        w = self.world
+        if not before.any() or self._free_bank().any() or any(w.facilities(s) for s in (C.PUMP, C.OUTLET,
+                                                                                        C.TREATMENT)):
+            return ""
+        ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))
+        if not len(xs):                                   # not taken by this zoning: someone else's doing
+            return ""
+        return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities needs one for its pump "
+                f"and sewage outlet - dezone one near ({xs[0]},{ys[0]})")
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:

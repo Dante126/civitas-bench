@@ -441,11 +441,19 @@ tasks and money, and to let people coach it.
   the roads is taken, or no roadside lot is away from homes for a landfill, cemetery or
   jail; a site on one of the last two free riverbank lots is marked to keep for a pump or
   sewage outlet) and its memory. Both have a short Map block (size, highway entry,
-  river columns by row band, the extent of the connected roads and the built-up area) and
+  river columns by row band, the extent of the connected roads, any road tiles not
+  connected to the highway, and the built-up area) and
   end with the next milestone. Actions run immediately and return
   `ok`, a message, the cost and the money left, so a failed action can be fixed in the
   same turn. Bad arguments, unknown tools and refused actions come back as
   `{"ok": false, "error": ...}` for the model to correct.
+- **Guards.** A `bulldoze` that would cut highway-connected road tiles off the highway
+  (the road network relabelled without the removed tiles, as `World.refresh()` does) is
+  refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
+  action, still a tool call), naming how many tiles and where; the agent can build a new link
+  first or repeat with `confirm: true`. A `zone` that takes the last free riverbank lot
+  beside the connected roads while the city has neither a pump nor a sewage outlet /
+  treatment plant succeeds, with a warning to dezone one for utilities.
 
 | tools | |
 |---|---|
@@ -481,7 +489,8 @@ arguments after type coercion) returns the earlier result marked `repeat`, and a
 repeat of an action that failed is refused without running (`refused: "repeat"`, not charged
 as an invalid action), until the agent's next successful action. A successful `update_plan`
 also refreshes look-ups, and a failed action refreshes `history` (which lists it). Both kinds
-of repeat still count as tool calls.
+of repeat still count as tool calls. A guard refusal (above) is not remembered as a failure:
+an identical repeat is checked, and refused, again.
 
 **Coaching with playbooks.** The system prompt starts with a fixed part: how to play, the
 role's mission and the game rules. Then comes the coach's playbook: the fleet playbook

@@ -27,8 +27,8 @@ MSG_CHARS = 160
 
 def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
-    look-up that failed, an action tool refused before the action ran. A repeated failed action refused without
-    running is counted in `refused`, not here."""
+    look-up that failed, an action tool refused before the action ran. A repeated failed action or a guarded
+    bulldoze refused without running is counted in `refused`, not here."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
@@ -51,7 +51,7 @@ def turn_row(rec: dict) -> dict:
                          "message": str(r.get("message") or "")[:MSG_CHARS], "cost": r.get("cost") or 0}
                         for r in rec.get("results") or []],
             "tool_errors": [e for e in errors if e is not None],
-            "repeats": marked("repeat"), "refused": marked("refused")}   # repeated look-ups / failed actions
+            "repeats": marked("repeat"), "refused": marked("refused")}   # repeated look-ups / refused actions
 
 
 def rows_from_trajectories(path: str | Path) -> list[dict]:

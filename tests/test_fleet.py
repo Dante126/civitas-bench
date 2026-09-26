@@ -927,6 +927,94 @@ def test_role_specific_history_description_and_fresh_lookups():
     assert ToolBox(env, "mayor").call("city_overview", {})["trend"] is None
 
 
+# ---------------------------------------------------------------- guards
+CUT_OFF = ("this would cut 17 road tiles (e.g. around (3,24)) off the highway, disconnecting the city; build a new "
+           "link first or pick tiles that aren't on the only route; to do it anyway repeat with confirm: true")
+UNCONNECTED = "- roads not connected to the highway: 17 tiles (x 3-19, y 24) - reconnect them"
+
+
+def test_bulldozing_the_only_link_to_the_highway_is_refused_until_confirmed():
+    """Seed 1, v7: planning bulldozed (0,22)-(2,26) for a road along x 0, taking the 2 road tiles between the highway
+    (0,24) and the main road; the city emptied. Seed 0's starter road has the same neck."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.briefing import briefing
+    from civitas.fleet.report import _tool_error, turn_row
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    assert w.highway == (0, 24) and (w.struct[24, 1:20] == C.ROAD).all()
+    assert map_facts(w)["unconnected"] is None and "not connected" not in "\n".join(map_lines(map_facts(w)))
+    struct, funds = w.struct.copy(), dict(w.dept_funds)
+    box = ToolBox(env, "planning")
+    rect = {"x1": 0, "y1": 22, "x2": 2, "y2": 26}
+    for n in (1, 2):                                     # an identical repeat is refused the same way, not as a repeat
+        res = box.call("bulldoze", rect)
+        assert res == {"ok": False, "refused": "disconnect", "error": CUT_OFF}, res
+        assert box.n_calls == n
+    assert (w.struct == struct).all() and w.dept_funds == funds
+    assert box.executed == [] and box._failed == {} and FleetState.of(env).history(months=12) == []
+    call = {"tool": "bulldoze", "args": rect, "result": _slim(res)}
+    assert call["result"]["refused"] == "disconnect" and _tool_error(call) is None
+    assert turn_row({"role": "planning", "month": 0, "tool_trace": [call]})["refused"] == 1
+    props = next(s["function"] for s in box.schemas() if s["function"]["name"] == "bulldoze")["parameters"]
+    assert props["properties"]["confirm"]["type"] == "boolean"
+    res = box.call("bulldoze", {**rect, "confirm": "true"})
+    assert res["ok"] and res["message"] == "bulldozed 2 tiles", res
+    assert (w.struct[24, 1:3] == C.NONE).all() and w.struct[24, 0] == C.HIGHWAY
+    assert box.executed[-1]["action"] == {**rect, "type": "bulldoze"}              # confirm is not an action param
+    assert UNCONNECTED in map_lines(map_facts(w))
+    for role in ("mayor", "planning", "police"):                                   # every role sees the broken link
+        assert UNCONNECTED in briefing(env, role, mark=False)
+
+
+def test_bulldozing_a_dead_end_or_a_building_is_not_refused():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 5, "y1": 25, "x2": 5, "y2": 28}).ok
+    box = ToolBox(env, "planning")
+    res = box.call("bulldoze", {"x": 5, "y": 26})                 # the middle of the spur strands its tail
+    assert res["refused"] == "disconnect" and "cut 2 road tiles (e.g. around (5,27))" in res["error"]
+    res = box.call("bulldoze", {"x1": 5, "y1": 25, "x2": 5, "y2": 28})      # the whole spur: nothing left behind
+    assert res["ok"] and res["message"] == "bulldozed 4 tiles" and "refused" not in res
+    assert apply_action(w, "planning", {"type": "zone", "zone": "R", "x1": 4, "y1": 25, "x2": 4, "y2": 26}).ok
+    assert ToolBox(env, "planning").call("bulldoze", {"x1": 4, "y1": 25, "x2": 4, "y2": 26})["ok"]   # zones only
+    w.dept_funds["utilities"] = 10000
+    s = ToolBox(env, "utilities").call("find_sites", {"purpose": "wind"})["sites"][0]
+    assert apply_action(w, "utilities", {"type": "build_power_plant", "kind": "wind", "x": s["x"], "y": s["y"]}).ok
+    res = ToolBox(env, "utilities").call("demolish", {"x": s["x"], "y": s["y"]})
+    assert res["ok"] and "demolished" in res["message"], res
+
+
+def test_zoning_the_last_riverbank_lot_warns_while_there_is_no_pump_or_outlet():
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
+
+    def zone(x, y):
+        return ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
+
+    (x, y), (x2, y2) = taken[:2]
+    for tx, ty in ((x, y), (x2, y2)):
+        w.struct[ty, tx] = C.NONE
+    w.refresh()
+    res = zone(x, y)                                     # one free lot left: no warning
+    assert res["ok"] and "WARNING" not in res["message"], res
+    res = zone(x2, y2)                                   # the last one
+    assert res["ok"] and res["message"].endswith(
+        " WARNING: that zoned the last free riverbank lot(s) beside roads; utilities needs one for its pump and "
+        f"sewage outlet - dezone one near ({x2},{y2})"), res
+    assert "WARNING" not in FleetState.of(env).history(kind="action", role="planning")[-1]["message"]   # result only
+    for tx, ty in ((x, y), (x2, y2)):                    # free two again; a pump takes one
+        w.struct[ty, tx] = C.NONE
+    w.refresh()
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": x, "y": y}).ok
+    res = zone(x2, y2)
+    assert res["ok"] and "WARNING" not in res["message"], res
+
+
 # ---------------------------------------------------------------- briefing
 import copy
 
@@ -1280,6 +1368,9 @@ def test_briefings_stay_bounded_at_the_limits():
         env.council.post(0, "press", f"msg {i} " + "y" * 300, "all")
     for i in range(12):
         w.event(f"event {i} " + "e" * 300)
+    w.struct[36:48, 37:47] = C.ROAD                     # 121 road tiles off the highway, spanning x 10-46, y 10-47
+    w.struct[10, 10] = C.ROAD
+    w.refresh()
     env.end_month()
     w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
     w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
@@ -1292,6 +1383,7 @@ def test_briefings_stay_bounded_at_the_limits():
         assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
     assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
+    assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
     assert "(cut reports: history kind=report)" in mayor
 
 
