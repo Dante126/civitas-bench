@@ -564,10 +564,11 @@ reached 1.0k–1.7k residents and a city score of 40.6–43.5. A final run (v5) 
 committed code reached 2,244 residents and 43.1: 13.8 tool calls and 53k prompt / 4.7k
 completion tokens per turn, 24% of actions failed, 7 of 32 turns ended on the step limit.
 The scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and
-43.8, or 916 and 45.4 acting monthly (seed 1: 384 and 36.2).
+43.8 on seed 0 and 384 and 36.2 on seed 1; acting monthly, 916 and 45.4 (seed 1: 872 and
+43.4).
 
 **v6** (2026-09-26, after the briefing blocks, `map_overview`, repeats, the mayor's
-`find_sites` and the playbooks above; two seeds run in parallel, 15–16 minutes each):
+`find_sites` and the playbooks above; two seeds run in parallel, 14.5–16 minutes each):
 seed 0 reached 1,848 residents and a city score of 45.1, seed 1 2,756 and 46.6. Sewage was
 built on month 0 in both (v5 never built it), the mayor funded the plan in its first turn,
 and planning freed a riverbank lot when asked. Turns averaged 14.6–14.7 tool calls and
@@ -575,7 +576,10 @@ and planning freed a riverbank lot when asked. Turns averaged 14.6–14.7 tool c
 most turns, the mayor calls `find_sites` about 5 times a turn and `inspect` use rose);
 19–27% of actions failed and 6–7 of 32 turns ended on the step limit, about as in v5.
 Twelve months is too short to compare with the 120-month benchmark, and single runs vary
-a lot (the two v6 seeds differ by 900 residents).
+a lot (the two v6 seeds differ by 900 residents). Wording changes landed after the v6 runs
+and are untested live: `map_overview` "only when you need tile-level layout (at most once per
+turn)", the mayor's `find_sites` limited to checking "no site" claims (at most 2 per turn),
+"hold" allowing money to be taken back, and the health `cemetery` purpose.
 
 **Not built yet:**
 

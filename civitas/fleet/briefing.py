@@ -19,7 +19,7 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
+from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
     ready_lines, site_lists
 
 # paths into build_observation(...)["city"]
@@ -64,8 +64,9 @@ HOW_TO_PLAY = """\
 You are the {title} in a fleet of AI agents that runs a city. The mayor is the manager: it sets the city plan \
 (goals, a budget target and a priority per department) and moves the money; the departments ({depts}) carry the \
 plan out. {cadence}, and you start each turn from a short briefing.
-- Each turn you work by calling tools. Look things up before acting ({lookups}). Use map_overview once to \
-orient yourself; inspect for details.{coords}
+- Each turn you work by calling tools. Look things up before acting ({lookups}). The Map block in your \
+briefing usually suffices; call map_overview only when you need tile-level layout (at most once per turn); \
+inspect for details.{coords}
 - Action tools run immediately and report success or failure, the cost and the money left. When an action fails, \
 read the error and fix the cause (another site, a cheaper option, wait for an unlock) instead of repeating it.
 - {budget}
@@ -113,7 +114,7 @@ def _date(env) -> str:
     w = env.world
     season = f", {w.season()}" if w.seasons_on else ""
     return (f"month {w.month} of {env.cfg.months} (year {w.month // 12 + 1}, {calendar.month_name[w.month % 12 + 1]}"
-            f"{season}): {env.cfg.months - w.month} months left")
+            f"{season}): {months(env.cfg.months - w.month)} left")
 
 
 def _action(e: dict) -> str:
@@ -247,7 +248,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append("- no reports yet")
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
-                 + (f"): {f.hold}" if f.hold else
+                 + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
                     f", {money(f.spare)} above the {money(f.reserve)} reserve): allocate_budget" if f.short else
                     "): allocate_budget"))
     L += [""]

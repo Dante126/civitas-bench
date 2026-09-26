@@ -720,14 +720,17 @@ def test_health_finds_cemetery_sites():
 
 def test_update_plan_says_hold_under_the_reserve():
     env = _env()
+    from civitas.fleet.fmt import money
     w = env.world
     for treasury in (3000, 1200, -500):                  # at, under and below zero: nothing above the $3,000 reserve
         w.treasury = treasury
         res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})
-        assert res["next"] == "hold: the treasury is under the $3,000 reserve; lower targets or wait for income"
+        assert res["next"] == (f"the treasury ({money(treasury)}) is at or under the $3,000 reserve: hold; lower "
+                               "targets or wait for income")
         text = briefing(env, "mayor", mark=False)
         line, = [ln for ln in text.splitlines() if "below target" in ln]
-        assert line.endswith("): hold: the treasury is under the $3,000 reserve; lower targets or wait for income")
+        assert line.endswith(f"treasury {money(treasury)}, at or under the $3,000 reserve): hold; lower targets "
+                             "or wait for income")
         assert "allocate_budget" not in line
     w.treasury = 3001                                    # $1 above: short, but something to allocate
     assert ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})["next"].startswith(
@@ -927,7 +930,7 @@ def test_system_prompt_fits_the_fleet():
         assert "Each game month is one turn" in text
     assert "find_sites (check which sites a department has; read-only)" in mayor and "x = column" not in mayor
     assert "find_sites" in fire and "x = column" in fire
-    assert all("map_overview" in t and "map_overview once to orient yourself" in t for t in (mayor, fire))
+    assert all("map_overview" in t and "map_overview only when you need tile-level layout (at most once per turn)" in t for t in (mayor, fire))
     slow = system_prompt("fire", cfg, 36, act_every=3)
     assert "every 3 months" in slow and "Each game month is one turn" not in slow
 
@@ -1195,6 +1198,8 @@ def test_mayor_warning_and_offer_lines():
     w.months_negative, w.low_approval_months = 1, 0
     warn, = [ln for ln in briefing(env, "mayor", mark=False).splitlines() if "WARNING" in ln]
     assert "negative treasury 1 month (" in warn and "% 0 months (" in warn
+    w.month = env.cfg.months - 1
+    assert "): 1 month left" in briefing(env, "mayor", mark=False).splitlines()[0]
     offer, = [ln for ln in text.splitlines() if "OPEN OFFER #7" in ln]
     assert "250 jobs" in offer and "$8,000" in offer and "accept_offer" in offer and "month 5" in offer
 

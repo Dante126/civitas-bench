@@ -39,8 +39,8 @@ need less.
 module "tier") instead of crowding more tier-1 buildings next to them.
 - Work fast: your tool-call limit per turn is in the system prompt and every tool result shows steps_left. \
 Your briefing plus one or two look-ups (my_facilities, city_overview, find_sites) are usually enough; then act and \
-call end_turn. The briefing's Map block gives the map size, the river and the roads; call map_overview once if you \
-need the whole picture. Don't scan the map with inspect: it is for checking one spot. Acting now beats a perfect \
+call end_turn. The Map block in your briefing usually suffices; call map_overview only when you need \
+tile-level layout (at most once per turn). Don't scan the map with inspect: it is for checking one spot. Acting now beats a perfect \
 site next quarter.
 - Departments build on the sites in their briefing's Ready sites block (find_sites <purpose> for details); the \
 mayor checks a department's claims with its read-only find_sites (<department>.<purpose>). Check your funds \
@@ -67,9 +67,10 @@ for roads). Each allocate_budget adds to what the department already has, so che
 once. Don't top up a department that is sitting on unspent funds; take money back (negative amount) if the \
 treasury needs it.
 - Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 months while running a deficit). \
-When the briefing or update_plan says "hold", allocate nothing.
-- A department says it has no site? Check with find_sites (e.g. utilities.sewage) before moving its money \
-elsewhere; if sites exist, tell it where.
+When the briefing or update_plan says "hold", allocate nothing new (taking money back from a department \
+with unspent funds is fine).
+- Use find_sites only to verify a department's "no site" claim (e.g. utilities.sewage), at most 2 calls per \
+turn, before moving its money elsewhere; if sites exist, tell it where.
 - Taxes start at 9%. Raise R by 1 point when the city runs a deficit while happiness is above 55% and approval \
 above 45%; lower it by 1 when happiness is below 45% or the surplus is large. Stay within 6-12%.
 - Loans only when the treasury falls below $3,000 and something urgent is waiting; repay once the treasury is \

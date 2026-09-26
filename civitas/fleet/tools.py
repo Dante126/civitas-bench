@@ -36,6 +36,7 @@ RIVER_BANDS = 3              # row bands the Map block describes the river in
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
+HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -484,10 +485,9 @@ class Funding(NamedTuple):
         return self.total > self.spare
 
     @property
-    def hold(self) -> str:
-        """What to do when the treasury is at or under the reserve (nothing to allocate)."""
-        return (f"hold: the treasury is under the {money(self.reserve)} reserve; lower targets or wait for income"
-                if self.spare <= 0 else "")
+    def hold(self) -> bool:
+        """The treasury is at or under the reserve: nothing to allocate (HOLD says what to do instead)."""
+        return self.spare <= 0
 
 
 def funding_gaps(env, fleet: FleetState) -> Funding:
@@ -990,7 +990,8 @@ class ToolBox:
             raise ToolError(str(e))
         f = funding_gaps(self.env, self.fleet)
         if f.gaps:
-            nxt = f.hold or f"call allocate_budget to fund these (treasury {money(w.treasury)})"
+            nxt = (f"the treasury ({money(w.treasury)}) is at or under the {money(f.reserve)} reserve: {HOLD}"
+                   if f.hold else f"call allocate_budget to fund these (treasury {money(w.treasury)})")
             if f.short and not f.hold:
                 nxt += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} reserve "
                         f"({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
