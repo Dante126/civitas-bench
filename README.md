@@ -430,8 +430,8 @@ tasks and money, and to let people coach it.
   seven departments carry the plan out, and each one sees only its own slice. Turn order
   doesn't change, so the mayor acts first each month.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
-  The mayor's briefing covers the city, the finances, each department's funds, target and
-  latest report, and the plan. A department's briefing covers its plan slice, its budget,
+  The mayor's briefing covers the city, the finances, each department's funds, target
+  (`funds $0 < target $2,500` when it still needs funding) and latest report, and the plan. A department's briefing covers its plan slice, its budget,
   its key metrics, a "since your last turn" digest (failed actions, events, new messages)
   and its memory. Both have a short map block (size, highway entry, river columns, the
   extent of the connected roads and the built-up area) and end with the next milestone. Actions run immediately and return
@@ -441,8 +441,8 @@ tasks and money, and to let people coach it.
 
 | tools | |
 |---|---|
-| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`; not for the mayor), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
-| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only), `end_turn(report)` |
+| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
+| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
 **Three memory layers.** Nothing else carries over between turns.

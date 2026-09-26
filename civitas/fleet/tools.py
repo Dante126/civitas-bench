@@ -22,7 +22,7 @@ from ..core.observation import MAP_LEGEND, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import shift
-from .fmt import TOOL_MESSAGE_CHARS
+from .fmt import TOOL_MESSAGE_CHARS, money
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -33,6 +33,8 @@ MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
 RIVER_BANDS = 3              # row bands the Map block describes the river in
+RESERVE_MIN = 3000           # the treasury reserve (the mayor's playbook): this, or 3 months of expenses (6 in a deficit)
+GAP_MIN = 100                # a department this close to its plan target counts as funded
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -460,6 +462,26 @@ def plan_slice(fleet: FleetState, role: str) -> dict:
     return out
 
 
+def reserve(w) -> float:
+    """The treasury to keep back: RESERVE_MIN or last month's expenses x 3 (x 6 while running a deficit)."""
+    if not w.history:
+        return RESERVE_MIN
+    last = w.history[-1]
+    return max(RESERVE_MIN, (3 if last["income"] >= last["expenses"] else 6) * last["expenses"])
+
+
+def funding_gaps(env, fleet: FleetState) -> dict[str, dict]:
+    """Departments (in turn order) whose funds are at least GAP_MIN below their plan budget target:
+    {dept: {"funds", "target", "gap"}}. The update_plan result and the mayor's briefing show them."""
+    w, budgets = env.world, fleet.plan["budgets"]
+    out = {}
+    for d in DEPARTMENTS:
+        if d in env.roles and d in budgets and budgets[d] - w.dept_funds[d] >= GAP_MIN:
+            out[d] = {"funds": round(w.dept_funds[d]), "target": round(budgets[d]),
+                      "gap": round(budgets[d] - w.dept_funds[d])}
+    return out
+
+
 class SiteList(NamedTuple):
     sites: list[dict]       # ranked, as build_observation lists them (find_sites sorts by distance and cuts)
     short: str | None       # why the list is empty or unusable (locked), in a few words: the briefing's line
@@ -652,9 +674,6 @@ class ToolBox:
         if tool is None:
             if name == "update_plan":
                 raise ToolError("update_plan is for the mayor only; send the mayor a message instead")
-            if name == "find_sites" and self.role == "mayor":
-                raise ToolError("find_sites is for the departments, which place buildings; the mayor funds "
-                                "them (allocate_budget) and sets their priorities (update_plan)")
             if name == "noop":
                 raise ToolError("there is no noop tool; to do nothing, call end_turn")
             if name in ALL_ACTIONS:
@@ -724,7 +743,14 @@ class ToolBox:
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:
-        purposes = list(SITE_PURPOSES[self.role])
+        if self.role == "mayor":                        # read-only: every department's lists, "<department>.<purpose>"
+            purposes = [f"{d}.{p}" for d in DEPARTMENTS if d in self.env.roles for p in SITE_PURPOSES[d]]
+            what = ("Check which sites a department has (read-only), e.g. before believing \"no sites\": the list "
+                    "the department's own find_sites returns for <department>.<purpose>, up to "
+                    f"{MAX_SITES} ranked sites (crowded spots last) or a note saying why there are none")
+        else:
+            purposes = list(SITE_PURPOSES[self.role])
+            what = f"Up to {MAX_SITES} suggested sites for a purpose (ranked; crowded spots last)"
         tools = [
             Tool("city_overview", "Headline numbers: population, happiness, jobs, money, taxes, demand, utilities "
                  "supply vs demand, service coverage, scores and the change over the last 3 months.",
@@ -759,8 +785,8 @@ class ToolBox:
         ]
         if purposes:
             tools.insert(3, Tool(
-                "find_sites", f"Up to {MAX_SITES} suggested sites for a purpose (ranked; crowded spots last), sorted "
-                "by distance to (near_x, near_y) when given. Rectangles and lines also carry x1, y1, x2, y2.",
+                "find_sites", what + ", sorted by distance to (near_x, near_y) when given. Rectangles and lines "
+                "also carry x1, y1, x2, y2.",
                 self.find_sites, {"purpose": {"type": "string", "enum": purposes},
                                   "near_x": {"type": "integer"}, "near_y": {"type": "integer"}}, ("purpose",)))
         return tools
@@ -820,9 +846,10 @@ class ToolBox:
         if (near_x is None) != (near_y is None):
             raise ToolError("give both near_x and near_y, or neither")
         w = self.world
-        obs = build_observation(w, self.role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
+        role, key = purpose.split(".", 1) if self.role == "mayor" else (self.role, purpose)
+        obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
                                 include_map=False, site_hints=True)
-        lst = site_lists(w, self.role, obs)[purpose]
+        lst = site_lists(w, role, obs)[key]
         sites = lst.sites
         if near_x is not None:
             near = (int(near_x), int(near_y))
@@ -932,10 +959,22 @@ class ToolBox:
             raise ToolError(str(e))
 
     def update_plan(self, **fields) -> dict:
+        """Save the plan; the result lists the departments now below their budget target (budgets are targets, the
+        money moves with allocate_budget) and says when the gaps exceed the treasury above the reserve."""
+        w = self.world
         try:
-            return {"ok": True, "message": self.fleet.update_plan(self.world.month, **fields)}
+            out = {"ok": True, "message": self.fleet.update_plan(w.month, **fields)}
         except ValueError as e:
             raise ToolError(str(e))
+        gaps = funding_gaps(self.env, self.fleet)
+        if gaps:
+            total, keep = sum(g["gap"] for g in gaps.values()), reserve(w)
+            nxt = f"call allocate_budget to fund these (treasury {money(w.treasury)})"
+            if total > w.treasury - keep:
+                nxt += (f"; the gaps total {money(total)}, more than the treasury above a {money(keep)} reserve "
+                        f"({money(max(0.0, w.treasury - keep))}): fund the most urgent first or lower targets")
+            out.update(below_target=gaps, treasury=round(w.treasury), next=nxt)
+        return out
 
     def end_turn(self, report: str) -> dict:
         report = report.strip()[:REPORT_MAX_CHARS]

@@ -187,6 +187,7 @@ import numpy as np
 
 from civitas.agents.scripted import SCRIPTED
 from civitas.core.roles import ROLES, TURN_ORDER
+from civitas.fleet.memory import DEPARTMENTS
 from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox
 from civitas.sim import catalog as C
 
@@ -495,8 +496,8 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     from civitas.fleet.tools import _why_empty
     note = _why_empty(w, "planning", "road_extension")[1]
     assert "find_sites" not in note and "build_road" in note                   # not circular
-    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})
-    assert not res["ok"] and "for the departments" in res["error"]
+    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})     # the mayor names the department
+    assert not res["ok"] and "education.school" in res["error"] and "utilities.sewage" in res["error"]
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
@@ -621,9 +622,37 @@ def test_downsampled_blocks_break_ties_by_reading_order():
     assert _ascii(w, 2)[2][4] == "r"
 
 
+def _check_mayor_sites(env):
+    mayor = ToolBox(env, "mayor")
+    for dept in DEPARTMENTS:
+        box = ToolBox(env, dept)
+        for purpose in SITE_PURPOSES[dept]:
+            for near in ({}, {"near_x": 30, "near_y": 12}):
+                mine = mayor.call("find_sites", {"purpose": f"{dept}.{purpose}", **near})
+                theirs = box.call("find_sites", {"purpose": purpose, **near})
+                assert mine["ok"] and mine["purpose"] == f"{dept}.{purpose}", (dept, purpose, mine)
+                assert (mine["sites"], mine.get("note")) == (theirs["sites"], theirs.get("note")), (dept, purpose)
+
+
+def test_mayor_find_sites_is_every_department_s_list():
+    env = _env()
+    tools = {s["function"]["name"]: s["function"] for s in ToolBox(env, "mayor").schemas()}
+    fs = tools["find_sites"]
+    assert fs["parameters"]["properties"]["purpose"]["enum"] == [f"{d}.{p}" for d in DEPARTMENTS
+                                                                 for p in SITE_PURPOSES[d]]
+    assert "read-only" in fs["description"]
+    _check_mayor_sites(env)
+    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "utilities.sewage", "near_x": 5})
+    assert not res["ok"] and "near_y" in res["error"]
+    for bad in ("sewage", "utilities.school", "mayor.x"):
+        res = ToolBox(env, "mayor").call("find_sites", {"purpose": bad})
+        assert not res["ok"] and "planning.zone_R" in res["error"] and "education.school" in res["error"], bad
+
+
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
     env = grown_env
     _check_sites(env)
+    _check_mayor_sites(env)
     near = ToolBox(env, "utilities").call("find_sites", {"purpose": "near_homes", "near_x": 40, "near_y": 40})["sites"]
     d = [abs(s["x"] - 40) + abs(s["y"] - 40) for s in near]
     assert d == sorted(d)
@@ -640,6 +669,48 @@ def test_find_sites_and_lookups_on_a_grown_world(grown_env):
     assert any(n["plants"] for n in util["networks"])
     health = ToolBox(env, "health").call("my_facilities", {})
     assert health["facilities"]
+
+
+def test_update_plan_lists_the_departments_below_their_target():
+    env = _env()
+    w = env.world
+    w.treasury = 30000
+    w.dept_funds.update(planning=9500, utilities=2000)
+    mayor = ToolBox(env, "mayor")
+    res = mayor.call("update_plan", {"goals": ["grow"]})
+    assert res["ok"] and "below_target" not in res and "next" not in res          # no targets yet
+    res = mayor.call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500, "police": 0}})
+    assert res["ok"] and res["message"].startswith("plan v2 saved")
+    assert res["below_target"] == {"utilities": {"funds": 2000, "target": 7000, "gap": 5000},
+                                   "fire": {"funds": 0, "target": 2500, "gap": 2500}}      # planning is funded
+    assert res["treasury"] == 30000
+    assert res["next"] == "call allocate_budget to fund these (treasury $30k)"
+    assert mayor.call("allocate_budget", {"department": "utilities", "amount": 5000})["ok"]
+    res = mayor.call("update_plan", {"priorities": {"fire": "stations by homes"}})
+    assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
+    assert res["treasury"] == 25000
+
+
+def test_update_plan_says_when_the_gaps_exceed_the_treasury():
+    env = _env()
+    w = env.world
+    w.treasury = 12000                                   # gaps $9,000 = treasury - the $3,000 reserve: enough
+    res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
+    assert res["next"] == "call allocate_budget to fund these (treasury $12k)"
+    w.treasury = 11000
+    res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
+    assert res["next"] == ("call allocate_budget to fund these (treasury $11k); the gaps total $9,000, more than the "
+                           "treasury above a $3,000 reserve ($8,000): fund the most urgent first or lower targets")
+
+
+def test_reserve_follows_the_mayor_playbook():
+    from types import SimpleNamespace
+    from civitas.fleet.tools import reserve
+    world = lambda *h: SimpleNamespace(history=[{"income": i, "expenses": e} for i, e in h])
+    assert reserve(world()) == 3000                                      # before the first month
+    assert reserve(world((5000, 800))) == 3000
+    assert reserve(world((5000, 2000))) == 6000                          # 3 months of expenses
+    assert reserve(world((1000, 2000))) == 12000                         # 6 while running a deficit
 
 
 def test_turn_control_tools():
@@ -810,7 +881,7 @@ def test_system_prompt_fits_the_fleet():
         assert "tile H" not in text and "get_messages" in text.split("# Game rules")[1]
         assert "refused" in text and "autonomous = " in text and "supervised = " in text
         assert "Each game month is one turn" in text
-    assert "find_sites" not in mayor and "x = column" not in mayor
+    assert "find_sites (check which sites a department has; read-only)" in mayor and "x = column" not in mayor
     assert "find_sites" in fire and "x = column" in fire
     assert all("map_overview" in t and "map_overview once to orient yourself" in t for t in (mayor, fire))
     slow = system_prompt("fire", cfg, 36, act_every=3)
@@ -969,6 +1040,28 @@ def test_mayor_briefing_lists_department_reports():
     fire, = [ln for ln in text.splitlines() if "FIRE-REPORT" in ln]
     assert len(fire) < 270
     assert "no reports yet" not in text.lower()
+
+
+def test_mayor_briefing_marks_departments_below_their_target():
+    env = _env()
+    w = env.world
+    w.dept_funds.update(planning=9500, utilities=2000)
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500}})
+    lines = {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
+             if ln.startswith("- ") and ": funds " in ln}
+    assert lines["planning"] == "- planning: funds $9,500, target $9,000"
+    assert lines["utilities"] == "- utilities: funds $2,000 < target $7,000"
+    assert lines["fire"] == "- fire: funds $0 < target $2,500"
+    assert lines["police"] == "- police: funds $0"
+    text = briefing(env, "mayor", mark=False)
+    from civitas.fleet.fmt import money
+    assert f"- 2 below target ($7,500 short; treasury {money(w.treasury)}): allocate_budget" in text
+    w.treasury = 9000
+    assert ("- 2 below target ($7,500 short; treasury $9,000, $6,000 above the $3,000 reserve): "
+            "allocate_budget") in briefing(env, "mayor", mark=False)
+    w.dept_funds.update(utilities=7000, fire=2450)                  # within $100 of the target counts as funded
+    text = briefing(env, "mayor", mark=False)
+    assert "below target" not in text and "- fire: funds $2,450, target $2,500" in text
 
 
 def test_department_briefing_digests_its_own_last_turn():

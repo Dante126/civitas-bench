@@ -19,8 +19,8 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice, \
-    ready_lines, site_lists
+from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
+    ready_lines, reserve, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -79,6 +79,7 @@ refused (a failed action).
 may revise the playbook between sessions."""
 LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan",
            "get_messages", "history")
+LOOKUP_NOTES = {("mayor", "find_sites"): "find_sites (check which sites a department has; read-only)"}
 
 BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month, so keep a reserve when you move money "
                    "to departments (allocate_budget) or cut taxes.",
@@ -228,14 +229,21 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     plan = bool(fleet.plan_versions)
     budgets, priorities = (p["budgets"], p["priorities"]) if plan else ({}, {})
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
+    gaps = funding_gaps(env, fleet)
     L += ["", "## Departments: funds, plan target, priority, latest report"]
     for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(w.dept_funds[d])}" + (f", target {money(budgets[d])}" if d in budgets else "")
+        L.append(f"- {d}: funds {money(w.dept_funds[d])}"
+                 + (f"{' <' if d in gaps else ','} target {money(budgets[d])}" if d in budgets else "")
                  + (f"; priority: {cut(priorities[d], 60)}" if priorities.get(d) else ""))
         if d in latest:
             text = cut(latest[d]["text"], REPORT_PREVIEW_CHARS)
             clipped = len(" ".join(latest[d]["text"].split())) > REPORT_PREVIEW_CHARS
             L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if clipped else ""))
+    if gaps:
+        total, spare = sum(g["gap"] for g in gaps.values()), w.treasury - reserve(w)
+        L.append(f"- {len(gaps)} below target ({money(total)} short; treasury {money(w.treasury)}"
+                 + (f", {money(max(0.0, spare))} above the {money(reserve(w))} reserve" if total > spare else "")
+                 + "): allocate_budget")
     if not latest:
         L.append("- no reports yet")
     L += [""]
@@ -293,7 +301,8 @@ def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: i
                  title=spec["title"], depts=", ".join(DEPARTMENTS), budget=BUDGET[side], team=TEAM[side],
                  cadence="Each game month is one turn" if act_every <= 1 else
                  f"You act every {act_every} months (the city runs on its own in between)",
-                 lookups=", ".join(t for t in LOOKUPS if t != "find_sites" or SITE_PURPOSES[role]),
+                 lookups=", ".join(LOOKUP_NOTES.get((role, t), t) for t in LOOKUPS
+                                   if t != "find_sites" or SITE_PURPOSES[role] or role == "mayor"),
                  coords="" if role == "mayor" else " Coordinates: x = column (0 = west), y = row (0 = north).",
                  max_steps=cfg.max_steps, actions=cap + " (look-ups still work; call end_turn)."),
              f"# Your role: {spec['title']}\n{spec['mission']}",
