@@ -73,6 +73,8 @@ lessons) and the game's history log. Write down what you learn.
 - When you are done, call end_turn with a short report (what you did, what you need).
 - Limits per turn: at most {max_steps} tool calls; at that limit the turn ends and completed actions stay. \
 {actions}
+- Each tool result shows steps_left; repeating an identical call returns the earlier result (look-ups) or is \
+refused (a failed action).
 - The mode in your briefing header: autonomous = no coach will intervene during the game; supervised = your coach \
 may revise the playbook between sessions."""
 LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan",

@@ -467,6 +467,11 @@ trinity-large-thinking sometimes does) still run, and the trajectory counts them
 `recovered_calls`.
 On a limit or an API error the turn ends, and completed actions stay. Every turn records
 why it ended: `end_turn`, `max_steps`, `turn_tokens`, `no_tool_calls` or `api_error`.
+Every tool result except `end_turn`'s carries `steps_left`, plus a `wrap_up` note once 3 or
+fewer calls are left. Within a turn, an identical repeat of a look-up (same tool, same
+arguments after type coercion) returns the earlier result marked `repeat`, and an identical
+repeat of an action that failed is refused without running (`refused: "repeat"`, not charged
+as an invalid action), until the agent's next successful action. Both still count as tool calls.
 
 **Coaching with playbooks.** The system prompt starts with a fixed part: how to play, the
 role's mission and the game rules. Then comes the coach's playbook: the fleet playbook
@@ -527,7 +532,7 @@ next to its summary. They contain:
 
 - the scoreboard
 - the final plan and the months it changed
-- per-role stats: turns, tool calls, actions, failures, tool errors, spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
+- per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups and refused repeats, spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
 - the top failures, last reports and the lessons in memory
 - coaching hints
 

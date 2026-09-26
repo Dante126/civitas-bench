@@ -20,6 +20,7 @@ from .memory import FleetState
 from .tools import ToolBox
 
 TRACE_CHARS = 300
+WRAP_UP_AT = 3               # tool results carry a wrap-up note from this many calls left
 NUDGE = "Use the tools to act, then call end_turn with a short report."
 
 
@@ -103,7 +104,19 @@ def _slim(res: dict) -> dict:
     for k in ("error", "message"):
         if res.get(k):
             out[k] = str(res[k])[:TRACE_CHARS]
-    out.update({k: res[k] for k in ("cost", "budget_left") if k in res})
+    out.update({k: res[k] for k in ("cost", "budget_left", "repeat", "refused") if k in res})
+    return out
+
+
+def _budget(res: dict, left: int) -> dict:
+    """The result with the tool calls left this turn, and a wrap-up note when few are."""
+    out = {**res, "steps_left": left}
+    if left == 0:
+        out["wrap_up"] = "no tool calls left: the turn ends now without a report; completed actions stay"
+    elif left == 1:
+        out["wrap_up"] = "1 tool call left: call end_turn with your report now"
+    elif left <= WRAP_UP_AT:
+        out["wrap_up"] = f"{left} tool calls left: finish what matters, then call end_turn with your report"
     return out
 
 
@@ -190,6 +203,8 @@ class ToolAgent(Agent):
                     recovered += from_text
                     trace.append({"step": step, "finish_reason": finish, "tool": name, "args": args,
                                   "result": _slim(res)})
+                    if not box.ended:                    # end_turn's own result needs no budget
+                        res = _budget(res, cfg.max_steps - len(trace))
                 messages.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]})
             step += 1

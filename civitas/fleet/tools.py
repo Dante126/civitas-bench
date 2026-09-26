@@ -30,6 +30,7 @@ MAX_RADIUS = 4
 MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
+REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 
 # purpose -> path into build_observation(..., site_hints=True)
@@ -138,10 +139,11 @@ def _size(v) -> int:
 
 
 def _fit(res: dict, limit: int = RESULT_CHARS, newest_last: bool = False, hint: str = "") -> dict:
-    """Drop items from the biggest lists until the JSON fits (from the end, or from the front for newest-last
-    lists); counts them in "truncated"."""
+    """Drop items from the biggest lists until the JSON, with its "truncated" note counting them, fits (from the
+    end, or from the front for newest-last lists)."""
+    note = lambda n: f"{n} {'older' if newest_last else 'more'} list items left out" + (f"; {hint}" if hint else "")
     dropped = 0
-    while _size(res) > limit:
+    while _size({**res, "truncated": note(dropped)} if dropped else res) > limit:
         lists = []
 
         def walk(v):
@@ -160,8 +162,7 @@ def _fit(res: dict, limit: int = RESULT_CHARS, newest_last: bool = False, hint: 
             del big[-n:]
         dropped += n
     if dropped:
-        res["truncated"] = f"{dropped} {'older' if newest_last else 'more'} list items left out" + (
-            f"; {hint}" if hint else "")
+        res["truncated"] = note(dropped)
     return res
 
 
@@ -588,8 +589,13 @@ class ToolBox:
         self.report = ""
         self.executed: list[dict] = []
         self.messages: list[dict] = []
+        self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
+        self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
+        self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self.tools: dict[str, Tool] = {}
-        for t in self._lookup_tools() + self._turn_tools():
+        lookups = self._lookup_tools()
+        self.lookups = {t.name for t in lookups}
+        for t in lookups + self._turn_tools():
             self.tools[t.name] = t
         docs = action_docs()
         for a in ROLES[role]["actions"]:
@@ -601,21 +607,60 @@ class ToolBox:
         return [t.schema() for t in self.tools.values()]
 
     def call(self, name: str, arguments: str | dict | None = None) -> dict:
+        """Run one tool call. An identical repeat (same tool, same arguments after coercion) of a look-up returns
+        the earlier result marked "repeat", and one of an action that failed is refused ("refused": "repeat")
+        without running, until something changes: a successful action (or plan update) for look-ups, a
+        successful action for failed actions; a failed action only refreshes `history`, which lists it."""
+        self.n_calls += 1
         try:
-            tool = self.tools.get(name)
-            if tool is None:
-                if name == "update_plan":
-                    raise ToolError("update_plan is for the mayor only; send the mayor a message instead")
-                if name == "find_sites" and self.role == "mayor":
-                    raise ToolError("find_sites is for the departments, which place buildings; the mayor funds "
-                                    "them (allocate_budget) and sets their priorities (update_plan)")
-                if name == "noop":
-                    raise ToolError("there is no noop tool; to do nothing, call end_turn")
-                if name in ALL_ACTIONS:
-                    raise ToolError(f"the {self.role} role cannot use '{name}'")
-                raise ToolError(f"unknown tool {name!r}; available: {', '.join(self.tools)}")
-            args = self._parse(arguments)
-            res = tool.fn(**self._check(tool, args))
+            tool, args = self._resolve(name, arguments)
+        except ToolError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in self._seen:
+            n, res = self._seen[key]
+            return {**res, "repeat": f"same as call {n} (nothing changed since)"}
+        if key in self._failed:
+            n, err = self._failed[key]
+            return {"ok": False, "refused": "repeat",
+                    "error": f"this exact call failed at call {n}: {err}; change the arguments or do something else"}
+        executed = len(self.executed)
+        res = self._run(tool, args)
+        if name in self.lookups:
+            self._seen[key] = (self.n_calls, res)
+        elif name in ALL_ACTIONS:
+            if res.get("ok"):
+                self._seen.clear()
+                self._failed.clear()
+            else:
+                self._failed[key] = (self.n_calls, str(res.get("error"))[:REPEAT_ERROR_CHARS])
+                if len(self.executed) > executed:         # logged as a failure: history shows it
+                    self._seen = {k: v for k, v in self._seen.items() if k[0] != "history"}
+        elif name == "update_plan" and res.get("ok"):
+            self._seen.clear()
+        return res
+
+    def _resolve(self, name: str, arguments) -> tuple[Tool, dict]:
+        """The tool and its checked, coerced arguments; ToolError for unknown tools and bad arguments."""
+        tool = self.tools.get(name)
+        if tool is None:
+            if name == "update_plan":
+                raise ToolError("update_plan is for the mayor only; send the mayor a message instead")
+            if name == "find_sites" and self.role == "mayor":
+                raise ToolError("find_sites is for the departments, which place buildings; the mayor funds "
+                                "them (allocate_budget) and sets their priorities (update_plan)")
+            if name == "noop":
+                raise ToolError("there is no noop tool; to do nothing, call end_turn")
+            if name in ALL_ACTIONS:
+                raise ToolError(f"the {self.role} role cannot use '{name}'")
+            raise ToolError(f"unknown tool {name!r}; available: {', '.join(self.tools)}")
+        return tool, self._check(tool, self._parse(arguments))
+
+    def _run(self, tool: Tool, args: dict) -> dict:
+        try:
+            res = tool.fn(**args)
             res = _fit(_py(res), newest_last=tool.newest_last, hint=tool.trim_hint)
             if res.get("ok") is False and "error" not in res:
                 res["error"] = res.get("message", "failed")

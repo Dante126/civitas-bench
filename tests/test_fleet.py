@@ -349,7 +349,7 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     bank = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 1
     w.dept_funds["planning"] = 1000
     assert apply_action(w, "planning", {"type": "build_road", "x1": x_end, "y1": y, "x2": bank, "y2": y}).ok
-    res = box.call("find_sites", {"purpose": "pump"})
+    res = ToolBox(env, "utilities").call("find_sites", {"purpose": "pump"})     # utilities' next turn
     assert res["sites"] and "note" not in res
 
 
@@ -395,6 +395,7 @@ def test_riverbank_note_says_the_bank_beside_the_road_is_taken():
             if (nx, ny) != (x, y) and w.struct[ny, nx] == C.NONE and w.terrain[ny, nx] == C.LAND:
                 w.struct[ny, nx] = C.PARK
     w.refresh()
+    box = ToolBox(env, "utilities")                      # a new turn: this one's look-ups would repeat
     res = box.call("find_sites", {"purpose": "pump"})
     assert [(s["x"], s["y"]) for s in res["sites"]] == [(x, y)] and "note" not in res
     res = box.call("find_sites", {"purpose": "riverbank_2x2"})    # one free tile is no 2x2 block
@@ -791,6 +792,7 @@ def test_system_prompt_sections_in_order():
         pos = [text.find(m) for m in marks]
         assert -1 not in pos and pos == sorted(pos), (role, list(zip(marks, pos)))
         assert "end_turn" in text and "17 tool calls" in text and "5 successful actions" in text
+        assert "steps_left" in text and "identical call" in text
         assert "{" not in text.replace("{}", "")                         # every placeholder filled
     assert ("update_plan" in system_prompt("mayor", cfg, 36)) and "update_plan" not in system_prompt("fire", cfg, 36)
     bare = system_prompt("fire", FleetAgentConfig(), 36)
@@ -1567,6 +1569,148 @@ def test_tool_agent_keeps_actions_when_the_client_crashes():
     assert env.apply("mayor", d) == d.executed and env.world.dept_funds["health"] == 1000
 
 
+# ------------------------------------------------------------------ step budget and repeated calls
+def _tool_msgs(d) -> list[dict]:
+    return [json.loads(m["content"]) for m in d.meta["messages"] if m["role"] == "tool"]
+
+
+def test_tool_results_carry_steps_left_and_a_wrap_up_note():
+    a, env = _agent(reply=lambda m: [_call("inspect", {"x": 10 + len(m), "y": 20, "radius": 0})], max_steps=6)
+    d = a.act(env.observe("police"))
+    res = _tool_msgs(d)
+    assert [r["steps_left"] for r in res] == [5, 4, 3, 2, 1, 0]
+    assert "wrap_up" not in res[0] and "wrap_up" not in res[1]
+    assert res[2]["wrap_up"].startswith("3 tool calls left") and "end_turn" in res[2]["wrap_up"]
+    assert res[3]["wrap_up"].startswith("2 tool calls left")
+    assert res[4]["wrap_up"].startswith("1 tool call left") and "end_turn" in res[4]["wrap_up"]
+    assert "turn ends now" in res[5]["wrap_up"]
+    assert all("steps_left" not in c["result"] for c in d.meta["tool_trace"])      # the trace stays slim
+    a, env = _agent(reply=lambda m: [_call("unlocks", {}), _call("end_turn", {"report": "done"})], max_steps=5)
+    d = a.act(env.observe("police"))
+    unlocks, end = _tool_msgs(d)
+    assert unlocks["steps_left"] == 4 and "wrap_up" not in unlocks
+    assert end == {"ok": True, "message": "turn ended"}                             # end_turn's own result: no budget
+
+
+def test_steps_left_and_notes_fit_in_the_tool_message():
+    a, env = _agent(role="planning", reply=lambda m: [_call("map_overview", {}), _call("history", {"months": 12}),
+                                                     _call("inspect", {"x": 24, "y": 24, "radius": 4})], max_steps=6)
+    d = a.act(env.observe("planning"))
+    msgs = [m["content"] for m in d.meta["messages"] if m["role"] == "tool"]
+    assert len(msgs) == 6 and all(len(m) <= 4000 for m in msgs)
+    res = [json.loads(m) for m in msgs]                                              # nothing cut mid-JSON
+    assert res[3]["repeat"] == "same as call 1 (nothing changed since)" and res[3]["wrap_up"]
+    assert max(len(m) for m in msgs) > 3000                                         # a big result was in the mix
+
+
+def test_fit_leaves_room_for_its_truncation_note():
+    from civitas.fleet.tools import _fit
+    res = _fit({"ok": True, "items": [{"x": i, "y": i} for i in range(500)]}, limit=600, hint="ask for less")
+    assert len(json.dumps(res)) <= 600 and "truncated" in res
+
+
+def test_repeated_look_up_returns_the_earlier_result():
+    env = _env()
+    box = ToolBox(env, "police")
+    first = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    again = box.call("inspect", '{"y": "20", "radius": 1, "x": 20.0}')              # same after coercion, any order
+    assert again == {**first, "repeat": "same as call 1 (nothing changed since)"}
+    assert "repeat" not in first
+    other = box.call("inspect", {"x": 20, "y": 20})                                   # radius left out: a new call
+    assert "repeat" not in other
+    assert box.call("unlocks", {})["ok"]
+    assert box.call("unlocks", None)["repeat"] == "same as call 4 (nothing changed since)"
+
+
+def test_repeated_look_up_after_a_successful_action_runs_again():
+    env = _env()
+    env.world.treasury = 50000
+    box = ToolBox(env, "mayor")
+    before = box.call("city_overview", {})
+    assert box.call("allocate_budget", {"department": "health", "amount": 1000})["ok"]
+    after = box.call("city_overview", {})
+    assert "repeat" not in after and after != before
+    assert box.call("city_overview", {})["repeat"] == "same as call 3 (nothing changed since)"
+    plan = box.call("get_plan", {})                                                   # the plan is state too
+    assert box.call("update_plan", {"goals": ["grow"]})["ok"]
+    assert "repeat" not in box.call("get_plan", {}) and box.call("get_plan", {})["goals"] == ["grow"]
+    assert plan["plan"] is None
+
+
+def test_failed_action_refreshes_history_but_not_other_look_ups():
+    env = _env()
+    env.world.dept_funds["utilities"] = 0
+    box = ToolBox(env, "utilities")
+    box.call("history", {"kind": "failure"})
+    box.call("find_sites", {"purpose": "wind"})
+    assert box.call("build_power_plant", {"kind": "wind", "x": 0, "y": 0})["ok"] is False
+    hist = box.call("history", {"kind": "failure"})
+    assert "repeat" not in hist and len(hist["entries"]) == 1                        # shows the new failure
+    assert box.call("find_sites", {"purpose": "wind"})["repeat"] == "same as call 2 (nothing changed since)"
+
+
+def test_repeated_failed_action_is_refused():
+    env = _env()
+    env.world.dept_funds["utilities"] = 0
+    box = ToolBox(env, "utilities")
+    first = box.call("build_power_plant", {"kind": "wind", "x": 0, "y": 0})
+    assert first["ok"] is False
+    struct = env.world.struct.copy()
+    again = box.call("build_power_plant", '{"y": "0", "x": 0, "kind": "wind"}')
+    assert again == {"ok": False, "refused": "repeat",
+                     "error": f"this exact call failed at call 1: {first['error']}; change the arguments or do "
+                              "something else"}
+    assert len(box.executed) == 1 and (env.world.struct == struct).all()
+    assert len(FleetState.of(env).history(kind="failure", role="utilities")) == 1   # not charged twice
+    moved = box.call("build_power_plant", {"kind": "wind", "x": 1, "y": 0})           # other arguments run
+    assert "refused" not in moved and len(box.executed) == 2
+    env.apply("utilities", Decision(executed=box.executed))
+    assert env.invalid_counts["utilities"] == 2
+
+
+def test_failed_action_repeated_after_a_success_runs_again():
+    env = _env()
+    env.world.treasury = 500
+    box = ToolBox(env, "mayor")
+    big = {"department": "health", "amount": 1000}
+    assert box.call("allocate_budget", big)["ok"] is False
+    assert box.call("allocate_budget", big)["refused"] == "repeat"
+    assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]
+    res = box.call("allocate_budget", big)
+    assert res["ok"] is False and "refused" not in res and "treasury only has" in res["error"]
+    assert len(box.executed) == 3
+    assert len(FleetState.of(env).history(kind="failure", role="mayor")) == 2
+
+
+def test_turn_control_tools_are_not_deduplicated():
+    env = _env()
+    box = ToolBox(env, "police")
+    for _ in range(2):
+        res = box.call("send_message", {"to": "mayor", "text": "need funds"})
+        assert res["ok"] and "repeat" not in res
+        res = box.call("update_memory", {"lessons": ["roads first"]})
+        assert res["ok"] and "repeat" not in res
+    assert len(box.messages) == 2
+    bad = [box.call("end_turn", {}) for _ in range(2)]                              # a failed end_turn is not refused
+    assert all(r["ok"] is False and "refused" not in r for r in bad)
+
+
+def test_refused_repeats_in_the_agent_trace():
+    a, env = _agent(role="mayor", reply=lambda m: [_call("allocate_budget", {"department": "fire", "amount": 10**9}),
+                                                   _call("allocate_budget", {"amount": "1000000000",
+                                                                             "department": "fire"}),
+                                                   _call("unlocks", {}), _call("unlocks", {}),
+                                                   _call("end_turn", {"report": "r"})])
+    d = a.act(env.observe("mayor"))
+    tr = d.meta["tool_trace"]
+    assert tr[1]["result"]["refused"] == "repeat" and "failed at call 1" in tr[1]["result"]["error"]
+    assert tr[3]["result"]["repeat"] == "same as call 3 (nothing changed since)"
+    assert len(d.executed) == 1 and d.meta["steps"] == 5
+    res = _tool_msgs(d)
+    assert res[1]["steps_left"] == 18 and res[1]["refused"] == "repeat"
+    assert env.apply("mayor", d) == d.executed and env.invalid_counts["mayor"] == 1
+
+
 # ------------------------------------------------------------------ end-of-run report
 from civitas.fleet.report import fleet_report, rows_from_trajectories, turn_row
 
@@ -1608,13 +1752,16 @@ def test_turn_row_is_slim():
              {"tool": "zone", "result": {"ok": False, "error": "no land", "message": "no land"}},   # a failed action
              {"tool": "zone", "result": {"ok": False, "error": "action limit reached"}},           # refused: tool error
              {"tool": "get_plan", "result": {"ok": False, "error": "no plan", "message": "no plan"}},
-             {"tool": "city_overview", "result": {"ok": True}}, {"tool": "inspect"}]
+             {"tool": "city_overview", "result": {"ok": True}}, {"tool": "inspect"},
+             {"tool": "zone", "result": {"ok": False, "error": "this exact call failed at call 2: no land; change "
+                                         "the arguments or do something else", "refused": "repeat"}},
+             {"tool": "city_overview", "result": {"ok": True, "repeat": "same as call 5 (nothing changed since)"}}]
     row = turn_row(_rec("police", 3, [("build_service", False, "tile (3,4) is occupied", 0)], trace=trace,
                         length_stops=2))
     assert row == {"role": "police", "month": 3, "prompt_tokens": 100, "completion_tokens": 20, "steps": 3,
                    "finish_reason": "end_turn", "length_stops": 2, "ended": True, "parse_error": None,
                    "results": [{"type": "build_service", "ok": False, "message": "tile (3,4) is occupied", "cost": 0}],
-                   "tool_errors": ["bad args", "action limit reached", "no plan"]}
+                   "tool_errors": ["bad args", "action limit reached", "no plan"], "repeats": 1, "refused": 1}
 
 
 def test_turn_row_and_rebuild_tolerate_minimal_records(tmp_path):
@@ -1674,6 +1821,22 @@ def test_fleet_report_tool_errors_count_towards_repeated_failures():
     assert [(h["role"], h["count"]) for h in hs] == [("fire", 3), ("health", 3)] and "no noop tool" in hs[1]["text"]
     assert rep["roles"]["health"]["tool_errors"] == 3 and rep["roles"]["health"]["failed"] == 0
     assert rep["roles"]["health"]["top_failures"] == [{"message": trace[0]["result"]["error"], "count": 3}]
+
+
+def test_fleet_report_counts_repeats_apart_from_failures():
+    env = _report_env()
+    refused = {"tool": "build_service", "result": {"ok": False, "refused": "repeat",
+                                                   "error": "this exact call failed at call 1: occupied; change the "
+                                                            "arguments or do something else"}}
+    seen = {"tool": "find_sites", "result": {"ok": True, "repeat": "same as call 2 (nothing changed since)"}}
+    rows = _clean_rows() + [turn_row(_rec("fire", m, [("build_service", False, "occupied", 0)],
+                                          trace=[refused, refused, seen])) for m in (1, 2)]
+    rep, md = fleet_report(env, _summary(env), rows)
+    fire = rep["roles"]["fire"]
+    assert fire["failed"] == 2 and fire["tool_errors"] == 0
+    assert fire["repeats"] == 2 and fire["refused"] == 4
+    assert "repeats (look-ups / refused)" in md and "| 2 / 4 |" in md
+    assert _hints(rep, "repeated_failures") == []
 
 
 def test_every_repeated_failure_hint_is_in_top_failures():
