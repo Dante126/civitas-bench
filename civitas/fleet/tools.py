@@ -73,6 +73,8 @@ RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no ro
 SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("need", "need {}"),
                ("opens_land", "opens {} land tiles"), ("load_vs_capacity", "load {}x capacity"), ("tiles", "{} tiles"),
                ("pollution", "pollution {}")]
+SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
+SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -228,6 +230,13 @@ def _site(s) -> dict:
         s = {"x": s["x1"], "y": s["y1"], **s}
     s.pop("network", None)
     return s
+
+
+def _on_connected_road(w, s) -> bool:
+    """False for a hint that names a road network off the highway (the riverbank lists take any network): a
+    building there would get no power, water or customers."""
+    net = s.get("network") if isinstance(s, dict) else None
+    return net is None or bool(w.networks[net].outside_connected)
 
 
 def _distance(s: dict, near: tuple[int, int]) -> int:
@@ -463,7 +472,7 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
         found = obs
         for key in path:
             found = found.get(key) if isinstance(found, dict) else None
-        sites = [_site(s) for s in (found or [])]
+        sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             key = min(keys, key=C.UNLOCK_POP.get)
@@ -480,11 +489,11 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
     """(short, full): why a site list is empty and what to do: no free roadside land (roads must grow), no road
     at the river or its bank lots taken, or nothing needs the building yet (the lists only rank spots near
     uncovered homes / jobs)."""
-    roads = _roads_text(_roads(w))
+    roads = lambda: _roads_text(_roads(w))
     if purpose == "road_extension":
         return ("no straight extension from a dead end: build_road from any road into free land",
                 "no straight extension from a dead end into open land; build_road from any road tile into free "
-                f"land (L-shaped roads work, bridges cross the river; {roads})")
+                f"land (L-shaped roads work, bridges cross the river; {roads()})")
     if purpose in RIVERBANK_PURPOSES:
         river = _river_cols(w)
         if river is None:
@@ -492,7 +501,7 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
         lots, contact = _riverbank_by_roads(w)
         near = ", ".join(f"({x},{y})" for x, y in _ends(contact))
         if not contact:
-            return (f"no road reaches the river yet: ask planning for a road to the bank (river at x "
+            return (f"no connected road reaches the river yet: ask planning for a road to it (river at x "
                     f"{_span(river[0], river[1])})",
                     f"no free riverbank tile next to a highway-connected road: a road has to reach the river first "
                     f"({_river_span(w)}); ask planning (send_message) for a road to the riverbank, and build what "
@@ -510,11 +519,11 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
     free = _free_roadside(w)
     if role == "planning":
         return ("no free roadside strip: extend the roads (find_sites road_extension)",
-                f"no free strip along a highway-connected road ({roads}; {free} free roadside tiles); "
+                f"no free strip along a highway-connected road ({roads()}; {free} free roadside tiles); "
                 "extend the roads first (find_sites road_extension lists dead ends to build from)")
     if not free:
         return ("no free roadside land: ask planning for a lot",
-                f"no free land next to a highway-connected road ({roads}); ask planning (send_message) to extend a "
+                f"no free land next to a highway-connected road ({roads()}); ask planning (send_message) to extend a "
                 "road or leave an empty lot by one")
     return ("nothing needs it right now",
             f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
@@ -525,16 +534,46 @@ def _brief(v) -> str:
     return f"{round(v):,}" if abs(v) >= 10 else f"{round(float(v), 2):g}"
 
 
-def ready_line(purpose: str, lst: SiteList) -> str:
-    """One Ready sites line: the count and best site, or the short reason."""
-    if lst.short:
-        return f"- {purpose}: " + (lst.short if lst.short.startswith("locked") else f"none - {lst.short}")
-    sites = lst.sites[:MAX_SITES]
-    best = sites[0]
-    where = (f"({best['x1']},{best['y1']})-({best['x2']},{best['y2']})" if "x2" in best else
-             f"({best['x']},{best['y']})")
-    extra = next((fmt.format(_brief(best[k])) for k, fmt in SITE_FIELDS if k in best), "")
-    return f"- {purpose}: {len(sites)} site{'s' * (len(sites) != 1)}, best {where}" + (f", {extra}" if extra else "")
+def _where(s: dict) -> str:
+    return f"({s['x1']},{s['y1']})-({s['x2']},{s['y2']})" if "x2" in s else f"({s['x']},{s['y']})"
+
+
+def _extra(purpose: str, s: dict) -> str:
+    for k, fmt in SITE_FIELDS:
+        if k in s and k not in SITE_FIELDS_HIDDEN.get(purpose, ()):
+            return "" if purpose in SITE_FIELDS_NONZERO and not s[k] else ", " + fmt.format(_brief(s[k]))
+    return ""
+
+
+def ready_lines(role: str, lists: dict[str, SiteList]) -> list[str]:
+    """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
+    on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
+    zone types rank the same strip first); a purpose reading another's list says so."""
+    lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
+    for purpose, lst in lists.items():
+        head = f"- {purpose}: "
+        path = SITE_PURPOSES[role][purpose]
+        if lst.short:
+            lines.append(head + (lst.short if lst.short.startswith("locked") else f"none - {lst.short}"))
+            continue
+        sites = lst.sites[:MAX_SITES]
+        head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
+        if path in paths:
+            lines.append(head + f"same list as {paths[path]}")
+            continue
+        paths[path] = purpose
+        best, first = sites[0], shown.get(_where(sites[0]))
+        if first is None:
+            shown[_where(best)] = purpose
+            lines.append(head + f"best {_where(best)}{_extra(purpose, best)}")
+            continue
+        nxt = next((t for t in sites[1:] if _where(t) not in shown), None)
+        if nxt is None:
+            lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}")
+        else:
+            shown[_where(nxt)] = purpose
+            lines.append(head + f"best as {first}; next {_where(nxt)}{_extra(purpose, nxt)}")
+    return lines
 
 
 # ------------------------------------------------------------------ toolbox

@@ -19,8 +19,8 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice, ready_line, \
-    site_lists
+from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice, \
+    ready_lines, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -155,7 +155,7 @@ def _map(w) -> list[str]:
 def _ready_sites(w, role: str, obs: dict) -> list[str]:
     """One line per find_sites purpose (count and best site, or why there is none), so agents don't re-run
     find_sites for every purpose each turn."""
-    return (["## Ready sites"] + [ready_line(p, lst) for p, lst in site_lists(w, role, obs).items()]
+    return (["## Ready sites"] + ready_lines(role, site_lists(w, role, obs))
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
