@@ -12,7 +12,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 
@@ -61,11 +61,18 @@ SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": 
                 "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear"), "train_station": ("train_station",),
                 "harbour": ("harbour",), "metro_station": ("metro",), "jail": ("jail",), "hospital": ("hospital",),
                 "high_school": ("high_school",), "university": ("university",)}
-SITE_NOTES = {"levee": "no flood is forecast within 3 months; riverbank stretches to protect appear with a flood warning",
-              "congested_roads": "no road is congested right now",
-              "bus_stops": "too few homes and job centres on the highway-connected roads yet to suggest stops; "
-                           "bus lines pay off once the city is bigger (~1,500 residents)"}
+# purpose -> (short reason for the briefing, full note for find_sites) when its list is empty
+SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 months; riverbank stretches to protect "
+                        "appear with a flood warning"),
+              "congested_roads": ("no road is congested", "no road is congested right now"),
+              "bus_stops": ("too few homes and jobs on the roads yet (~1,500 residents)",
+                            "too few homes and job centres on the highway-connected roads yet to suggest stops; "
+                            "bus lines pay off once the city is bigger (~1,500 residents)")}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
+# the best site's most useful field for the briefing's Ready sites line, first match wins
+SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("need", "need {}"),
+               ("opens_land", "opens {} land tiles"), ("load_vs_capacity", "load {}x capacity"), ("tiles", "{} tiles"),
+               ("pollution", "pollution {}")]
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -215,17 +222,19 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     return Tool(name, text, fn, props, strict=False)
 
 
-def _site(s, near) -> dict:
+def _site(s) -> dict:
     s = {"x": s[0], "y": s[1]} if isinstance(s, (list, tuple)) else dict(s)
     if "x" not in s:                           # a rectangle or line: its first corner
         s = {"x": s["x1"], "y": s["y1"], **s}
     s.pop("network", None)
-    if near is not None:
-        nx, ny = near
-        cx = min(max(nx, s.get("x1", s["x"])), s.get("x2", s["x"])) if "x2" in s else s["x"]
-        cy = min(max(ny, s.get("y1", s["y"])), s.get("y2", s["y"])) if "y2" in s else s["y"]
-        s["distance"] = abs(cx - nx) + abs(cy - ny)
     return s
+
+
+def _distance(s: dict, near: tuple[int, int]) -> int:
+    nx, ny = near
+    cx = min(max(nx, s.get("x1", s["x"])), s.get("x2", s["x"])) if "x2" in s else s["x"]
+    cy = min(max(ny, s.get("y1", s["y"])), s.get("y2", s["y"])) if "y2" in s else s["y"]
+    return abs(cx - nx) + abs(cy - ny)
 
 
 def _connected_roads(w) -> np.ndarray:
@@ -234,16 +243,43 @@ def _connected_roads(w) -> np.ndarray:
     return np.isin(w.road_labels, labels) if labels else np.zeros(w.struct.shape, bool)
 
 
-def _free_roadside(w) -> int:
-    """Empty land tiles touching a highway-connected road (8-neighbourhood, as `adjacent_network` and the build
-    actions use): where a new building could go."""
-    road = _connected_roads(w)
-    touch = np.zeros_like(road)
+def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
+    """Tiles with a neighbour in `mask`: 8-neighbourhood (as `adjacent_network` and the build actions check road
+    access), or 4 (as `is_riverbank` checks water)."""
+    out = np.zeros_like(mask)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
-            if dx or dy:
-                touch |= shift(road, dy, dx, False)
-    return int((touch & (w.struct == C.NONE) & (w.terrain == C.LAND)).sum())
+            if (dx or dy) and (diagonal or not (dx and dy)):
+                out |= shift(mask, dy, dx, False)
+    return out
+
+
+def _empty_land(w) -> np.ndarray:
+    return (w.struct == C.NONE) & (w.terrain == C.LAND)
+
+
+def _free_roadside(w) -> int:
+    """Empty land tiles touching a highway-connected road: where a new building could go."""
+    return int((_touching(_connected_roads(w)) & _empty_land(w)).sum())
+
+
+def _riverbank_by_roads(w) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Riverbank land tiles (next to water, as the build actions check `is_riverbank`) that touch a
+    highway-connected road, road tiles excluded: the lots a pump or outlet could use. And where those roads meet
+    the river: bridgeheads, else their tiles on the bank (roads along it), else the bank lots beside them (a road
+    passing the water diagonally); empty when no connected road reaches the river."""
+    road, water = _connected_roads(w), w.terrain == C.WATER
+    bank = (w.terrain == C.LAND) & _touching(water, diagonal=False)
+    lots = bank & _touching(road) & (w.struct != C.ROAD) & (w.struct != C.HIGHWAY)
+    heads = road & bank & _touching(road & water, diagonal=False)
+    contact = next((m for m in (heads, road & bank) if m.any()), lots)
+    ys, xs = np.nonzero(contact)
+    return lots, [(int(x), int(y)) for y, x in zip(ys, xs)]
+
+
+def _ends(points: list) -> list:
+    """The first and last point (reading order): a bridge's two ends, a riverside road's two ends."""
+    return points[:1] + points[-1:] if len(points) > 1 else points
 
 
 def _box(mask) -> tuple[list[int], list[int]] | None:
@@ -267,18 +303,22 @@ def _roads_text(r: dict | None) -> str:
             "no roads connected to the highway yet")
 
 
-def _river_span(w) -> str | None:
-    """Where the river runs, within the rows the connected roads span (the whole map before there are roads);
-    None without a river."""
+def _river_cols(w) -> tuple[int, int, int, int] | None:
+    """(x0, x1, y0, y1): the river's columns within the rows the connected roads span (the whole map before
+    there are roads, or when the river misses those rows); None without a river."""
     road_rows = np.nonzero(_connected_roads(w).any(axis=1))[0]
     y0, y1 = (int(road_rows.min()), int(road_rows.max())) if len(road_rows) else (0, w.h - 1)
     cols = np.nonzero((w.terrain[y0:y1 + 1] == C.WATER).any(axis=0))[0]
     if not len(cols):
         cols = np.nonzero((w.terrain == C.WATER).any(axis=0))[0]
         y0, y1 = 0, w.h - 1
-    if not len(cols):
-        return None
-    return f"the river runs at x {int(cols.min())}-{int(cols.max())} in rows {y0}-{y1}"
+    return (int(cols.min()), int(cols.max()), y0, y1) if len(cols) else None
+
+
+def _river_span(w) -> str | None:
+    """Where the river runs, within the rows the connected roads span; None without a river."""
+    r = _river_cols(w)
+    return r and f"the river runs at x {r[0]}-{r[1]} in rows {r[2]}-{r[3]}"
 
 
 def _edge(w, x: int, y: int) -> str:
@@ -407,6 +447,94 @@ def plan_slice(fleet: FleetState, role: str) -> dict:
     if p["notes"]:
         out["notes"] = p["notes"]
     return out
+
+
+class SiteList(NamedTuple):
+    sites: list[dict]       # ranked, as build_observation lists them (find_sites sorts by distance and cuts)
+    short: str | None       # why the list is empty or unusable (locked), in a few words: the briefing's line
+    note: str | None        # the same in full, with what to do: find_sites' "note"
+
+
+def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
+    """Every find_sites purpose of `role` from one build_observation(..., site_hints=True): the find_sites tool
+    and the briefing's Ready sites block both read this, so they can't disagree."""
+    out = {}
+    for purpose, path in SITE_PURPOSES[role].items():
+        found = obs
+        for key in path:
+            found = found.get(key) if isinstance(found, dict) else None
+        sites = [_site(s) for s in (found or [])]
+        keys = SITE_UNLOCKS.get(purpose, ())
+        if keys and not any(w.unlocked(k) for k in keys):
+            key = min(keys, key=C.UNLOCK_POP.get)
+            short, note = f"locked (unlocks at {C.UNLOCK_POP[key]:,} residents)", "locked: " + w.unlock_note(key)
+        elif sites:
+            short = note = None
+        else:                    # models told to "inspect the map" scanned it blindly for whole turns
+            short, note = SITE_NOTES.get(purpose) or _why_empty(w, role, purpose)
+        out[purpose] = SiteList(sites, short, note)
+    return out
+
+
+def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
+    """(short, full): why a site list is empty and what to do: no free roadside land (roads must grow), no road
+    at the river or its bank lots taken, or nothing needs the building yet (the lists only rank spots near
+    uncovered homes / jobs)."""
+    roads = _roads_text(_roads(w))
+    if purpose == "road_extension":
+        return ("no straight extension from a dead end: build_road from any road into free land",
+                "no straight extension from a dead end into open land; build_road from any road tile into free "
+                f"land (L-shaped roads work, bridges cross the river; {roads})")
+    if purpose in RIVERBANK_PURPOSES:
+        river = _river_cols(w)
+        if river is None:
+            return "no river on this map", "this map has no river"
+        lots, contact = _riverbank_by_roads(w)
+        near = ", ".join(f"({x},{y})" for x, y in _ends(contact))
+        if not contact:
+            return (f"no road reaches the river yet: ask planning for a road to the bank (river at x "
+                    f"{_span(river[0], river[1])})",
+                    f"no free riverbank tile next to a highway-connected road: a road has to reach the river first "
+                    f"({_river_span(w)}); ask planning (send_message) for a road to the riverbank, and build what "
+                    "doesn't need the river meanwhile")
+        free = [(int(x), int(y)) for y, x in zip(*np.nonzero(lots & _empty_land(w)))]
+        if purpose == "riverbank_2x2" and free:
+            return (f"no free 2x2 riverbank block by a road: ask planning to leave one near {near}",
+                    f"no free 2x2 block on the riverbank beside a highway-connected road (free bank lots are single "
+                    f"tiles, e.g. ({free[0][0]},{free[0][1]})); ask planning (send_message) to leave a 2x2 riverbank "
+                    f"lot beside the road near {near}")
+        return (f"riverbank beside roads all taken: ask planning to free a lot near {near}",
+                "the river bank tiles next to highway-connected roads are all taken (zoned or built): ask planning "
+                f"(send_message) to leave or free (dezone) a riverbank lot beside the road (e.g. near {near}, where "
+                "the road meets the river), and build what doesn't need the river meanwhile")
+    free = _free_roadside(w)
+    if role == "planning":
+        return ("no free roadside strip: extend the roads (find_sites road_extension)",
+                f"no free strip along a highway-connected road ({roads}; {free} free roadside tiles); "
+                "extend the roads first (find_sites road_extension lists dead ends to build from)")
+    if not free:
+        return ("no free roadside land: ask planning for a lot",
+                f"no free land next to a highway-connected road ({roads}); ask planning (send_message) to extend a "
+                "road or leave an empty lot by one")
+    return ("nothing needs it right now",
+            f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
+            "(check coverage in city_overview / my_facilities before building)")
+
+
+def _brief(v) -> str:
+    return f"{round(v):,}" if abs(v) >= 10 else f"{round(float(v), 2):g}"
+
+
+def ready_line(purpose: str, lst: SiteList) -> str:
+    """One Ready sites line: the count and best site, or the short reason."""
+    if lst.short:
+        return f"- {purpose}: " + (lst.short if lst.short.startswith("locked") else f"none - {lst.short}")
+    sites = lst.sites[:MAX_SITES]
+    best = sites[0]
+    where = (f"({best['x1']},{best['y1']})-({best['x2']},{best['y2']})" if "x2" in best else
+             f"({best['x']},{best['y']})")
+    extra = next((fmt.format(_brief(best[k])) for k, fmt in SITE_FIELDS if k in best), "")
+    return f"- {purpose}: {len(sites)} site{'s' * (len(sites) != 1)}, best {where}" + (f", {extra}" if extra else "")
 
 
 # ------------------------------------------------------------------ toolbox
@@ -606,47 +734,15 @@ class ToolBox:
         w = self.world
         obs = build_observation(w, self.role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
                                 include_map=False, site_hints=True)
-        found = obs
-        for key in SITE_PURPOSES[self.role][purpose]:
-            found = found.get(key) if isinstance(found, dict) else None
-        near = None if near_x is None else (int(near_x), int(near_y))
-        sites = [_site(s, near) for s in (found or [])]
-        if near is not None:
-            sites.sort(key=lambda s: s["distance"])
+        lst = site_lists(w, self.role, obs)[purpose]
+        sites = lst.sites
+        if near_x is not None:
+            near = (int(near_x), int(near_y))
+            sites = sorted(({**s, "distance": _distance(s, near)} for s in sites), key=lambda s: s["distance"])
         out = {"ok": True, "purpose": purpose, "sites": sites[:MAX_SITES]}
-        keys = SITE_UNLOCKS.get(purpose, ())
-        if keys and not any(w.unlocked(k) for k in keys):
-            out["note"] = "locked: " + w.unlock_note(min(keys, key=C.UNLOCK_POP.get))
-        elif not sites and purpose in SITE_NOTES:
-            out["note"] = SITE_NOTES[purpose]
-        elif not sites:                  # models told to "inspect the map" scanned it blindly for whole turns
-            out["note"] = self._no_sites_note(purpose)
+        if lst.note:
+            out["note"] = lst.note
         return out
-
-    def _no_sites_note(self, purpose: str) -> str:
-        """Why a site list is empty and what to do: no free roadside land (roads must grow), or nothing needs the
-        building yet (the lists only rank spots near uncovered homes / jobs)."""
-        w = self.world
-        if purpose == "road_extension":
-            return ("no straight extension from a dead end into open land; build_road from any road tile into free "
-                    f"land (L-shaped roads work, bridges cross the river; {_roads_text(_roads(w))})")
-        if purpose in RIVERBANK_PURPOSES:
-            river = _river_span(w)
-            if river is None:
-                return "this map has no river"
-            return (f"no free riverbank tile next to a highway-connected road: a road has to reach the river first "
-                    f"({river}); ask planning (send_message) for a road to the riverbank, and build what doesn't "
-                    "need the river meanwhile")
-        free = _free_roadside(w)
-        if self.role == "planning":
-            return (f"no free strip along a highway-connected road ({_roads_text(_roads(w))}; {free} free "
-                    "roadside tiles); "
-                    "extend the roads first (find_sites road_extension lists dead ends to build from)")
-        if not free:
-            return (f"no free land next to a highway-connected road ({_roads_text(_roads(w))}); ask planning (send_message) "
-                    "to extend a road or leave an empty lot by one")
-        return (f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
-                "(check coverage in city_overview / my_facilities before building)")
 
     def my_facilities(self) -> dict:
         w, role = self.world, self.role

@@ -3,7 +3,8 @@
 `system_prompt()` is the same every turn: how to play, the role's mission and the game rules, then the coach's
 playbooks, so coaches steer strategy but cannot change rules or tools. `briefing()` is a compact status for the
 turn: the mayor gets the city, finances, department reports and the plan; a department gets its plan slice,
-budget, key metrics, a "since your last turn" digest and its memory. Everything else is a tool call away.
+budget, key metrics, a "since your last turn" digest, the map, its ready sites and its memory. Everything else is a
+tool call away.
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice
+from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, map_facts, map_lines, overview, plan_slice, ready_line, \
+    site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -150,6 +152,13 @@ def _map(w) -> list[str]:
     return ["## Map"] + map_lines(map_facts(w))
 
 
+def _ready_sites(w, role: str, obs: dict) -> list[str]:
+    """One line per find_sites purpose (count and best site, or why there is none), so agents don't re-run
+    find_sites for every purpose each turn."""
+    return (["## Ready sites"] + [ready_line(p, lst) for p, lst in site_lists(w, role, obs).items()]
+            + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
+
+
 def _memory(fleet: FleetState, role: str) -> list[str]:
     mem = fleet.memory.get(role, {})
     return ["## Your memory"] + ([f"- {k.replace('_', ' ')}: " + "; ".join(v) for k, v in mem.items() if v] or [
@@ -258,11 +267,11 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
           f"- {money(w.dept_funds[dept])} in department funds" + (f" (plan target {money(target)})"
                                                                    if target is not None else "")
           + f"; spent last month {money(spent)}"]
-    city = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
-                             include_map=False, site_hints=False)["city"]
-    L += ["", "## Key metrics", *(_metric(city, k) for k in KEY_METRICS[role])]
+    obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
+                            include_map=False, site_hints=True)          # the one build: metrics and ready sites
+    L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _map(w) + [""] + _memory(fleet, role)
+    return L + [""] + _map(w) + [""] + _ready_sites(w, role, obs) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: int = 1,

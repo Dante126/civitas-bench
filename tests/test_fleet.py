@@ -187,7 +187,7 @@ import numpy as np
 
 from civitas.agents.scripted import SCRIPTED
 from civitas.core.roles import ROLES, TURN_ORDER
-from civitas.fleet.tools import SITE_PURPOSES, ToolBox
+from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox
 from civitas.sim import catalog as C
 
 
@@ -340,6 +340,7 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     box = ToolBox(env, "utilities")
     res = box.call("find_sites", {"purpose": "pump"})
     assert res["sites"] == [] and "ask planning" in res["note"] and "inspect the map" not in res["note"]
+    assert "a road has to reach the river" in res["note"] and "taken" not in res["note"]
     ys = np.nonzero((w.struct == C.ROAD).any(axis=1))[0]
     cols = np.nonzero((w.terrain[ys.min():ys.max() + 1] == C.WATER).any(axis=0))[0]
     assert f"x {cols.min()}-{cols.max()} in rows {ys.min()}-{ys.max()}" in res["note"]
@@ -350,6 +351,74 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     assert apply_action(w, "planning", {"type": "build_road", "x1": x_end, "y1": y, "x2": bank, "y2": y}).ok
     res = box.call("find_sites", {"purpose": "pump"})
     assert res["sites"] and "note" not in res
+
+
+def _bridge_and_take_the_bank(env):
+    """Seed 0: the highway road on row 24 ends at x 19, the river runs at x 26-28 there. Bridge it and zone every
+    riverbank tile beside the connected roads, as planning did in the v5 smoke run."""
+    from civitas.fleet.tools import _connected_roads
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    assert (w.terrain[24, 26:29] == C.WATER).all() and (w.terrain[24, [25, 29]] == C.LAND).all()
+    road, water = _connected_roads(w), w.terrain == C.WATER
+    taken = []
+    for y, x in zip(*np.nonzero((w.struct == C.NONE) & (w.terrain == C.LAND))):
+        near_road = road[max(0, y - 1):y + 2, max(0, x - 1):x + 2].any()
+        if near_road and w.is_riverbank(x, y):
+            w.struct[y, x] = C.RES
+            taken.append((int(x), int(y)))
+    w.refresh()
+    assert taken
+    return taken
+
+
+def test_riverbank_note_says_the_bank_beside_the_road_is_taken():
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    box = ToolBox(env, "utilities")
+    for purpose in ("pump", "sewage"):
+        res = box.call("find_sites", {"purpose": purpose})
+        note = res["note"]
+        assert res["sites"] == [] and "taken" in note and "a road has to reach" not in note, note
+        assert "(25,24)" in note and "(29,24)" in note and "ask planning" in note      # the bridgeheads
+    line, = [ln for ln in _ready_sites(briefing(env, "utilities", mark=False)) if ln.startswith("- sewage:")]
+    assert "taken" in line and "(25,24)" in line and len(line) <= 120, line
+    w.milestones_on = False                              # riverbank_2x2 unlocked: same reason
+    res = box.call("find_sites", {"purpose": "riverbank_2x2"})
+    assert res["sites"] == [] and "taken" in res["note"], res
+    x, y = taken[0]                                      # free one lot, hemmed in: the pump list finds it
+    w.struct[y, x] = C.NONE
+    for ny in range(y - 1, y + 2):
+        for nx in range(x - 1, x + 2):
+            if (nx, ny) != (x, y) and w.struct[ny, nx] == C.NONE and w.terrain[ny, nx] == C.LAND:
+                w.struct[ny, nx] = C.PARK
+    w.refresh()
+    res = box.call("find_sites", {"purpose": "pump"})
+    assert [(s["x"], s["y"]) for s in res["sites"]] == [(x, y)] and "note" not in res
+    res = box.call("find_sites", {"purpose": "riverbank_2x2"})    # one free tile is no 2x2 block
+    assert res["sites"] == [] and "2x2" in res["note"] and "taken" not in res["note"], res
+
+
+def test_riverbank_note_when_only_roads_line_the_bank():
+    """A road that bridges the river counts as reaching it even when every bank tile beside the connected roads
+    is itself road: the note must not send planning after a road that exists."""
+    from civitas.fleet.tools import _touching
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    bank = (w.terrain == C.LAND) & _touching(w.terrain == C.WATER, diagonal=False)
+    while True:                                     # pave every empty bank tile beside a road
+        lots = bank & _touching(w.road_labels >= 0) & (w.struct == C.NONE)
+        if not lots.any():
+            break
+        w.struct[lots] = C.ROAD
+        w.refresh()
+    res = ToolBox(env, "utilities").call("find_sites", {"purpose": "sewage"})
+    assert res["sites"] == [] and "taken" in res["note"] and "a road has to reach" not in res["note"], res
+    assert "(25,24)" in res["note"], res
 
 
 def _fill_roadside(w):
@@ -383,14 +452,15 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     assert res["sites"] == [] and "ask planning" in res["note"] and span in res["note"]
     res = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})
     assert res["sites"] == [] and "find_sites road_extension" in res["note"] and "ask planning" not in res["note"]
-    note = ToolBox(env, "planning")._no_sites_note("road_extension")
+    from civitas.fleet.tools import _why_empty
+    note = _why_empty(w, "planning", "road_extension")[1]
     assert "find_sites" not in note and "build_road" in note                   # not circular
     res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})
     assert not res["ok"] and "for the departments" in res["error"]
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
-    from civitas.fleet.tools import _river_span, _roads, _roads_text
+    from civitas.fleet.tools import _river_span, _roads, _roads_text, _why_empty
     env = _env()
     w = env.world
     before = _roads_text(_roads(w))
@@ -399,7 +469,7 @@ def test_road_span_ignores_unconnected_roads_and_no_river_maps():
     assert _roads_text(_roads(w)) == before and "x 44" not in before
     w.terrain[w.terrain == C.WATER] = C.LAND
     assert _river_span(w) is None
-    assert ToolBox(env, "utilities")._no_sites_note("pump") == "this map has no river"
+    assert _why_empty(w, "utilities", "pump")[1] == "this map has no river"
 
 
 def test_map_facts_on_a_fresh_world():
@@ -758,6 +828,63 @@ def test_briefings_render_for_every_role(grown, env12):
     assert "$1,234" in briefing(env, "police", mark=False)
     mayor = briefing(env, "mayor", mark=False)
     assert "reach 5k residents" in mayor and "PRIORITY-health" in mayor and "no plan yet" not in mayor
+
+
+def _ready_sites(text: str) -> list[str]:
+    block = text[text.index("## Ready sites"):].split("\n\n")[0].splitlines()
+    return block[1:]
+
+
+@pytest.mark.parametrize("grown", [False, True])
+def test_ready_sites_in_department_briefings(grown, grown_env):
+    env = grown_env if grown else CivitasEnv(GameConfig(seed=0, months=24))
+    w = env.world
+    assert "## Ready sites" not in briefing(env, "mayor", mark=False)
+    for role in DEPTS:
+        text = briefing(env, role, mark=False)
+        assert text.index("## Map") < text.index("## Ready sites") < text.index("## Your memory")
+        lines = _ready_sites(text)
+        purposes = list(SITE_PURPOSES[role])
+        assert len(lines) == len(purposes) + 1 and lines[-1] == "find_sites <purpose> lists up to 6 with details"
+        box = ToolBox(env, role)
+        for purpose, line in zip(purposes, lines):
+            assert line.startswith(f"- {purpose}: ") and len(line) <= 120, (role, line)
+            res = box.call("find_sites", {"purpose": purpose})
+            sites, note = res["sites"], res.get("note", "")
+            if note.startswith("locked"):
+                pop = min(C.UNLOCK_POP[k] for k in SITE_UNLOCKS[purpose])
+                assert f"locked (unlocks at {pop:,} residents)" in line, (role, line)
+            elif sites:
+                n = len(sites)
+                assert f": {n} site{'s' * (n != 1)}, best ({sites[0]['x']},{sites[0]['y']})" in line, (role, line)
+            else:
+                assert ": none - " in line and note, (role, line)
+    if not grown:                                       # fresh seed 0: the road stops short of the river
+        util = _ready_sites(briefing(env, "utilities", mark=False))
+        assert any("no road reaches the river" in ln for ln in util)
+        assert any(ln.startswith("- wind: 6 sites, best (") and "wind 1." in ln for ln in util)
+    assert w.month == (24 if grown else 0)
+
+
+def test_department_briefing_builds_one_observation(monkeypatch):
+    import civitas.fleet.briefing as B
+    import civitas.fleet.tools as T
+    env = _env()
+    calls = []
+    real = B.build_observation
+
+    def counted(*a, **k):
+        calls.append(k.get("site_hints"))
+        return real(*a, **k)
+    monkeypatch.setattr(B, "build_observation", counted)
+    monkeypatch.setattr(T, "build_observation", counted)
+    for role in DEPTS:
+        calls.clear()
+        briefing(env, role, mark=False)
+        assert calls == [True], (role, calls)
+    calls.clear()
+    briefing(env, "mayor", mark=False)
+    assert calls == []
 
 
 def test_mayor_briefing_lists_department_reports():
