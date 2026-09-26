@@ -1682,6 +1682,31 @@ def test_failed_action_repeated_after_a_success_runs_again():
     assert len(FleetState.of(env).history(kind="failure", role="mayor")) == 2
 
 
+def test_refused_repeat_after_the_action_cap_says_end_turn():
+    env = _env(max_actions_per_turn=1)
+    env.world.treasury = 50000
+    box = ToolBox(env, "mayor")
+    assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]
+    capped = box.call("set_tax", {"sector": "C", "rate": 9})
+    assert capped["ok"] is False and capped["error"].endswith("call end_turn")
+    again = box.call("set_tax", {"sector": "C", "rate": 9})
+    assert again == {"ok": False, "refused": "repeat", "error": f"this exact call failed at call 2: {capped['error']}"}
+    assert "change the arguments" not in again["error"]
+
+
+def test_repeated_look_up_is_a_copy():
+    env = _env()
+    box = ToolBox(env, "police")
+    first = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    want = copy.deepcopy(first)
+    first["tiles"].clear()
+    first["ok"] = "changed"
+    again = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    assert again == {**want, "repeat": "same as call 1 (nothing changed since)"}
+    again["tiles"].clear()
+    assert box.call("inspect", {"x": 20, "y": 20, "radius": 1})["tiles"] == want["tiles"]
+
+
 def test_turn_control_tools_are_not_deduplicated():
     env = _env()
     box = ToolBox(env, "police")

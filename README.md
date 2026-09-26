@@ -471,7 +471,9 @@ Every tool result except `end_turn`'s carries `steps_left`, plus a `wrap_up` not
 fewer calls are left. Within a turn, an identical repeat of a look-up (same tool, same
 arguments after type coercion) returns the earlier result marked `repeat`, and an identical
 repeat of an action that failed is refused without running (`refused: "repeat"`, not charged
-as an invalid action), until the agent's next successful action. Both still count as tool calls.
+as an invalid action), until the agent's next successful action. A successful `update_plan`
+also refreshes look-ups, and a failed action refreshes `history` (which lists it). Both kinds
+of repeat still count as tool calls.
 
 **Coaching with playbooks.** The system prompt starts with a fixed part: how to play, the
 role's mission and the game rules. Then comes the coach's playbook: the fleet playbook

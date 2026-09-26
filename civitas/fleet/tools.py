@@ -7,6 +7,7 @@ fleet memory (`FleetState`) and collect council messages and the end-of-turn rep
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections import Counter
@@ -621,15 +622,18 @@ class ToolBox:
         key = (name, json.dumps(args, sort_keys=True, default=str))
         if key in self._seen:
             n, res = self._seen[key]
-            return {**res, "repeat": f"same as call {n} (nothing changed since)"}
+            return {**copy.deepcopy(res), "repeat": f"same as call {n} (nothing changed since)"}
         if key in self._failed:
             n, err = self._failed[key]
-            return {"ok": False, "refused": "repeat",
-                    "error": f"this exact call failed at call {n}: {err}; change the arguments or do something else"}
+            if "end_turn" not in err:
+                err += "; change the arguments or do something else"
+            elif not err.endswith("call end_turn"):
+                err += "; call end_turn"
+            return {"ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}"}
         executed = len(self.executed)
         res = self._run(tool, args)
         if name in self.lookups:
-            self._seen[key] = (self.n_calls, res)
+            self._seen[key] = (self.n_calls, copy.deepcopy(res))     # callers may change the result they get
         elif name in ALL_ACTIONS:
             if res.get("ok"):
                 self._seen.clear()
