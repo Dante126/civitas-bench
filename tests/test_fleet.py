@@ -631,7 +631,9 @@ def _check_mayor_sites(env):
                 mine = mayor.call("find_sites", {"purpose": f"{dept}.{purpose}", **near})
                 theirs = box.call("find_sites", {"purpose": purpose, **near})
                 assert mine["ok"] and mine["purpose"] == f"{dept}.{purpose}", (dept, purpose, mine)
-                assert (mine["sites"], mine.get("note")) == (theirs["sites"], theirs.get("note")), (dept, purpose)
+                assert mine["sites"] == theirs["sites"], (dept, purpose)
+                assert mine.get("note") == (theirs["note"] and f"({dept} department's note) {theirs['note']}"
+                                            if "note" in theirs else None), (dept, purpose)
 
 
 def test_mayor_find_sites_is_every_department_s_list():
@@ -701,6 +703,19 @@ def test_update_plan_says_when_the_gaps_exceed_the_treasury():
     res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
     assert res["next"] == ("call allocate_budget to fund these (treasury $11k); the gaps total $9,000, more than the "
                            "treasury above a $3,000 reserve ($8,000): fund the most urgent first or lower targets")
+
+
+def test_mayor_tools_in_a_mixed_line_up():
+    env = _env(roles=["mayor", "planning", "utilities"])
+    mayor = ToolBox(env, "mayor")
+    fs, = [s["function"] for s in mayor.schemas() if s["function"]["name"] == "find_sites"]
+    assert fs["parameters"]["properties"]["purpose"]["enum"] == [f"{d}.{p}" for d in ("planning", "utilities")
+                                                                 for p in SITE_PURPOSES[d]]
+    assert not mayor.call("find_sites", {"purpose": "education.school"})["ok"]
+    res = mayor.call("update_plan", {"budgets": {"planning": 5000, "fire": 2500}})
+    assert res["ok"] and set(res["below_target"]) == {"planning"}                 # no fire department in the game
+    text = briefing(env, "mayor", mark=False)
+    assert "- 1 below target ($5,000 short" in text and "- fire:" not in text
 
 
 def test_reserve_follows_the_mayor_playbook():
@@ -1059,9 +1074,19 @@ def test_mayor_briefing_marks_departments_below_their_target():
     w.treasury = 9000
     assert ("- 2 below target ($7,500 short; treasury $9,000, $6,000 above the $3,000 reserve): "
             "allocate_budget") in briefing(env, "mayor", mark=False)
-    w.dept_funds.update(utilities=7000, fire=2450)                  # within $100 of the target counts as funded
     text = briefing(env, "mayor", mark=False)
-    assert "below target" not in text and "- fire: funds $2,450, target $2,500" in text
+    assert text.index("- no reports yet") < text.index("- 2 below target")
+    w.dept_funds.update(utilities=6400, fire=2350)                  # within 10% of the target counts as funded
+    text = briefing(env, "mayor", mark=False)
+    assert "below target" not in text and "- fire: funds $2,350, target $2,500" in text
+    w.dept_funds.update(fire=2399)                                  # $101 short of $2,500: max($100, 10%) = $250
+    assert "below target" not in briefing(env, "mayor", mark=False)
+    w.dept_funds.update(fire=0)
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"fire": 500}})
+    w.dept_funds.update(fire=401)                                   # $99 short: under the $100 floor
+    assert "below target" not in briefing(env, "mayor", mark=False)
+    w.dept_funds.update(fire=399)
+    assert "- 1 below target ($101 short" in briefing(env, "mayor", mark=False)
 
 
 def test_department_briefing_digests_its_own_last_turn():
@@ -1166,15 +1191,18 @@ def test_briefings_stay_bounded_at_the_limits():
     for i in range(12):
         w.event(f"event {i} " + "e" * 300)
     env.end_month()
+    w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
+    w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 7500, (role, len(text) - len(memory))   # memory is shown in full by design
+        assert len(text) - len(memory) < 7500 - 300, (role, len(text) - len(memory))   # memory is shown in full
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
         assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
-    assert mayor.count("(full: history kind=report)") == len(DEPTS)
+    assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
+    assert "(cut reports: history kind=report)" in mayor
 
 
 

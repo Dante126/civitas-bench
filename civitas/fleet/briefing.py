@@ -20,7 +20,7 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
-    ready_lines, reserve, site_lists
+    ready_lines, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -52,6 +52,8 @@ UNLOCK_ROLES = {
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
+# the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
+GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 70, 40, 150
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -211,15 +213,17 @@ def _mayor(env, fleet: FleetState) -> list[str]:
          f"unemployment {pct(o['unemployment_pct'])}",
          "- jobs: " + ", ".join(f"{k} {num(v)}" for k, v in o["jobs"].items())
          + " | demand: " + _value("demand", o["demand"]),
-         *(f"- {k}: {_value(k, o[k])}" for k in ("power", "water", "sewage")),
+         "- supply / demand (coverage): " + ", ".join(
+             f"{k} {num(o[k]['supply'])} / {num(o[k]['demand'])} ({pct(o[k]['coverage_pct'])})"
+             for k in ("power", "water", "sewage")),
          "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
          "", "## Finances",
          f"- treasury {money(o['treasury'])}{ch('treasury', money)}, debt {money(o['debt'])}; last month income "
          f"{money(o['last_month']['income'])}, expenses {money(o['last_month']['expenses'])}"]
     if w.months_negative or w.low_approval_months:
-        L.append(f"- WARNING: {w.months_negative} month(s) with a negative treasury ({C.BANKRUPTCY_MONTHS} = "
-                 f"bankruptcy), {w.low_approval_months} month(s) of approval below {100 * C.RECALL_APPROVAL:.0f}% "
+        L.append(f"- WARNING: negative treasury {w.months_negative} months ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
+                 f"approval below {100 * C.RECALL_APPROVAL:.0f}% {w.low_approval_months} months "
                  f"({C.RECALL_MONTHS} = recall)")
     L += [""] + _digest(env, fleet, "mayor")
     for off in w.offers:
@@ -229,31 +233,31 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     plan = bool(fleet.plan_versions)
     budgets, priorities = (p["budgets"], p["priorities"]) if plan else ({}, {})
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
-    gaps = funding_gaps(env, fleet)
-    L += ["", "## Departments: funds, plan target, priority, latest report"]
+    f = funding_gaps(env, fleet)
+    clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
+    L += ["", "## Departments: funds, plan target, priority, latest report"
+          + (" (cut reports: history kind=report)" if clipped else "")]
     for d in (r for r in DEPARTMENTS if r in env.roles):
         L.append(f"- {d}: funds {money(w.dept_funds[d])}"
-                 + (f"{' <' if d in gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-                 + (f"; priority: {cut(priorities[d], 60)}" if priorities.get(d) else ""))
+                 + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
+                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
-            text = cut(latest[d]["text"], REPORT_PREVIEW_CHARS)
-            clipped = len(" ".join(latest[d]["text"].split())) > REPORT_PREVIEW_CHARS
-            L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if clipped else ""))
-    if gaps:
-        total, spare = sum(g["gap"] for g in gaps.values()), w.treasury - reserve(w)
-        L.append(f"- {len(gaps)} below target ({money(total)} short; treasury {money(w.treasury)}"
-                 + (f", {money(max(0.0, spare))} above the {money(reserve(w))} reserve" if total > spare else "")
-                 + "): allocate_budget")
+            L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
     if not latest:
         L.append("- no reports yet")
+    if f.gaps:
+        L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
+                 + ("" if not f.short else f", {money(f.spare)} above the {money(f.reserve)} reserve" if f.spare > 0
+                    else f", under the {money(f.reserve)} reserve")
+                 + "): allocate_budget")
     L += [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")
     else:
         L += [f"## City plan (v{p['version']}, month {p['month']}; full text: get_plan)",
-              f"- goals: {_goals(p['goals'], 100)}"]
+              f"- goals: {_goals(p['goals'], GOAL_CHARS)}"]
         if p["notes"]:
-            L.append(f"- notes: {cut(p['notes'], 200)}")
+            L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")
     return L + [""] + _map(w) + [""] + _memory(fleet, "mayor")
 
 

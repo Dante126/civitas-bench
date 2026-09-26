@@ -33,8 +33,9 @@ MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
 RIVER_BANDS = 3              # row bands the Map block describes the river in
-RESERVE_MIN = 3000           # the treasury reserve (the mayor's playbook): this, or 3 months of expenses (6 in a deficit)
-GAP_MIN = 100                # a department this close to its plan target counts as funded
+RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
+                             # expenses (6 in a deficit)
+GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -470,16 +471,29 @@ def reserve(w) -> float:
     return max(RESERVE_MIN, (3 if last["income"] >= last["expenses"] else 6) * last["expenses"])
 
 
-def funding_gaps(env, fleet: FleetState) -> dict[str, dict]:
-    """Departments (in turn order) whose funds are at least GAP_MIN below their plan budget target:
-    {dept: {"funds", "target", "gap"}}. The update_plan result and the mayor's briefing show them."""
+class Funding(NamedTuple):
+    gaps: dict[str, dict]   # {dept: {"funds", "target", "gap"}}, in turn order
+    total: int              # the gaps summed
+    reserve: float          # reserve(w)
+    spare: float            # treasury above the reserve (negative below it)
+
+    @property
+    def short(self) -> bool:
+        return self.total > self.spare
+
+
+def funding_gaps(env, fleet: FleetState) -> Funding:
+    """Departments in the game whose funds are below their plan budget target by more than max(GAP_MIN, GAP_SHARE x
+    target), and whether the treasury above the reserve covers them: the update_plan result and the mayor's
+    briefing show this."""
     w, budgets = env.world, fleet.plan["budgets"]
-    out = {}
+    gaps = {}
     for d in DEPARTMENTS:
-        if d in env.roles and d in budgets and budgets[d] - w.dept_funds[d] >= GAP_MIN:
-            out[d] = {"funds": round(w.dept_funds[d]), "target": round(budgets[d]),
-                      "gap": round(budgets[d] - w.dept_funds[d])}
-    return out
+        if d in env.roles and d in budgets and budgets[d] - w.dept_funds[d] >= max(GAP_MIN, GAP_SHARE * budgets[d]):
+            gaps[d] = {"funds": round(w.dept_funds[d]), "target": round(budgets[d]),
+                       "gap": round(budgets[d] - w.dept_funds[d])}
+    keep = reserve(w)
+    return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep)
 
 
 class SiteList(NamedTuple):
@@ -855,8 +869,8 @@ class ToolBox:
             near = (int(near_x), int(near_y))
             sites = sorted(({**s, "distance": _distance(s, near)} for s in sites), key=lambda s: s["distance"])
         out = {"ok": True, "purpose": purpose, "sites": sites[:MAX_SITES]}
-        if lst.note:
-            out["note"] = lst.note
+        if lst.note:                  # written to the department: the mayor mustn't read "ask planning" as its own task
+            out["note"] = lst.note if role == self.role else f"({role} department's note) {lst.note}"
         return out
 
     def my_facilities(self) -> dict:
@@ -966,14 +980,13 @@ class ToolBox:
             out = {"ok": True, "message": self.fleet.update_plan(w.month, **fields)}
         except ValueError as e:
             raise ToolError(str(e))
-        gaps = funding_gaps(self.env, self.fleet)
-        if gaps:
-            total, keep = sum(g["gap"] for g in gaps.values()), reserve(w)
+        f = funding_gaps(self.env, self.fleet)
+        if f.gaps:
             nxt = f"call allocate_budget to fund these (treasury {money(w.treasury)})"
-            if total > w.treasury - keep:
-                nxt += (f"; the gaps total {money(total)}, more than the treasury above a {money(keep)} reserve "
-                        f"({money(max(0.0, w.treasury - keep))}): fund the most urgent first or lower targets")
-            out.update(below_target=gaps, treasury=round(w.treasury), next=nxt)
+            if f.short:
+                nxt += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} reserve "
+                        f"({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
+            out.update(below_target=f.gaps, treasury=round(w.treasury), next=nxt)
         return out
 
     def end_turn(self, report: str) -> dict:

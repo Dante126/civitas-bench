@@ -50,6 +50,8 @@ same call.
 end_turn report.
 """
 
+# The Reserve rule below is mirrored in code (fleet/tools.py:reserve, used by update_plan results and the
+# mayor's briefing); keep the two in step.
 [agents.mayor]
 kind = "fleet"
 playbook = """
