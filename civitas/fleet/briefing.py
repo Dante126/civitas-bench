@@ -17,7 +17,7 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
     ready_lines, site_lists
@@ -222,8 +222,8 @@ def _mayor(env, fleet: FleetState) -> list[str]:
          f"- treasury {money(o['treasury'])}{ch('treasury', money)}, debt {money(o['debt'])}; last month income "
          f"{money(o['last_month']['income'])}, expenses {money(o['last_month']['expenses'])}"]
     if w.months_negative or w.low_approval_months:
-        L.append(f"- WARNING: negative treasury {w.months_negative} months ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
-                 f"approval below {100 * C.RECALL_APPROVAL:.0f}% {w.low_approval_months} months "
+        L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
+                 f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
                  f"({C.RECALL_MONTHS} = recall)")
     L += [""] + _digest(env, fleet, "mayor")
     for off in w.offers:
@@ -247,9 +247,9 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append("- no reports yet")
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
-                 + ("" if not f.short else f", {money(f.spare)} above the {money(f.reserve)} reserve" if f.spare > 0
-                    else f", under the {money(f.reserve)} reserve")
-                 + "): allocate_budget")
+                 + (f"): {f.hold}" if f.hold else
+                    f", {money(f.spare)} above the {money(f.reserve)} reserve): allocate_budget" if f.short else
+                    "): allocate_budget"))
     L += [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")

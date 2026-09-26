@@ -58,7 +58,9 @@ SITE_PURPOSES = {
     "fire": {"station": ("fire", "candidate_sites"), "shelter": ("fire", "shelter_sites"),
              "levee": ("fire", "levee_lines")},
     "health": {"clinic": ("health", "clinic_sites"), "hospital": ("health", "hospital_sites"),
-               "landfill": ("health", "landfill_sites")},
+               "landfill": ("health", "landfill_sites"),
+               # a cemetery serves the whole city (no radius): any roadside lot away from homes will do
+               "cemetery": ("health", "landfill_sites")},
     "education": {"school": ("education", "school_sites"), "high_school": ("education", "high_school_sites"),
                   "university": ("education", "university_sites")},
 }
@@ -480,6 +482,12 @@ class Funding(NamedTuple):
     @property
     def short(self) -> bool:
         return self.total > self.spare
+
+    @property
+    def hold(self) -> str:
+        """What to do when the treasury is at or under the reserve (nothing to allocate)."""
+        return (f"hold: the treasury is under the {money(self.reserve)} reserve; lower targets or wait for income"
+                if self.spare <= 0 else "")
 
 
 def funding_gaps(env, fleet: FleetState) -> Funding:
@@ -982,8 +990,8 @@ class ToolBox:
             raise ToolError(str(e))
         f = funding_gaps(self.env, self.fleet)
         if f.gaps:
-            nxt = f"call allocate_budget to fund these (treasury {money(w.treasury)})"
-            if f.short:
+            nxt = f.hold or f"call allocate_budget to fund these (treasury {money(w.treasury)})"
+            if f.short and not f.hold:
                 nxt += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} reserve "
                         f"({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
             out.update(below_target=f.gaps, treasury=round(w.treasury), next=nxt)

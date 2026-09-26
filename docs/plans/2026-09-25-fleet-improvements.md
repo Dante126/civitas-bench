@@ -20,20 +20,26 @@ Checkpoint after each task: `pytest -q -m "not slow"` (234 passed at the start).
 1. **Requests in the briefing.** The "since your last turn" digest lists the newest council messages from
    other roles addressed to this role or `all` (up to 5, ~200 chars each, sender + month), newest last, instead
    of only a count; keep the "(N more: get_messages)" pointer when there are more.
+   Done: the digest quotes the newest 5 council messages; in v6 planning dezoned riverbank lots on request (both seeds).
 2. **Map orientation.** A short "Map" block in every briefing (map size, highway entry, river columns by row
    band, extent of the highway-connected roads, built-up box) and a `map_overview` look-up returning a compact
    ASCII map (≤ 3,800 chars, legend) for all roles.
+   Done: Map block + `map_overview`; used in 25–29 of 32 turns in v6 (5–6% of calls), no road built off the map.
 3. **Ready sites in department briefings.** One line per `find_sites` purpose: count and best site, or the short
    reason when empty (locked / nothing needs it / no free land / riverbank taken). The riverbank note must tell
    apart "no road reaches the river" from "the bank tiles next to roads are taken - ask planning to free or
    leave a riverbank lot".
+   Done: one line per purpose, connected roads only; sewage built on month 0 in both v6 seeds.
 4. **Step budgeting and repeats.** Every tool result carries `steps_left`; with ≤ 3 left add "wrap up: call
    end_turn". An identical repeat of a look-up within a turn returns its result with "same as call N"; an
    identical repeat of an action that failed this turn is refused with the earlier error (not charged as an
    invalid action).
+   Done: `steps_left` / `wrap_up`, cached look-ups (23 and 9 repeats in v6), 0 refused repeats.
 5. **Mayor fixes.** The mayor gets a read-only `find_sites` over every department's purposes
    (`<department>.<purpose>`), so it can check a department's claims. `update_plan`'s result lists departments
    whose funds are below their new target (with the gap) and reminds the mayor to `allocate_budget`.
+   Done: read-only `find_sites` (19–21 calls in v6, 1 bad purpose), funding gaps with "hold" under the reserve.
 6. **Playbooks, smoke run, docs.** Planning: keep roads inside the map, leave a riverbank lot beside the road
    for utilities, answer requests in the briefing before zoning. Fleet playbook: `find_sites` wording that fits
    every role. Live smoke run (v6, seed 0) compared with v5; README/CLAUDE.md updates.
+   Done: playbooks, `cemetery` purpose for health; v6 seed 0 1,848 / 45.1 (v5 2,244 / 43.1), seed 1 2,756 / 46.6.

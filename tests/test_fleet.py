@@ -705,6 +705,35 @@ def test_update_plan_says_when_the_gaps_exceed_the_treasury():
                            "treasury above a $3,000 reserve ($8,000): fund the most urgent first or lower targets")
 
 
+def test_health_finds_cemetery_sites():
+    env = _env()
+    w = env.world
+    w.dept_funds["health"] = 5000
+    box = ToolBox(env, "health")
+    res = box.call("find_sites", {"purpose": "cemetery"})
+    assert res["ok"] and res["sites"] == box.call("find_sites", {"purpose": "landfill"})["sites"]
+    s = res["sites"][0]
+    assert box.call("build_cemetery", {"x": s["x"], "y": s["y"]})["ok"]
+    line, = [ln for ln in briefing(env, "health", mark=False).splitlines() if ln.startswith("- cemetery:")]
+    assert "same list as landfill" in line
+
+
+def test_update_plan_says_hold_under_the_reserve():
+    env = _env()
+    w = env.world
+    for treasury in (3000, 1200, -500):                  # at, under and below zero: nothing above the $3,000 reserve
+        w.treasury = treasury
+        res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})
+        assert res["next"] == "hold: the treasury is under the $3,000 reserve; lower targets or wait for income"
+        text = briefing(env, "mayor", mark=False)
+        line, = [ln for ln in text.splitlines() if "below target" in ln]
+        assert line.endswith("): hold: the treasury is under the $3,000 reserve; lower targets or wait for income")
+        assert "allocate_budget" not in line
+    w.treasury = 3001                                    # $1 above: short, but something to allocate
+    assert ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})["next"].startswith(
+        "call allocate_budget")
+
+
 def test_mayor_tools_in_a_mixed_line_up():
     env = _env(roles=["mayor", "planning", "utilities"])
     mayor = ToolBox(env, "mayor")
@@ -1162,7 +1191,10 @@ def test_mayor_warning_and_offer_lines():
     text = briefing(env, "mayor", mark=False)
     warn, = [ln for ln in text.splitlines() if "WARNING" in ln]
     assert f"{C.BANKRUPTCY_MONTHS} = bankruptcy" in warn and f"{C.RECALL_MONTHS} = recall" in warn
-    assert f"{100 * C.RECALL_APPROVAL:.0f}%" in warn and "3 month" in warn
+    assert f"{100 * C.RECALL_APPROVAL:.0f}%" in warn and "treasury 3 months (" in warn and "% 2 months (" in warn
+    w.months_negative, w.low_approval_months = 1, 0
+    warn, = [ln for ln in briefing(env, "mayor", mark=False).splitlines() if "WARNING" in ln]
+    assert "negative treasury 1 month (" in warn and "% 0 months (" in warn
     offer, = [ln for ln in text.splitlines() if "OPEN OFFER #7" in ln]
     assert "250 jobs" in offer and "$8,000" in offer and "accept_offer" in offer and "month 5" in offer
 

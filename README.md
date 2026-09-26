@@ -431,10 +431,16 @@ tasks and money, and to let people coach it.
   doesn't change, so the mayor acts first each month.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
   The mayor's briefing covers the city, the finances, each department's funds, target
-  (`funds $0 < target $2,500` when it still needs funding) and latest report, and the plan. A department's briefing covers its plan slice, its budget,
-  its key metrics, a "since your last turn" digest (failed actions, events, new messages)
-  and its memory. Both have a short map block (size, highway entry, river columns, the
-  extent of the connected roads and the built-up area) and end with the next milestone. Actions run immediately and return
+  (`funds $0 < target $2,500` when it still needs funding) and latest report, a line with
+  the total funding gap (ending in `allocate_budget`, or in "hold" when the treasury is at
+  or under the reserve), and the plan. A department's briefing covers its plan slice, its
+  budget, its key metrics, a "since your last turn" digest (failed actions, events, and the
+  newest council messages addressed to it or to `all`, quoted with sender and month), a
+  Ready sites block (one line per `find_sites` purpose: the count and best site, or why
+  there is none, e.g. locked, no connected road reaches the river, or the riverbank beside
+  the roads is taken) and its memory. Both have a short Map block (size, highway entry,
+  river columns by row band, the extent of the connected roads and the built-up area) and
+  end with the next milestone. Actions run immediately and return
   `ok`, a message, the cost and the money left, so a failed action can be fixed in the
   same turn. Bad arguments, unknown tools and refused actions come back as
   `{"ok": false, "error": ...}` for the model to correct.
@@ -442,7 +448,7 @@ tasks and money, and to let people coach it.
 | tools | |
 |---|---|
 | look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
-| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
+| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
 **Three memory layers.** Nothing else carries over between turns.
@@ -558,8 +564,18 @@ reached 1.0k–1.7k residents and a city score of 40.6–43.5. A final run (v5) 
 committed code reached 2,244 residents and 43.1: 13.8 tool calls and 53k prompt / 4.7k
 completion tokens per turn, 24% of actions failed, 7 of 32 turns ended on the step limit.
 The scripted baseline on the same settings (`act_every = 3`) reaches 468 residents and
-43.8, or 916 and 45.4 acting monthly. Twelve months is too short to compare with the
-120-month benchmark, and single runs vary a lot.
+43.8, or 916 and 45.4 acting monthly (seed 1: 384 and 36.2).
+
+**v6** (2026-09-26, after the briefing blocks, `map_overview`, repeats, the mayor's
+`find_sites` and the playbooks above; two seeds run in parallel, 15–16 minutes each):
+seed 0 reached 1,848 residents and a city score of 45.1, seed 1 2,756 and 46.6. Sewage was
+built on month 0 in both (v5 never built it), the mayor funded the plan in its first turn,
+and planning freed a riverbank lot when asked. Turns averaged 14.6–14.7 tool calls and
+68–71k prompt / 5–6k completion tokens (up from 53k / 4.7k: agents call `map_overview`
+most turns, the mayor calls `find_sites` about 5 times a turn and `inspect` use rose);
+19–27% of actions failed and 6–7 of 32 turns ended on the step limit, about as in v5.
+Twelve months is too short to compare with the 120-month benchmark, and single runs vary
+a lot (the two v6 seeds differ by 900 residents).
 
 **Not built yet:**
 

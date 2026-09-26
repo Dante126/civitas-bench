@@ -28,5 +28,9 @@ def pct(v) -> str:
     return "n/a" if v is None else f"{v:.0f}%" if abs(v) >= 10 or v == 0 else f"{v:.1f}%"
 
 
+def months(n: int) -> str:
+    return f"{n} month" + ("" if n == 1 else "s")
+
+
 def signed(v, fmt=num) -> str:
     return ("+" if v >= 0 else "-") + fmt(abs(v))
