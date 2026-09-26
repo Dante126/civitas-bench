@@ -362,7 +362,7 @@ def _bridge_and_take_the_bank(env):
     w.dept_funds["planning"] = 5000
     assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
     assert (w.terrain[24, 26:29] == C.WATER).all() and (w.terrain[24, [25, 29]] == C.LAND).all()
-    road, water = _connected_roads(w), w.terrain == C.WATER
+    road = _connected_roads(w)
     taken = []
     for y, x in zip(*np.nonzero((w.struct == C.NONE) & (w.terrain == C.LAND))):
         near_road = road[max(0, y - 1):y + 2, max(0, x - 1):x + 2].any()
@@ -401,6 +401,57 @@ def test_riverbank_note_says_the_bank_beside_the_road_is_taken():
     assert [(s["x"], s["y"]) for s in res["sites"]] == [(x, y)] and "note" not in res
     res = box.call("find_sites", {"purpose": "riverbank_2x2"})    # one free tile is no 2x2 block
     assert res["sites"] == [] and "2x2" in res["note"] and "taken" not in res["note"], res
+
+
+def test_scarce_riverbank_lots_are_marked_for_pump_and_sewage():
+    from civitas.fleet.tools import SiteList, ready_lines, scarce_bank
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    assert scarce_bank(w) == set()                       # no free bank lot at all
+    for x, y in taken[:2]:
+        w.struct[y, x] = C.NONE
+    w.refresh()
+    assert scarce_bank(w) == set(taken[:2])
+    x, y = taken[2]
+    w.struct[y, x] = C.NONE
+    w.refresh()
+    assert scarce_bank(w) == set()                       # three free lots: plenty
+    bank, dry = {"x": 5, "y": 6, "homes_within_5": 0}, {"x": 9, "y": 9, "homes_within_5": 1}
+    lists = {"coal_or_gas": SiteList([bank, dry], None, None), "near_homes": SiteList([bank, dry], None, None),
+             "pump": SiteList([{"x": 5, "y": 6, "pollution": 0.1}], None, None)}
+    lines = ready_lines("utilities", lists, {(5, 6)})
+    assert lines == ["- coal_or_gas: 2 sites, best (5,6), 0 homes within 5 (riverbank: keep for pump/sewage)",
+                     "- near_homes: 2 sites, best as coal_or_gas; next (9,9), 1 homes within 5",
+                     "- pump: 1 site, same site as coal_or_gas"]
+    assert "riverbank" not in ready_lines("utilities", lists)[0]
+    assert ready_lines("health", {"landfill": SiteList([{"x": 5, "y": 6, "need": 3}], None, None)}, {(5, 6)}) == [
+        "- landfill: 1 site, best (5,6), need 3 (riverbank: keep for pump/sewage)"]
+    assert ready_lines("transport", {"harbour": SiteList([{"x": 5, "y": 6}], None, None)}, {(5, 6)}) == [
+        "- harbour: 1 site, best (5,6)"]                  # a harbour belongs on the river
+
+
+def test_sites_away_from_homes_say_when_every_roadside_lot_is_near_homes():
+    from civitas.fleet.tools import _connected_roads, _touching, _why_empty
+    env = _env()
+    w = env.world
+    assert ToolBox(env, "health").call("find_sites", {"purpose": "landfill"})["sites"]
+    free = (w.struct == C.NONE) & (w.terrain == C.LAND)
+    w.struct[free & ~_touching(_connected_roads(w))] = C.RES        # homes behind every roadside lot
+    w.refresh()
+    box = ToolBox(env, "health")
+    for purpose in ("landfill", "cemetery"):
+        res = box.call("find_sites", {"purpose": purpose})
+        note = res["note"]
+        assert res["sites"] == [] and "3 or more homes within 4 tiles" in note and "edge of town" in note, note
+        assert "nothing needs" not in note and f"a {purpose} must stay away" in note
+    lines = [ln for ln in _ready_sites(briefing(env, "health", mark=False)) if ln.startswith(("- landfill", "- cem"))]
+    assert len(lines) == 2
+    for line in lines:
+        assert "away from homes" in line and "town edge" in line and len(line) <= 110, line
+    short, note = _why_empty(w, "police", "jail")
+    assert "away from homes" in short and "a jail must stay away" in note
+    assert _why_empty(w, "health", "clinic")[0] == "nothing needs it right now"     # other purposes: unchanged
 
 
 def _isolated_riverside_road(w):
@@ -1170,8 +1221,10 @@ def test_briefing_lists_new_council_messages_for_this_role():
     msgs = text[text.index("new council messages"):].split("\n\n")[0]
     assert [f"REQ-{i}" in msgs for i in range(6)] == [False] + [True] * 5
     assert "TO-PLANNING" not in msgs and "(3 older: get_messages)" in msgs
-    env.cfg.council_window = 0                                              # the older ones are out of get_messages' reach
-    assert f"(3 older; get_messages shows only the latest {MAX_ENTRIES})" in briefing(env, "planning", mark=False)
+    env.cfg.council_window = 0                             # two of the older ones (month 0) are out of the window
+    assert "(3 older, 2 of them beyond get_messages' 0-month window)" in briefing(env, "planning", mark=False)
+    env.world.month = 2
+    assert "(3 older, beyond get_messages' 0-month window)" in briefing(env, "planning", mark=False)
     assert "- m1 health -> all: REQ-5" in briefing(env, "mayor", mark=False)
 
 

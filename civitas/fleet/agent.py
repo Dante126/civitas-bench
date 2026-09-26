@@ -111,7 +111,7 @@ def _slim(res: dict) -> dict:
 def _budget(res: dict, left: int) -> dict:
     """The result with the tool calls left this turn, and a wrap-up note when few are."""
     out = {**res, "steps_left": left}
-    if left == 0:
+    if left == 0:                # trace-only: the loop stops here, so the model never reads it (the log does)
         out["wrap_up"] = "no tool calls left: the turn ends now without a report; completed actions stay"
     elif left == 1:
         out["wrap_up"] = "1 tool call left: call end_turn with your report now"

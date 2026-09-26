@@ -18,7 +18,7 @@ from typing import Callable, NamedTuple
 import numpy as np
 
 from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, action_docs, apply_action
-from ..core.observation import MAP_LEGEND, build_observation
+from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import shift
@@ -60,7 +60,8 @@ SITE_PURPOSES = {
              "levee": ("fire", "levee_lines")},
     "health": {"clinic": ("health", "clinic_sites"), "hospital": ("health", "hospital_sites"),
                "landfill": ("health", "landfill_sites"),
-               # a cemetery serves the whole city (no radius): any roadside lot away from homes will do
+               # a cemetery serves the whole city (no radius), so it reuses the landfill list: roadside lots away
+               # from homes, ranked by uncovered garbage nearby (which doesn't matter for a cemetery)
                "cemetery": ("health", "landfill_sites")},
     "education": {"school": ("education", "school_sites"), "high_school": ("education", "high_school_sites"),
                   "university": ("education", "university_sites")},
@@ -77,6 +78,11 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
+RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
+SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
+# purposes whose lists skip lots with 3+ homes within 4 tiles (observation._far_from_homes): never empty for lack
+# of need (the landfill ranking adds 0.01 everywhere, the jail's is flat), only for lack of such a lot
+AWAY_FROM_HOMES = {"jail", "landfill", "cemetery"}
 # the best site's most useful field for the briefing's Ready sites line, first match wins
 SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("need", "need {}"),
                ("opens_land", "opens {} land tiles"), ("load_vs_capacity", "load {}x capacity"), ("tiles", "{} tiles"),
@@ -275,9 +281,13 @@ def _empty_land(w) -> np.ndarray:
     return (w.struct == C.NONE) & (w.terrain == C.LAND)
 
 
-def _free_roadside(w) -> int:
+def _roadside(w) -> np.ndarray:
     """Empty land tiles touching a highway-connected road: where a new building could go."""
-    return int((_touching(_connected_roads(w)) & _empty_land(w)).sum())
+    return _touching(_connected_roads(w)) & _empty_land(w)
+
+
+def _free_roadside(w) -> int:
+    return int(_roadside(w).sum())
 
 
 def _riverbank_by_roads(w) -> tuple[np.ndarray, list[tuple[int, int]]]:
@@ -533,8 +543,8 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
 
 def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
     """(short, full): why a site list is empty and what to do: no free roadside land (roads must grow), no road
-    at the river or its bank lots taken, or nothing needs the building yet (the lists only rank spots near
-    uncovered homes / jobs)."""
+    at the river or its bank lots taken, no free roadside lot away from homes (AWAY_FROM_HOMES purposes), or
+    nothing needs the building yet (the lists only rank spots near uncovered homes / jobs)."""
     roads = lambda: _roads_text(_roads(w))
     if purpose == "road_extension":
         return ("no straight extension from a dead end: build_road from any road into free land",
@@ -571,6 +581,11 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
         return ("no free roadside land: ask planning for a lot",
                 f"no free land next to a highway-connected road ({roads()}); ask planning (send_message) to extend a "
                 "road or leave an empty lot by one")
+    if purpose in AWAY_FROM_HOMES and not (_roadside(w) & ~_far_from_homes(w)).any():
+        return ("no roadside lot away from homes (3+ within 4 tiles): ask planning for one at the town edge",
+                f"all {free} free roadside tiles have 3 or more homes within 4 tiles, and a {purpose} must stay away "
+                "from homes; ask planning (send_message) to leave an empty lot by a road at the edge of town, away "
+                f"from the houses, or to extend a road into open land ({roads()})")
     return ("nothing needs it right now",
             f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
             "(check coverage in city_overview / my_facilities before building)")
@@ -591,11 +606,26 @@ def _extra(purpose: str, s: dict) -> str:
     return ""
 
 
-def ready_lines(role: str, lists: dict[str, SiteList]) -> list[str]:
+def scarce_bank(w) -> set[tuple[int, int]]:
+    """The free riverbank lots beside highway-connected roads (where a pump or outlet can go) when there are at most
+    SCARCE_BANK of them, else none: the Ready sites line of another purpose whose site is one of them says to keep
+    it for pump / sewage."""
+    lots = _riverbank_by_roads(w)[0] & _empty_land(w)
+    ys, xs = np.nonzero(lots)
+    return {(int(x), int(y)) for y, x in zip(ys, xs)} if len(xs) <= SCARCE_BANK else set()
+
+
+def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset()) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
-    zone types rank the same strip first); a purpose reading another's list says so."""
+    zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
+    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
+
+    def site(purpose: str, s: dict) -> str:
+        bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
+        return _where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+
     for purpose, lst in lists.items():
         head = f"- {purpose}: "
         path = SITE_PURPOSES[role][purpose]
@@ -611,14 +641,14 @@ def ready_lines(role: str, lists: dict[str, SiteList]) -> list[str]:
         best, first = sites[0], shown.get(_where(sites[0]))
         if first is None:
             shown[_where(best)] = purpose
-            lines.append(head + f"best {_where(best)}{_extra(purpose, best)}")
+            lines.append(head + f"best {site(purpose, best)}")
             continue
         nxt = next((t for t in sites[1:] if _where(t) not in shown), None)
         if nxt is None:
             lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}")
         else:
             shown[_where(nxt)] = purpose
-            lines.append(head + f"best as {first}; next {_where(nxt)}{_extra(purpose, nxt)}")
+            lines.append(head + f"best as {first}; next {site(purpose, nxt)}")
     return lines
 
 
@@ -769,16 +799,19 @@ class ToolBox:
             purposes = [f"{d}.{p}" for d in DEPARTMENTS if d in self.env.roles for p in SITE_PURPOSES[d]]
             what = ("Check which sites a department has (read-only), e.g. before believing \"no sites\": the list "
                     "the department's own find_sites returns for <department>.<purpose>, up to "
-                    f"{MAX_SITES} ranked sites (crowded spots last) or a note saying why there are none")
+                    f"{MAX_SITES} ranked sites (crowded spots last; sorted by distance to (near_x, near_y) when "
+                    "given), or a note saying why there are none.")
         else:
             purposes = list(SITE_PURPOSES[self.role])
-            what = f"Up to {MAX_SITES} suggested sites for a purpose (ranked; crowded spots last)"
+            what = (f"Up to {MAX_SITES} suggested sites for a purpose (ranked; crowded spots last), sorted by distance "
+                    "to (near_x, near_y) when given.")
         tools = [
             Tool("city_overview", "Headline numbers: population, happiness, jobs, money, taxes, demand, utilities "
                  "supply vs demand, service coverage, scores and the change over the last 3 months.",
                  self.city_overview),
             Tool("map_overview", "The whole city as an ASCII map with rulers and a legend, plus where the "
-                 "highway, river, roads and built-up area are. Use it once to orient yourself; inspect for details.",
+                 "highway, river, roads and built-up area are. The Map block in your briefing usually suffices: call "
+                 "this only when you need tile-level layout, at most once per turn; inspect for details.",
                  self.map_overview),
             Tool("inspect", f"Look at the map around (x, y) within `radius` tiles (0-{MAX_RADIUS}, default 2): every "
                  "non-empty tile with what is there (zone letter + level such as R3, a building's tier name, road, "
@@ -807,8 +840,7 @@ class ToolBox:
         ]
         if purposes:
             tools.insert(3, Tool(
-                "find_sites", what + ", sorted by distance to (near_x, near_y) when given. Rectangles and lines "
-                "also carry x1, y1, x2, y2.",
+                "find_sites", what + " Rectangles and lines also carry x1, y1, x2, y2.",
                 self.find_sites, {"purpose": {"type": "string", "enum": purposes},
                                   "near_x": {"type": "integer"}, "near_y": {"type": "integer"}}, ("purpose",)))
         return tools

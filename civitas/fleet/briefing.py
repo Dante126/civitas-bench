@@ -20,7 +20,7 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
-    ready_lines, site_lists
+    ready_lines, scarce_bank, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -145,13 +145,26 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     L.append("- new council messages (newest last):" if msgs else "- no new council messages")
     older = msgs[:-MAX_MESSAGES]
     if older:
-        reach = (len(older) <= MAX_ENTRIES - MAX_MESSAGES
-                 and older[0]["month"] >= w.month - env.cfg.council_window)     # what get_messages returns
-        L.append(f"  - ({len(older)} older" + (": get_messages)" if reach else
-                                                f"; get_messages shows only the latest {MAX_ENTRIES})"))
+        L.append(f"  - ({len(older)} older{_older_reach(env, role, older)})")
     L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] == role else m['to']}: "
              f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
     return L
+
+
+def _older_reach(env, role: str, older: list[dict]) -> str:
+    """How the briefing's older new messages can be read: get_messages returns the newest MAX_ENTRIES messages
+    visible within the council window (ToolBox.get_messages), so some may be past its cap or its window."""
+    window = env.cfg.council_window
+    since = env.world.month - window
+    key = lambda m: (m["month"], m["sender"], m["to"], m["text"])
+    got = {key(env._local(m)) for m in env.council.visible_to(env._name(role), since_month=since)[-MAX_ENTRIES:]}
+    missing = [m for m in older if key(m) not in got]
+    if not missing:
+        return ": get_messages"
+    if any(m["month"] >= since for m in missing):        # in the window but past the cap
+        return f"; get_messages shows only the latest {MAX_ENTRIES}"
+    beyond = "beyond" if len(missing) == len(older) else f"{len(missing)} of them beyond"
+    return f", {beyond} get_messages' {window}-month window"
 
 
 def _map(w) -> list[str]:
@@ -161,7 +174,7 @@ def _map(w) -> list[str]:
 def _ready_sites(w, role: str, obs: dict) -> list[str]:
     """One line per find_sites purpose (count and best site, or why there is none), so agents don't re-run
     find_sites for every purpose each turn."""
-    return (["## Ready sites"] + ready_lines(role, site_lists(w, role, obs))
+    return (["## Ready sites"] + ready_lines(role, site_lists(w, role, obs), scarce_bank(w))
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
@@ -289,7 +302,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     return L + [""] + _map(w) + [""] + _ready_sites(w, role, obs) + [""] + _memory(fleet, role)
 
 
-def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: int = 1,
+def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,
                   max_actions: int | None = None, target_pop: int | None = None) -> str:
     """Fixed "how to play" rules, the role's mission and the game rules, then the coach's playbooks (fleet, then
     the role's; empty ones left out). Callers pass `act_every=env.cfg.act_every`,
@@ -311,7 +324,7 @@ def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: i
                  coords="" if role == "mayor" else " Coordinates: x = column (0 = west), y = row (0 = north).",
                  max_steps=cfg.max_steps, actions=cap + " (look-ups still work; call end_turn)."),
              f"# Your role: {spec['title']}\n{spec['mission']}",
-             "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=months,
+             "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=total_months,
                                              target_pop=target_pop or ScoringConfig.target_population).rstrip()]
     books = [(h, b.strip()) for h, b in (("Fleet", cfg.fleet_playbook), (spec["title"], cfg.playbook)) if b.strip()]
     if books:

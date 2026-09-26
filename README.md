@@ -437,8 +437,10 @@ tasks and money, and to let people coach it.
   budget, its key metrics, a "since your last turn" digest (failed actions, events, and the
   newest council messages addressed to it or to `all`, quoted with sender and month), a
   Ready sites block (one line per `find_sites` purpose: the count and best site, or why
-  there is none, e.g. locked, no connected road reaches the river, or the riverbank beside
-  the roads is taken) and its memory. Both have a short Map block (size, highway entry,
+  there is none, e.g. locked, no connected road reaches the river, the riverbank beside
+  the roads is taken, or no roadside lot is away from homes for a landfill, cemetery or
+  jail; a site on one of the last two free riverbank lots is marked to keep for a pump or
+  sewage outlet) and its memory. Both have a short Map block (size, highway entry,
   river columns by row band, the extent of the connected roads and the built-up area) and
   end with the next milestone. Actions run immediately and return
   `ok`, a message, the cost and the money left, so a failed action can be fixed in the
@@ -473,8 +475,8 @@ trinity-large-thinking sometimes does) still run, and the trajectory counts them
 `recovered_calls`.
 On a limit or an API error the turn ends, and completed actions stay. Every turn records
 why it ended: `end_turn`, `max_steps`, `turn_tokens`, `no_tool_calls` or `api_error`.
-Every tool result except `end_turn`'s carries `steps_left`, plus a `wrap_up` note once 3 or
-fewer calls are left. Within a turn, an identical repeat of a look-up (same tool, same
+Every tool result carries `steps_left` (except `end_turn`'s and the "not run" ones for calls
+after `end_turn` or past the limit), plus a `wrap_up` note once 3 or fewer calls are left. Within a turn, an identical repeat of a look-up (same tool, same
 arguments after type coercion) returns the earlier result marked `repeat`, and an identical
 repeat of an action that failed is refused without running (`refused: "repeat"`, not charged
 as an invalid action), until the agent's next successful action. A successful `update_plan`
@@ -485,6 +487,8 @@ of repeat still count as tool calls.
 role's mission and the game rules. Then comes the coach's playbook: the fleet playbook
 (`[fleet].playbook`, shared by every role) and the role's own (`[agents.<role>].playbook`).
 Coaches can steer strategy this way but can't change the rules or the tools.
+The "hold" advice follows a reserve rule that lives in code (`fleet/tools.py:reserve`): a coach
+who changes the mayor playbook's reserve rule must change it there too.
 `civitas prompt -c configs/fleet_trinity.toml --role planning` prints a fleet agent's
 system prompt, its first briefing and its tool names.
 
