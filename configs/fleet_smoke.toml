@@ -167,6 +167,6 @@ kind = "fleet"
 playbook = """
 - An elementary school ($2,500) once children live in the city and enrolment is below 90% (find_sites school); \
 upgrade a full school rather than building next to it.
-- From 1k: a high school when teens go unenrolled, and a library. From 5k: a university.
+- From 1k: a high school when teens go unenrolled, and a library (find_sites library). From 5k: a university.
 - Graduates fill office and skilled jobs: tell planning when the high-school share rises so it can zone offices.
 """
