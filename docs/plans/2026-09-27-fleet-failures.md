@@ -84,3 +84,15 @@ Checkpoint after each task: `pytest -q -m "not slow"` (276 passed at the start).
 6. **Docs and smoke run v9.** Update the README "Agent fleets" section and the CLAUDE.md fleet paragraph where
    behaviour changed. Run live v9 on seeds 0 and 1 (trinity-large-thinking) and compare with v8: failed-action
    rate, idle-turn prompt tokens, population and score. Write the results into the README smoke paragraph.
+7. **After smoke v9.**
+   - Evidence: in both seeds the mayor's needs line named the cheapest building, "needs $1,500 for a shelter", and the
+     mayor gave fire $1,500. In seed 1 it also wrote "Build first shelter" into fire's priority. Fire never reached the
+     $2,500 station: 0% coverage and a fire score of 31.4.
+     - Fix: add `shelter` and `cemetery` to `SUPPLEMENTARY`, beside `library`. A department's first build is never
+       one of them: the playbooks put the station first, and landfill and clinic before the cemetery.
+   - Evidence: seed 0's planning lost its whole month-0 turn. Two replies in a row were cut at max_tokens (16k) while
+     still reasoning. The loop's single generic nudge was spent after the first cut, and the turn ended with 0 tool
+     calls.
+     - Fix (`fleet/agent.py`): a reply cut by length with no tool call gets its own nudge ("keep your reasoning short;
+       call a tool now"), up to 2 per turn and within `turn_tokens`, separate from the one generic nudge.
+   - Then run smoke v10 on both seeds.
