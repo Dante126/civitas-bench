@@ -10,17 +10,17 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 
 from ..agents.prompts import GAME_RULES
 from ..bench.scoring import ScoringConfig
-from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, build_cost, cheapest_ready, funding_gaps, map_facts, \
-    map_lines, overview, plan_slice, ready_lines, scarce_bank, site_lists
+from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, cheapest, funding_gaps, map_facts, map_lines, \
+    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -171,11 +171,10 @@ def _map(w) -> list[str]:
     return ["## Map"] + map_lines(map_facts(w))
 
 
-def _ready_sites(w, role: str, lists: dict, funds: float) -> list[str]:
+def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
     find_sites for every purpose each turn."""
-    costs = {p: build_cost(w, role, p) for p in lists}
-    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), costs, funds)
+    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds)
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
@@ -189,13 +188,14 @@ def _needs(env, dept: str) -> str:
     dearest priced purpose (else no ready build can be out of reach)."""
     w = env.world
     funds = w.dept_funds[dept]
-    if funds >= max((c for p in SITE_PURPOSES[dept] if (c := build_cost(w, dept, p)) is not None), default=0):
+    if not short_of(funds, max((pr.cost for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))), default=0)):
         return ""
-    obs = build_observation(w, dept, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
-                            include_map=False, site_hints=True)
-    low = cheapest_ready(w, dept, site_lists(w, dept, obs))
-    return (f"; needs {money(low.cost)} for {_a(low.building)} ({low.sites} ready site{'s' * (low.sites != 1)})"
-            if low and funds < low.cost else "")
+    lists = site_lists(w, dept, role_obs(env, dept))
+    purpose, low = cheapest(ready_prices(w, dept, lists)) or (None, None)
+    if low is None or not short_of(funds, low.cost):
+        return ""
+    n = len(lists[purpose].sites[:MAX_SITES])
+    return f"; needs {money(low.cost)} for {_a(low.building)} ({n} ready site{'s' * (n != 1)})"
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -272,7 +272,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     L += ["", "## Departments"
           + (" (cut reports: history kind=report)" if clipped else "")]
     for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(w.dept_funds[d])}"
+        L.append(f"- {d}: funds {money(math.floor(w.dept_funds[d]))}"
                  + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
                  + _needs(env, d) + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
@@ -312,20 +312,21 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
             L.append(f"- mayor's notes: {cut(p['notes'], 200)}")
     spent = w.history[-1]["dept_spent"].get(dept, 0) if w.history else 0
     funds = w.dept_funds[dept]
-    obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
-                            include_map=False, site_hints=True)          # the one build: metrics and ready sites
+    obs = role_obs(env, role)             # the one build: metrics and ready sites
     lists = site_lists(w, role, obs)
+    prices = ready_prices(w, role, lists)
     L += ["", "## Your budget",
-          f"- {money(funds)} in department funds" + (f" (plan target {money(target)})" if target is not None else "")
+          f"- {money(math.floor(funds))} in department funds"      # rounded down, as against a price (short_of)
+          + (f" (plan target {money(target)})" if target is not None else "")
           + f"; spent last month {money(spent)}"]
-    low = cheapest_ready(w, role, lists)
-    if low and funds < low.cost:           # smoke runs: builds tried with $0, stations funded $1,000 of $2,500
-        L.append(f"- You can't pay for any ready site (cheapest: {low.purpose} {money(low.cost)}). Don't call build "
+    purpose, low = cheapest(prices) or (None, None)
+    if low and short_of(funds, low.cost):        # smoke runs: builds tried with $0, stations funded $1,000 of $2,500
+        L.append(f"- You can't pay for any ready site (cheapest: {purpose} {low.text()}). Don't call build "
                  "tools this turn: ask the mayor for the amount with a reason (send_message) unless you already did, "
                  "then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, funds) + [""] + _memory(fleet, role)
+    return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,

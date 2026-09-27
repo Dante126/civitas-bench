@@ -93,8 +93,8 @@ SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("n
 SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
 SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
 # purpose -> the buildings its sites are for (tier names, or TRANSPORT_BUILDS keys): the cheapest unlocked one prices
-# the site (build_cost). Not priced: planning, levees (per tile), bus stops, congested roads
-BUILDS = {
+# the site (site_price). Levees are priced per tile (SITE_TILES); planning, bus stops and congested roads not at all
+SITE_BUILDS = {
     "utilities": {"coal_or_gas": ("coal", "gas"), "wind": ("wind",), "pump": ("pump",), "sewage": ("outlet",),
                   "near_homes": ("tower", "solar", "wind"),
                   "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear")},
@@ -108,6 +108,7 @@ BUILDS = {
 # build actions do (a balance override may replace it)
 TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
                     "metro_station": ("METRO_STATION", "metro")}
+SITE_TILES = {"fire": {"levee": "levee"}}    # purposes priced per tile -> their CATALOG entry (read when priced)
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -574,6 +575,13 @@ class SiteList(NamedTuple):
     note: str | None        # the same in full, with what to do: find_sites' "note"
 
 
+def role_obs(env, role: str, site_hints: bool = True) -> dict:
+    """`role`'s observation for the fleet's look-ups and briefings: no map, council messages or memory; with the
+    site hints site_lists reads unless site_hints=False."""
+    return build_observation(env.world, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
+                             include_map=False, site_hints=site_hints)
+
+
 def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
     """Every find_sites purpose of `role` from one build_observation(..., site_hints=True): the find_sites tool
     and the briefing's Ready sites block both read this, so they can't disagree."""
@@ -680,22 +688,8 @@ def _price(w, name: str) -> float | None:
     return None if spec.get("unlock") and not w.unlocked(spec["unlock"]) else spec["cost"]
 
 
-def _cheapest(w, role: str, purpose: str) -> tuple[float, str] | None:
-    """(cost, name) of the cheapest unlocked building `role`'s `purpose` sites are for (BUILDS); None for purposes
-    without a price or while all of them are locked."""
-    priced = [(c, n) for n in BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
-    return min(priced, key=lambda t: t[0], default=None)
-
-
-def build_cost(w, role: str, purpose: str) -> int | None:
-    """The price of a site on `role`'s find_sites `purpose` list: the cheapest unlocked building the list is for,
-    as its build action charges it. None for purposes without a price or while all of them are locked."""
-    best = _cheapest(w, role, purpose)
-    return None if best is None else round(best[0])
-
-
 def building_name(name: str) -> str:
-    """A BUILDS name for people: a line's base tier by its struct's name (tower -> water tower, outlet -> sewage
+    """A SITE_BUILDS name for people: a line's base tier by its struct's name (tower -> water tower, outlet -> sewage
     outlet), a higher tier by its own (water works: the struct is the line's), transport's as it is."""
     if name in C.TIER_BY_NAME:
         line, tier = C.TIER_BY_NAME[name]
@@ -703,28 +697,57 @@ def building_name(name: str) -> str:
     return name.replace("_", " ")
 
 
-class ReadyBuild(NamedTuple):
-    purpose: str
-    cost: int
-    building: str           # the cheapest building's name (building_name)
-    sites: int              # listed, as the Ready sites line counts them
+class Price(NamedTuple):
+    cost: float             # as the build action charges it, unrounded (one tile for SITE_TILES purposes)
+    building: str           # what it buys, for people (building_name, or "levee tile")
+    per_tile: bool = False
+
+    def text(self) -> str:
+        return money(self.cost) + ("/tile" if self.per_tile else "")
 
 
-def cheapest_ready(w, role: str, lists: dict[str, SiteList]) -> ReadyBuild | None:
-    """The cheapest priced purpose with ready sites (listed and unlocked); None when there is none. Funds below it
-    buy no ready site: the department's budget block and the mayor's Departments block say so."""
-    ready = [ReadyBuild(p, round(b[0]), building_name(b[1]), len(lst.sites[:MAX_SITES])) for p, lst in lists.items()
-             if lst.sites and not lst.short and (b := _cheapest(w, role, p))]
-    return min(ready, key=lambda r: r.cost, default=None)
+def short_of(funds: float, cost: float) -> bool:
+    """`funds` can't pay `cost`, as actions._spend decides (it lets float dust through)."""
+    return funds + 1e-9 < cost
 
 
-def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(), costs: dict | None = None,
-                funds: float | None = None) -> list[str]:
+def site_price(w, role: str, purpose: str) -> Price | None:
+    """What a site on `role`'s find_sites `purpose` list costs: the cheapest unlocked building the list is for
+    (SITE_BUILDS), as its build action charges it, or one tile for purposes priced per tile (SITE_TILES). None for
+    purposes without a price or while all their buildings are locked."""
+    tile = SITE_TILES.get(role, {}).get(purpose)
+    if tile:
+        return Price(C.CATALOG[tile]["cost"], f"{tile} tile", per_tile=True)
+    priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
+    best = min(priced, key=lambda t: t[0], default=None)
+    return None if best is None else Price(best[0], building_name(best[1]))
+
+
+def build_cost(w, role: str, purpose: str) -> int | None:
+    """site_price rounded, for whole buildings: None for purposes priced per tile (levees) or not at all, or while
+    all their buildings are locked."""
+    p = site_price(w, role, purpose)
+    return None if p is None or p.per_tile else round(p.cost)
+
+
+def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
+    """site_price of each of `role`'s priced purposes with ready sites (listed and unlocked): the Ready sites lines
+    end with it, and funds short of the cheapest (cheapest()) buy no ready site."""
+    return {p: pr for p, lst in lists.items() if lst.sites and not lst.short and (pr := site_price(w, role, p))}
+
+
+def cheapest(prices: dict[str, Price]) -> tuple[str, Price] | None:
+    """(purpose, price) of the lowest price, the first on ties; None when there is none."""
+    return min(prices.items(), key=lambda kv: kv[1].cost, default=None)
+
+
+def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
+                prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
     zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
     (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. A line with
-    sites ends with its price (`costs`: purpose -> build_cost), and with `funds` when they are short of it."""
+    sites ends with its price (`prices`: ready_prices), and with `funds` (rounded down) when they are short of it."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
 
     def site(purpose: str, s: dict) -> str:
@@ -732,9 +755,9 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
         return _where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
 
     def price(purpose: str) -> str:
-        c = (costs or {}).get(purpose)
-        return "" if c is None else f"; {money(c)}" + (f" - you have {money(funds)}"
-                                                       if funds is not None and funds < c else "")
+        pr = (prices or {}).get(purpose)
+        return "" if pr is None else f"; {pr.text()}" + (f" - you have {money(math.floor(funds))}"
+                                                         if funds is not None and short_of(funds, pr.cost) else "")
 
     for purpose, lst in lists.items():
         head = f"- {purpose}: "
@@ -1055,9 +1078,7 @@ class ToolBox:
             raise ToolError("give both near_x and near_y, or neither")
         w = self.world
         role, key = purpose.split(".", 1) if self.role == "mayor" else (self.role, purpose)
-        obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
-                                include_map=False, site_hints=True)
-        lst = site_lists(w, role, obs)[key]
+        lst = site_lists(w, role, role_obs(self.env, role))[key]
         sites = lst.sites
         if near_x is not None:
             near = (int(near_x), int(near_y))
@@ -1069,8 +1090,7 @@ class ToolBox:
 
     def my_facilities(self) -> dict:
         w, role = self.world, self.role
-        obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
-                                include_map=False, site_hints=False)
+        obs = role_obs(self.env, role, site_hints=False)
         if role == "mayor":
             return {"ok": True, **{k: obs[k] for k in ("funding_pct", "policies", "service_imports",
                                                        "department_upkeep")}}

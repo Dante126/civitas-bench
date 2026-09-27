@@ -1270,19 +1270,25 @@ def test_build_cost_prices_the_cheapest_unlocked_building(grown_env, open_env):
 
 
 def test_ready_sites_show_the_price_and_what_is_short():
-    from civitas.fleet.tools import SiteList, ready_lines
+    from civitas.fleet.tools import Price, SiteList, ready_lines
     lists = {"clinic": SiteList([{"x": 1, "y": 2, "need": 5}], None, None),
              "hospital": SiteList([{"x": 3, "y": 4}], "locked (unlocks at 5,000 residents)", "locked"),
              "landfill": SiteList([{"x": 5, "y": 6, "need": 3}], None, None),
              "cemetery": SiteList([{"x": 5, "y": 6, "need": 3}], None, None)}
-    costs = {"clinic": 2000, "hospital": 8000, "landfill": 2000, "cemetery": 1500}
-    assert ready_lines("health", lists, costs=costs, funds=1800) == [
+    prices = {"clinic": Price(2000, "clinic"), "hospital": Price(8000, "hospital"), "landfill": Price(2000, "landfill"),
+              "cemetery": Price(1500, "cemetery")}
+    assert ready_lines("health", lists, prices=prices, funds=1800) == [
         "- clinic: 1 site, best (1,2), need 5; $2,000 - you have $1,800",
         "- hospital: locked (unlocks at 5,000 residents)",
         "- landfill: 1 site, best (5,6), need 3; $2,000 - you have $1,800",
         "- cemetery: 1 site, same list as landfill; $1,500"]
-    assert ready_lines("health", lists, costs=costs, funds=2000)[0] == "- clinic: 1 site, best (1,2), need 5; $2,000"
-    assert ready_lines("health", lists, costs={"clinic": None})[0] == "- clinic: 1 site, best (1,2), need 5"
+    clinic = lambda funds: ready_lines("health", lists, prices=prices, funds=funds)[0]
+    assert clinic(2000) == clinic(2000 - 1e-10) == "- clinic: 1 site, best (1,2), need 5; $2,000"   # _spend's tolerance
+    assert clinic(1999.6) == "- clinic: 1 site, best (1,2), need 5; $2,000 - you have $1,999"       # rounded down
+    assert ready_lines("health", lists)[0] == "- clinic: 1 site, best (1,2), need 5"
+    levee = {"levee": SiteList([{"x": 25, "y": 15, "x1": 25, "y1": 15, "x2": 25, "y2": 16, "tiles": 2}], None, None)}
+    assert ready_lines("fire", levee, prices={"levee": Price(300, "levee tile", per_tile=True)}, funds=299) == [
+        "- levee: 1 site, best (25,15)-(25,16), 2 tiles; $300/tile - you have $299"]
 
 
 def _block(text: str, head: str) -> list[str]:
@@ -1309,6 +1315,40 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
     station, jail = _ready_sites(police)[:2]
     assert re.search(r", need [\d,]+; \$2,500$", station) and jail.endswith("; $4,000 - you have $3,000"), police
     assert len(_block(police, "## Your budget")) == 1
+    for funds in (2500, 2500 - 1e-10):                 # exactly the cost, or short by float dust (_spend lets it pass)
+        w.dept_funds["police"] = funds
+        police = briefing(env, "police", mark=False)
+        assert len(_block(police, "## Your budget")) == 1 and _ready_sites(police)[0].endswith("; $2,500"), police
+    w.dept_funds["police"] = 2499.6                    # short: funds shown rounded down, never "$2,500"
+    police = briefing(env, "police", mark=False)
+    assert _block(police, "## Your budget")[0].startswith("- $2,499 in department funds"), police
+    assert "(cheapest: station $2,500)" in police and _ready_sites(police)[0].endswith("; $2,500 - you have $2,499")
+    w.dept_funds["police"] = 2500 - 1e-10
+    s = ToolBox(env, "police").call("find_sites", {"purpose": "station"})["sites"][0]
+    assert apply_action(w, "police", {"type": "build_police_station", "x": s["x"], "y": s["y"]}).ok
+
+
+def test_levees_are_priced_per_tile_in_a_flood(grown_env):
+    from civitas.fleet.tools import build_cost, site_price
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.schedule.append({"kind": "flood", "month": w.month + 2, "duration": 1, "y1": 15, "y2": 32})
+    tile = C.CATALOG["levee"]["cost"]
+    assert build_cost(w, "fire", "levee") is None and site_price(w, "fire", "levee").per_tile      # not a building
+    fire_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- fire:"))
+    w.dept_funds["fire"] = tile                        # one levee tile, less than a shelter
+    fire = briefing(env, "fire", mark=False)
+    levee, = [ln for ln in _ready_sites(fire) if ln.startswith("- levee:")]
+    assert levee.endswith(f"; ${tile:,}/tile") and "can't pay" not in fire, fire
+    assert fire_line() == f"- fire: funds ${tile:,}"
+    w.dept_funds["fire"] = tile - 1
+    fire = briefing(env, "fire", mark=False)
+    levee, = [ln for ln in _ready_sites(fire) if ln.startswith("- levee:")]
+    assert levee.endswith(f"; ${tile:,}/tile - you have ${tile - 1:,}") and f"(cheapest: levee ${tile:,}/tile)" in fire
+    assert fire_line().startswith(f"- fire: funds ${tile - 1:,}; needs ${tile:,} for a levee tile (")
+    s = ToolBox(env, "fire").call("find_sites", {"purpose": "levee"})["sites"][0]
+    res = apply_action(w, "fire", {"type": "build_levee", "x": s["x"], "y": s["y"]})       # a single tile
+    assert not res.ok and res.message.startswith(f"costs ${tile:,} but the fire budget only has ${tile - 1:,}")
 
 
 def test_mayor_briefing_says_what_short_departments_need(grown_env):
@@ -1334,8 +1374,8 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
 
 def test_mayor_names_the_cheapest_building():
     from civitas.fleet.briefing import _a
-    from civitas.fleet.tools import BUILDS, building_name
-    names = {n: _a(building_name(n)) for purposes in BUILDS.values() for ns in purposes.values() for n in ns}
+    from civitas.fleet.tools import SITE_BUILDS, building_name
+    names = {n: _a(building_name(n)) for purposes in SITE_BUILDS.values() for ns in purposes.values() for n in ns}
     assert (names["tower"], names["outlet"], names["coal"], names["pump"]) == (
         "a water tower", "a sewage outlet", "a coal plant", "a water pump")                  # base tiers: struct names
     assert (names["water_works"], names["advanced_treatment"], names["hospital"]) == (
@@ -1346,25 +1386,23 @@ def test_mayor_names_the_cheapest_building():
 
 
 def test_department_briefing_builds_one_observation(monkeypatch):
-    import civitas.fleet.briefing as B
     import civitas.fleet.tools as T
     env = _env()
     calls = []
-    real = B.build_observation
+    real = T.build_observation
 
     def counted(*a, **k):
         calls.append(k.get("site_hints"))
         return real(*a, **k)
-    monkeypatch.setattr(B, "build_observation", counted)
-    monkeypatch.setattr(T, "build_observation", counted)
+    monkeypatch.setattr(T, "build_observation", counted)           # briefings build it through tools.role_obs
     for role in DEPTS:
         calls.clear()
         briefing(env, role, mark=False)
         assert calls == [True], (role, calls)
-    from civitas.fleet.tools import build_cost
     calls.clear()                                      # the mayor: one per department that may lack money for a site
     briefing(env, "mayor", mark=False)
-    assert calls == [True] * sum(any(build_cost(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS) != []
+    n = sum(any(T.site_price(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS)
+    assert n and calls == [True] * n
     env.world.dept_funds.update({d: 50000 for d in DEPTS})
     calls.clear()
     briefing(env, "mayor", mark=False)
