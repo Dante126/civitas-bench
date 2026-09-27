@@ -17,7 +17,8 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _rect, action_docs, apply_action
+from ..core.actions import (MAX_RECT, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _rect, action_docs,
+                            apply_action)
 from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
@@ -32,6 +33,7 @@ MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
+BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
@@ -930,8 +932,11 @@ class ToolBox:
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
         dept = ROLES[self.role]["budget"]
-        msg = res["message"] + (self._bank_warning(bank) if bank is not None and res["ok"] else "")
-        return {"ok": res["ok"], "message": msg, "cost": res["cost"],
+        if res["ok"]:                                     # advice goes to the model only; the log keeps the core text
+            note = self._bank_warning(bank) if bank is not None else ""
+        else:
+            note = self._explain(name, args, res["message"])
+        return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
                 "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
 
     def _disconnect_refusal(self, args: dict) -> str | None:
@@ -969,6 +974,51 @@ class ToolBox:
             return ""
         return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
+
+    def _explain(self, name: str, args: dict, message: str) -> str:
+        """How to fix a failed build_road or zone, appended to the core message in the tool result (v8, seed 0 month
+        0: planning zoned row 23, then ran four roads north through those lots, still empty, told only "occupied by
+        residential" and never that dezoning is free; it also re-built a road twice and zoned high density before
+        'Town'). A blocked road names the empty zoned lots and the buildings on its line, and a dezone for the lots:
+        their bounding box, or the first lot when the box holds a developed zone tile (dezone razes it) or is too big
+        for one action. "" for other failures and bad arguments (the core message says so)."""
+        w = self.world
+        if name == "zone" and message == w.unlock_note("high_density"):
+            return ' - zone with density "low" now'
+        if name != "build_road":
+            return ""
+        if message == "every tile on that line is already road":
+            return f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites road_extension)"
+        if " is occupied by " not in message:
+            return ""
+        try:
+            line = _line(w, args)
+        except Exception:
+            return ""
+        lots, built = [], []
+        for x, y in line:                                 # what build_road can't take, as it walks the line
+            if w.struct[y, x] not in (C.NONE, C.ROAD, C.HIGHWAY):
+                (lots if w.struct[y, x] in C.ZONES and w.level[y, x] == 0 else built).append((x, y))
+        tiles = lambda pts: (", ".join(f"({x},{y})" for x, y in pts[:BLOCKERS_NAMED])
+                             + (f" +{len(pts) - BLOCKERS_NAMED} more" if len(pts) > BLOCKERS_NAMED else ""))
+        s = "s" if len(built) > 1 else ""
+        around = "route around (the Map block has the road extent)"
+        if not lots:
+            return f" - in the way: building{s} {tiles(built)}; {around}"
+        xs, ys = zip(*lots)
+        x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+        box = np.s_[y1:y2 + 1, x1:x2 + 1]
+        whole = w.struct[box].size <= MAX_RECT and not (np.isin(w.struct[box], list(C.ZONES)) & (w.level[box] > 0)).any()
+        if not whole:                                     # dezone razes developed tiles: the first lot alone
+            (x1, y1), (x2, y2) = lots[0], lots[0]
+        who = ("the lots" if built else "them") if len(lots) > 1 else "the lot" if built else "it"
+        rect = f"dezone x1={x1},y1={y1},x2={x2},y2={y2}"
+        fix = (f"dezone {who} first (free): {rect}" if whole else
+               f"dezone {who} first (free) in boxes without buildings (dezone razes them), e.g. {rect}")
+        head = f" - in the way: empty zoned lot{'s' * (len(lots) > 1)} {tiles(lots)}"
+        if not built:
+            return f"{head}; {fix}, then retry"
+        return f"{head} and building{s} {tiles(built)}; {fix}, and route around the building{s}, or just {around}"
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:

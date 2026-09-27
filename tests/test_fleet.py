@@ -1020,6 +1020,115 @@ def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing()
     assert res["ok"] and "WARNING" not in res["message"], res
 
 
+# ------------------------------------------------------------ explained failures
+ROUTE_AROUND = "route around (the Map block has the road extent)"
+
+
+def test_road_through_empty_zoned_lots_says_to_dezone_them_first():
+    """Seed 0, v8 month 0: planning ran the highway road on to x 28, zoned R along row 23 and built roads north
+    through the lots it had just zoned (still empty; dezoning is free), then re-built the row-24 road."""
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    box = ToolBox(env, "planning")
+    row = {"x1": 19, "y1": 24, "x2": 28, "y2": 24}
+    assert box.call("build_road", row)["ok"]
+    res = box.call("build_road", row)
+    assert res["ok"] is False and res["message"] == (
+        "every tile on that line is already road - highway-connected roads: x 0-28, y 24, 29 tiles; start on the road "
+        "and run into free land (find_sites road_extension)"), res
+    assert box.call("zone", {"zone": "R", "x1": 19, "y1": 21, "x2": 28, "y2": 23})["ok"]
+    core = "tile (19,23) is occupied by residential; bulldoze it or route around"
+    road = {"x1": 19, "y1": 24, "x2": 19, "y2": 20}
+    res = box.call("build_road", road)
+    assert res["ok"] is False and res["message"] == res["error"] == (
+        core + " - in the way: empty zoned lots (19,23), (19,22), (19,21); dezone them first (free): "
+        "dezone x1=19,y1=21,x2=19,y2=23, then retry"), res
+    assert box.executed[-1]["message"] == core                    # the log and the trajectories keep the core message
+    assert FleetState.of(env).history(kind="failure", role="planning")[-1]["message"] == core
+    again = box.call("build_road", road)                          # the refused repeat quotes the advice
+    assert again["refused"] == "repeat" and again["error"].startswith(f"this exact call failed at call 4: {core} - ")
+    assert box.call("dezone", {"x1": 19, "y1": 21, "x2": 19, "y2": 23})["message"] == "de-zoned 3 tiles"
+    res = box.call("build_road", road)
+    assert res["ok"] and res["message"] == "built 4 road tiles", res          # a success gets no advice
+    res = box.call("build_road", {"x1": 21, "y1": 24, "x2": 21, "y2": 23})
+    assert res["message"].endswith(" - in the way: empty zoned lot (21,23); dezone it first (free): "
+                                   "dezone x1=21,y1=23,x2=21,y2=23, then retry"), res
+    res = box.call("build_road", {"x1": 20, "y1": 22, "x2": 25, "y2": 22})   # names 3 lots, the box covers all
+    assert res["message"].endswith(" - in the way: empty zoned lots (20,22), (21,22), (22,22) +3 more; dezone them "
+                                   "first (free): dezone x1=20,y1=22,x2=25,y2=22, then retry"), res
+    w.dept_funds["planning"] = 0                                  # other failures are left as they are
+    res = box.call("build_road", {"x1": 19, "y1": 20, "x2": 10, "y2": 20})
+    assert res["message"] == "costs $90 but the planning budget only has $0; ask the mayor for funds", res
+
+
+def test_zoning_high_density_before_town_says_zone_low():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    box = ToolBox(env, "planning")
+    rect = {"x1": 3, "y1": 25, "x2": 8, "y2": 25}
+    res = box.call("zone", {"zone": "R", "density": "high", **rect})
+    assert res["ok"] is False and res["message"] == (
+        "high density unlocks when the city reaches 1,000 residents (milestone 'Town') - zone with density \"low\" now")
+    assert box.executed[-1]["message"] == w.unlock_note("high_density")
+    assert box.call("zone", {"zone": "O", **rect})["message"] == w.unlock_note("office_zone")    # not about density
+    res = box.call("zone", {"zone": "R", "density": "low", **rect})
+    assert res["ok"] and res["message"] == "zoned 6 tiles R (low density)", res
+    assert box.call("zone", {"zone": "C", **rect})["message"] == "no empty land tiles in that area"
+
+
+def _developed_below_free_land(w):
+    """A developed zone tile (x, y) of the grown city with a zoned tile south of it and free land on the 3 x 3 block
+    north of it."""
+    zoned = np.isin(w.struct, list(C.ZONES))
+    free = (w.struct == C.NONE) & (w.terrain == C.LAND)
+    return next((int(x), int(y)) for y, x in zip(*np.nonzero(zoned & (w.level > 0)))
+                if 0 < x < w.w - 1 and 3 <= y < w.h - 1 and free[y - 3:y, x - 1:x + 2].all() and zoned[y + 1, x])
+
+
+def test_road_into_buildings_says_to_route_around_them(grown_env):
+    from civitas.fleet.tools import REPEAT_ERROR_CHARS
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    x, y = _developed_below_free_land(w)
+    box = ToolBox(env, "planning")
+    road = {"x1": x, "y1": y - 3, "x2": x, "y2": y}                # free land, then the building
+    res = box.call("build_road", road)
+    assert res["message"] == (f"tile ({x},{y}) is occupied by {C.STRUCT_NAME[int(w.struct[y, x])]}; bulldoze it or "
+                              f"route around - in the way: building ({x},{y}); {ROUTE_AROUND}"), res
+    assert box.call("zone", {"zone": "R", "x1": x - 1, "y1": y - 2, "x2": x + 1, "y2": y - 1})["ok"]
+    res = box.call("build_road", road)                             # lots, then the building
+    assert res["message"] == (f"tile ({x},{y - 2}) is occupied by residential; bulldoze it or route around - in the "
+                              f"way: empty zoned lots ({x},{y - 2}), ({x},{y - 1}) and building ({x},{y}); dezone the "
+                              f"lots first (free): dezone x1={x},y1={y - 2},x2={x},y2={y - 1}, and route around the "
+                              f"building, or just {ROUTE_AROUND}"), res
+    assert len(res["message"]) < REPEAT_ERROR_CHARS
+    res = box.call("build_road", {"x1": x, "y1": y - 1, "x2": x, "y2": y})
+    assert res["message"].endswith(f" - in the way: empty zoned lot ({x},{y - 1}) and building ({x},{y}); dezone the lot "
+                                   f"first (free): dezone x1={x},y1={y - 1},x2={x},y2={y - 1}, and route around the "
+                                   f"building, or just {ROUTE_AROUND}"), res
+
+
+def test_dezone_advice_keeps_developed_tiles_out_of_the_box(grown_env):
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    x, y = _developed_below_free_land(w)
+    box = ToolBox(env, "planning")
+    south = {"x1": x, "y1": y + 1, "x2": x, "y2": y + 1}
+    assert box.call("dezone", south)["ok"] and box.call("zone", {"zone": "R", **south})["ok"]     # an empty lot
+    assert box.call("zone", {"zone": "R", "x1": x, "y1": y - 2, "x2": x, "y2": y - 1})["ok"]
+    res = box.call("build_road", {"x1": x, "y1": y + 1, "x2": x, "y2": y - 2})    # lot, building, lot, lot
+    first = f"dezone x1={x},y1={y + 1},x2={x},y2={y + 1}"         # the lots' box holds the building: the first lot
+    assert res["message"].endswith(
+        f" - in the way: empty zoned lots ({x},{y + 1}), ({x},{y - 1}), ({x},{y - 2}) and building ({x},{y}); dezone "
+        f"the lots first (free) in boxes without buildings (dezone razes them), e.g. {first}, and route around the "
+        f"building, or just {ROUTE_AROUND}"), res
+    assert box.call("dezone", south)["message"] == "de-zoned 1 tiles" and w.level[y, x] > 0
+
+
 # ---------------------------------------------------------------- briefing
 import copy
 
