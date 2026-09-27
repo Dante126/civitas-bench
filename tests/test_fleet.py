@@ -495,6 +495,53 @@ def test_listed_riverbank_sites_build_on_the_highway_network():
         assert res.ok and "not connected" not in res.message, res.message
 
 
+def test_riverbank_lists_top_up_when_the_hints_name_unconnected_roads():
+    """The observation cuts its riverbank lists to 6 before site_lists drops the sites beside roads off the highway:
+    road stubs along the bank north and south left pump and sewage empty ("all taken") with 8 free lots beside the
+    connected roads."""
+    from civitas.fleet.tools import _site, role_obs
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 50000
+    for road in ({"x1": 19, "y1": 24, "x2": 38, "y2": 24}, {"x1": 20, "y1": 25, "x2": 20, "y2": 34},
+                 {"x1": 21, "y1": 34, "x2": 38, "y2": 34}):          # bridges on rows 24 and 34
+        assert apply_action(w, "planning", {"type": "build_road", **road}).ok
+    lots = {(25, 23), (29, 23), (26, 25), (30, 25), (29, 33), (33, 33), (28, 35), (33, 35)}
+    hints = lambda key: role_obs(env, "utilities")["candidate_sites"][key]
+    where = lambda sites: [(s["x"], s["y"]) for s in sites]
+    find = lambda purpose: ToolBox(env, "utilities").call("find_sites", {"purpose": purpose})
+
+    def stubs(rows):                                     # a road tile two west of the river, off the highway
+        for y in rows:
+            x = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 2
+            assert apply_action(w, "planning", {"type": "build_road", "x1": x, "y1": y, "x2": x, "y2": y}).ok
+
+    for purpose, key in (("pump", "riverbank_next_to_road"), ("sewage", "riverbank_for_sewage")):
+        sites = find(purpose)["sites"]                   # nothing dropped: the hints as they are
+        assert sites == [_site(s) for s in hints(key)] and len(sites) == 6 and set(where(sites)) < lots
+    stubs(range(2))                                      # 3 unconnected lots north: the pump hints' first 3
+    assert where(hints("riverbank_next_to_road"))[:3] == [(30, 0), (30, 1), (30, 2)]
+    assert where(find("pump")["sites"]) == [(25, 23), (29, 23), (26, 25), (30, 25), (29, 33), (33, 33)]
+    assert find("sewage")["sites"] == [_site(s) for s in hints("riverbank_for_sewage")]     # south first: untouched
+    stubs([*range(2, 10), *range(38, 48)])
+    w.river_row[23] = 0.3                                # the river is dirty by row 23, and so is (30,25)
+    w.pollution[25, 30] = 0.12
+    for key in ("riverbank_next_to_road", "riverbank_for_sewage"):
+        assert len(hints(key)) == 6 and not any(w.networks[s["network"]].outside_connected for s in hints(key))
+    pump = find("pump")
+    assert "note" not in pump and where(pump["sites"]) == [(26, 25), (29, 33), (33, 33), (28, 35), (33, 35), (30, 25)]
+    assert [s["pollution"] for s in pump["sites"]] == [0, 0, 0, 0, 0, 0.12]           # cleanest, then north first
+    sewage = find("sewage")["sites"]
+    assert where(sewage) == [(28, 35), (33, 35), (29, 33), (33, 33), (26, 25), (30, 25)]     # south first
+    ready = _ready_sites(briefing(env, "utilities", mark=False))
+    assert next(ln for ln in ready if ln.startswith("- pump:")).startswith("- pump: 6 sites, best (26,25), pollution 0;")
+    assert next(ln for ln in ready if ln.startswith("- sewage:")).startswith("- sewage: 6 sites, best (28,35);")
+    res = apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": 26, "y": 25})
+    assert res.ok and "not connected" not in res.message, res.message
+    res = apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": 28, "y": 35})
+    assert res.ok and "not connected" not in res.message, res.message
+
+
 def test_riverbank_note_when_only_roads_line_the_bank():
     """A road that bridges the river counts as reaching it even when every bank tile beside the connected roads
     is itself road: the note must not send planning after a road that exists."""
@@ -771,6 +818,24 @@ def test_health_finds_cemetery_sites():
     assert "same list as landfill" in line
 
 
+def test_education_finds_library_sites(grown_env):
+    from civitas.fleet.tools import build_cost
+    line = lambda env: next(ln for ln in _ready_sites(briefing(env, "education", mark=False))
+                            if ln.startswith("- library:"))
+    assert line(_env()) == f"- library: locked (unlocks at {C.UNLOCK_POP['library']:,} residents)"
+    env = copy.deepcopy(grown_env)                     # 2,6xx residents: unlocked
+    w = env.world
+    box = ToolBox(env, "education")
+    res = box.call("find_sites", {"purpose": "library"})
+    sites = res["sites"]
+    assert sites and sites == box.call("find_sites", {"purpose": "school"})["sites"] and "note" not in res
+    assert build_cost(w, "education", "library") == C.TIER_LINES["library"][0]["cost"] == 1500
+    w.dept_funds["education"] = 1500
+    assert line(env) == f"- library: {len(sites)} sites, same list as school; $1,500"
+    assert box.call("build_library", {"x": sites[0]["x"], "y": sites[0]["y"]})["ok"]
+    assert w.struct[sites[0]["y"], sites[0]["x"]] == C.LIBRARY and w.dept_funds["education"] == 0
+
+
 def test_update_plan_says_hold_under_the_reserve():
     env = _env()
     from civitas.fleet.fmt import money
@@ -989,6 +1054,72 @@ def test_bulldozing_a_dead_end_or_a_building_is_not_refused():
     assert apply_action(w, "utilities", {"type": "build_power_plant", "kind": "wind", "x": s["x"], "y": s["y"]}).ok
     res = ToolBox(env, "utilities").call("demolish", {"x": s["x"], "y": s["y"]})
     assert res["ok"] and "demolished" in res["message"], res
+
+
+def _linked_road(env, road: dict, action: dict):
+    """An off-highway road (`road`, planning's build_road) that transport links to the region with `action`."""
+    w = env.world
+    w.milestones_on = False
+    w.dept_funds["planning"] = w.dept_funds["transport"] = 100000
+    assert apply_action(w, "planning", {"type": "build_road", **road}).ok
+    x, y = road["x1"], road["y1"]
+    assert not w.networks[w.road_labels[y, x]].outside_connected
+    res = apply_action(w, "transport", action)
+    assert res.ok, res.message
+    assert w.networks[w.road_labels[y, x]].outside_connected
+
+
+def test_demolishing_the_only_rail_link_is_refused_until_confirmed():
+    """A train station, harbour or airport links the roads it touches to the region (World.refresh): demolishing
+    the only link of highway-connected roads cuts them off, as bulldozing the link to the highway does."""
+    from civitas.fleet.report import turn_row
+    env = _env()
+    w = env.world
+    _linked_road(env, {"x1": 10, "y1": 0, "x2": 10, "y2": 5}, {"type": "build_train_station", "x": 11, "y": 0})
+    struct, funds = w.struct.copy(), dict(w.dept_funds)
+    box = ToolBox(env, "transport")
+    for n in (1, 2):                                     # an identical repeat is refused the same way, not as a repeat
+        res = box.call("demolish", {"x": 11, "y": 0})
+        assert res == {"ok": False, "refused": "disconnect", "error": (
+            "this would cut 6 road tiles (e.g. around (10,0)) off the region: the train station is their only link; "
+            "ask planning to connect them to the highway by road first; to do it anyway repeat with confirm: true")}
+        assert box.n_calls == n
+    assert (w.struct == struct).all() and w.dept_funds == funds
+    assert box.executed == [] and box._failed == {} and FleetState.of(env).history(months=12) == []
+    trace = [{"tool": "demolish", "args": {"x": 11, "y": 0}, "result": res}]
+    assert turn_row({"role": "transport", "month": 0, "tool_trace": trace})["refused"] == 1
+    props = lambda role, tool: next(s["function"]["parameters"]["properties"] for s in ToolBox(env, role).schemas()
+                                    if s["function"]["name"] == tool)
+    assert props("transport", "demolish")["confirm"]["type"] == "boolean"
+    assert "demolish" in props("transport", "demolish")["confirm"]["description"]
+    assert "bulldoze" in props("planning", "bulldoze")["confirm"]["description"]
+    for role in ("utilities", "police", "fire", "health", "education", "planning"):    # can't demolish a link
+        assert "confirm" not in props(role, "demolish"), role
+    res = box.call("demolish", {"x": 11, "y": 0, "confirm": "true"})
+    assert res["ok"] and res["message"] == "demolished train_station at (11,0)", res
+    assert box.executed[-1]["action"] == {"x": 11, "y": 0, "type": "demolish"}    # confirm is not an action param
+    assert w.struct[0, 11] == C.NONE and not w.networks[w.road_labels[0, 10]].outside_connected
+
+
+def test_demolishing_an_airport_checks_the_whole_building_and_other_links(monkeypatch):
+    """Any tile of a multi-tile link names the building; a link the roads don't need (another link, the highway)
+    and a demolish of anything else pass without relabelling."""
+    import civitas.fleet.tools as tools
+    env = _env()
+    w = env.world
+    _linked_road(env, {"x1": 40, "y1": 1, "x2": 40, "y2": 8}, {"type": "build_airport", "x": 41, "y": 3})
+    box = ToolBox(env, "transport")
+    res = box.call("demolish", {"x": 43, "y": 5})               # the 3x3 airport's far corner
+    assert res["refused"] == "disconnect" and res["error"].startswith(
+        "this would cut 8 road tiles (e.g. around (40,3)) off the region: the airport is their only link;"), res
+    assert apply_action(w, "transport", {"type": "build_train_station", "x": 40, "y": 0}).ok   # a second link
+    assert box.call("demolish", {"x": 43, "y": 5})["ok"] and w.struct[5, 43] == C.NONE
+    assert apply_action(w, "transport", {"type": "build_train_station", "x": 0, "y": 25}).ok   # beside the highway
+    assert box.call("demolish", {"x": 0, "y": 25})["ok"]
+    assert apply_action(w, "transport", {"type": "build_metro_station", "x": 5, "y": 23}).ok
+    monkeypatch.setattr(tools, "label_components", None)       # a metro station links nothing: no relabelling
+    assert box.call("demolish", {"x": 5, "y": 23})["ok"]
+    assert box.call("demolish", {"x": 30, "y": 30})["message"].startswith("no transport facility at (30,30)")
 
 
 def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing():
@@ -1390,6 +1521,7 @@ BUILD_ACTIONS = {
     ("education", "school"): {"type": "build_school", "kind": "elementary"},
     ("education", "high_school"): {"type": "build_school", "kind": "high"},
     ("education", "university"): {"type": "build_school", "kind": "university"},
+    ("education", "library"): {"type": "build_library"},
 }
 
 
@@ -1535,7 +1667,7 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
     got = lines()                                      # the building, not the find_sites purpose
     assert got["police"] == f"- police: funds $1,000; needs $2,500 for a police station ({n} ready sites)"
     assert got["health"].startswith("- health: funds $0; needs $1,500 for a cemetery (")
-    assert got["education"].startswith("- education: funds $0; needs $2,500 for an elementary school (")
+    assert got["education"].startswith("- education: funds $0; needs $1,500 for a library (")    # < a school
     assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for a water tower (")
     assert got["fire"] == "- fire: funds $5,000"
     assert got["transport"] == "- transport: funds $0" and got["planning"] == "- planning: funds $0"

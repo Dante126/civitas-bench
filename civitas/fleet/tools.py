@@ -17,8 +17,8 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import (POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _rect, action_docs,
-                            apply_action)
+from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _point,
+                            _rect, action_docs, apply_action)
 from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
@@ -41,8 +41,12 @@ RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' 
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
 ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolish takes buildings, never roads)
-CONFIRM_PARAM = {"type": "boolean", "description": "true only to repeat a bulldoze refused for cutting roads off the "
-                 "highway, once you are sure"}
+# buildings that link the road networks they touch to the region, as World.refresh() counts them (metro stations
+# don't) -> their name in a refusal
+LINKS = {C.TRAIN: "train station", C.HARBOUR: "harbour", C.AIRPORT: "airport"}
+LINK_REMOVERS = {r for r, owned in OWNED_STRUCTS.items() if owned & set(LINKS)}   # roles whose demolish takes one
+# guarded action -> what its refusal and confirm parameter say the roads would be cut off from
+CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -70,12 +74,15 @@ SITE_PURPOSES = {
                # from homes, ranked by uncovered garbage nearby (which doesn't matter for a cemetery)
                "cemetery": ("health", "landfill_sites")},
     "education": {"school": ("education", "school_sites"), "high_school": ("education", "high_school_sites"),
-                  "university": ("education", "university_sites")},
+                  "university": ("education", "university_sites"),
+                  # a library speeds up schooling in the homes within its radius, so it reuses the school list:
+                  # roadside lots near homes no school covers yet
+                  "library": ("education", "school_sites")},
 }
 SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": ("casino",),
                 "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear"), "train_station": ("train_station",),
                 "harbour": ("harbour",), "metro_station": ("metro",), "jail": ("jail",), "hospital": ("hospital",),
-                "high_school": ("high_school",), "university": ("university",)}
+                "high_school": ("high_school",), "university": ("university",), "library": ("library",)}
 # purpose -> (short reason for the briefing, full note for find_sites) when its list is empty
 SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 months; riverbank stretches to protect "
                         "appear with a flood warning"),
@@ -84,6 +91,7 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
+BANK_TOP_UP = {"pump": False, "sewage": True}   # one-tile riverbank purposes site_lists tops up -> south first
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
 # purposes whose lists skip lots with 3+ homes within 4 tiles (observation._far_from_homes): never empty for lack
@@ -105,7 +113,8 @@ SITE_BUILDS = {
     "police": {"station": ("police_station",), "jail": ("jail",)},
     "fire": {"station": ("fire_station",), "shelter": ("shelter",)},
     "health": {"clinic": ("clinic",), "hospital": ("hospital",), "landfill": ("landfill",), "cemetery": ("cemetery",)},
-    "education": {"school": ("elementary_school",), "high_school": ("high_school",), "university": ("university",)},
+    "education": {"school": ("elementary_school",), "high_school": ("high_school",), "university": ("university",),
+                  "library": ("library",)},
 }
 # transport buildings outside the tier lines -> (catalog spec, unlock key); the spec is looked up when priced, as the
 # build actions do (a balance override may replace it)
@@ -247,7 +256,8 @@ def _items_schema(example: list) -> dict:
     return {"type": _JSON_TYPE[type(first)]}
 
 
-def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
+def _action_tool(name: str, doc: tuple[str, str], fn: Callable, confirm: bool = False) -> Tool:
+    """The tool for action `name`, with a confirm parameter when the action is guarded for the role (guarded())."""
     example, text = doc
     props = {}
     for k, v in json.loads(example).items():
@@ -258,8 +268,9 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     if name.startswith("build_") and any(len(C.TIER_LINES[ln]) > 1 for ln in lines):
         props["tier"] = dict(_TIER_PARAM)
     props.update(_EXTRA_PARAMS.get(name, {}))
-    if name in ROAD_REMOVERS:
-        props["confirm"] = dict(CONFIRM_PARAM)
+    if confirm:
+        props["confirm"] = {"type": "boolean", "description": f"true only to repeat a {name} refused for cutting "
+                            f"roads off the {CUT_FROM[name]}, once you are sure"}
     return Tool(name, text, fn, props, strict=False)
 
 
@@ -291,11 +302,11 @@ def _connected_roads(w) -> np.ndarray:
     return np.isin(w.road_labels, labels) if labels else np.zeros(w.struct.shape, bool)
 
 
-def _outside_labels(w, labels: np.ndarray) -> set[int]:
+def _outside_labels(w, labels: np.ndarray, drop=frozenset()) -> set[int]:
     """The road components linked to the region, as World.refresh() finds them: those holding a highway tile, and
-    those next to (8-neighbourhood) a train station, harbour or airport."""
+    those next to (8-neighbourhood) a train station, harbour or airport (LINKS) not anchored at a tile in `drop`."""
     out = {int(labels[y, x]) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))} - {-1}
-    for x, y in w.facilities(C.TRAIN) + w.facilities(C.HARBOUR) + w.facilities(C.AIRPORT):
+    for x, y in (a for st in LINKS for a in w.facilities(st) if a not in drop):
         for px, py in w.parts(x, y):
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
@@ -304,18 +315,25 @@ def _outside_labels(w, labels: np.ndarray) -> set[int]:
     return out
 
 
-def cut_off(w, tiles) -> np.ndarray:
-    """The highway-connected road tiles (the removed ones excluded) that removing the road tiles among `tiles` would
-    cut off the highway: the road network relabelled without them as World.refresh() labels it (4-neighbour
-    components, linked by a highway tile or a station / harbour / airport)."""
+def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
+    """The highway-connected road tiles (the removed ones excluded) that removing the road tiles among `tiles`, and
+    the link buildings anchored at the tiles in `drop`, would cut off the region: the road network relabelled
+    without them as World.refresh() labels it (4-neighbour components, linked by a highway tile or a station /
+    harbour / airport)."""
     before = _connected_roads(w)
     gone = np.zeros(before.shape, bool)
     for x, y in tiles:
         gone[y, x] = w.struct[y, x] == C.ROAD
-    if not (gone & before).any():
+    if not (gone & before).any() and not drop:
         return np.zeros_like(before)
     labels, _ = label_components(((w.struct == C.ROAD) | (w.struct == C.HIGHWAY)) & ~gone)
-    return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels)))
+    return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels, drop)))
+
+
+def guarded(role: str, action: str) -> bool:
+    """Whether `role`'s `action` is refused when it would cut roads off (confirm: true lets it run): a bulldoze, and
+    a demolish by a role that can take a train station, harbour or airport (transport; LINK_REMOVERS)."""
+    return action in ROAD_REMOVERS or (action == "demolish" and role in LINK_REMOVERS)
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -599,6 +617,8 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
         for key in path:
             found = found.get(key) if isinstance(found, dict) else None
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
+        if purpose in BANK_TOP_UP and len(sites) < len(found or []):
+            sites += _bank_top_up(w, sites, south_first=BANK_TOP_UP[purpose])
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             key = min(keys, key=C.UNLOCK_POP.get)
@@ -609,6 +629,21 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             short, note = SITE_NOTES.get(purpose) or _why_empty(w, role, purpose)
         out[purpose] = SiteList(sites, short, note)
     return out
+
+
+def _bank_top_up(w, listed: list[dict], south_first: bool) -> list[dict]:
+    """Free riverbank lots beside highway-connected roads (where a pump or outlet can go) not in `listed`, as many as
+    fit in MAX_SITES with it: the observation cuts its riverbank lists to 6 before site_lists drops the sites off
+    the highway network, so off-highway roads by the bank could leave pump and sewage short, or empty ("all
+    taken"), with free lots beside the connected roads. Pumps cleanest then north first, outlets south first (as
+    the observation ranks them, bar crowding and the pump / outlet order); pollution as the observation computes
+    it."""
+    have = {(s["x"], s["y"]) for s in listed}
+    ys, xs = np.nonzero(_riverbank_by_roads(w)[0] & _empty_land(w))
+    more = [{"x": x, "y": y, "pollution": round(max(float(w.pollution[y, x]), w._river_near(x, y)), 2)}
+            for x, y in zip(xs.tolist(), ys.tolist()) if (x, y) not in have]
+    more.sort(key=(lambda s: -s["y"]) if south_first else (lambda s: (s["pollution"], s["y"])))
+    return more[:max(0, MAX_SITES - len(listed))]
 
 
 def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
@@ -817,7 +852,7 @@ class ToolBox:
         docs = action_docs()
         for a in ROLES[role]["actions"]:
             if a != "noop":
-                self.tools[a] = _action_tool(a, docs[a], partial(self._act, a))
+                self.tools[a] = _action_tool(a, docs[a], partial(self._act, a), confirm=guarded(role, a))
 
     # ------------------------------------------------------------ interface
     def schemas(self) -> list[dict]:
@@ -829,8 +864,9 @@ class ToolBox:
         without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
         until something changes: a successful action (or plan update) for look-ups, a successful action for failed
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
-        roads off the highway is refused before it runs ("refused": "disconnect"; not executed, logged or
-        remembered as a failure) unless it passes confirm: true."""
+        roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
+        before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
+        confirm: true."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -951,8 +987,8 @@ class ToolBox:
         t = args.pop("type", None)
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
-        if not args.pop("confirm", False) and name in ROAD_REMOVERS:
-            refusal = self._disconnect_refusal(args)
+        if not args.pop("confirm", False) and guarded(self.role, name):
+            refusal = self._disconnect_refusal(name, args)
             if refusal:
                 return {"ok": False, "refused": "disconnect", "error": refusal}
         bank = self._free_bank() if name == "zone" else None
@@ -968,24 +1004,32 @@ class ToolBox:
         return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
                 "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
 
-    def _disconnect_refusal(self, args: dict) -> str | None:
-        """Why a bulldoze with these arguments must not run: it would cut highway-connected road tiles off the
-        highway (seed 1, v7: planning cleared the 2-tile link to the highway and the city emptied). None when it
+    def _disconnect_refusal(self, name: str, args: dict) -> str | None:
+        """Why a bulldoze or demolish (guarded()) with these arguments must not run: it would cut highway-connected
+        road tiles off the region (seed 1, v7: planning cleared the 2-tile link to the highway and the city emptied;
+        a demolished train station, harbour or airport unlinks the roads it was the only link of). None when it
         wouldn't, or when the arguments are bad (the action reports those)."""
         w = self.world
         try:
-            tiles = _rect(w, args)
+            tiles = _rect(w, args) if name in ROAD_REMOVERS else [_point(w, args)]
         except Exception:
             return None
-        lost = cut_off(w, tiles)
+        if name in ROAD_REMOVERS:
+            lost, gone = cut_off(w, tiles), [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
+            why = "; build a new link first or pick tiles that aren't on the only route"
+        else:
+            (x, y), = tiles
+            link = LINKS.get(int(w.struct[y, x]))
+            if link is None:                              # not a link: nothing to relabel
+                return None
+            lost, gone = cut_off(w, (), drop={w._anchor_of(x, y)}), w.parts(x, y)
+            why = f": the {link} is their only link; ask planning to connect them to the highway by road first"
         if not lost.any():
             return None
         ys, xs = np.nonzero(lost)
-        gone = [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
         return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
-                "highway; build a new link first or pick tiles that aren't on the only route; to do it anyway repeat "
-                "with confirm: true")
+                f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
 
     def _free_bank(self) -> np.ndarray:
         """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
