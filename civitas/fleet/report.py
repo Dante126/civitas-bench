@@ -4,8 +4,8 @@
 `trajectories.jsonl` with `rows_from_trajectories`) and writes `fleet_report.json` / `fleet_report.md`.
 Hint rules: >= 3 failures alike (failed actions and tool errors); funds above max(2x the plan budget, $1,000) for
 3+ consecutive months; 2+ consecutive turns without a successful action spanning 6+ months (a turn with no plan
-budget and funds under $1 all month is blocked, not idle, and splits the run); a negative city treasury; > 20% of
-turns ended on the step or token limit.
+budget and under $1 in funds at the turn is blocked, not idle, and splits the run); a negative city treasury; > 20%
+of turns ended on the step or token limit.
 """
 from __future__ import annotations
 
@@ -159,12 +159,13 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
                                   f"{money(max(e[1] for e in run))}) - have it spend, or lower its allocation"})
     for dept in (d for d in DEPARTMENTS if d in roles):
         # a turn in month t ends in history entry t + 1 (after the mayor's turn, which comes first, and its own). Only
-        # actions move dept funds, so under $1 there after a turn without a success means it had none all month;
-        # with no plan budget either, it was blocked, not idle: such turns split idle runs like successful ones
+        # actions move dept funds, so after a turn without a success the funds there are the funds it had at its turn;
+        # under $1 with no plan budget either, it was blocked, not idle: such turns split idle runs like successful ones
         after = {m["month"] - 1: ((m.get("dept_funds") or {}).get(dept), target(dept, m["month"])) for m in history}
         broke = lambda t: t in after and after[t][0] is not None and after[t][0] < 1
-        turns = sorted((row["month"], any(r["ok"] for r in row["results"])
-                        or (broke(row["month"]) and not after[row["month"]][1])) for row in rows if row["role"] == dept)
+        blocked = lambda t: broke(t) and not after[t][1]
+        turns = sorted((row["month"], any(r["ok"] for r in row["results"]) or blocked(row["month"]))
+                       for row in rows if row["role"] == dept)
         idle = _idle(turns, months)
         if idle:
             n, a, end = idle

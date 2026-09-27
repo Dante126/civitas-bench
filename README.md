@@ -565,7 +565,7 @@ A hint fires on any of these:
 - 3 or more similar failures
 - a department holding more than 2× its plan budget for 3+ months
 - a department with no successful action for 2+ turns spanning 6+ months (a turn with no plan budget and
-  under $1 in funds all month doesn't count: the department was blocked, not idle)
+  under $1 in funds at the turn doesn't count: the department was blocked, not idle)
 - a negative treasury
 - a role ending more than 20% of its turns on a limit
 
