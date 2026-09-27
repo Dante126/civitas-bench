@@ -1776,17 +1776,22 @@ def test_levees_are_priced_per_tile_in_a_flood(grown_env):
     tile = C.CATALOG["levee"]["cost"]
     assert _building_cost(w, "fire", "levee") is None and site_price(w, "fire", "levee").per_tile  # not a building
     fire_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- fire:"))
+    sites = ToolBox(env, "fire").call("find_sites", {"purpose": "levee"})["sites"]
+    s, n = sites[0], sites[0]["tiles"]                 # the mayor's line prices the best run whole
+    assert n > 1
+    needs = f"needs ${n * tile:,} for {n} levee tiles ({len(sites)} ready sites)"
     w.dept_funds["fire"] = tile                        # one levee tile, less than a shelter
     fire = briefing(env, "fire", mark=False)
     levee, = [ln for ln in _ready_sites(fire) if ln.startswith("- levee:")]
-    assert levee.endswith(f"; ${tile:,}/tile") and "can't pay" not in fire, fire
-    assert fire_line() == f"- fire: funds ${tile:,}"
+    assert levee.endswith(f"; ${tile:,}/tile") and "can't pay" not in fire, fire     # one tile is buildable
+    assert fire_line() == f"- fire: funds ${tile:,}; {needs}"       # cheaper than the $2,500 station
+    w.dept_funds["fire"] = n * tile                    # the whole run
+    assert fire_line() == f"- fire: funds ${n * tile:,}"
     w.dept_funds["fire"] = tile - 1
     fire = briefing(env, "fire", mark=False)
     levee, = [ln for ln in _ready_sites(fire) if ln.startswith("- levee:")]
     assert levee.endswith(f"; ${tile:,}/tile - you have ${tile - 1:,}") and f"(cheapest: levee ${tile:,}/tile)" in fire
-    assert fire_line().startswith(f"- fire: funds ${tile - 1:,}; needs ${tile:,} for a levee tile (")
-    s = ToolBox(env, "fire").call("find_sites", {"purpose": "levee"})["sites"][0]
+    assert fire_line() == f"- fire: funds ${tile - 1:,}; {needs}"
     res = apply_action(w, "fire", {"type": "build_levee", "x": s["x"], "y": s["y"]})       # a single tile
     assert not res.ok and res.message.startswith(f"costs ${tile:,} but the fire budget only has ${tile - 1:,}")
 
@@ -1808,9 +1813,48 @@ def test_congested_roads_are_priced_per_avenue_tile(open_env):
     w.dept_funds["transport"] = cost - 1
     res = apply_action(w, "transport", action)
     assert not res.ok and res.message.startswith(f"costs ${cost:,} but the transport budget only has ${cost - 1:,}")
-    w.dept_funds["transport"] = cost
+    fleet_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines()
+                              if ln.startswith("- transport:"))
+    assert fleet_line() == f"- transport: funds ${cost - 1:,}; needs ${cost:,} for 4 avenue tiles (1 ready site)"
+    w.dept_funds["transport"] = cost                   # the whole stretch: cheaper than the $1,500 bus line
+    assert fleet_line() == f"- transport: funds ${cost:,}"
     res = apply_action(w, "transport", action)
     assert res.ok and res.cost == cost and w.dept_funds["transport"] == 0, res.message
+
+
+def test_a_congested_bridge_is_priced_as_upgrade_road_charges():
+    """The mayor's line prices a congested stretch whole: its tiles below avenue class, a bridge tile 3 times (as
+    upgrade_road charges it); the first listed stretch with something to charge (an avenue stretch has nothing)."""
+    from civitas.fleet.tools import best_stretch, site_price, site_tiles
+    env = _env()
+    w = env.world
+    w.milestones_on = False                            # avenues unlocked
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    w.congestion[24, 24:31] = 1.5                      # x 24-30: 4 land tiles and the 3-tile bridge
+    s = ToolBox(env, "transport").call("find_sites", {"purpose": "congested_roads"})["sites"][0]
+    assert (s["x1"], s["x2"], s["y1"]) == (24, 30, 24), s
+    per = site_price(w, "transport", "congested_roads").cost
+    assert site_tiles(w, "congested_roads", s) == (7, 4 + 3 * 3)
+    cost = (4 + 3 * 3) * per
+    mayor = briefing(env, "mayor", mark=False).splitlines()
+    assert next(ln for ln in mayor if ln.startswith("- transport:")) == (
+        f"- transport: funds $0; needs ${cost:,} for 7 avenue tiles (1 ready site)")     # no bus stops yet
+    assert f"(cheapest: congested_roads ${per:,}/tile)" in briefing(env, "transport", mark=False)
+    w.dept_funds["transport"] = cost - 1
+    res = apply_action(w, "transport", {"type": "upgrade_road", "to": "avenue", "x1": 24, "y1": 24, "x2": 30, "y2": 24})
+    assert not res.ok and res.message.startswith(f"costs ${cost:,} but"), res.message
+    w.congestion[24, 5:9] = 1.2                       # a second stretch, x 5-8 on land
+    w.road_class[24, 24:31] = C.ROAD_CLASSES["avenue"]    # the first one avenues already: nothing to charge there
+    sites = ToolBox(env, "transport").call("find_sites", {"purpose": "congested_roads"})["sites"]
+    assert [(t["x1"], t["x2"]) for t in sites] == [(24, 30), (5, 8)], sites
+    assert site_tiles(w, "congested_roads", sites[0]) == (0, 0) and best_stretch(w, "congested_roads", sites) == (4, 4)
+    w.dept_funds["transport"] = 0
+    mayor = briefing(env, "mayor", mark=False).splitlines()
+    assert next(ln for ln in mayor if ln.startswith("- transport:")) == (
+        f"- transport: funds $0; needs ${4 * per:,} for 4 avenue tiles (2 ready sites)")
+    w.road_class[24, 5:9] = C.ROAD_CLASSES["avenue"]      # none left to charge: one tile, as when a site doesn't say
+    assert best_stretch(w, "congested_roads", sites) == (1, 1)
 
 
 def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
@@ -1919,9 +1963,10 @@ def test_department_briefing_builds_one_observation(monkeypatch):
     n = sum(any(T.site_price(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS)
     assert n and calls == [True] * n
     env.world.dept_funds.update({d: 50000 for d in DEPTS})
-    calls.clear()
+    calls.clear()                                      # rich: only where a per-tile stretch has no upper bound (levees)
     briefing(env, "mayor", mark=False)
-    assert calls == []
+    tiles = sum(any((pr := T.site_price(env.world, d, p)) and pr.per_tile for p in SITE_PURPOSES[d]) for d in DEPTS)
+    assert calls == [True] * tiles and tiles == 1
 
 
 def test_mayor_briefing_lists_department_reports():

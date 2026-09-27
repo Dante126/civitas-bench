@@ -127,6 +127,7 @@ OFF_TIER_SPECS = {"train_station": (lambda: C.TRAIN_STATION["cost"], "train_stat
                   "levee_tile": (lambda: C.CATALOG["levee"]["cost"], None),
                   "avenue_tile": (lambda: C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]], "avenue")}
 PER_TILE = {"levee_tile", "avenue_tile"}
+BRIDGE_UPGRADE = 3           # upgrade_road charges a bridge tile this many times a land tile's upgrade
 # priced purposes that are never a department's first build: cheapest() skips them, so the mayor's needs line and the
 # budget line name the primary price (their Ready lines keep theirs; affordable, they still keep the budget line
 # away, which would be false). At $1,500 each they undercut the first build and were named instead. A library only
@@ -786,6 +787,26 @@ def site_price(w, role: str, purpose: str) -> Price | None:
     priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
     best = min(priced, key=lambda t: t[0], default=None)
     return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE)
+
+
+def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
+    """(tiles, charged units) of one site of a per-tile purpose built whole: a congested stretch's roads below avenue
+    class, as upgrade_road charges them (BRIDGE_UPGRADE units on a bridge; none on a stretch of avenues), else the
+    site's "tiles" (a levee run: empty bank land, one unit each), one when it doesn't say."""
+    if purpose == "congested_roads":
+        xs = range(min(site["x1"], site["x2"]), max(site["x1"], site["x2"]) + 1)
+        ys = range(min(site["y1"], site["y2"]), max(site["y1"], site["y2"]) + 1)
+        road = [(x, y) for y in ys for x in xs
+                if w.struct[y, x] == C.ROAD and w.road_class[y, x] < C.ROAD_CLASSES["avenue"]]
+        return len(road), sum(BRIDGE_UPGRADE if w.terrain[y, x] == C.WATER else 1 for x, y in road)
+    n = max(1, int(site.get("tiles", 1)))
+    return n, n
+
+
+def best_stretch(w, purpose: str, sites: list[dict]) -> tuple[int, int]:
+    """site_tiles of the first site with something to charge (the best stretch the avenue price applies to: seed 0's
+    most congested roads were avenues already by month 60); one tile when none has."""
+    return next((t for s in sites if (t := site_tiles(w, purpose, s))[0]), (1, 1))
 
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
