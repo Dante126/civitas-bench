@@ -589,10 +589,21 @@ and planning freed a riverbank lot when asked. Turns averaged 14.6–14.7 tool c
 most turns, the mayor calls `find_sites` about 5 times a turn and `inspect` use rose);
 19–27% of actions failed and 6–7 of 32 turns ended on the step limit, about as in v5.
 Twelve months is too short to compare with the 120-month benchmark, and single runs vary
-a lot (the two v6 seeds differ by 900 residents). Wording changes landed after the v6 runs
-and are untested live: `map_overview` "only when you need tile-level layout (at most once per
-turn)", the mayor's `find_sites` limited to checking "no site" claims (at most 2 per turn),
-"hold" allowing money to be taken back, and the health `cemetery` purpose.
+a lot (the two v6 seeds differ by 900 residents).
+
+**v7** (2026-09-26, after the wording changes: `map_overview` only for tile-level layout,
+the mayor's `find_sites` limited to checking "no site" claims, "hold" allowing money to be
+taken back, the health `cemetery` purpose and the away-from-homes site notes) went badly on
+both seeds: 736 residents / 35.4 and 180 / 22.6. On seed 1 planning bulldozed the two road
+tiles linking the city to the highway (after health asked for a landfill lot "at the town
+edge"), cutting the city off: garbage coverage stayed at 0% and 1,268 residents fell to 180.
+On seed 0 planning zoned both riverbanks on month 0, so utilities never built a pump or
+outlet. The guards above (bulldoze refusal, riverbank warning, unconnected-roads line) came
+from these runs. **v8** (2026-09-27, with the guards) was healthy on both seeds: 2,504
+residents / 46.4 and 1,984 / 45.1, full water and sewage coverage, 11–13 tool calls and
+53–68k prompt tokens per turn, 25–27% of actions failed, 2 of 64 turns on the step limit.
+The guards did not fire in v8, so the recovery from v7 is mostly run-to-run variance; they
+stay as a safety net against the v7 failures.
 
 **Not built yet:**
 
