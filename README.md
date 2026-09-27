@@ -663,6 +663,16 @@ replies get their own nudge) reached 2,076 / 47.5 and 1,028 / 45.6.
   - On seed 1 the mayor gave health $5,000 while education, asking for $2,500 every turn, got nothing.
   - On seed 1 planning spent two turns routing a road through a wind turbine.
 
+**v11** (2026-09-27, after the final review fixes: bus lines and avenue tiles priced;
+train station, harbour and metro never named as the first build; no bus stops before 1,500
+residents) reached 2,008 / 46.1 and 1,916 / 45.4. A first seed-0 attempt stalled on the
+Arcee API and was rerun.
+- **Failed actions:** 15.9% and 17.2%, the lowest so far. There were 2 and 1 funding failures, 44–52k prompt tokens and about 9 calls per turn, and no turn was cut at the token limit.
+- **Funding:** at month 3 the mayor gave police, fire and health enough for a first building.
+- **Transport:** its idle turns took 1–4 calls.
+- **Remaining failures:** mostly planning. Roads along existing roads and zoning taken land. It ended 2–3 of 4 turns on the step limit; on seed 1 every planning action in months 6–9 failed.
+- **Idle departments:** on seed 1 fire, health and education held funds for two turns without building.
+
 **Not built yet:**
 
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
