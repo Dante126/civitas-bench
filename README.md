@@ -637,6 +637,27 @@ residents / 46.4 and 1,984 / 45.1, full water and sewage coverage, 11–13 tool 
 The guards did not fire in v8, so the recovery from v7 is mostly run-to-run variance; they
 stay as a safety net against the v7 failures.
 
+**v9** (2026-09-27, after prices in the briefings, the action-error hints, the
+briefing-first playbook and the idle rule) reached 952 residents / 41.8 on seed 0 and 1,844 /
+45.2 on seed 1.
+- **Funding failures:** "costs $X but the budget only has $Y" fell from 10 and 4 to 1 and 2.
+- **Tokens and calls:** prompt tokens per turn fell from 53–68k to 41–50k, and calls per turn from 11–13 to 7–9.
+- **Idle turns:** their share of prompt tokens fell from 37–48% to 15–30%. Transport's idle hint is gone.
+- **Hints worked:** after each road or zone hint, planning ran the suggested dezone or zoned at low density on its next call.
+- **Two new problems:**
+  - Seed 0's planning lost its whole month-0 turn to two replies cut at `max_tokens` with no tool call.
+  - On both seeds the mayor funded fire's cheapest ready site ("needs $1,500 for a shelter"), so fire never reached a station (seed 1: fire score 31.4).
+
+**v10** (2026-09-27; shelter and cemetery are never named as the first build, and cut
+replies get their own nudge) reached 2,076 / 47.5 and 1,028 / 45.6.
+- **Lost turns:** none. Four turns were cut at the token limit, and all recovered.
+- **Stations:** the mayor funded police and fire with $2,500 each, and both built a station (fire 69.8 and 78.6, up from 53.3 and 31.4).
+- **Tokens and calls:** 41–57k prompt tokens and 7–10 calls per turn.
+- **Failed actions: still 27–30%.** Funding failures stay low (3 and 3), but planning's road and zone attempts now make up most failures: roads along existing roads, roads through buildings, zoning taken land. Planning also ended 2–3 of its 4 turns on the step limit.
+- **Other problems:**
+  - On seed 1 the mayor gave health $5,000 while education, asking for $2,500 every turn, got nothing.
+  - On seed 1 planning spent two turns routing a road through a wind turbine.
+
 **Not built yet:**
 
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
