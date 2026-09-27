@@ -1634,6 +1634,30 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
     assert apply_action(w, "police", {"type": "build_police_station", "x": s["x"], "y": s["y"]}).ok
 
 
+def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
+    """A library ($1,500) only multiplies school graduation: it keeps its price on its Ready line but doesn't drive
+    the budget line or the mayor's needs line, which name the $2,500 school."""
+    from civitas.fleet.tools import Price, cheapest
+    school, library = Price(2500, "elementary school"), Price(1500, "library")
+    assert cheapest({"library": library, "school": school}) == ("school", school)
+    assert cheapest({"library": library}) is None
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    ready = lambda: {ln.split(":")[0][2:]: ln for ln in _ready_sites(briefing(env, "education", mark=False))}
+    budget = lambda: _block(briefing(env, "education", mark=False), "## Your budget")
+    needs = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- education:"))
+    w.dept_funds["education"] = 2500                   # the school is affordable: no advice
+    assert len(budget()) == 1 and needs() == "- education: funds $2,500"
+    assert ready()["library"].endswith("same list as school; $1,500") and ready()["school"].endswith("; $2,500")
+    w.dept_funds["education"] = 2000                   # a library is affordable, the school isn't: ask for the school
+    assert budget()[1].startswith("- You can't pay for any ready site (cheapest: school $2,500).")
+    assert needs().startswith("- education: funds $2,000; needs $2,500 for an elementary school (")
+    assert ready()["library"].endswith("; $1,500") and ready()["school"].endswith("; $2,500 - you have $2,000")
+    w.dept_funds["education"] = 1000                   # short of both: the library's line says so too
+    assert "(cheapest: school $2,500)" in budget()[1] and "$2,500 for an elementary school" in needs()
+    assert ready()["library"].endswith("; $1,500 - you have $1,000")
+
+
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
     from civitas.fleet.tools import build_cost, site_price
     env = copy.deepcopy(grown_env)
@@ -1667,7 +1691,7 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
     got = lines()                                      # the building, not the find_sites purpose
     assert got["police"] == f"- police: funds $1,000; needs $2,500 for a police station ({n} ready sites)"
     assert got["health"].startswith("- health: funds $0; needs $1,500 for a cemetery (")
-    assert got["education"].startswith("- education: funds $0; needs $1,500 for a library (")    # < a school
+    assert got["education"].startswith("- education: funds $0; needs $2,500 for an elementary school (")
     assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for a water tower (")
     assert got["fire"] == "- fire: funds $5,000"
     assert got["transport"] == "- transport: funds $0" and got["planning"] == "- planning: funds $0"

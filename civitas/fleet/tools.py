@@ -121,6 +121,10 @@ SITE_BUILDS = {
 TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
                     "metro_station": ("METRO_STATION", "metro")}
 SITE_TILES = {"fire": {"levee": "levee"}}    # purposes priced per tile -> their CATALOG entry (read when priced)
+# priced purposes that only add to another building, never the first buy: cheapest() skips them, so they don't drive
+# the budget line or the mayor's needs line (their Ready lines keep the price). A library only multiplies school
+# graduation (LIBRARY_BOOST): useless without school seats, yet at $1,500 it undercut the $2,500 school
+SUPPLEMENTARY = {"library"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -775,13 +779,15 @@ def build_cost(w, role: str, purpose: str) -> int | None:
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     """site_price of each of `role`'s priced purposes with ready sites (listed and unlocked): the Ready sites lines
-    end with it, and funds short of the cheapest (cheapest()) buy no ready site."""
+    end with it, and funds short of the cheapest (cheapest(), SUPPLEMENTARY skipped) buy no ready site."""
     return {p: pr for p, lst in lists.items() if lst.sites and not lst.short and (pr := site_price(w, role, p))}
 
 
 def cheapest(prices: dict[str, Price]) -> tuple[str, Price] | None:
-    """(purpose, price) of the lowest price, the first on ties; None when there is none."""
-    return min(prices.items(), key=lambda kv: kv[1].cost, default=None)
+    """(purpose, price) of the lowest price, the first on ties, SUPPLEMENTARY purposes skipped (the budget line and
+    the mayor's needs line read it); None when there is none."""
+    return min(((p, pr) for p, pr in prices.items() if p not in SUPPLEMENTARY), key=lambda kv: kv[1].cost,
+               default=None)
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
