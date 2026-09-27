@@ -2590,6 +2590,48 @@ def test_idle_hint_ignores_the_mayor():
     assert _hints(rep, "idle") == []
 
 
+def _transport_idle(funds, plans=(), turns=(0, 3, 6, 9), months=12):
+    """Idle hints for a transport department that never acts; `funds` maps history month -> its funds (default 0),
+    `plans` are (month, budgets) plan versions."""
+    env = _env()
+    fs = FleetState.of(env)
+    fs.update_plan(0, goals=["grow"])
+    for m, b in plans:
+        fs.update_plan(m, budgets=b)
+    env.world.month = months
+    env.world.history = [{"month": m, "treasury": 100.0, "dept_funds": {**{d: 500.0 for d in DEPTS},
+                                                                       "transport": funds.get(m, 0.0)}}
+                         for m in range(1, months + 1)]
+    rows = [turn_row(_rec("transport", m, trace=[{"tool": "inspect", "result": {"ok": True}}])) for m in turns]
+    rep, _ = fleet_report(env, _summary(env), rows)
+    return _hints(rep, "idle")
+
+
+def test_idle_hint_skips_a_department_without_money_or_a_target():
+    assert _transport_idle({}) == []                                      # $0 and no plan budget all run
+    assert _transport_idle({}, plans=[(0, {"transport": 0})]) == []       # a zero budget counts as none
+    assert _transport_idle({m: 0.6 for m in range(13)}) == []             # under $1
+    h, = _transport_idle({m: 500.0 for m in range(13)})                   # money but no target: idle
+    assert (h["turns"], h["months"]) == (4, 12) and "mayor" not in h["text"]
+    h, = _transport_idle({}, plans=[(0, {"transport": 1000})])            # a target but no money: the mayor's fault
+    assert (h["turns"], h["months"]) == (4, 12)
+    assert "its funds stayed at $0 against a $1,000 target: check the mayor's allocations" in h["text"]
+    h, = _transport_idle({4: 500.0}, plans=[(0, {"transport": 1000})])    # money at one turn of the run: no note
+    assert (h["turns"], h["months"]) == (4, 12) and "mayor" not in h["text"]
+
+
+def test_unfunded_turns_split_idle_runs_and_read_the_month_after_the_turn():
+    # a turn in month t ends in history entry t + 1: the mayor's month-6 allocation shows there, not in entry 6
+    h, = _transport_idle({m: 5000.0 for m in range(7, 13)})
+    assert (h["turns"], h["first"], h["last"]) == (2, 6, 11)
+    assert _transport_idle({m: 5000.0 for m in range(8, 13)}) == []       # funded after the month-6 turn: one idle turn
+    # the plan saved in month 6 (before the departments' turns) is in force for the month-6 turn
+    h, = _transport_idle({}, plans=[(6, {"transport": 2000})])
+    assert (h["turns"], h["first"], h["last"]) == (2, 6, 11) and "$2,000 target" in h["text"]
+    assert _transport_idle({4: 500.0, 10: 500.0}) == []                   # idle turns at 3 and 9, blocked between
+    assert _transport_idle({}, turns=range(12)) == []
+
+
 def test_fleet_report_negative_treasury_hint():
     env = _report_env()
     env.world.history[4]["treasury"] = -2500.0
