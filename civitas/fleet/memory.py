@@ -153,14 +153,14 @@ class FleetState:
 
     def digest(self, role: str, now: int, council=None) -> dict:
         """Since the role's previous turn (inclusive of that month): its failed actions and world events, plus the
-        number of council messages from others posted after that turn was marked. `since` is None before its
-        first turn (all months)."""
+        council messages from others it can see that were posted after that turn was marked, oldest first. `since`
+        is None before its first turn (all months)."""
         since = self.last_turn_month.get(role)
         span = None if since is None else now - since + 1
-        msgs = 0
+        msgs = []
         if council is not None:
             new = council.visible_to(role, since_month=0)[self.seen_messages.get(role, 0):]
-            msgs = sum(1 for m in new if m["sender"] != role)
+            msgs = [m for m in new if m["sender"] != role]
         return {"since": since,
                 "failed_actions": self.history("failure", span, role=role, now=now),
                 "events": [e["text"] for e in self.history("event", span, now=now)],

@@ -27,9 +27,10 @@ MSG_CHARS = 160
 
 def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
-    look-up that failed, an action tool refused before the action ran."""
+    look-up that failed, an action tool refused before the action ran. A repeated failed action or a guarded
+    bulldoze refused without running is counted in `refused`, not here."""
     res = call.get("result") or {}
-    if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res):
+    if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
     return str(res.get("error") or res.get("message") or "failed")[:MSG_CHARS]
 
@@ -37,7 +38,9 @@ def _tool_error(call: dict) -> str | None:
 def turn_row(rec: dict) -> dict:
     """The part of a trajectory record the report needs."""
     usage = rec.get("usage") or {}
-    errors = [_tool_error(c) for c in rec.get("tool_trace") or []]
+    trace = rec.get("tool_trace") or []
+    errors = [_tool_error(c) for c in trace]
+    marked = lambda k: sum(k in (c.get("result") or {}) for c in trace)
     return {"role": rec["role"], "month": rec["month"],
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
@@ -47,7 +50,8 @@ def turn_row(rec: dict) -> dict:
             "results": [{"type": (r.get("action") or {}).get("type"), "ok": bool(r.get("ok")),
                          "message": str(r.get("message") or "")[:MSG_CHARS], "cost": r.get("cost") or 0}
                         for r in rec.get("results") or []],
-            "tool_errors": [e for e in errors if e is not None]}
+            "tool_errors": [e for e in errors if e is not None],
+            "repeats": marked("repeat"), "refused": marked("refused")}   # repeated look-ups / refused actions
 
 
 def rows_from_trajectories(path: str | Path) -> list[dict]:
@@ -97,6 +101,7 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
     groups = _failure_groups(fails + tool_errs)
     return {"turns": len(rows), "tool_calls": sum(r["steps"] for r in rows), "actions": len(results),
             "failed": len(fails), "tool_errors": len(tool_errs),
+            "repeats": sum(r["repeats"] for r in rows), "refused": sum(r["refused"] for r in rows),
             "spent": round(sum(r["cost"] for r in results if r["ok"]), 2),
             "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
             "completion_tokens": sum(r["completion_tokens"] for r in rows),
@@ -225,11 +230,13 @@ def markdown(rep: dict) -> str:
     if plan["notes"]:
         L += ["", f"Notes: {_cell(plan['notes'])}"]
     L += ["", "## Roles", "",
-          "| role | turns | tool calls | actions | failed | tool errors | spent | tokens (prompt / completion) "
-          "| limit turns | length stops | API / briefing errors |", "|---|" + "---:|" * 10]
+          "| role | turns | tool calls | actions | failed | tool errors | repeats (look-ups / refused) | spent "
+          "| tokens (prompt / completion) | limit turns | length stops | API / briefing errors |",
+          "|---|" + "---:|" * 11]
     for r, st in rep["roles"].items():
         L.append(f"| {r} | {st['turns']} | {st['tool_calls']} | {st['actions']} | {st['failed']} | {st['tool_errors']} "
-                 f"| {money(st['spent'])} | {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
+                 f"| {st['repeats']} / {st['refused']} | {money(st['spent'])} "
+                 f"| {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
                  f"| {st['limit_turns']} | {st['length_stops']} | {st['api_errors']} |")
     fails = [(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]
     if fails:

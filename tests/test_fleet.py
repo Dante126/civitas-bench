@@ -157,9 +157,9 @@ def test_digest_covers_only_this_role_since_its_last_turn():
     assert d["since"] == 1
     assert [e["message"] for e in d["failed_actions"]] == ["blocked"]
     assert d["events"] == ["Fire downtown"]
-    assert d["messages"] == 2
-    assert fs.digest("police", 2)["since"] is None and fs.digest("police", 2)["messages"] == 0
-    assert fs.digest("police", 2, council=env.council)["messages"] == 3   # never marked: all from others
+    assert [m["text"] for m in d["messages"]] == ["fire: build a station", "hello all"]
+    assert fs.digest("police", 2)["since"] is None and fs.digest("police", 2)["messages"] == []
+    assert len(fs.digest("police", 2, council=env.council)["messages"]) == 3   # never marked: all from others
     assert fs.digest("fire", 2)["failed_actions"] == d["failed_actions"]
     first = FleetState()
     first.record(0, "fire", "event", text="x")
@@ -187,7 +187,8 @@ import numpy as np
 
 from civitas.agents.scripted import SCRIPTED
 from civitas.core.roles import ROLES, TURN_ORDER
-from civitas.fleet.tools import SITE_PURPOSES, ToolBox
+from civitas.fleet.memory import DEPARTMENTS
+from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox
 from civitas.sim import catalog as C
 
 
@@ -340,6 +341,7 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     box = ToolBox(env, "utilities")
     res = box.call("find_sites", {"purpose": "pump"})
     assert res["sites"] == [] and "ask planning" in res["note"] and "inspect the map" not in res["note"]
+    assert "a road has to reach the river" in res["note"] and "taken" not in res["note"]
     ys = np.nonzero((w.struct == C.ROAD).any(axis=1))[0]
     cols = np.nonzero((w.terrain[ys.min():ys.max() + 1] == C.WATER).any(axis=0))[0]
     assert f"x {cols.min()}-{cols.max()} in rows {ys.min()}-{ys.max()}" in res["note"]
@@ -348,8 +350,167 @@ def test_riverbank_sites_say_a_road_must_reach_the_river():
     bank = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 1
     w.dept_funds["planning"] = 1000
     assert apply_action(w, "planning", {"type": "build_road", "x1": x_end, "y1": y, "x2": bank, "y2": y}).ok
-    res = box.call("find_sites", {"purpose": "pump"})
+    res = ToolBox(env, "utilities").call("find_sites", {"purpose": "pump"})     # utilities' next turn
     assert res["sites"] and "note" not in res
+
+
+def _bridge_and_take_the_bank(env):
+    """Seed 0: the highway road on row 24 ends at x 19, the river runs at x 26-28 there. Bridge it and zone every
+    riverbank tile beside the connected roads, as planning did in the v5 smoke run."""
+    from civitas.fleet.tools import _connected_roads
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    assert (w.terrain[24, 26:29] == C.WATER).all() and (w.terrain[24, [25, 29]] == C.LAND).all()
+    road = _connected_roads(w)
+    taken = []
+    for y, x in zip(*np.nonzero((w.struct == C.NONE) & (w.terrain == C.LAND))):
+        near_road = road[max(0, y - 1):y + 2, max(0, x - 1):x + 2].any()
+        if near_road and w.is_riverbank(x, y):
+            w.struct[y, x] = C.RES
+            taken.append((int(x), int(y)))
+    w.refresh()
+    assert taken
+    return taken
+
+
+def test_riverbank_note_says_the_bank_beside_the_road_is_taken():
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    box = ToolBox(env, "utilities")
+    for purpose in ("pump", "sewage"):
+        res = box.call("find_sites", {"purpose": purpose})
+        note = res["note"]
+        assert res["sites"] == [] and "taken" in note and "a road has to reach" not in note, note
+        assert "(25,24)" in note and "(29,24)" in note and "ask planning" in note      # the bridgeheads
+    line, = [ln for ln in _ready_sites(briefing(env, "utilities", mark=False)) if ln.startswith("- sewage:")]
+    assert "taken" in line and "(25,24)" in line and len(line) <= 120, line
+    w.milestones_on = False                              # riverbank_2x2 unlocked: same reason
+    res = box.call("find_sites", {"purpose": "riverbank_2x2"})
+    assert res["sites"] == [] and "taken" in res["note"], res
+    x, y = taken[0]                                      # free one lot, hemmed in: the pump list finds it
+    w.struct[y, x] = C.NONE
+    for ny in range(y - 1, y + 2):
+        for nx in range(x - 1, x + 2):
+            if (nx, ny) != (x, y) and w.struct[ny, nx] == C.NONE and w.terrain[ny, nx] == C.LAND:
+                w.struct[ny, nx] = C.PARK
+    w.refresh()
+    box = ToolBox(env, "utilities")                      # a new turn: this one's look-ups would repeat
+    res = box.call("find_sites", {"purpose": "pump"})
+    assert [(s["x"], s["y"]) for s in res["sites"]] == [(x, y)] and "note" not in res
+    res = box.call("find_sites", {"purpose": "riverbank_2x2"})    # one free tile is no 2x2 block
+    assert res["sites"] == [] and "2x2" in res["note"] and "taken" not in res["note"], res
+
+
+def test_scarce_riverbank_lots_are_marked_for_pump_and_sewage():
+    from civitas.fleet.tools import SiteList, ready_lines, scarce_bank
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    assert scarce_bank(w) == set()                       # no free bank lot at all
+    for x, y in taken[:2]:
+        w.struct[y, x] = C.NONE
+    w.refresh()
+    assert scarce_bank(w) == set(taken[:2])
+    x, y = taken[2]
+    w.struct[y, x] = C.NONE
+    w.refresh()
+    assert scarce_bank(w) == set()                       # three free lots: plenty
+    bank, dry = {"x": 5, "y": 6, "homes_within_5": 0}, {"x": 9, "y": 9, "homes_within_5": 1}
+    lists = {"coal_or_gas": SiteList([bank, dry], None, None), "near_homes": SiteList([bank, dry], None, None),
+             "pump": SiteList([{"x": 5, "y": 6, "pollution": 0.1}], None, None)}
+    lines = ready_lines("utilities", lists, {(5, 6)})
+    assert lines == ["- coal_or_gas: 2 sites, best (5,6), 0 homes within 5 (riverbank: keep for pump/sewage)",
+                     "- near_homes: 2 sites, best as coal_or_gas; next (9,9), 1 homes within 5",
+                     "- pump: 1 site, same site as coal_or_gas"]
+    assert "riverbank" not in ready_lines("utilities", lists)[0]
+    assert ready_lines("health", {"landfill": SiteList([{"x": 5, "y": 6, "need": 3}], None, None)}, {(5, 6)}) == [
+        "- landfill: 1 site, best (5,6), need 3 (riverbank: keep for pump/sewage)"]
+    assert ready_lines("transport", {"harbour": SiteList([{"x": 5, "y": 6}], None, None)}, {(5, 6)}) == [
+        "- harbour: 1 site, best (5,6)"]                  # a harbour belongs on the river
+
+
+def test_sites_away_from_homes_say_when_every_roadside_lot_is_near_homes():
+    from civitas.fleet.tools import _connected_roads, _touching, _why_empty
+    env = _env()
+    w = env.world
+    assert ToolBox(env, "health").call("find_sites", {"purpose": "landfill"})["sites"]
+    free = (w.struct == C.NONE) & (w.terrain == C.LAND)
+    w.struct[free & ~_touching(_connected_roads(w))] = C.RES        # homes behind every roadside lot
+    w.refresh()
+    box = ToolBox(env, "health")
+    for purpose in ("landfill", "cemetery"):
+        res = box.call("find_sites", {"purpose": purpose})
+        note = res["note"]
+        assert res["sites"] == [] and "3 or more homes within 4 tiles" in note and "edge of town" in note, note
+        assert "nothing needs" not in note and f"a {purpose} must stay away" in note
+    lines = [ln for ln in _ready_sites(briefing(env, "health", mark=False)) if ln.startswith(("- landfill", "- cem"))]
+    assert len(lines) == 2
+    for line in lines:
+        assert "away from homes" in line and "town edge" in line and len(line) <= 110, line
+    short, note = _why_empty(w, "police", "jail")
+    assert "away from homes" in short and "a jail must stay away" in note
+    assert _why_empty(w, "health", "clinic")[0] == "nothing needs it right now"     # other purposes: unchanged
+
+
+def _isolated_riverside_road(w):
+    """A road at (24,15)-(24,17), off the highway network, touching the riverbank tile (25,17) on seed 0."""
+    assert w.is_riverbank(25, 17) and w.struct[17, 25] == C.NONE
+    w.struct[15:18, 24] = C.ROAD
+    w.refresh()
+    assert not w.networks[w.adjacent_network(25, 17)].outside_connected
+
+
+def test_riverbank_sites_beside_unconnected_roads_are_not_listed():
+    env = _env()
+    w = env.world
+    _isolated_riverside_road(w)
+    from civitas.core.observation import build_observation
+    obs = build_observation(w, "utilities", council_msgs=[], memory={}, scores={}, months_total=12,
+                            include_map=False, site_hints=True)
+    assert (25, 17) in [(s["x"], s["y"]) for s in obs["candidate_sites"]["riverbank_next_to_road"]]  # the hint has it
+    box = ToolBox(env, "utilities")
+    for purpose in ("pump", "sewage"):
+        res = box.call("find_sites", {"purpose": purpose})
+        assert res["sites"] == [] and "a road has to reach the river" in res["note"], res
+    line, = [ln for ln in _ready_sites(briefing(env, "utilities", mark=False)) if ln.startswith("- pump:")]
+    assert "no connected road reaches the river yet" in line, line
+
+
+def test_listed_riverbank_sites_build_on_the_highway_network():
+    env = _env()
+    w = env.world
+    _isolated_riverside_road(w)
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 50000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    box = ToolBox(env, "utilities")
+    for purpose, action, kind in (("pump", "build_water", "pump"), ("sewage", "build_sewage", "outlet")):
+        sites = box.call("find_sites", {"purpose": purpose})["sites"]
+        assert sites and (25, 17) not in [(s["x"], s["y"]) for s in sites]
+        s = sites[0]
+        res = apply_action(w, "utilities", {"type": action, "kind": kind, "x": s["x"], "y": s["y"]})
+        assert res.ok and "not connected" not in res.message, res.message
+
+
+def test_riverbank_note_when_only_roads_line_the_bank():
+    """A road that bridges the river counts as reaching it even when every bank tile beside the connected roads
+    is itself road: the note must not send planning after a road that exists."""
+    from civitas.fleet.tools import _touching
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    bank = (w.terrain == C.LAND) & _touching(w.terrain == C.WATER, diagonal=False)
+    while True:                                     # pave every empty bank tile beside a road
+        lots = bank & _touching(w.road_labels >= 0) & (w.struct == C.NONE)
+        if not lots.any():
+            break
+        w.struct[lots] = C.ROAD
+        w.refresh()
+    res = ToolBox(env, "utilities").call("find_sites", {"purpose": "sewage"})
+    assert res["sites"] == [] and "taken" in res["note"] and "a road has to reach" not in res["note"], res
+    assert "(25,24)" in res["note"], res
 
 
 def _fill_roadside(w):
@@ -378,33 +539,173 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     _fill_roadside(w)
     from civitas.fleet.tools import _connected_roads
     ys, xs = np.nonzero(_connected_roads(w))
-    span = f"the highway-connected roads span x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}"
+    span = f"highway-connected roads: x {xs.min()}-{xs.max()}, y {ys.min()}-{ys.max()}, {len(xs)} tiles"
     res = ToolBox(env, "education").call("find_sites", {"purpose": "school"})
     assert res["sites"] == [] and "ask planning" in res["note"] and span in res["note"]
     res = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})
     assert res["sites"] == [] and "find_sites road_extension" in res["note"] and "ask planning" not in res["note"]
-    note = ToolBox(env, "planning")._no_sites_note("road_extension")
+    from civitas.fleet.tools import _why_empty
+    note = _why_empty(w, "planning", "road_extension")[1]
     assert "find_sites" not in note and "build_road" in note                   # not circular
-    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})
-    assert not res["ok"] and "for the departments" in res["error"]
+    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})     # the mayor names the department
+    assert not res["ok"] and "education.school" in res["error"] and "utilities.sewage" in res["error"]
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
-    from civitas.fleet.tools import _river_span, _road_span
+    from civitas.fleet.tools import _river_span, _roads, _roads_text, _why_empty
     env = _env()
     w = env.world
-    before = _road_span(w)
+    before = _roads_text(_roads(w))
     w.struct[2, 44] = w.struct[2, 45] = C.ROAD           # a stray road far from the network
     w.refresh()
-    assert _road_span(w) == before and "x 44" not in before
+    assert _roads_text(_roads(w)) == before and "x 44" not in before
     w.terrain[w.terrain == C.WATER] = C.LAND
     assert _river_span(w) is None
-    assert ToolBox(env, "utilities")._no_sites_note("pump") == "this map has no river"
+    assert _why_empty(w, "utilities", "pump")[1] == "this map has no river"
+
+
+def test_map_facts_on_a_fresh_world():
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    f = map_facts(w)
+    assert f["size"] == [48, 48]
+    (hx, hy), = [(int(x), int(y)) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
+    assert hx == 0 and f["highway"] == [{"x": 0, "y": hy, "edge": "west"}]
+    assert len(f["river"]) == 3
+    for band in f["river"]:
+        for x0, x1, y in band:                                                 # the real columns at the band's ends
+            cols = np.nonzero(w.terrain[y] == C.WATER)[0]
+            assert (x0, x1) == (cols.min(), cols.max())
+    ends = [e[2] for band in f["river"] for e in band]
+    assert ends[0] == 0 and ends[-1] == 47 and ends == sorted(ends)
+    assert all(b[0][2] == a[1][2] + 1 for a, b in zip(f["river"], f["river"][1:]))   # bands tile the rows
+    ys, xs = np.nonzero((w.struct == C.ROAD) | (w.struct == C.HIGHWAY))        # only the starter road
+    assert f["roads"] == {"x": [0, int(xs.max())], "y": [hy, hy], "tiles": len(xs)}
+    tx, ty = w.facilities(C.TOWNHALL)[0]
+    assert f["built"] == {"x": [tx, tx], "y": [ty, ty], "zoned": 0, "developed": 0, "buildings": 1}
+    lines = map_lines(f)
+    text = "\n".join(lines)
+    assert len(lines) <= 6 and len(text) <= 400, (len(lines), len(text))
+    assert f"(0,{hy}) on the west edge" in text and "x = column 0-47" in text
+    (a0, a1, _), (b0, b1, by) = f["river"][0]
+    assert f"river: x {a0}-{a1} at row 0 to x {b0}-{b1} at row {by}," in text
+    assert f"highway-connected roads: x 0-{int(xs.max())}, y {hy}, {len(xs)} tiles" in text
+
+
+def test_map_facts_on_an_empty_map():
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    w.struct[:] = C.NONE
+    w.anchor[:] = -1
+    w.refresh()
+    f = map_facts(w)
+    assert f["highway"] == [] and f["roads"] is None and f["built"] is None
+    assert map_lines(f)[1:] == ["- highway entry: none", map_lines(f)[2], "- no roads connected to the highway yet",
+                                "- built-up area: none yet"]
+
+
+def test_map_facts_grow_and_without_a_river(grown_env):
+    from civitas.fleet.tools import map_facts, map_lines
+    fresh, grown = map_facts(_env().world), map_facts(grown_env.world)
+    assert grown["roads"]["tiles"] > fresh["roads"]["tiles"]
+    r = grown["roads"]
+    assert r["x"][1] - r["x"][0] >= fresh["roads"]["x"][1] - fresh["roads"]["x"][0] and r["y"][0] < r["y"][1]
+    b = grown["built"]
+    assert b["zoned"] > 0 and b["developed"] > 0 and b["buildings"] > 1 and b["x"][0] < b["x"][1]
+    assert len("\n".join(map_lines(grown))) <= 400
+    env = _env()
+    env.world.terrain[env.world.terrain == C.WATER] = C.LAND
+    f = map_facts(env.world)
+    assert f["river"] == [] and "- no river" in map_lines(f)
+
+
+def _map_body(res):
+    return [row[4:] for row in res["map"][2:]]
+
+
+def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
+    from civitas.fleet.tools import RESULT_CHARS, map_facts, map_lines
+    for role in TURN_ORDER:
+        res = ToolBox(grown_env, role).call("map_overview", {})
+        assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS, (role, len(json.dumps(res)))
+        assert "scale" not in res and "truncated" not in res                     # 48x48 fits at full size
+    rows = res["map"]
+    assert rows[0].strip() == "".join(str(x // 10) for x in range(48))
+    assert rows[1].strip() == "".join(str(x % 10) for x in range(48))
+    assert rows[2].startswith("  0 ") and rows[-1].startswith(" 47 ") and len(rows) == 50
+    assert _map_body(res) == [grown_env.world.ascii_map().split("\n")[y + 2][4:] for y in range(48)]
+    assert res["legend"].startswith("Legend: ")
+    keys = {c for item in res["legend"][8:].split("  ") for c in item.split(" ", 1)[0].split("/")}
+    used = set("".join(_map_body(res)))
+    assert used <= keys and {"#", "~", "H", "T", "R"} <= used
+    assert "E coal" not in res["legend"] or "E" in used                       # only what is on the map
+    assert res["summary"] == [ln[2:] for ln in map_lines(map_facts(grown_env.world))]
+    assert "higher tiers keep the letter" in res["read"] and "higher tiers" not in res["legend"]
+    from civitas.fleet.tools import map_overview
+    tight = map_overview(grown_env.world, limit=len(json.dumps(res)) - 1)     # a full legend: summary goes first
+    assert "briefing" in tight["summary"][0] and tight["map"] == res["map"] and "scale" not in tight
+
+
+def test_map_overview_downsamples_big_maps():
+    from civitas.fleet.tools import RESULT_CHARS
+    env = CivitasEnv(GameConfig(seed=0, months=12, width=96, height=80))
+    res = ToolBox(env, "planning").call("map_overview", {})
+    assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS and "truncated" not in res
+    k = int(res["scale"].split("x")[0].split()[-1])
+    assert k >= 2 and "inspect" in res["scale"]
+    rows = res["map"]
+    assert rows[2].startswith("  0 ") and rows[3].startswith(f"{k:>3} ")
+    assert len(rows) - 2 == -(-80 // k) and len(rows[2]) - 4 == -(-96 // k)
+    assert any("~" in r for r in rows) and any("H" in r for r in rows)
+
+
+def test_downsampled_blocks_break_ties_by_reading_order():
+    from civitas.fleet.tools import _ascii
+    w = _env().world
+    w.struct[0, 0] = w.struct[1, 1] = C.COM                    # c r / r c: a 2-2 tie, 'c' comes first
+    w.struct[0, 1] = w.struct[1, 0] = C.RES
+    w.struct[0, 2] = w.struct[0, 3] = C.ROAD                   # # # / . c: the road wins 2-1
+    w.struct[1, 3] = C.COM
+    assert _ascii(w, 2)[2][4:6] == "c#"
+    w.struct[0, 0], w.struct[0, 1] = C.RES, C.COM              # r c / r c: now 'r' comes first
+    assert _ascii(w, 2)[2][4] == "r"
+
+
+def _check_mayor_sites(env):
+    mayor = ToolBox(env, "mayor")
+    for dept in DEPARTMENTS:
+        box = ToolBox(env, dept)
+        for purpose in SITE_PURPOSES[dept]:
+            for near in ({}, {"near_x": 30, "near_y": 12}):
+                mine = mayor.call("find_sites", {"purpose": f"{dept}.{purpose}", **near})
+                theirs = box.call("find_sites", {"purpose": purpose, **near})
+                assert mine["ok"] and mine["purpose"] == f"{dept}.{purpose}", (dept, purpose, mine)
+                assert mine["sites"] == theirs["sites"], (dept, purpose)
+                assert mine.get("note") == (theirs["note"] and f"({dept} department's note) {theirs['note']}"
+                                            if "note" in theirs else None), (dept, purpose)
+
+
+def test_mayor_find_sites_is_every_department_s_list():
+    env = _env()
+    tools = {s["function"]["name"]: s["function"] for s in ToolBox(env, "mayor").schemas()}
+    fs = tools["find_sites"]
+    assert fs["parameters"]["properties"]["purpose"]["enum"] == [f"{d}.{p}" for d in DEPARTMENTS
+                                                                 for p in SITE_PURPOSES[d]]
+    assert "read-only" in fs["description"]
+    _check_mayor_sites(env)
+    res = ToolBox(env, "mayor").call("find_sites", {"purpose": "utilities.sewage", "near_x": 5})
+    assert not res["ok"] and "near_y" in res["error"]
+    for bad in ("sewage", "utilities.school", "mayor.x"):
+        res = ToolBox(env, "mayor").call("find_sites", {"purpose": bad})
+        assert not res["ok"] and "planning.zone_R" in res["error"] and "education.school" in res["error"], bad
 
 
 def test_find_sites_and_lookups_on_a_grown_world(grown_env):
     env = grown_env
     _check_sites(env)
+    _check_mayor_sites(env)
     near = ToolBox(env, "utilities").call("find_sites", {"purpose": "near_homes", "near_x": 40, "near_y": 40})["sites"]
     d = [abs(s["x"] - 40) + abs(s["y"] - 40) for s in near]
     assert d == sorted(d)
@@ -421,6 +722,93 @@ def test_find_sites_and_lookups_on_a_grown_world(grown_env):
     assert any(n["plants"] for n in util["networks"])
     health = ToolBox(env, "health").call("my_facilities", {})
     assert health["facilities"]
+
+
+def test_update_plan_lists_the_departments_below_their_target():
+    env = _env()
+    w = env.world
+    w.treasury = 30000
+    w.dept_funds.update(planning=9500, utilities=2000)
+    mayor = ToolBox(env, "mayor")
+    res = mayor.call("update_plan", {"goals": ["grow"]})
+    assert res["ok"] and "below_target" not in res and "next" not in res          # no targets yet
+    res = mayor.call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500, "police": 0}})
+    assert res["ok"] and res["message"].startswith("plan v2 saved")
+    assert res["below_target"] == {"utilities": {"funds": 2000, "target": 7000, "gap": 5000},
+                                   "fire": {"funds": 0, "target": 2500, "gap": 2500}}      # planning is funded
+    assert res["treasury"] == 30000
+    assert res["next"] == "call allocate_budget to fund these (treasury $30k)"
+    assert mayor.call("allocate_budget", {"department": "utilities", "amount": 5000})["ok"]
+    res = mayor.call("update_plan", {"priorities": {"fire": "stations by homes"}})
+    assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
+    assert res["treasury"] == 25000
+
+
+def test_update_plan_says_when_the_gaps_exceed_the_treasury():
+    env = _env()
+    w = env.world
+    w.treasury = 12000                                   # gaps $9,000 = treasury - the $3,000 reserve: enough
+    res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
+    assert res["next"] == "call allocate_budget to fund these (treasury $12k)"
+    w.treasury = 11000
+    res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
+    assert res["next"] == ("call allocate_budget to fund these (treasury $11k); the gaps total $9,000, more than the "
+                           "treasury above a $3,000 reserve ($8,000): fund the most urgent first or lower targets")
+
+
+def test_health_finds_cemetery_sites():
+    env = _env()
+    w = env.world
+    w.dept_funds["health"] = 5000
+    box = ToolBox(env, "health")
+    res = box.call("find_sites", {"purpose": "cemetery"})
+    assert res["ok"] and res["sites"] == box.call("find_sites", {"purpose": "landfill"})["sites"]
+    s = res["sites"][0]
+    assert box.call("build_cemetery", {"x": s["x"], "y": s["y"]})["ok"]
+    line, = [ln for ln in briefing(env, "health", mark=False).splitlines() if ln.startswith("- cemetery:")]
+    assert "same list as landfill" in line
+
+
+def test_update_plan_says_hold_under_the_reserve():
+    env = _env()
+    from civitas.fleet.fmt import money
+    w = env.world
+    for treasury in (3000, 1200, -500):                  # at, under and below zero: nothing above the $3,000 reserve
+        w.treasury = treasury
+        res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})
+        assert res["next"] == (f"the treasury ({money(treasury)}) is at or under the $3,000 reserve: hold; lower "
+                               "targets or wait for income")
+        text = briefing(env, "mayor", mark=False)
+        line, = [ln for ln in text.splitlines() if "below target" in ln]
+        assert line.endswith(f"treasury {money(treasury)}, at or under the $3,000 reserve): hold; lower targets "
+                             "or wait for income")
+        assert "allocate_budget" not in line
+    w.treasury = 3001                                    # $1 above: short, but something to allocate
+    assert ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})["next"].startswith(
+        "call allocate_budget")
+
+
+def test_mayor_tools_in_a_mixed_line_up():
+    env = _env(roles=["mayor", "planning", "utilities"])
+    mayor = ToolBox(env, "mayor")
+    fs, = [s["function"] for s in mayor.schemas() if s["function"]["name"] == "find_sites"]
+    assert fs["parameters"]["properties"]["purpose"]["enum"] == [f"{d}.{p}" for d in ("planning", "utilities")
+                                                                 for p in SITE_PURPOSES[d]]
+    assert not mayor.call("find_sites", {"purpose": "education.school"})["ok"]
+    res = mayor.call("update_plan", {"budgets": {"planning": 5000, "fire": 2500}})
+    assert res["ok"] and set(res["below_target"]) == {"planning"}                 # no fire department in the game
+    text = briefing(env, "mayor", mark=False)
+    assert "- 1 below target ($5,000 short" in text and "- fire:" not in text
+
+
+def test_reserve_follows_the_mayor_playbook():
+    from types import SimpleNamespace
+    from civitas.fleet.tools import reserve
+    world = lambda *h: SimpleNamespace(history=[{"income": i, "expenses": e} for i, e in h])
+    assert reserve(world()) == 3000                                      # before the first month
+    assert reserve(world((5000, 800))) == 3000
+    assert reserve(world((5000, 2000))) == 6000                          # 3 months of expenses
+    assert reserve(world((1000, 2000))) == 12000                         # 6 while running a deficit
 
 
 def test_turn_control_tools():
@@ -539,6 +927,99 @@ def test_role_specific_history_description_and_fresh_lookups():
     assert ToolBox(env, "mayor").call("city_overview", {})["trend"] is None
 
 
+# ---------------------------------------------------------------- guards
+CUT_OFF = ("this would cut 17 road tiles (e.g. around (3,24)) off the highway; build a new link first or pick tiles "
+           "that aren't on the only route; to do it anyway repeat with confirm: true")
+UNCONNECTED = "- roads not connected to the highway: 17 tiles (x 3-19, y 24) - reconnect them"
+
+
+def test_bulldozing_the_only_link_to_the_highway_is_refused_until_confirmed():
+    """Seed 1, v7: planning bulldozed (0,22)-(2,26) for a road along x 0, taking the 2 road tiles between the highway
+    (0,24) and the main road; the city emptied. Seed 0's starter road has the same neck."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.briefing import briefing
+    from civitas.fleet.report import _tool_error, turn_row
+    from civitas.fleet.tools import map_facts, map_lines
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    assert w.highway == (0, 24) and (w.struct[24, 1:20] == C.ROAD).all()
+    assert map_facts(w)["unconnected"] is None and "not connected" not in "\n".join(map_lines(map_facts(w)))
+    struct, funds = w.struct.copy(), dict(w.dept_funds)
+    box = ToolBox(env, "planning")
+    rect = {"x1": 0, "y1": 22, "x2": 2, "y2": 26}
+    for n in (1, 2):                                     # an identical repeat is refused the same way, not as a repeat
+        res = box.call("bulldoze", rect)
+        assert res == {"ok": False, "refused": "disconnect", "error": CUT_OFF}, res
+        assert box.n_calls == n
+    assert (w.struct == struct).all() and w.dept_funds == funds
+    assert box.executed == [] and box._failed == {} and FleetState.of(env).history(months=12) == []
+    call = {"tool": "bulldoze", "args": rect, "result": _slim(res)}
+    assert call["result"]["refused"] == "disconnect" and _tool_error(call) is None
+    assert turn_row({"role": "planning", "month": 0, "tool_trace": [call]})["refused"] == 1
+    props = next(s["function"] for s in box.schemas() if s["function"]["name"] == "bulldoze")["parameters"]
+    assert props["properties"]["confirm"]["type"] == "boolean"
+    res = box.call("bulldoze", {**rect, "confirm": "true"})
+    assert res["ok"] and res["message"] == "bulldozed 2 tiles", res
+    assert (w.struct[24, 1:3] == C.NONE).all() and w.struct[24, 0] == C.HIGHWAY
+    assert box.executed[-1]["action"] == {**rect, "type": "bulldoze"}              # confirm is not an action param
+    assert UNCONNECTED in map_lines(map_facts(w))
+    for role in ("mayor", "planning", "police"):                                   # every role sees the broken link
+        assert UNCONNECTED in briefing(env, role, mark=False)
+
+
+def test_bulldozing_a_dead_end_or_a_building_is_not_refused():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 5, "y1": 25, "x2": 5, "y2": 28}).ok
+    box = ToolBox(env, "planning")
+    res = box.call("bulldoze", {"x": 5, "y": 26})                 # the middle of the spur strands its tail
+    assert res["refused"] == "disconnect" and "cut 2 road tiles (e.g. around (5,27))" in res["error"]
+    res = box.call("bulldoze", {"x1": 5, "y1": 25, "x2": 5, "y2": 28})      # the whole spur: nothing left behind
+    assert res["ok"] and res["message"] == "bulldozed 4 tiles" and "refused" not in res
+    assert apply_action(w, "planning", {"type": "zone", "zone": "R", "x1": 4, "y1": 25, "x2": 4, "y2": 26}).ok
+    assert ToolBox(env, "planning").call("bulldoze", {"x1": 4, "y1": 25, "x2": 4, "y2": 26})["ok"]   # zones only
+    w.dept_funds["utilities"] = 10000
+    s = ToolBox(env, "utilities").call("find_sites", {"purpose": "wind"})["sites"][0]
+    assert apply_action(w, "utilities", {"type": "build_power_plant", "kind": "wind", "x": s["x"], "y": s["y"]}).ok
+    res = ToolBox(env, "utilities").call("demolish", {"x": s["x"], "y": s["y"]})
+    assert res["ok"] and "demolished" in res["message"], res
+
+
+def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing():
+    env = _env()
+    w = env.world
+    taken = _bridge_and_take_the_bank(env)
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
+    warning = (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
+               "{} - dezone one near ({},{})")
+
+    def free(*lots):
+        for tx, ty in lots:
+            w.struct[ty, tx] = C.NONE
+        w.refresh()
+
+    def zone(x, y):
+        return ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
+
+    (x, y), (x2, y2), (x3, y3) = taken[:3]
+    free((x, y), (x2, y2))
+    res = zone(x, y)                                     # one free lot left: no warning
+    assert res["ok"] and "WARNING" not in res["message"], res
+    res = zone(x2, y2)                                   # the last one, with neither pump nor outlet
+    assert res["ok"] and res["message"].endswith(warning.format("pump and sewage outlet", x2, y2)), res
+    assert "WARNING" not in FleetState.of(env).history(kind="action", role="planning")[-1]["message"]   # result only
+    free((x, y), (x2, y2))                               # a pump takes one: the outlet still needs the other
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": x, "y": y}).ok
+    res = zone(x2, y2)
+    assert res["ok"] and res["message"].endswith(warning.format("sewage outlet", x2, y2)), res
+    free((x2, y2), (x3, y3))                             # an outlet takes one: nothing left to warn about
+    assert apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": x2, "y": y2}).ok
+    res = zone(x3, y3)
+    assert res["ok"] and "WARNING" not in res["message"], res
+
+
 # ---------------------------------------------------------------- briefing
 import copy
 
@@ -573,6 +1054,7 @@ def test_system_prompt_sections_in_order():
         pos = [text.find(m) for m in marks]
         assert -1 not in pos and pos == sorted(pos), (role, list(zip(marks, pos)))
         assert "end_turn" in text and "17 tool calls" in text and "5 successful actions" in text
+        assert "steps_left" in text and "identical call" in text
         assert "{" not in text.replace("{}", "")                         # every placeholder filled
     assert ("update_plan" in system_prompt("mayor", cfg, 36)) and "update_plan" not in system_prompt("fire", cfg, 36)
     bare = system_prompt("fire", FleetAgentConfig(), 36)
@@ -590,8 +1072,9 @@ def test_system_prompt_fits_the_fleet():
         assert "tile H" not in text and "get_messages" in text.split("# Game rules")[1]
         assert "refused" in text and "autonomous = " in text and "supervised = " in text
         assert "Each game month is one turn" in text
-    assert "find_sites" not in mayor and "x = column" not in mayor
+    assert "find_sites (check which sites a department has; read-only)" in mayor and "x = column" not in mayor
     assert "find_sites" in fire and "x = column" in fire
+    assert all("map_overview" in t and "map_overview only when you need tile-level layout (at most once per turn)" in t for t in (mayor, fire))
     slow = system_prompt("fire", cfg, 36, act_every=3)
     assert "every 3 months" in slow and "Each game month is one turn" not in slow
 
@@ -618,6 +1101,7 @@ def test_key_metrics_come_from_the_observation():
 
 @pytest.mark.parametrize("grown", [False, True])
 def test_briefings_render_for_every_role(grown, env12):
+    from civitas.fleet.tools import map_facts, map_lines
     env = copy.deepcopy(env12) if grown else CivitasEnv(GameConfig(seed=0, months=24))
     w = env.world
     for role in TURN_ORDER:
@@ -627,6 +1111,7 @@ def test_briefings_render_for_every_role(grown, env12):
             dev, = [ln for ln in text.splitlines() if "developed tiles" in ln]
             assert "R " in dev and "+" not in dev                        # counts, not signed demand values
         assert f"{24 - w.month} months left" in text and "autonomous" in text
+        assert "\n## Map\n" + "\n".join(map_lines(map_facts(w))) + "\n" in text     # every role, mayor included
         if role == "mayor":
             assert "no plan yet" in text and "update_plan" in text and "treasury" in text
         else:
@@ -648,6 +1133,92 @@ def test_briefings_render_for_every_role(grown, env12):
     assert "reach 5k residents" in mayor and "PRIORITY-health" in mayor and "no plan yet" not in mayor
 
 
+def _ready_sites(text: str) -> list[str]:
+    block = text[text.index("## Ready sites"):].split("\n\n")[0].splitlines()
+    return block[1:]
+
+
+@pytest.mark.parametrize("grown", [False, True])
+def test_ready_sites_in_department_briefings(grown, grown_env):
+    env = grown_env if grown else CivitasEnv(GameConfig(seed=0, months=24))
+    w = env.world
+    assert "## Ready sites" not in briefing(env, "mayor", mark=False)
+    for role in DEPTS:
+        text = briefing(env, role, mark=False)
+        assert text.index("## Map") < text.index("## Ready sites") < text.index("## Your memory")
+        lines = _ready_sites(text)
+        purposes = list(SITE_PURPOSES[role])
+        assert len(lines) == len(purposes) + 1 and lines[-1] == "find_sites <purpose> lists up to 6 with details"
+        box = ToolBox(env, role)
+        for purpose, line in zip(purposes, lines):
+            assert line.startswith(f"- {purpose}: ") and len(line) <= 110, (role, line)
+            res = box.call("find_sites", {"purpose": purpose})
+            sites, note = res["sites"], res.get("note", "")
+            if note.startswith("locked"):
+                pop = min(C.UNLOCK_POP[k] for k in SITE_UNLOCKS[purpose])
+                assert f"locked (unlocks at {pop:,} residents)" in line, (role, line)
+            elif sites:
+                n = len(sites)
+                assert line.startswith(f"- {purpose}: {n} site{'s' * (n != 1)}, "), (role, line)
+                assert (f"best ({sites[0]['x']},{sites[0]['y']})" in line
+                        or re.search(r"(best as|same (strip|site|list) as) \w+", line)), (role, line)
+            else:
+                assert ": none - " in line and note, (role, line)
+    if not grown:                                       # fresh seed 0: the road stops short of the river
+        util = _ready_sites(briefing(env, "utilities", mark=False))
+        assert any("no connected road reaches the river" in ln for ln in util)
+        assert any(ln.startswith("- wind: 6 sites, best (") and "wind 1." in ln for ln in util)
+    assert w.month == (24 if grown else 0)
+
+
+def test_ready_sites_never_repeat_a_best_site(grown_env):
+    """Zoning ranks one strip first for several zone types: later lines show the next distinct strip, or say it's
+    the same; zone_M reads zone_C's list by design."""
+    fresh = CivitasEnv(GameConfig(seed=0, months=24))
+    plan = _ready_sites(briefing(fresh, "planning", mark=False))
+    assert plan[0].startswith("- zone_R: 2 sites, best (0,25)-(19,26)"), plan
+    for line in plan[1:3]:                              # zone_C, zone_I: same top strip as zone_R
+        assert "best (0,25)-(19,26)" not in line and ("best as zone_R; next (" in line
+                                                     or "same strip as zone_R" in line), line
+    for env in (fresh, grown_env):
+        for role in DEPTS:
+            shown = [m.group(1) for ln in _ready_sites(briefing(env, role, mark=False))
+                     for m in [re.search(r"(?:best|next) (\(\d+,\d+\)(?:-\(\d+,\d+\))?)", ln)] if m]
+            assert len(shown) == len(set(shown)), (role, shown)
+    zone_m, = [ln for ln in _ready_sites(briefing(grown_env, "planning", mark=False)) if ln.startswith("- zone_M:")]
+    assert zone_m.endswith("same list as zone_C"), zone_m
+
+
+def test_ready_sites_extra_fields():
+    from civitas.fleet.tools import SiteList, ready_lines
+    lists = {"near_homes": SiteList([{"x": 1, "y": 2, "homes_within_5": 0}], None, None),
+             "sewage": SiteList([{"x": 3, "y": 4, "pollution": 0.2}], None, None),
+             "pump": SiteList([{"x": 5, "y": 6, "pollution": 0.2}], None, None)}
+    assert ready_lines("utilities", lists) == ["- near_homes: 1 site, best (1,2)", "- sewage: 1 site, best (3,4)",
+                                               "- pump: 1 site, best (5,6), pollution 0.2"]
+
+
+def test_department_briefing_builds_one_observation(monkeypatch):
+    import civitas.fleet.briefing as B
+    import civitas.fleet.tools as T
+    env = _env()
+    calls = []
+    real = B.build_observation
+
+    def counted(*a, **k):
+        calls.append(k.get("site_hints"))
+        return real(*a, **k)
+    monkeypatch.setattr(B, "build_observation", counted)
+    monkeypatch.setattr(T, "build_observation", counted)
+    for role in DEPTS:
+        calls.clear()
+        briefing(env, role, mark=False)
+        assert calls == [True], (role, calls)
+    calls.clear()
+    briefing(env, "mayor", mark=False)
+    assert calls == []
+
+
 def test_mayor_briefing_lists_department_reports():
     env = _env()
     assert "no reports yet" in briefing(env, "mayor").lower()
@@ -660,6 +1231,38 @@ def test_mayor_briefing_lists_department_reports():
     fire, = [ln for ln in text.splitlines() if "FIRE-REPORT" in ln]
     assert len(fire) < 270
     assert "no reports yet" not in text.lower()
+
+
+def test_mayor_briefing_marks_departments_below_their_target():
+    env = _env()
+    w = env.world
+    w.dept_funds.update(planning=9500, utilities=2000)
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500}})
+    lines = {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
+             if ln.startswith("- ") and ": funds " in ln}
+    assert lines["planning"] == "- planning: funds $9,500, target $9,000"
+    assert lines["utilities"] == "- utilities: funds $2,000 < target $7,000"
+    assert lines["fire"] == "- fire: funds $0 < target $2,500"
+    assert lines["police"] == "- police: funds $0"
+    text = briefing(env, "mayor", mark=False)
+    from civitas.fleet.fmt import money
+    assert f"- 2 below target ($7,500 short; treasury {money(w.treasury)}): allocate_budget" in text
+    w.treasury = 9000
+    assert ("- 2 below target ($7,500 short; treasury $9,000, $6,000 above the $3,000 reserve): "
+            "allocate_budget") in briefing(env, "mayor", mark=False)
+    text = briefing(env, "mayor", mark=False)
+    assert text.index("- no reports yet") < text.index("- 2 below target")
+    w.dept_funds.update(utilities=6400, fire=2350)                  # within 10% of the target counts as funded
+    text = briefing(env, "mayor", mark=False)
+    assert "below target" not in text and "- fire: funds $2,350, target $2,500" in text
+    w.dept_funds.update(fire=2399)                                  # $101 short of $2,500: max($100, 10%) = $250
+    assert "below target" not in briefing(env, "mayor", mark=False)
+    w.dept_funds.update(fire=0)
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"fire": 500}})
+    w.dept_funds.update(fire=401)                                   # $99 short: under the $100 floor
+    assert "below target" not in briefing(env, "mayor", mark=False)
+    w.dept_funds.update(fire=399)
+    assert "- 1 below target ($101 short" in briefing(env, "mayor", mark=False)
 
 
 def test_department_briefing_digests_its_own_last_turn():
@@ -679,10 +1282,43 @@ def test_department_briefing_digests_its_own_last_turn():
     assert "build_police_station" in text and bad["message"][:40] in text and "failed actions: none" not in text
     assert "events: none" not in text
     assert "build_fire_station" not in text and "FIRE-KIND" not in text
-    assert "A tornado hit" in text and "1 new council message" in text
+    assert "A tornado hit" in text and "- m0 mayor -> you: police: cover downtown" in text
     assert fs.last_turn_month["police"] == 0                          # mark=False leaves the turn unmarked
     briefing(env, "police")
-    assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == 0
+    assert fs.last_turn_month["police"] == 1 and fs.digest("police", 1, env.council)["messages"] == []
+    assert "no new council messages" in briefing(env, "police", mark=False)
+
+
+def test_briefing_lists_new_council_messages_for_this_role():
+    from civitas.fleet.tools import MAX_ENTRIES
+    env = _env()
+    c = env.council
+    c.post(0, "mayor", "OLD-MSG before the last turn", "planning")
+    briefing(env, "planning")
+    c.post(0, "utilities", "TO-PLANNING need road access at the river " + "r" * 300, "planning")
+    c.post(0, "mayor", "TO-ALL keep the treasury positive", "all")
+    c.post(0, "fire", "TO-POLICE share the corner lot", "police")
+    c.post(0, "planning", "OWN-POST zoning the east side", "all")
+    env.end_month()
+    text = briefing(env, "planning", mark=False)
+    msgs = text[text.index("new council messages"):].split("\n\n")[0]
+    line, = [ln for ln in msgs.splitlines() if "TO-PLANNING" in ln]
+    assert line.startswith("  - m0 utilities -> you: ") and line.endswith("...") and len(line) < 240
+    assert "  - m0 mayor -> all: TO-ALL keep the treasury positive" in msgs
+    assert msgs.index("TO-PLANNING") < msgs.index("TO-ALL")                 # newest last
+    assert "TO-POLICE" not in msgs and "OWN-POST" not in msgs and "OLD-MSG" not in text
+    assert "older" not in msgs
+    for i in range(6):
+        c.post(1, "health", f"REQ-{i} clinic lot please", "all")
+    text = briefing(env, "planning", mark=False)
+    msgs = text[text.index("new council messages"):].split("\n\n")[0]
+    assert [f"REQ-{i}" in msgs for i in range(6)] == [False] + [True] * 5
+    assert "TO-PLANNING" not in msgs and "(3 older: get_messages)" in msgs
+    env.cfg.council_window = 0                             # two of the older ones (month 0) are out of the window
+    assert "(3 older, 2 of them beyond get_messages' 0-month window)" in briefing(env, "planning", mark=False)
+    env.world.month = 2
+    assert "(3 older, beyond get_messages' 0-month window)" in briefing(env, "planning", mark=False)
+    assert "- m1 health -> all: REQ-5" in briefing(env, "mayor", mark=False)
 
 
 def test_briefing_dates_and_milestones():
@@ -704,7 +1340,12 @@ def test_mayor_warning_and_offer_lines():
     text = briefing(env, "mayor", mark=False)
     warn, = [ln for ln in text.splitlines() if "WARNING" in ln]
     assert f"{C.BANKRUPTCY_MONTHS} = bankruptcy" in warn and f"{C.RECALL_MONTHS} = recall" in warn
-    assert f"{100 * C.RECALL_APPROVAL:.0f}%" in warn and "3 month" in warn
+    assert f"{100 * C.RECALL_APPROVAL:.0f}%" in warn and "treasury 3 months (" in warn and "% 2 months (" in warn
+    w.months_negative, w.low_approval_months = 1, 0
+    warn, = [ln for ln in briefing(env, "mayor", mark=False).splitlines() if "WARNING" in ln]
+    assert "negative treasury 1 month (" in warn and "% 0 months (" in warn
+    w.month = env.cfg.months - 1
+    assert "): 1 month left" in briefing(env, "mayor", mark=False).splitlines()[0]
     offer, = [ln for ln in text.splitlines() if "OPEN OFFER #7" in ln]
     assert "250 jobs" in offer and "$8,000" in offer and "accept_offer" in offer and "month 5" in offer
 
@@ -732,16 +1373,23 @@ def test_briefings_stay_bounded_at_the_limits():
         env.council.post(0, "press", f"msg {i} " + "y" * 300, "all")
     for i in range(12):
         w.event(f"event {i} " + "e" * 300)
+    w.struct[36:48, 37:47] = C.ROAD                     # 121 road tiles off the highway, spanning x 10-46, y 10-47
+    w.struct[10, 10] = C.ROAD
+    w.refresh()
     env.end_month()
+    w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
+    w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 6000, (role, len(text) - len(memory))   # memory is shown in full by design
-        assert len(text) < 12000, (role, len(text))
+        assert len(text) - len(memory) < 7500 - 300, (role, len(text) - len(memory))   # memory is shown in full
+        assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
-        assert f"{MAX_ENTRIES + 5} new council messages (get_messages shows the latest {MAX_ENTRIES})" in text
+        assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
-    assert mayor.count("(full: history kind=report)") == len(DEPTS)
+    assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
+    assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
+    assert "(cut reports: history kind=report)" in mayor
 
 
 
@@ -1229,6 +1877,173 @@ def test_tool_agent_keeps_actions_when_the_client_crashes():
     assert env.apply("mayor", d) == d.executed and env.world.dept_funds["health"] == 1000
 
 
+# ------------------------------------------------------------------ step budget and repeated calls
+def _tool_msgs(d) -> list[dict]:
+    return [json.loads(m["content"]) for m in d.meta["messages"] if m["role"] == "tool"]
+
+
+def test_tool_results_carry_steps_left_and_a_wrap_up_note():
+    a, env = _agent(reply=lambda m: [_call("inspect", {"x": 10 + len(m), "y": 20, "radius": 0})], max_steps=6)
+    d = a.act(env.observe("police"))
+    res = _tool_msgs(d)
+    assert [r["steps_left"] for r in res] == [5, 4, 3, 2, 1, 0]
+    assert "wrap_up" not in res[0] and "wrap_up" not in res[1]
+    assert res[2]["wrap_up"].startswith("3 tool calls left") and "end_turn" in res[2]["wrap_up"]
+    assert res[3]["wrap_up"].startswith("2 tool calls left")
+    assert res[4]["wrap_up"].startswith("1 tool call left") and "end_turn" in res[4]["wrap_up"]
+    assert "turn ends now" in res[5]["wrap_up"]
+    assert all("steps_left" not in c["result"] for c in d.meta["tool_trace"])      # the trace stays slim
+    a, env = _agent(reply=lambda m: [_call("unlocks", {}), _call("end_turn", {"report": "done"})], max_steps=5)
+    d = a.act(env.observe("police"))
+    unlocks, end = _tool_msgs(d)
+    assert unlocks["steps_left"] == 4 and "wrap_up" not in unlocks
+    assert end == {"ok": True, "message": "turn ended"}                             # end_turn's own result: no budget
+
+
+def test_steps_left_and_notes_fit_in_the_tool_message():
+    a, env = _agent(role="planning", reply=lambda m: [_call("map_overview", {}), _call("history", {"months": 12}),
+                                                     _call("inspect", {"x": 24, "y": 24, "radius": 4})], max_steps=6)
+    d = a.act(env.observe("planning"))
+    msgs = [m["content"] for m in d.meta["messages"] if m["role"] == "tool"]
+    assert len(msgs) == 6 and all(len(m) <= 4000 for m in msgs)
+    res = [json.loads(m) for m in msgs]                                              # nothing cut mid-JSON
+    assert res[3]["repeat"] == "same as call 1 (nothing changed since)" and res[3]["wrap_up"]
+    assert max(len(m) for m in msgs) > 3000                                         # a big result was in the mix
+
+
+def test_fit_leaves_room_for_its_truncation_note():
+    from civitas.fleet.tools import _fit
+    res = _fit({"ok": True, "items": [{"x": i, "y": i} for i in range(500)]}, limit=600, hint="ask for less")
+    assert len(json.dumps(res)) <= 600 and "truncated" in res
+
+
+def test_repeated_look_up_returns_the_earlier_result():
+    env = _env()
+    box = ToolBox(env, "police")
+    first = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    again = box.call("inspect", '{"y": "20", "radius": 1, "x": 20.0}')              # same after coercion, any order
+    assert again == {**first, "repeat": "same as call 1 (nothing changed since)"}
+    assert "repeat" not in first
+    other = box.call("inspect", {"x": 20, "y": 20})                                   # radius left out: a new call
+    assert "repeat" not in other
+    assert box.call("unlocks", {})["ok"]
+    assert box.call("unlocks", None)["repeat"] == "same as call 4 (nothing changed since)"
+
+
+def test_repeated_look_up_after_a_successful_action_runs_again():
+    env = _env()
+    env.world.treasury = 50000
+    box = ToolBox(env, "mayor")
+    before = box.call("city_overview", {})
+    assert box.call("allocate_budget", {"department": "health", "amount": 1000})["ok"]
+    after = box.call("city_overview", {})
+    assert "repeat" not in after and after != before
+    assert box.call("city_overview", {})["repeat"] == "same as call 3 (nothing changed since)"
+    plan = box.call("get_plan", {})                                                   # the plan is state too
+    assert box.call("update_plan", {"goals": ["grow"]})["ok"]
+    assert "repeat" not in box.call("get_plan", {}) and box.call("get_plan", {})["goals"] == ["grow"]
+    assert plan["plan"] is None
+
+
+def test_failed_action_refreshes_history_but_not_other_look_ups():
+    env = _env()
+    env.world.dept_funds["utilities"] = 0
+    box = ToolBox(env, "utilities")
+    box.call("history", {"kind": "failure"})
+    box.call("find_sites", {"purpose": "wind"})
+    assert box.call("build_power_plant", {"kind": "wind", "x": 0, "y": 0})["ok"] is False
+    hist = box.call("history", {"kind": "failure"})
+    assert "repeat" not in hist and len(hist["entries"]) == 1                        # shows the new failure
+    assert box.call("find_sites", {"purpose": "wind"})["repeat"] == "same as call 2 (nothing changed since)"
+
+
+def test_repeated_failed_action_is_refused():
+    env = _env()
+    env.world.dept_funds["utilities"] = 0
+    box = ToolBox(env, "utilities")
+    first = box.call("build_power_plant", {"kind": "wind", "x": 0, "y": 0})
+    assert first["ok"] is False
+    struct = env.world.struct.copy()
+    again = box.call("build_power_plant", '{"y": "0", "x": 0, "kind": "wind"}')
+    assert again == {"ok": False, "refused": "repeat",
+                     "error": f"this exact call failed at call 1: {first['error']}; change the arguments or do "
+                              "something else"}
+    assert len(box.executed) == 1 and (env.world.struct == struct).all()
+    assert len(FleetState.of(env).history(kind="failure", role="utilities")) == 1   # not charged twice
+    moved = box.call("build_power_plant", {"kind": "wind", "x": 1, "y": 0})           # other arguments run
+    assert "refused" not in moved and len(box.executed) == 2
+    env.apply("utilities", Decision(executed=box.executed))
+    assert env.invalid_counts["utilities"] == 2
+
+
+def test_failed_action_repeated_after_a_success_runs_again():
+    env = _env()
+    env.world.treasury = 500
+    box = ToolBox(env, "mayor")
+    big = {"department": "health", "amount": 1000}
+    assert box.call("allocate_budget", big)["ok"] is False
+    assert box.call("allocate_budget", big)["refused"] == "repeat"
+    assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]
+    res = box.call("allocate_budget", big)
+    assert res["ok"] is False and "refused" not in res and "treasury only has" in res["error"]
+    assert len(box.executed) == 3
+    assert len(FleetState.of(env).history(kind="failure", role="mayor")) == 2
+
+
+def test_refused_repeat_after_the_action_cap_says_end_turn():
+    env = _env(max_actions_per_turn=1)
+    env.world.treasury = 50000
+    box = ToolBox(env, "mayor")
+    assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]
+    capped = box.call("set_tax", {"sector": "C", "rate": 9})
+    assert capped["ok"] is False and capped["error"].endswith("call end_turn")
+    again = box.call("set_tax", {"sector": "C", "rate": 9})
+    assert again == {"ok": False, "refused": "repeat", "error": f"this exact call failed at call 2: {capped['error']}"}
+    assert "change the arguments" not in again["error"]
+
+
+def test_repeated_look_up_is_a_copy():
+    env = _env()
+    box = ToolBox(env, "police")
+    first = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    want = copy.deepcopy(first)
+    first["tiles"].clear()
+    first["ok"] = "changed"
+    again = box.call("inspect", {"x": 20, "y": 20, "radius": 1})
+    assert again == {**want, "repeat": "same as call 1 (nothing changed since)"}
+    again["tiles"].clear()
+    assert box.call("inspect", {"x": 20, "y": 20, "radius": 1})["tiles"] == want["tiles"]
+
+
+def test_turn_control_tools_are_not_deduplicated():
+    env = _env()
+    box = ToolBox(env, "police")
+    for _ in range(2):
+        res = box.call("send_message", {"to": "mayor", "text": "need funds"})
+        assert res["ok"] and "repeat" not in res
+        res = box.call("update_memory", {"lessons": ["roads first"]})
+        assert res["ok"] and "repeat" not in res
+    assert len(box.messages) == 2
+    bad = [box.call("end_turn", {}) for _ in range(2)]                              # a failed end_turn is not refused
+    assert all(r["ok"] is False and "refused" not in r for r in bad)
+
+
+def test_refused_repeats_in_the_agent_trace():
+    a, env = _agent(role="mayor", reply=lambda m: [_call("allocate_budget", {"department": "fire", "amount": 10**9}),
+                                                   _call("allocate_budget", {"amount": "1000000000",
+                                                                             "department": "fire"}),
+                                                   _call("unlocks", {}), _call("unlocks", {}),
+                                                   _call("end_turn", {"report": "r"})])
+    d = a.act(env.observe("mayor"))
+    tr = d.meta["tool_trace"]
+    assert tr[1]["result"]["refused"] == "repeat" and "failed at call 1" in tr[1]["result"]["error"]
+    assert tr[3]["result"]["repeat"] == "same as call 3 (nothing changed since)"
+    assert len(d.executed) == 1 and d.meta["steps"] == 5
+    res = _tool_msgs(d)
+    assert res[1]["steps_left"] == 18 and res[1]["refused"] == "repeat"
+    assert env.apply("mayor", d) == d.executed and env.invalid_counts["mayor"] == 1
+
+
 # ------------------------------------------------------------------ end-of-run report
 from civitas.fleet.report import fleet_report, rows_from_trajectories, turn_row
 
@@ -1270,13 +2085,16 @@ def test_turn_row_is_slim():
              {"tool": "zone", "result": {"ok": False, "error": "no land", "message": "no land"}},   # a failed action
              {"tool": "zone", "result": {"ok": False, "error": "action limit reached"}},           # refused: tool error
              {"tool": "get_plan", "result": {"ok": False, "error": "no plan", "message": "no plan"}},
-             {"tool": "city_overview", "result": {"ok": True}}, {"tool": "inspect"}]
+             {"tool": "city_overview", "result": {"ok": True}}, {"tool": "inspect"},
+             {"tool": "zone", "result": {"ok": False, "error": "this exact call failed at call 2: no land; change "
+                                         "the arguments or do something else", "refused": "repeat"}},
+             {"tool": "city_overview", "result": {"ok": True, "repeat": "same as call 5 (nothing changed since)"}}]
     row = turn_row(_rec("police", 3, [("build_service", False, "tile (3,4) is occupied", 0)], trace=trace,
                         length_stops=2))
     assert row == {"role": "police", "month": 3, "prompt_tokens": 100, "completion_tokens": 20, "steps": 3,
                    "finish_reason": "end_turn", "length_stops": 2, "ended": True, "parse_error": None,
                    "results": [{"type": "build_service", "ok": False, "message": "tile (3,4) is occupied", "cost": 0}],
-                   "tool_errors": ["bad args", "action limit reached", "no plan"]}
+                   "tool_errors": ["bad args", "action limit reached", "no plan"], "repeats": 1, "refused": 1}
 
 
 def test_turn_row_and_rebuild_tolerate_minimal_records(tmp_path):
@@ -1336,6 +2154,22 @@ def test_fleet_report_tool_errors_count_towards_repeated_failures():
     assert [(h["role"], h["count"]) for h in hs] == [("fire", 3), ("health", 3)] and "no noop tool" in hs[1]["text"]
     assert rep["roles"]["health"]["tool_errors"] == 3 and rep["roles"]["health"]["failed"] == 0
     assert rep["roles"]["health"]["top_failures"] == [{"message": trace[0]["result"]["error"], "count": 3}]
+
+
+def test_fleet_report_counts_repeats_apart_from_failures():
+    env = _report_env()
+    refused = {"tool": "build_service", "result": {"ok": False, "refused": "repeat",
+                                                   "error": "this exact call failed at call 1: occupied; change the "
+                                                            "arguments or do something else"}}
+    seen = {"tool": "find_sites", "result": {"ok": True, "repeat": "same as call 2 (nothing changed since)"}}
+    rows = _clean_rows() + [turn_row(_rec("fire", m, [("build_service", False, "occupied", 0)],
+                                          trace=[refused, refused, seen])) for m in (1, 2)]
+    rep, md = fleet_report(env, _summary(env), rows)
+    fire = rep["roles"]["fire"]
+    assert fire["failed"] == 2 and fire["tool_errors"] == 0
+    assert fire["repeats"] == 2 and fire["refused"] == 4
+    assert "repeats (look-ups / refused)" in md and "| 2 / 4 |" in md
+    assert _hints(rep, "repeated_failures") == []
 
 
 def test_every_repeated_failure_hint_is_in_top_failures():

@@ -3,7 +3,8 @@
 `system_prompt()` is the same every turn: how to play, the role's mission and the game rules, then the coach's
 playbooks, so coaches steer strategy but cannot change rules or tools. `briefing()` is a compact status for the
 turn: the mayor gets the city, finances, department reports and the plan; a department gets its plan slice,
-budget, key metrics, a "since your last turn" digest and its memory. Everything else is a tool call away.
+budget, key metrics, a "since your last turn" digest, the map, its ready sites and its memory. Everything else is a
+tool call away.
 """
 from __future__ import annotations
 
@@ -16,9 +17,10 @@ from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import REPORT_PREVIEW_CHARS, cut, money, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import MAX_ENTRIES, SITE_PURPOSES, overview, plan_slice
+from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
+    ready_lines, scarce_bank, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -49,6 +51,9 @@ UNLOCK_ROLES = {
 }
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
+MAX_MESSAGES = 5         # new council messages quoted per briefing
+# the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
+GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -59,7 +64,9 @@ HOW_TO_PLAY = """\
 You are the {title} in a fleet of AI agents that runs a city. The mayor is the manager: it sets the city plan \
 (goals, a budget target and a priority per department) and moves the money; the departments ({depts}) carry the \
 plan out. {cadence}, and you start each turn from a short briefing.
-- Each turn you work by calling tools. Look things up before acting ({lookups}).{coords}
+- Each turn you work by calling tools. Look things up before acting ({lookups}). The Map block in your \
+briefing usually suffices; call map_overview only when you need tile-level layout (at most once per turn); \
+inspect for details.{coords}
 - Action tools run immediately and report success or failure, the cost and the money left. When an action fails, \
 read the error and fix the cause (another site, a cheaper option, wait for an unlock) instead of repeating it.
 - {budget}
@@ -69,9 +76,13 @@ lessons) and the game's history log. Write down what you learn.
 - When you are done, call end_turn with a short report (what you did, what you need).
 - Limits per turn: at most {max_steps} tool calls; at that limit the turn ends and completed actions stay. \
 {actions}
+- Each tool result shows steps_left; repeating an identical call returns the earlier result (look-ups) or is \
+refused (a failed action).
 - The mode in your briefing header: autonomous = no coach will intervene during the game; supervised = your coach \
 may revise the playbook between sessions."""
-LOOKUPS = ("city_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan", "get_messages", "history")
+LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan",
+           "get_messages", "history")
+LOOKUP_NOTES = {("mayor", "find_sites"): "find_sites (check which sites a department has; read-only)"}
 
 BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month, so keep a reserve when you move money "
                    "to departments (allocate_budget) or cut taxes.",
@@ -103,7 +114,7 @@ def _date(env) -> str:
     w = env.world
     season = f", {w.season()}" if w.seasons_on else ""
     return (f"month {w.month} of {env.cfg.months} (year {w.month // 12 + 1}, {calendar.month_name[w.month % 12 + 1]}"
-            f"{season}): {env.cfg.months - w.month} months left")
+            f"{season}): {months(env.cfg.months - w.month)} left")
 
 
 def _action(e: dict) -> str:
@@ -130,10 +141,41 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     L.extend(_listed(events, "history kind=event"))
     for f in w.forecast():
         L.append(f"- forecast: {cut(f)}")
-    n = d["messages"]
-    shows = f"get_messages shows the latest {MAX_ENTRIES}" if n > MAX_ENTRIES else "get_messages"
-    L.append(f"- {n or 'no'} new council message{'' if n == 1 else 's'}" + (f" ({shows})" if n else ""))
+    msgs = [env._local(m) for m in d["messages"]]
+    L.append("- new council messages (newest last):" if msgs else "- no new council messages")
+    older = msgs[:-MAX_MESSAGES]
+    if older:
+        L.append(f"  - ({len(older)} older{_older_reach(env, role, older)})")
+    L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] == role else m['to']}: "
+             f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
     return L
+
+
+def _older_reach(env, role: str, older: list[dict]) -> str:
+    """How the briefing's older new messages can be read: get_messages returns the newest MAX_ENTRIES messages
+    visible within the council window (ToolBox.get_messages), so some may be past its cap or its window."""
+    window = env.cfg.council_window
+    since = env.world.month - window
+    key = lambda m: (m["month"], m["sender"], m["to"], m["text"])
+    got = {key(env._local(m)) for m in env.council.visible_to(env._name(role), since_month=since)[-MAX_ENTRIES:]}
+    missing = [m for m in older if key(m) not in got]
+    if not missing:
+        return ": get_messages"
+    if any(m["month"] >= since for m in missing):        # in the window but past the cap
+        return f"; get_messages shows only the latest {MAX_ENTRIES}"
+    beyond = "beyond" if len(missing) == len(older) else f"{len(missing)} of them beyond"
+    return f", {beyond} get_messages' {window}-month window"
+
+
+def _map(w) -> list[str]:
+    return ["## Map"] + map_lines(map_facts(w))
+
+
+def _ready_sites(w, role: str, obs: dict) -> list[str]:
+    """One line per find_sites purpose (count and best site, or why there is none), so agents don't re-run
+    find_sites for every purpose each turn."""
+    return (["## Ready sites"] + ready_lines(role, site_lists(w, role, obs), scarce_bank(w))
+            + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -185,15 +227,17 @@ def _mayor(env, fleet: FleetState) -> list[str]:
          f"unemployment {pct(o['unemployment_pct'])}",
          "- jobs: " + ", ".join(f"{k} {num(v)}" for k, v in o["jobs"].items())
          + " | demand: " + _value("demand", o["demand"]),
-         *(f"- {k}: {_value(k, o[k])}" for k in ("power", "water", "sewage")),
+         "- supply / demand (coverage): " + ", ".join(
+             f"{k} {num(o[k]['supply'])} / {num(o[k]['demand'])} ({pct(o[k]['coverage_pct'])})"
+             for k in ("power", "water", "sewage")),
          "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
          "", "## Finances",
          f"- treasury {money(o['treasury'])}{ch('treasury', money)}, debt {money(o['debt'])}; last month income "
          f"{money(o['last_month']['income'])}, expenses {money(o['last_month']['expenses'])}"]
     if w.months_negative or w.low_approval_months:
-        L.append(f"- WARNING: {w.months_negative} month(s) with a negative treasury ({C.BANKRUPTCY_MONTHS} = "
-                 f"bankruptcy), {w.low_approval_months} month(s) of approval below {100 * C.RECALL_APPROVAL:.0f}% "
+        L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
+                 f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
                  f"({C.RECALL_MONTHS} = recall)")
     L += [""] + _digest(env, fleet, "mayor")
     for off in w.offers:
@@ -203,25 +247,32 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     plan = bool(fleet.plan_versions)
     budgets, priorities = (p["budgets"], p["priorities"]) if plan else ({}, {})
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
-    L += ["", "## Departments: funds, plan target, priority, latest report"]
+    f = funding_gaps(env, fleet)
+    clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
+    L += ["", "## Departments"
+          + (" (cut reports: history kind=report)" if clipped else "")]
     for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(w.dept_funds[d])}" + (f", target {money(budgets[d])}" if d in budgets else "")
-                 + (f"; priority: {cut(priorities[d], 60)}" if priorities.get(d) else ""))
+        L.append(f"- {d}: funds {money(w.dept_funds[d])}"
+                 + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
+                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
-            text = cut(latest[d]["text"], REPORT_PREVIEW_CHARS)
-            clipped = len(" ".join(latest[d]["text"].split())) > REPORT_PREVIEW_CHARS
-            L.append(f"  report (m{latest[d]['month']}): {text}" + (" (full: history kind=report)" if clipped else ""))
+            L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
     if not latest:
         L.append("- no reports yet")
+    if f.gaps:
+        L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
+                 + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
+                    f", {money(f.spare)} above the {money(f.reserve)} reserve): allocate_budget" if f.short else
+                    "): allocate_budget"))
     L += [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")
     else:
         L += [f"## City plan (v{p['version']}, month {p['month']}; full text: get_plan)",
-              f"- goals: {_goals(p['goals'], 100)}"]
+              f"- goals: {_goals(p['goals'], GOAL_CHARS)}"]
         if p["notes"]:
-            L.append(f"- notes: {cut(p['notes'], 200)}")
-    return L + [""] + _memory(fleet, "mayor")
+            L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")
+    return L + [""] + _map(w) + [""] + _memory(fleet, "mayor")
 
 
 def _department(env, fleet: FleetState, role: str) -> list[str]:
@@ -244,14 +295,14 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
           f"- {money(w.dept_funds[dept])} in department funds" + (f" (plan target {money(target)})"
                                                                    if target is not None else "")
           + f"; spent last month {money(spent)}"]
-    city = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
-                             include_map=False, site_hints=False)["city"]
-    L += ["", "## Key metrics", *(_metric(city, k) for k in KEY_METRICS[role])]
+    obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
+                            include_map=False, site_hints=True)          # the one build: metrics and ready sites
+    L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _memory(fleet, role)
+    return L + [""] + _map(w) + [""] + _ready_sites(w, role, obs) + [""] + _memory(fleet, role)
 
 
-def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: int = 1,
+def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,
                   max_actions: int | None = None, target_pop: int | None = None) -> str:
     """Fixed "how to play" rules, the role's mission and the game rules, then the coach's playbooks (fleet, then
     the role's; empty ones left out). Callers pass `act_every=env.cfg.act_every`,
@@ -268,11 +319,12 @@ def system_prompt(role: str, cfg: FleetAgentConfig, months: int, *, act_every: i
                  title=spec["title"], depts=", ".join(DEPARTMENTS), budget=BUDGET[side], team=TEAM[side],
                  cadence="Each game month is one turn" if act_every <= 1 else
                  f"You act every {act_every} months (the city runs on its own in between)",
-                 lookups=", ".join(t for t in LOOKUPS if t != "find_sites" or SITE_PURPOSES[role]),
+                 lookups=", ".join(LOOKUP_NOTES.get((role, t), t) for t in LOOKUPS
+                                   if t != "find_sites" or SITE_PURPOSES[role] or role == "mayor"),
                  coords="" if role == "mayor" else " Coordinates: x = column (0 = west), y = row (0 = north).",
                  max_steps=cfg.max_steps, actions=cap + " (look-ups still work; call end_turn)."),
              f"# Your role: {spec['title']}\n{spec['mission']}",
-             "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=months,
+             "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=total_months,
                                              target_pop=target_pop or ScoringConfig.target_population).rstrip()]
     books = [(h, b.strip()) for h, b in (("Fleet", cfg.fleet_playbook), (spec["title"], cfg.playbook)) if b.strip()]
     if books:
