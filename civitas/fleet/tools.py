@@ -17,7 +17,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import (MAX_RECT, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _rect, action_docs,
+from ..core.actions import (POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _rect, action_docs,
                             apply_action)
 from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
 from ..core.roles import ROLES
@@ -34,6 +34,7 @@ MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
+DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
@@ -367,6 +368,11 @@ def _box(mask) -> tuple[list[int], list[int]] | None:
 
 def _span(a: int, b: int) -> str:
     return str(a) if a == b else f"{a}-{b}"
+
+
+def _some(items: list[str], n: int, sep: str = ", ") -> str:
+    """The first n items, and how many more there are."""
+    return sep.join(items[:n]) + (f" +{len(items) - n} more" if len(items) > n else "")
 
 
 def _roads(w) -> dict | None:
@@ -979,9 +985,9 @@ class ToolBox:
         """How to fix a failed build_road or zone, appended to the core message in the tool result (v8, seed 0 month
         0: planning zoned row 23, then ran four roads north through those lots, still empty, told only "occupied by
         residential" and never that dezoning is free; it also re-built a road twice and zoned high density before
-        'Town'). A blocked road names the empty zoned lots and the buildings on its line, and a dezone for the lots:
-        their bounding box, or the first lot when the box holds a developed zone tile (dezone razes it) or is too big
-        for one action. "" for other failures and bad arguments (the core message says so)."""
+        'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile building once),
+        and dezones that stay on the line: per straight leg, one per run of lots between buildings, from its first to
+        its last lot (dezone razes developed tiles, and a box off the line would take other lots). "" otherwise."""
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
@@ -991,34 +997,39 @@ class ToolBox:
             return f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites road_extension)"
         if " is occupied by " not in message:
             return ""
-        try:
-            line = _line(w, args)
-        except Exception:
-            return ""
-        lots, built = [], []
-        for x, y in line:                                 # what build_road can't take, as it walks the line
+        line = _line(w, args)                             # build_road got this far, so the arguments parse
+        kind = {}                                         # what build_road can't take, as it walks the line
+        for x, y in line:
             if w.struct[y, x] not in (C.NONE, C.ROAD, C.HIGHWAY):
-                (lots if w.struct[y, x] in C.ZONES and w.level[y, x] == 0 else built).append((x, y))
-        tiles = lambda pts: (", ".join(f"({x},{y})" for x, y in pts[:BLOCKERS_NAMED])
-                             + (f" +{len(pts) - BLOCKERS_NAMED} more" if len(pts) > BLOCKERS_NAMED else ""))
-        s = "s" if len(built) > 1 else ""
-        around = "route around (the Map block has the road extent)"
+                kind[x, y] = "lot" if w.struct[y, x] in C.ZONES and w.level[y, x] == 0 else "built"
+        lots = [p for p, k in kind.items() if k == "lot"]
+        firsts = {}                                       # a building once, at its first tile on the line
+        for p, k in kind.items():
+            if k == "built":
+                firsts.setdefault(w._anchor_of(*p), p)
+        built = list(firsts.values())
+        ls, bs = "s" * (len(lots) > 1), "s" * (len(built) > 1)
+        tiles = lambda pts: _some([f"({x},{y})" for x, y in pts], BLOCKERS_NAMED)
+        tail = f"; route around the building{bs} (the Map block has the road extent)"
         if not lots:
-            return f" - in the way: building{s} {tiles(built)}; {around}"
-        xs, ys = zip(*lots)
-        x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
-        box = np.s_[y1:y2 + 1, x1:x2 + 1]
-        whole = w.struct[box].size <= MAX_RECT and not (np.isin(w.struct[box], list(C.ZONES)) & (w.level[box] > 0)).any()
-        if not whole:                                     # dezone razes developed tiles: the first lot alone
-            (x1, y1), (x2, y2) = lots[0], lots[0]
-        who = ("the lots" if built else "them") if len(lots) > 1 else "the lot" if built else "it"
-        rect = f"dezone x1={x1},y1={y1},x2={x2},y2={y2}"
-        fix = (f"dezone {who} first (free): {rect}" if whole else
-               f"dezone {who} first (free) in boxes without buildings (dezone razes them), e.g. {rect}")
-        head = f" - in the way: empty zoned lot{'s' * (len(lots) > 1)} {tiles(lots)}"
+            return f" - in the way: building{bs} {tiles(built)}{tail}"
+        n = next((i for i, (_, y) in enumerate(line) if y != line[0][1]), len(line))    # the horizontal leg comes first
+        rects = []
+        for leg in (line[:n], line[n:]) if n > 1 else (line,):
+            run = []
+            for p in leg + [None]:                        # a run of lots ends at a building or the leg's end
+                if p is None or kind.get(p) == "built":
+                    if run:
+                        (xa, ya), (xb, yb) = run[0], run[-1]
+                        rects.append(f"dezone x1={min(xa, xb)},y1={min(ya, yb)},x2={max(xa, xb)},y2={max(ya, yb)}")
+                    run = []
+                elif kind.get(p) == "lot":
+                    run.append(p)
+        head = f" - in the way: empty zoned lot{ls} {tiles(lots)}"
+        fix = f"dezone the lot{ls} first (free): {_some(rects, DEZONES_NAMED, '; ')}"
         if not built:
             return f"{head}; {fix}, then retry"
-        return f"{head} and building{s} {tiles(built)}; {fix}, and route around the building{s}, or just {around}"
+        return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:
