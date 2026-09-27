@@ -444,11 +444,12 @@ tasks and money, and to let people coach it.
   council messages addressed to it or to `all`, quoted with sender and month), a Ready
   sites block (one line per `find_sites` purpose: the count and best site with the price
   of the cheapest unlocked building the sites are for (a bus line for bus stops; per tile
-  for levees, `$300/tile`, and for congested roads, `$30/tile` for an avenue), and `;
-  $2,500 - you have $1,000` when the funds are short; or why there is none, e.g. locked,
-  no connected road reaches the river, the riverbank beside the roads is taken, or no
-  roadside lot is away from homes for a landfill, cemetery or jail; a site on one of the
-  last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
+  for levees, `$300/tile`, and for congested roads, `$30/tile` for an avenue, with
+  stretches that are avenues already listed last), and `; $2,500 - you have $1,000` when
+  the funds are short; or why there is none, e.g. locked, under 1,500 residents for bus
+  stops, no connected road reaches the river, the riverbank beside the roads is taken, or
+  no roadside lot is away from homes for a landfill, cemetery or jail; a site on one of
+  the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
   memory. Every purpose outside planning is priced. A library (it only adds to schools), a
   shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
   train station, harbour or metro station (bus lines come first) are priced on their

@@ -90,6 +90,10 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
               "bus_stops": ("too few homes and jobs on the roads yet (~1,500 residents)",
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
+# purpose -> the population its list waits for (empty below it, with its SITE_NOTES reason): observation's suggested
+# stops have no floor, so from month 1 transport read "can't pay (cheapest: bus_stops $1,500)" and the mayor "needs
+# $1,500 for a bus line", against both playbooks (no bus line before ~1,500 residents)
+SITE_MIN_POP = {"bus_stops": 1500}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
@@ -641,10 +645,14 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
         if purpose in BANK_TOP_UP and len(sites) < len(found or []):
             sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
+        if purpose == "congested_roads":         # avenues already last (kept): an avenue upgrade charges nothing there
+            sites.sort(key=lambda s: not site_tiles(w, purpose, s)[0])
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             key = min(keys, key=C.UNLOCK_POP.get)
             short, note = f"locked (unlocks at {C.UNLOCK_POP[key]:,} residents)", "locked: " + w.unlock_note(key)
+        elif w.metrics()["population"] < SITE_MIN_POP.get(purpose, 0):
+            sites, (short, note) = [], SITE_NOTES[purpose]
         elif sites:
             short = note = None
         else:                    # models told to "inspect the map" scanned it blindly for whole turns
@@ -804,9 +812,11 @@ def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
 
 
 def best_stretch(w, purpose: str, sites: list[dict]) -> tuple[int, int]:
-    """site_tiles of the first site with something to charge (the best stretch the avenue price applies to: seed 0's
-    most congested roads were avenues already by month 60); one tile when none has."""
-    return next((t for s in sites if (t := site_tiles(w, purpose, s))[0]), (1, 1))
+    """site_tiles of the best (first) site, one tile when it has nothing to charge: site_lists ranks congested
+    stretches that are avenues already last (seed 0's most congested roads were by month 60), so a first one with
+    nothing to charge means none has."""
+    t = site_tiles(w, purpose, sites[0])
+    return t if t[0] else (1, 1)
 
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:

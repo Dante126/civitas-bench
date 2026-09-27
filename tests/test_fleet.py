@@ -1847,14 +1847,42 @@ def test_a_congested_bridge_is_priced_as_upgrade_road_charges():
     w.congestion[24, 5:9] = 1.2                       # a second stretch, x 5-8 on land
     w.road_class[24, 24:31] = C.ROAD_CLASSES["avenue"]    # the first one avenues already: nothing to charge there
     sites = ToolBox(env, "transport").call("find_sites", {"purpose": "congested_roads"})["sites"]
-    assert [(t["x1"], t["x2"]) for t in sites] == [(24, 30), (5, 8)], sites
-    assert site_tiles(w, "congested_roads", sites[0]) == (0, 0) and best_stretch(w, "congested_roads", sites) == (4, 4)
+    assert [(t["x1"], t["x2"]) for t in sites] == [(5, 8), (24, 30)], sites           # ranked last, not dropped
+    assert site_tiles(w, "congested_roads", sites[1]) == (0, 0) and best_stretch(w, "congested_roads", sites) == (4, 4)
     w.dept_funds["transport"] = 0
+    ready, = [ln for ln in _ready_sites(briefing(env, "transport", mark=False)) if ln.startswith("- congested_roads:")]
+    assert ready.startswith("- congested_roads: 2 sites, best (5,24)-(8,24)"), ready
     mayor = briefing(env, "mayor", mark=False).splitlines()
     assert next(ln for ln in mayor if ln.startswith("- transport:")) == (
         f"- transport: funds $0; needs ${4 * per:,} for 4 avenue tiles (2 ready sites)")
     w.road_class[24, 5:9] = C.ROAD_CLASSES["avenue"]      # none left to charge: one tile, as when a site doesn't say
     assert best_stretch(w, "congested_roads", sites) == (1, 1)
+
+
+def test_no_bus_stops_before_1500_residents():
+    """observation._suggest_stops has no population floor: from month 1 bus stops were listed, and with bus lines
+    priced transport at $0 read "can't pay (cheapest: bus_stops $1,500)" and the mayor "transport: needs $1,500 for
+    a bus line", against both playbooks ("not before ~1,500 residents"). Below SITE_MIN_POP the list is empty."""
+    from civitas.fleet.tools import SITE_MIN_POP, SITE_NOTES
+    from civitas.core.observation import build_observation
+    env = CivitasEnv(GameConfig(seed=0, months=24))
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(3):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    w = env.world
+    assert w.metrics()["population"] < SITE_MIN_POP["bus_stops"] == 1500
+    assert build_observation(w, "transport", council_msgs=[], memory={}, scores={}, months_total=24,
+                             include_map=False, site_hints=True)["transport"]["suggested_stops"]   # the hint has some
+    w.dept_funds["transport"] = 0
+    text = briefing(env, "transport", mark=False)
+    assert _ready_sites(text)[0] == f"- bus_stops: none - {SITE_NOTES['bus_stops'][0]}", _ready_sites(text)
+    assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text
+    res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
+    assert res["sites"] == [] and res["note"] == SITE_NOTES["bus_stops"][1]
+    mayor = briefing(env, "mayor", mark=False).splitlines()
+    assert next(ln for ln in mayor if ln.startswith("- transport:")) == "- transport: funds $0"
 
 
 def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
