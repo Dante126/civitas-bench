@@ -495,6 +495,26 @@ def test_listed_riverbank_sites_build_on_the_highway_network():
         assert res.ok and "not connected" not in res.message, res.message
 
 
+def _two_bridges(w):
+    """Seed 0: highway-connected bridges on rows 24 and 34, with 8 free riverbank lots beside them."""
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 50000
+    for road in ({"x1": 19, "y1": 24, "x2": 38, "y2": 24}, {"x1": 20, "y1": 25, "x2": 20, "y2": 34},
+                 {"x1": 21, "y1": 34, "x2": 38, "y2": 34}):
+        assert apply_action(w, "planning", {"type": "build_road", **road}).ok
+    return {(25, 23), (29, 23), (26, 25), (30, 25), (29, 33), (33, 33), (28, 35), (33, 35)}
+
+
+def _bank_stubs(w, rows):
+    """A road tile two west of the river on each row, off the highway: a riverbank hint beside it."""
+    for y in rows:
+        x = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 2
+        assert apply_action(w, "planning", {"type": "build_road", "x1": x, "y1": y, "x2": x, "y2": y}).ok
+
+
+def _where_all(sites):
+    return [(s["x"], s["y"]) for s in sites]
+
+
 def test_riverbank_lists_top_up_when_the_hints_name_unconnected_roads():
     """The observation cuts its riverbank lists to 6 before site_lists drops the sites beside roads off the highway:
     road stubs along the bank north and south left pump and sewage empty ("all taken") with 8 free lots beside the
@@ -502,28 +522,18 @@ def test_riverbank_lists_top_up_when_the_hints_name_unconnected_roads():
     from civitas.fleet.tools import _site, role_obs
     env = _env()
     w = env.world
-    w.dept_funds["planning"] = w.dept_funds["utilities"] = 50000
-    for road in ({"x1": 19, "y1": 24, "x2": 38, "y2": 24}, {"x1": 20, "y1": 25, "x2": 20, "y2": 34},
-                 {"x1": 21, "y1": 34, "x2": 38, "y2": 34}):          # bridges on rows 24 and 34
-        assert apply_action(w, "planning", {"type": "build_road", **road}).ok
-    lots = {(25, 23), (29, 23), (26, 25), (30, 25), (29, 33), (33, 33), (28, 35), (33, 35)}
+    lots = _two_bridges(w)
     hints = lambda key: role_obs(env, "utilities")["candidate_sites"][key]
-    where = lambda sites: [(s["x"], s["y"]) for s in sites]
+    where = _where_all
     find = lambda purpose: ToolBox(env, "utilities").call("find_sites", {"purpose": purpose})
-
-    def stubs(rows):                                     # a road tile two west of the river, off the highway
-        for y in rows:
-            x = int(np.nonzero(w.terrain[y] == C.WATER)[0].min()) - 2
-            assert apply_action(w, "planning", {"type": "build_road", "x1": x, "y1": y, "x2": x, "y2": y}).ok
-
     for purpose, key in (("pump", "riverbank_next_to_road"), ("sewage", "riverbank_for_sewage")):
         sites = find(purpose)["sites"]                   # nothing dropped: the hints as they are
         assert sites == [_site(s) for s in hints(key)] and len(sites) == 6 and set(where(sites)) < lots
-    stubs(range(2))                                      # 3 unconnected lots north: the pump hints' first 3
+    _bank_stubs(w, range(2))                             # 3 unconnected lots north: the pump hints' first 3
     assert where(hints("riverbank_next_to_road"))[:3] == [(30, 0), (30, 1), (30, 2)]
     assert where(find("pump")["sites"]) == [(25, 23), (29, 23), (26, 25), (30, 25), (29, 33), (33, 33)]
     assert find("sewage")["sites"] == [_site(s) for s in hints("riverbank_for_sewage")]     # south first: untouched
-    stubs([*range(2, 10), *range(38, 48)])
+    _bank_stubs(w, [*range(2, 10), *range(38, 48)])
     w.river_row[23] = 0.3                                # the river is dirty by row 23, and so is (30,25)
     w.pollution[25, 30] = 0.12
     for key in ("riverbank_next_to_road", "riverbank_for_sewage"):
@@ -540,6 +550,28 @@ def test_riverbank_lists_top_up_when_the_hints_name_unconnected_roads():
     assert res.ok and "not connected" not in res.message, res.message
     res = apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": 28, "y": 35})
     assert res.ok and "not connected" not in res.message, res.message
+
+
+def test_topped_up_bank_sites_rank_as_the_hints_do():
+    """Topped-up lots are ranked as observation._candidate_sites ranks its hints: pumps +0.5 at or below an outlet,
+    crowded spots last with "crowd" (the pump at (26,25) makes (25,23) lose 15%: it was the best pump site)."""
+    env = _env()
+    w = env.world
+    _two_bridges(w)
+    for action in ({"type": "build_water", "kind": "pump", "x": 26, "y": 25},
+                   {"type": "build_sewage", "kind": "outlet", "x": 28, "y": 35}):
+        assert apply_action(w, "utilities", action).ok
+    _bank_stubs(w, [*range(10), *range(38, 48)])
+    w.pollution[33, 33] = 0.2                            # dirtier than (33,35), which is below the outlet (+0.5)
+    box = ToolBox(env, "utilities")
+    pump = box.call("find_sites", {"purpose": "pump"})["sites"]
+    assert _where_all(pump) == [(29, 33), (33, 33), (33, 35), (25, 23), (29, 23), (30, 25)]
+    assert [s.get("crowd") for s in pump] == [None, None, None, 1, 1, 1]              # the pump's stretch last
+    sewage = box.call("find_sites", {"purpose": "sewage"})["sites"]
+    assert _where_all(sewage) == [(33, 35), (33, 33), (30, 25), (25, 23), (29, 23), (29, 33)]
+    assert [s.get("crowd") for s in sewage] == [None] * 5 + [1]                       # the outlet's stretch last
+    ready = _ready_sites(briefing(env, "utilities", mark=False))
+    assert next(ln for ln in ready if ln.startswith("- pump:")).startswith("- pump: 6 sites, best (29,33), pollution 0;")
 
 
 def test_riverbank_note_when_only_roads_line_the_bank():
@@ -1082,7 +1114,8 @@ def test_demolishing_the_only_rail_link_is_refused_until_confirmed():
         res = box.call("demolish", {"x": 11, "y": 0})
         assert res == {"ok": False, "refused": "disconnect", "error": (
             "this would cut 6 road tiles (e.g. around (10,0)) off the region: the train station is their only link; "
-            "ask planning to connect them to the highway by road first; to do it anyway repeat with confirm: true")}
+            "ask planning to connect them to the highway by road first, or build another link; to do it anyway repeat "
+            "with confirm: true")}
         assert box.n_calls == n
     assert (w.struct == struct).all() and w.dept_funds == funds
     assert box.executed == [] and box._failed == {} and FleetState.of(env).history(months=12) == []

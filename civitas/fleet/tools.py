@@ -19,7 +19,7 @@ import numpy as np
 
 from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _point,
                             _rect, action_docs, apply_action)
-from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
+from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import label_components, shift
@@ -91,7 +91,7 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
-BANK_TOP_UP = {"pump": False, "sewage": True}   # one-tile riverbank purposes site_lists tops up -> south first
+BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
 # purposes whose lists skip lots with 3+ homes within 4 tiles (observation._far_from_homes): never empty for lack
@@ -623,7 +623,7 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             found = found.get(key) if isinstance(found, dict) else None
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
         if purpose in BANK_TOP_UP and len(sites) < len(found or []):
-            sites += _bank_top_up(w, sites, south_first=BANK_TOP_UP[purpose])
+            sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             key = min(keys, key=C.UNLOCK_POP.get)
@@ -636,19 +636,25 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
     return out
 
 
-def _bank_top_up(w, listed: list[dict], south_first: bool) -> list[dict]:
+def _bank_top_up(w, listed: list[dict], line: str) -> list[dict]:
     """Free riverbank lots beside highway-connected roads (where a pump or outlet can go) not in `listed`, as many as
     fit in MAX_SITES with it: the observation cuts its riverbank lists to 6 before site_lists drops the sites off
     the highway network, so off-highway roads by the bank could leave pump and sewage short, or empty ("all
-    taken"), with free lots beside the connected roads. Pumps cleanest then north first, outlets south first (as
-    the observation ranks them, bar crowding and the pump / outlet order); pollution as the observation computes
-    it."""
+    taken"), with free lots beside the connected roads. Ranked as observation._candidate_sites ranks them for
+    `line` (pump: cleanest first, +0.5 at or south of an outlet, then north first; outlet: those at or north of a
+    pump last, then south first; crowded spots last, marked "crowd"), with pollution as it computes it."""
     have = {(s["x"], s["y"]) for s in listed}
     ys, xs = np.nonzero(_riverbank_by_roads(w)[0] & _empty_land(w))
     more = [{"x": x, "y": y, "pollution": round(max(float(w.pollution[y, x]), w._river_near(x, y)), 2)}
             for x, y in zip(xs.tolist(), ys.tolist()) if (x, y) not in have]
-    more.sort(key=(lambda s: -s["y"]) if south_first else (lambda s: (s["pollution"], s["y"])))
-    return more[:max(0, MAX_SITES - len(listed))]
+    if line == "pump":
+        outlets = w.facilities(C.OUTLET) + w.facilities(C.TREATMENT)
+        more.sort(key=lambda b: (b["pollution"] + (0.5 if any(oy <= b["y"] for _, oy in outlets) else 0), b["y"]))
+    else:
+        pumps = w.facilities(C.PUMP)
+        more.sort(key=lambda b: (any(py >= b["y"] for _, py in pumps), -b["y"]))
+    k = MAX_SITES - len(listed)
+    return _uncrowded_first(w, more, line, k) if k > 0 else []
 
 
 def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
@@ -1030,7 +1036,8 @@ class ToolBox:
             if link is None:                              # not a link: nothing to relabel
                 return None
             lost, gone = cut_off(w, (), drop={w._anchor_of(x, y)}), w.parts(x, y)
-            why = f": the {link} is their only link; ask planning to connect them to the highway by road first"
+            why = (f": the {link} is their only link; ask planning to connect them to the highway by road first, or "
+                   "build another link")
         if not lost.any():
             return None
         ys, xs = np.nonzero(lost)
