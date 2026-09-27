@@ -319,8 +319,10 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
           f"- {money(math.floor(funds))} in department funds"      # rounded down, as against a price (short_of)
           + (f" (plan target {money(target)})" if target is not None else "")
           + f"; spent last month {money(spent)}"]
-    purpose, low = cheapest(prices) or (None, None)
-    if low and short_of(funds, low.cost):        # smoke runs: builds tried with $0, stations funded $1,000 of $2,500
+    # smoke runs: builds tried with $0, stations funded $1,000 of $2,500. Only when funds are short of every ready
+    # price (a supplementary one too, else it's false); it names the cheapest primary one, else a supplementary one
+    purpose, low = cheapest(prices) or cheapest(prices, supplementary=True) or (None, None)
+    if low and all(short_of(funds, pr.cost) for pr in prices.values()):
         L.append(f"- You can't pay for any ready site (cheapest: {purpose} {low.text()}). Don't call build "
                  "tools this turn: ask the mayor for the amount with a reason (send_message) unless you already did, "
                  "then end_turn.")

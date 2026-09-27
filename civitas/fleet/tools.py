@@ -121,9 +121,10 @@ SITE_BUILDS = {
 TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
                     "metro_station": ("METRO_STATION", "metro")}
 SITE_TILES = {"fire": {"levee": "levee"}}    # purposes priced per tile -> their CATALOG entry (read when priced)
-# priced purposes that only add to another building, never the first buy: cheapest() skips them, so they don't drive
-# the budget line or the mayor's needs line (their Ready lines keep the price). A library only multiplies school
-# graduation (LIBRARY_BOOST): useless without school seats, yet at $1,500 it undercut the $2,500 school
+# priced purposes that only add to another building, never the first buy: cheapest() skips them, so the mayor's
+# needs line and the budget line name the primary price (their Ready lines keep theirs; affordable, they still keep
+# the budget line away, which would be false). A library only multiplies school graduation (LIBRARY_BOOST): useless
+# without school seats, yet at $1,500 it undercut the $2,500 school
 SUPPLEMENTARY = {"library"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
@@ -779,15 +780,15 @@ def build_cost(w, role: str, purpose: str) -> int | None:
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     """site_price of each of `role`'s priced purposes with ready sites (listed and unlocked): the Ready sites lines
-    end with it, and funds short of the cheapest (cheapest(), SUPPLEMENTARY skipped) buy no ready site."""
+    end with it, and funds short of every one buy no ready site."""
     return {p: pr for p, lst in lists.items() if lst.sites and not lst.short and (pr := site_price(w, role, p))}
 
 
-def cheapest(prices: dict[str, Price]) -> tuple[str, Price] | None:
-    """(purpose, price) of the lowest price, the first on ties, SUPPLEMENTARY purposes skipped (the budget line and
-    the mayor's needs line read it); None when there is none."""
-    return min(((p, pr) for p, pr in prices.items() if p not in SUPPLEMENTARY), key=lambda kv: kv[1].cost,
-               default=None)
+def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[str, Price] | None:
+    """(purpose, price) of the lowest price, the first on ties, SUPPLEMENTARY purposes skipped unless
+    `supplementary` (the mayor's needs line and the budget line name it); None when there is none."""
+    return min(((p, pr) for p, pr in prices.items() if supplementary or p not in SUPPLEMENTARY),
+               key=lambda kv: kv[1].cost, default=None)
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),

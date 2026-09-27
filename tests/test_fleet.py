@@ -1635,12 +1635,15 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
 
 
 def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
-    """A library ($1,500) only multiplies school graduation: it keeps its price on its Ready line but doesn't drive
-    the budget line or the mayor's needs line, which name the $2,500 school."""
+    """A library ($1,500) only multiplies school graduation: it keeps its price on its Ready line, and the mayor's
+    needs line and the budget line name the $2,500 school; the budget line still only shows when no ready site,
+    the library included, is affordable (else it would be false)."""
     from civitas.fleet.tools import Price, cheapest
     school, library = Price(2500, "elementary school"), Price(1500, "library")
     assert cheapest({"library": library, "school": school}) == ("school", school)
-    assert cheapest({"library": library}) is None
+    assert cheapest({"library": library}) is None and cheapest({"library": library}, supplementary=True) == (
+        "library", library)
+    assert cheapest({"library": library, "school": school}, supplementary=True) == ("library", library)
     env = copy.deepcopy(grown_env)
     w = env.world
     ready = lambda: {ln.split(":")[0][2:]: ln for ln in _ready_sites(briefing(env, "education", mark=False))}
@@ -1649,13 +1652,13 @@ def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
     w.dept_funds["education"] = 2500                   # the school is affordable: no advice
     assert len(budget()) == 1 and needs() == "- education: funds $2,500"
     assert ready()["library"].endswith("same list as school; $1,500") and ready()["school"].endswith("; $2,500")
-    w.dept_funds["education"] = 2000                   # a library is affordable, the school isn't: ask for the school
-    assert budget()[1].startswith("- You can't pay for any ready site (cheapest: school $2,500).")
-    assert needs().startswith("- education: funds $2,000; needs $2,500 for an elementary school (")
+    w.dept_funds["education"] = 2000                   # a library is affordable (no budget line), the school isn't
+    assert len(budget()) == 1 and needs().startswith("- education: funds $2,000; needs $2,500 for an elementary "
+                                                     "school (")
     assert ready()["library"].endswith("; $1,500") and ready()["school"].endswith("; $2,500 - you have $2,000")
     w.dept_funds["education"] = 1000                   # short of both: the library's line says so too
-    assert "(cheapest: school $2,500)" in budget()[1] and "$2,500 for an elementary school" in needs()
-    assert ready()["library"].endswith("; $1,500 - you have $1,000")
+    assert budget()[1].startswith("- You can't pay for any ready site (cheapest: school $2,500).")
+    assert "$2,500 for an elementary school" in needs() and ready()["library"].endswith("; $1,500 - you have $1,000")
 
 
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
