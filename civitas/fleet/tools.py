@@ -92,6 +92,22 @@ SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("n
                ("pollution", "pollution {}")]
 SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
 SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
+# purpose -> the buildings its sites are for (tier names, or TRANSPORT_BUILDS keys): the cheapest unlocked one prices
+# the site (build_cost). Not priced: planning, levees (per tile), bus stops, congested roads
+BUILDS = {
+    "utilities": {"coal_or_gas": ("coal", "gas"), "wind": ("wind",), "pump": ("pump",), "sewage": ("outlet",),
+                  "near_homes": ("tower", "solar", "wind"),
+                  "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear")},
+    "transport": {"train_station": ("train_station",), "harbour": ("harbour",), "metro_station": ("metro_station",)},
+    "police": {"station": ("police_station",), "jail": ("jail",)},
+    "fire": {"station": ("fire_station",), "shelter": ("shelter",)},
+    "health": {"clinic": ("clinic",), "hospital": ("hospital",), "landfill": ("landfill",), "cemetery": ("cemetery",)},
+    "education": {"school": ("elementary_school",), "high_school": ("high_school",), "university": ("university",)},
+}
+# transport buildings outside the tier lines -> (catalog spec, unlock key); the spec is looked up when priced, as the
+# build actions do (a balance override may replace it)
+TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
+                    "metro_station": ("METRO_STATION", "metro")}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -653,16 +669,55 @@ def scarce_bank(w) -> set[tuple[int, int]]:
     return {(int(x), int(y)) for y, x in zip(ys, xs)} if len(xs) <= SCARCE_BANK else set()
 
 
-def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset()) -> list[str]:
+def _price(w, name: str) -> float | None:
+    """What building `name` (a tier name or a TRANSPORT_BUILDS key) costs: the spec its build action charges. None
+    while it is locked."""
+    if name in TRANSPORT_BUILDS:
+        spec, key = TRANSPORT_BUILDS[name]
+        return getattr(C, spec)["cost"] if w.unlocked(key) else None
+    line, tier = C.TIER_BY_NAME[name]
+    spec = C.TIER_LINES[line][tier - 1]
+    return None if spec.get("unlock") and not w.unlocked(spec["unlock"]) else spec["cost"]
+
+
+def build_cost(w, role: str, purpose: str) -> int | None:
+    """The price of a site on `role`'s find_sites `purpose` list: the cheapest unlocked building the list is for
+    (BUILDS), as its build action charges it. None for purposes without a price or while all of them are locked."""
+    costs = [c for c in (_price(w, n) for n in BUILDS.get(role, {}).get(purpose, ())) if c is not None]
+    return round(min(costs)) if costs else None
+
+
+class ReadyBuild(NamedTuple):
+    purpose: str
+    cost: int
+    sites: int              # listed, as the Ready sites line counts them
+
+
+def cheapest_ready(w, role: str, lists: dict[str, SiteList]) -> ReadyBuild | None:
+    """The cheapest priced purpose with ready sites (listed and unlocked); None when there is none. Funds below it
+    buy no ready site: the department's budget block and the mayor's Departments block say so."""
+    ready = [ReadyBuild(p, c, len(lst.sites[:MAX_SITES])) for p, lst in lists.items()
+             if lst.sites and not lst.short and (c := build_cost(w, role, p)) is not None]
+    return min(ready, key=lambda r: r.cost, default=None)
+
+
+def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(), costs: dict | None = None,
+                funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
     zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
-    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage."""
+    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. A line with
+    sites ends with its price (`costs`: purpose -> build_cost), and with `funds` when they are short of it."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
 
     def site(purpose: str, s: dict) -> str:
         bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
         return _where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+
+    def price(purpose: str) -> str:
+        c = (costs or {}).get(purpose)
+        return "" if c is None else f"; {money(c)}" + (f" - you have {money(funds)}"
+                                                       if funds is not None and funds < c else "")
 
     for purpose, lst in lists.items():
         head = f"- {purpose}: "
@@ -673,20 +728,20 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
         if path in paths:
-            lines.append(head + f"same list as {paths[path]}")
+            lines.append(head + f"same list as {paths[path]}" + price(purpose))
             continue
         paths[path] = purpose
         best, first = sites[0], shown.get(_where(sites[0]))
         if first is None:
             shown[_where(best)] = purpose
-            lines.append(head + f"best {site(purpose, best)}")
+            lines.append(head + f"best {site(purpose, best)}" + price(purpose))
             continue
         nxt = next((t for t in sites[1:] if _where(t) not in shown), None)
         if nxt is None:
-            lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}")
+            lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}" + price(purpose))
         else:
             shown[_where(nxt)] = purpose
-            lines.append(head + f"best as {first}; next {site(purpose, nxt)}")
+            lines.append(head + f"best as {first}; next {site(purpose, nxt)}" + price(purpose))
     return lines
 
 

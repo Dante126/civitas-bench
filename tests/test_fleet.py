@@ -1198,6 +1198,138 @@ def test_ready_sites_extra_fields():
                                                "- pump: 1 site, best (5,6), pollution 0.2"]
 
 
+# find_sites purpose -> the build action for the cheapest building its sites are for, with every milestone reached
+BUILD_ACTIONS = {
+    ("utilities", "coal_or_gas"): {"type": "build_power_plant", "kind": "coal"},
+    ("utilities", "wind"): {"type": "build_power_plant", "kind": "wind"},
+    ("utilities", "pump"): {"type": "build_water", "kind": "pump"},
+    ("utilities", "sewage"): {"type": "build_sewage", "kind": "outlet"},
+    ("utilities", "near_homes"): {"type": "build_water", "kind": "tower"},
+    ("utilities", "riverbank_2x2"): {"type": "build_water", "kind": "water_works"},
+    ("transport", "train_station"): {"type": "build_train_station"},
+    ("transport", "harbour"): {"type": "build_harbour"},
+    ("transport", "metro_station"): {"type": "build_metro_station"},
+    ("police", "station"): {"type": "build_police_station"}, ("police", "jail"): {"type": "build_jail"},
+    ("fire", "station"): {"type": "build_fire_station"}, ("fire", "shelter"): {"type": "build_shelter"},
+    ("health", "clinic"): {"type": "build_clinic"}, ("health", "hospital"): {"type": "build_hospital"},
+    ("health", "landfill"): {"type": "build_landfill"}, ("health", "cemetery"): {"type": "build_cemetery"},
+    ("education", "school"): {"type": "build_school", "kind": "elementary"},
+    ("education", "high_school"): {"type": "build_school", "kind": "high"},
+    ("education", "university"): {"type": "build_school", "kind": "university"},
+}
+
+
+@pytest.fixture(scope="module")
+def open_env(grown_env):
+    """The grown city with every milestone reached and a road to the riverbank near the south edge: every priced
+    find_sites purpose has sites."""
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.milestones_on = False
+    w.dept_funds["planning"] = 50000
+    for line in ({"x1": 3, "y1": 29, "x2": 3, "y2": 46}, {"x1": 3, "y1": 46, "x2": 31, "y2": 46}):
+        assert apply_action(w, "planning", {"type": "build_road", **line}).ok
+    return env
+
+
+@pytest.mark.parametrize("role,purpose", list(BUILD_ACTIONS))
+def test_build_cost_is_what_the_build_charges(open_env, role, purpose):
+    from civitas.fleet.tools import build_cost
+    env = copy.deepcopy(open_env)
+    w = env.world
+    cost = build_cost(w, role, purpose)
+    s = ToolBox(env, role).call("find_sites", {"purpose": purpose})["sites"][0]
+    dept = ROLES[role]["budget"]
+    action = {**BUILD_ACTIONS[role, purpose], "x": s["x"], "y": s["y"]}
+    w.dept_funds[dept] = cost - 1
+    res = apply_action(w, role, action)
+    assert not res.ok and res.message.startswith(f"costs ${cost:,} but the {dept} budget only has ${cost - 1:,}"), \
+        res.message
+    w.dept_funds[dept] = cost                          # the listed site takes it, for exactly that
+    res = apply_action(w, role, action)
+    assert res.ok and res.cost == cost and w.dept_funds[dept] == 0, res.message
+
+
+def test_build_cost_prices_the_cheapest_unlocked_building(grown_env, open_env):
+    from civitas.fleet.tools import build_cost
+    w = grown_env.world                                # 2,6xx residents: hospitals, stations, 2x2 blocks locked
+    cost = lambda line, tier=1: C.TIER_LINES[line][tier - 1]["cost"]
+    assert build_cost(w, "utilities", "coal_or_gas") == cost("coal") < cost("gas")
+    assert build_cost(w, "utilities", "near_homes") == cost("tower") < cost("wind") < cost("solar")
+    assert build_cost(w, "education", "high_school") == cost("high_school")
+    assert build_cost(w, "health", "cemetery") == cost("cemetery")
+    for role, purpose in (("health", "hospital"), ("education", "university"), ("utilities", "riverbank_2x2"),
+                          ("transport", "train_station"), ("transport", "harbour"), ("transport", "metro_station")):
+        assert build_cost(w, role, purpose) is None, (role, purpose)
+    w = open_env.world
+    assert build_cost(w, "health", "hospital") == cost("clinic", 2)          # build_hospital: the clinic line's tier 2
+    assert build_cost(w, "utilities", "riverbank_2x2") == cost("pump", 3)     # water works
+    assert build_cost(w, "transport", "harbour") == C.HARBOUR_SPEC["cost"]
+    priced = {(r, p) for r in SITE_PURPOSES for p in SITE_PURPOSES[r] if build_cost(w, r, p) is not None}
+    assert priced == set(BUILD_ACTIONS)                # not planning, levees (per tile), bus stops, congested roads
+
+
+def test_ready_sites_show_the_price_and_what_is_short():
+    from civitas.fleet.tools import SiteList, ready_lines
+    lists = {"clinic": SiteList([{"x": 1, "y": 2, "need": 5}], None, None),
+             "hospital": SiteList([{"x": 3, "y": 4}], "locked (unlocks at 5,000 residents)", "locked"),
+             "landfill": SiteList([{"x": 5, "y": 6, "need": 3}], None, None),
+             "cemetery": SiteList([{"x": 5, "y": 6, "need": 3}], None, None)}
+    costs = {"clinic": 2000, "hospital": 8000, "landfill": 2000, "cemetery": 1500}
+    assert ready_lines("health", lists, costs=costs, funds=1800) == [
+        "- clinic: 1 site, best (1,2), need 5; $2,000 - you have $1,800",
+        "- hospital: locked (unlocks at 5,000 residents)",
+        "- landfill: 1 site, best (5,6), need 3; $2,000 - you have $1,800",
+        "- cemetery: 1 site, same list as landfill; $1,500"]
+    assert ready_lines("health", lists, costs=costs, funds=2000)[0] == "- clinic: 1 site, best (1,2), need 5; $2,000"
+    assert ready_lines("health", lists, costs={"clinic": None})[0] == "- clinic: 1 site, best (1,2), need 5"
+
+
+def _block(text: str, head: str) -> list[str]:
+    return text[text.index(head):].split("\n\n")[0].splitlines()[1:]
+
+
+def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(grown_env):
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.dept_funds.update(police=1000, fire=1499, health=0, transport=0, planning=0)
+    police = briefing(env, "police", mark=False)
+    station, jail = _ready_sites(police)[:2]
+    assert station.endswith("; $2,500 - you have $1,000") and jail.endswith("; $4,000 - you have $1,000"), police
+    assert _block(police, "## Your budget")[1] == (
+        "- You can't pay for any ready site (cheapest: station $2,500). Don't call build tools this turn: ask the "
+        "mayor for the amount with a reason (send_message) unless you already did, then end_turn.")
+    assert "(cheapest: shelter $1,500)" in briefing(env, "fire", mark=False)
+    assert "(cheapest: cemetery $1,500)" in briefing(env, "health", mark=False)     # cheaper than a clinic
+    for role in ("transport", "planning"):             # only bus stops ready / nothing priced
+        text = briefing(env, role, mark=False)
+        assert "can't pay" not in text and "$" not in "".join(_ready_sites(text)), role
+    w.dept_funds["police"] = 3000
+    police = briefing(env, "police", mark=False)
+    station, jail = _ready_sites(police)[:2]
+    assert re.search(r", need [\d,]+; \$2,500$", station) and jail.endswith("; $4,000 - you have $3,000"), police
+    assert len(_block(police, "## Your budget")) == 1
+
+
+def test_mayor_briefing_says_what_short_departments_need(grown_env):
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.dept_funds.update(police=1000, fire=5000, health=0, transport=0, planning=0)
+    n = len(ToolBox(env, "police").call("find_sites", {"purpose": "station"})["sites"])
+    lines = lambda: {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
+                     if ln.startswith("- ") and ": funds " in ln}
+    got = lines()
+    assert got["police"] == f"- police: funds $1,000; needs $2,500 for a station ({n} ready sites)"
+    assert got["health"].startswith("- health: funds $0; needs $1,500 for a cemetery (")
+    assert got["fire"] == "- fire: funds $5,000"
+    assert got["transport"] == "- transport: funds $0" and got["planning"] == "- planning: funds $0"
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 2500}, "priorities": {"police": "cover downtown"}})
+    assert lines()["police"] == (f"- police: funds $1,000 < target $2,500; needs $2,500 for a station ({n} ready "
+                                 "sites); priority: cover downtown")
+    w.dept_funds["police"] = 2500
+    assert lines()["police"] == "- police: funds $2,500, target $2,500; priority: cover downtown"
+
+
 def test_department_briefing_builds_one_observation(monkeypatch):
     import civitas.fleet.briefing as B
     import civitas.fleet.tools as T
@@ -1214,6 +1346,11 @@ def test_department_briefing_builds_one_observation(monkeypatch):
         calls.clear()
         briefing(env, role, mark=False)
         assert calls == [True], (role, calls)
+    from civitas.fleet.tools import build_cost
+    calls.clear()                                      # the mayor: one per department that may lack money for a site
+    briefing(env, "mayor", mark=False)
+    assert calls == [True] * sum(any(build_cost(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS) != []
+    env.world.dept_funds.update({d: 50000 for d in DEPTS})
     calls.clear()
     briefing(env, "mayor", mark=False)
     assert calls == []
@@ -1241,7 +1378,8 @@ def test_mayor_briefing_marks_departments_below_their_target():
     lines = {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
              if ln.startswith("- ") and ": funds " in ln}
     assert lines["planning"] == "- planning: funds $9,500, target $9,000"
-    assert lines["utilities"] == "- utilities: funds $2,000 < target $7,000"
+    assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000; needs $2,200 for a near_homes (6 ready "
+                                  "sites)")                          # a water tower: its cheapest ready build
     assert lines["fire"] == "- fire: funds $0 < target $2,500"
     assert lines["police"] == "- police: funds $0"
     text = briefing(env, "mayor", mark=False)
@@ -1382,7 +1520,7 @@ def test_briefings_stay_bounded_at_the_limits():
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 7500 - 300, (role, len(text) - len(memory))   # memory is shown in full
+        assert len(text) - len(memory) < 7500 - 200, (role, len(text) - len(memory))   # memory is shown in full
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
         assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text

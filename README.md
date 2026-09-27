@@ -431,22 +431,25 @@ tasks and money, and to let people coach it.
   doesn't change, so the mayor acts first each month.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
   The mayor's briefing covers the city, the finances, each department's funds, target
-  (`funds $0 < target $2,500` when it still needs funding) and latest report, a line with
-  the total funding gap (ending in `allocate_budget`, or in "hold" when the treasury is at
-  or under the reserve), and the plan. A department's briefing covers its plan slice, its
-  budget, its key metrics, a "since your last turn" digest (failed actions, events, and the
-  newest council messages addressed to it or to `all`, quoted with sender and month), a
-  Ready sites block (one line per `find_sites` purpose: the count and best site, or why
-  there is none, e.g. locked, no connected road reaches the river, the riverbank beside
-  the roads is taken, or no roadside lot is away from homes for a landfill, cemetery or
-  jail; a site on one of the last two free riverbank lots is marked to keep for a pump or
-  sewage outlet) and its memory. Both have a short Map block (size, highway entry,
-  river columns by row band, the extent of the connected roads, any road tiles not
-  connected to the highway, and the built-up area) and
-  end with the next milestone. Actions run immediately and return
-  `ok`, a message, the cost and the money left, so a failed action can be fixed in the
-  same turn. Bad arguments, unknown tools and refused actions come back as
-  `{"ok": false, "error": ...}` for the model to correct.
+  (`funds $0 < target $2,500` when it still needs funding), what it needs when its funds
+  buy none of its ready sites (`needs $2,500 for a station (5 ready sites)`) and latest
+  report, a line with the total funding gap (ending in `allocate_budget`, or in "hold"
+  when the treasury is at or under the reserve), and the plan. A department's briefing
+  covers its plan slice, its budget (when its funds buy none of its ready sites, a line
+  says so and tells it to ask the mayor instead of calling build tools), its key metrics,
+  a "since your last turn" digest (failed actions, events, and the newest council messages
+  addressed to it or to `all`, quoted with sender and month), a Ready sites block (one
+  line per `find_sites` purpose: the count and best site with the price of the cheapest
+  unlocked building the sites are for, `; $2,500 - you have $1,000` when the funds are
+  short, or why there is none, e.g. locked, no connected road reaches the river, the
+  riverbank beside the roads is taken, or no roadside lot is away from homes for a
+  landfill, cemetery or jail; a site on one of the last two free riverbank lots is marked
+  to keep for a pump or sewage outlet) and its memory. Both have a short Map block (size,
+  highway entry, river columns by row band, the extent of the connected roads, any road
+  tiles not connected to the highway, and the built-up area) and end with the next
+  milestone. Actions run immediately and return `ok`, a message, the cost and the money
+  left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
+  refused actions come back as `{"ok": false, "error": ...}` for the model to correct.
 - **Guards.** A `bulldoze` that would cut highway-connected road tiles off the highway
   (the road network relabelled without the removed tiles, as `World.refresh()` does) is
   refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
