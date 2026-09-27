@@ -432,35 +432,47 @@ tasks and money, and to let people coach it.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
   The mayor's briefing covers the city, the finances, each department's funds, target
   (`funds $0 < target $2,500` when it still needs funding), what it needs when its funds
-  buy none of its ready sites (`needs $2,500 for a police station (5 ready sites)`) and
-  latest report, a line with the total funding gap (ending in `allocate_budget`, or in
-  "hold" when the treasury is at or under the reserve), and the plan. A department's
+  are short of its cheapest ready building (`needs $2,500 for a police station (5 ready
+  sites)`) and latest report, a line with the total funding gap (ending in `allocate_budget`,
+  or in "hold" when the treasury is at or under the reserve), and the plan. A department's
   briefing covers its plan slice, its budget (when its funds buy none of its ready sites,
-  a line says so and tells it to ask the mayor instead of calling build tools), its key
-  metrics, a "since your last turn" digest (failed actions, events, and the newest council
-  messages addressed to it or to `all`, quoted with sender and month), a Ready sites block
-  (one line per `find_sites` purpose: the count and best site with the price of the
-  cheapest unlocked building the sites are for, `; $2,500 - you have $1,000` when the
-  funds are short, or why there is none, e.g. locked, no connected road reaches the river,
-  the riverbank beside the roads is taken, or no roadside lot is away from homes for a
-  landfill, cemetery or jail; a site on one of the last two free riverbank lots is marked
-  to keep for a pump or sewage outlet) and its memory. Both have a short Map block (size,
+  a line names the cheapest and tells it to ask the mayor and end the turn instead of
+  calling build tools), its key metrics, a "since your last turn" digest (failed actions,
+  events, and the newest council messages addressed to it or to `all`, quoted with sender
+  and month), a Ready sites block (one line per `find_sites` purpose: the count and best
+  site with the price of the cheapest unlocked building the sites are for, `$300/tile` for
+  levees, and `; $2,500 - you have $1,000` when the funds are short; or why there is none,
+  e.g. locked, no connected road reaches the river, the riverbank beside the roads is
+  taken, or no roadside lot is away from homes for a landfill, cemetery or jail; a site on
+  one of the last two free riverbank lots is marked to keep for a pump or sewage outlet)
+  and its memory. A library, which only adds to schools, is priced on its line but never
+  named as the cheapest. Prices are what the build actions charge, and funds count as short
+  exactly when the build action would refuse them. Both have a short Map block (size,
   highway entry, river columns by row band, the extent of the connected roads, any road
   tiles not connected to the highway, and the built-up area) and end with the next
   milestone. Actions run immediately and return `ok`, a message, the cost and the money
   left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
-  refused actions come back as `{"ok": false, "error": ...}` for the model to correct.
+  refused actions come back as `{"ok": false, "error": ...}` for the model to correct. A
+  failed `build_road` or `zone` also says how to fix it: a road blocked by empty zoned lots
+  names them and the `dezone` rectangles to run first (free; they stay on the road's line,
+  at most 2 named), one blocked by a building says to route around it, "already road" gets
+  the extent of the connected roads and a pointer to `find_sites road_extension`, and high
+  density before its unlock gets `zone with density "low" now`. These hints go to the model
+  only; the history log and the turn's action results keep the game's message.
 - **Guards.** A `bulldoze` that would cut highway-connected road tiles off the highway
   (the road network relabelled without the removed tiles, as `World.refresh()` does) is
   refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
   action, still a tool call), naming how many tiles and where; the agent can build a new link
-  first or repeat with `confirm: true`. A `zone` that takes the last free riverbank lot
-  beside the connected roads while the city still lacks a pump or a sewage outlet /
-  treatment plant succeeds, with a warning naming what utilities still needs the bank for.
+  first or repeat with `confirm: true`. Transport's `demolish` of a train station, harbour or
+  airport that is some roads' only link to the region (metro stations don't link) is refused
+  the same way; the refusal suggests asking planning for a road to the highway or building
+  another link first. A `zone` that takes the last free riverbank lot beside the connected
+  roads while the city still has no pump or water tower, or no sewage outlet / treatment
+  plant, succeeds, with a warning naming what utilities still needs the bank for.
 
 | tools | |
 |---|---|
-| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
+| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
 | turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
@@ -487,17 +499,19 @@ trinity-large-thinking sometimes does) still run, and the trajectory counts them
 On a limit or an API error the turn ends, and completed actions stay. Every turn records
 why it ended: `end_turn`, `max_steps`, `turn_tokens`, `no_tool_calls` or `api_error`.
 Every tool result carries `steps_left` (except `end_turn`'s and the "not run" ones for calls
-after `end_turn` or past the limit), plus a `wrap_up` note once 3 or fewer calls are left. Within a turn, an identical repeat of a look-up (same tool, same
-arguments after type coercion) returns the earlier result marked `repeat`, and an identical
-repeat of an action that failed is refused without running (`refused: "repeat"`, not charged
-as an invalid action), until the agent's next successful action. A successful `update_plan`
-also refreshes look-ups, and a failed action refreshes `history` (which lists it). Both kinds
-of repeat still count as tool calls. A guard refusal (above) is not remembered as a failure:
-an identical repeat is checked, and refused, again.
+after `end_turn` or past the limit), plus a `wrap_up` note once 3 or fewer calls are left.
+Within a turn, an identical repeat of a look-up (same tool, same arguments after type
+coercion) returns the earlier result marked `repeat`, and an identical repeat of an action
+that failed is refused without running (`refused: "repeat"`, not charged as an invalid
+action), as is one of an invalid call (bad arguments or JSON, or an unknown tool; same
+arguments as sent), with the earlier error, until the agent's next successful action. A
+successful `update_plan` also refreshes look-ups, and a failed action refreshes `history`
+(which lists it). Every kind of repeat still counts as a tool call. A guard refusal (above)
+is not remembered as a failure: an identical repeat is checked, and refused, again.
 
-**Coaching with playbooks.** The system prompt starts with a fixed part: how to play, the
-role's mission and the game rules. Then comes the coach's playbook: the fleet playbook
-(`[fleet].playbook`, shared by every role) and the role's own (`[agents.<role>].playbook`).
+**Coaching with playbooks.** The system prompt starts with a fixed part: how to play (start
+from the briefing and look up only what it lacks), the role's mission and the game rules.
+Then comes the coach's playbook: the fleet playbook (`[fleet].playbook`, shared by every role) and the role's own (`[agents.<role>].playbook`).
 Coaches can steer strategy this way but can't change the rules or the tools.
 The "hold" advice follows a reserve rule that lives in code (`fleet/tools.py:reserve`): a coach
 who changes the mayor playbook's reserve rule must change it there too.
@@ -544,7 +558,11 @@ max_steps = 12
 Fleet and non-fleet roles mix freely, for example a fleet mayor over scripted departments.
 `configs/fleet_trinity.toml` is the full fleet: all eight roles on trinity-large-thinking for
 120 months, acting every 3 months (320 turns), with a default fleet playbook and one
-playbook per department. `configs/fleet_smoke.toml` is the same fleet for 12 months.
+playbook per department. The fleet playbook tells departments that their briefing already
+has their plan slice, budget, new messages, map and ready sites, so they shouldn't re-read
+them with `get_plan` / `get_messages` / `history`, and that when it says they can't pay for
+any ready site they should send at most one request and end the turn.
+`configs/fleet_smoke.toml` is the same fleet for 12 months.
 `meta.json` records `fleet_version` and every fleet agent's system prompt once
 (`fleet_prompts`); `summary.json` records `fleet_version` too. `fleet_version` is a hash of
 `[fleet]` and the fleet agents' settings, so runs with the same coaching can be compared: the
@@ -556,7 +574,7 @@ next to its summary. They contain:
 
 - the scoreboard
 - the final plan and the months it changed
-- per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups and refused repeats, spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
+- per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups and refused calls (repeats and guard refusals), spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
 - the top failures, last reports and the lessons in memory
 - coaching hints
 
@@ -565,7 +583,8 @@ A hint fires on any of these:
 - 3 or more similar failures
 - a department holding more than 2× its plan budget for 3+ months
 - a department with no successful action for 2+ turns spanning 6+ months (a turn with no plan budget and
-  under $1 in funds at the turn doesn't count: the department was blocked, not idle)
+  under $1 in funds at the turn counts as blocked, not idle, and splits the run; when the funds were under $1
+  against a plan budget at every turn of the run, the hint says to check the mayor's allocations)
 - a negative treasury
 - a role ending more than 20% of its turns on a limit
 
