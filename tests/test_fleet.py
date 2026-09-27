@@ -1314,20 +1314,35 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
 def test_mayor_briefing_says_what_short_departments_need(grown_env):
     env = copy.deepcopy(grown_env)
     w = env.world
-    w.dept_funds.update(police=1000, fire=5000, health=0, transport=0, planning=0)
+    w.dept_funds.update(police=1000, fire=5000, health=0, education=0, utilities=0, transport=0, planning=0)
     n = len(ToolBox(env, "police").call("find_sites", {"purpose": "station"})["sites"])
     lines = lambda: {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
                      if ln.startswith("- ") and ": funds " in ln}
-    got = lines()
-    assert got["police"] == f"- police: funds $1,000; needs $2,500 for a station ({n} ready sites)"
+    got = lines()                                      # the building, not the find_sites purpose
+    assert got["police"] == f"- police: funds $1,000; needs $2,500 for a police station ({n} ready sites)"
     assert got["health"].startswith("- health: funds $0; needs $1,500 for a cemetery (")
+    assert got["education"].startswith("- education: funds $0; needs $2,500 for an elementary school (")
+    assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for a water tower (")
     assert got["fire"] == "- fire: funds $5,000"
     assert got["transport"] == "- transport: funds $0" and got["planning"] == "- planning: funds $0"
     ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 2500}, "priorities": {"police": "cover downtown"}})
-    assert lines()["police"] == (f"- police: funds $1,000 < target $2,500; needs $2,500 for a station ({n} ready "
-                                 "sites); priority: cover downtown")
+    assert lines()["police"] == (f"- police: funds $1,000 < target $2,500; needs $2,500 for a police station ({n} "
+                                 "ready sites); priority: cover downtown")
     w.dept_funds["police"] = 2500
     assert lines()["police"] == "- police: funds $2,500, target $2,500; priority: cover downtown"
+
+
+def test_mayor_names_the_cheapest_building():
+    from civitas.fleet.briefing import _a
+    from civitas.fleet.tools import BUILDS, building_name
+    names = {n: _a(building_name(n)) for purposes in BUILDS.values() for ns in purposes.values() for n in ns}
+    assert (names["tower"], names["outlet"], names["coal"], names["pump"]) == (
+        "a water tower", "a sewage outlet", "a coal plant", "a water pump")                  # base tiers: struct names
+    assert (names["water_works"], names["advanced_treatment"], names["hospital"]) == (
+        "a water works", "an advanced treatment", "a hospital")                               # higher tiers: their own
+    assert (names["elementary_school"], names["university"], names["harbour"], names["metro_station"]) == (
+        "an elementary school", "a university", "a harbour", "a metro station")
+    assert not any("_" in v for v in names.values()), names
 
 
 def test_department_briefing_builds_one_observation(monkeypatch):
@@ -1378,8 +1393,8 @@ def test_mayor_briefing_marks_departments_below_their_target():
     lines = {ln.split(":")[0][2:]: ln for ln in briefing(env, "mayor", mark=False).splitlines()
              if ln.startswith("- ") and ": funds " in ln}
     assert lines["planning"] == "- planning: funds $9,500, target $9,000"
-    assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000; needs $2,200 for a near_homes (6 ready "
-                                  "sites)")                          # a water tower: its cheapest ready build
+    assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000; needs $2,200 for a water tower (6 ready "
+                                  "sites)")                          # near_homes: its cheapest ready build
     assert lines["fire"] == "- fire: funds $0 < target $2,500"
     assert lines["police"] == "- police: funds $0"
     text = briefing(env, "mayor", mark=False)

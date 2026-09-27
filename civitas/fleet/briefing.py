@@ -179,9 +179,13 @@ def _ready_sites(w, role: str, lists: dict, funds: float) -> list[str]:
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
+def _a(name: str) -> str:
+    return ("an " if name[:1] in ("a", "e", "i", "o") else "a ") + name     # not u: a university
+
+
 def _needs(env, dept: str) -> str:
     """The mayor's Departments line suffix when `dept`'s funds are below its cheapest ready build: "; needs $X for a
-    <purpose> (N ready sites)", else "". The department's observation is built only when its funds are below its
+    <building> (N ready sites)", else "". The department's observation is built only when its funds are below its
     dearest priced purpose (else no ready build can be out of reach)."""
     w = env.world
     funds = w.dept_funds[dept]
@@ -190,7 +194,7 @@ def _needs(env, dept: str) -> str:
     obs = build_observation(w, dept, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
                             include_map=False, site_hints=True)
     low = cheapest_ready(w, dept, site_lists(w, dept, obs))
-    return (f"; needs {money(low.cost)} for a {low.purpose} ({low.sites} ready site{'s' * (low.sites != 1)})"
+    return (f"; needs {money(low.cost)} for {_a(low.building)} ({low.sites} ready site{'s' * (low.sites != 1)})"
             if low and funds < low.cost else "")
 
 

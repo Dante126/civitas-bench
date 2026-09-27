@@ -680,24 +680,41 @@ def _price(w, name: str) -> float | None:
     return None if spec.get("unlock") and not w.unlocked(spec["unlock"]) else spec["cost"]
 
 
+def _cheapest(w, role: str, purpose: str) -> tuple[float, str] | None:
+    """(cost, name) of the cheapest unlocked building `role`'s `purpose` sites are for (BUILDS); None for purposes
+    without a price or while all of them are locked."""
+    priced = [(c, n) for n in BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
+    return min(priced, key=lambda t: t[0], default=None)
+
+
 def build_cost(w, role: str, purpose: str) -> int | None:
-    """The price of a site on `role`'s find_sites `purpose` list: the cheapest unlocked building the list is for
-    (BUILDS), as its build action charges it. None for purposes without a price or while all of them are locked."""
-    costs = [c for c in (_price(w, n) for n in BUILDS.get(role, {}).get(purpose, ())) if c is not None]
-    return round(min(costs)) if costs else None
+    """The price of a site on `role`'s find_sites `purpose` list: the cheapest unlocked building the list is for,
+    as its build action charges it. None for purposes without a price or while all of them are locked."""
+    best = _cheapest(w, role, purpose)
+    return None if best is None else round(best[0])
+
+
+def building_name(name: str) -> str:
+    """A BUILDS name for people: a line's base tier by its struct's name (tower -> water tower, outlet -> sewage
+    outlet), a higher tier by its own (water works: the struct is the line's), transport's as it is."""
+    if name in C.TIER_BY_NAME:
+        line, tier = C.TIER_BY_NAME[name]
+        name = C.STRUCT_NAME[C.TIER_LINES[line][0]["struct"]] if tier == 1 else name
+    return name.replace("_", " ")
 
 
 class ReadyBuild(NamedTuple):
     purpose: str
     cost: int
+    building: str           # the cheapest building's name (building_name)
     sites: int              # listed, as the Ready sites line counts them
 
 
 def cheapest_ready(w, role: str, lists: dict[str, SiteList]) -> ReadyBuild | None:
     """The cheapest priced purpose with ready sites (listed and unlocked); None when there is none. Funds below it
     buy no ready site: the department's budget block and the mayor's Departments block say so."""
-    ready = [ReadyBuild(p, c, len(lst.sites[:MAX_SITES])) for p, lst in lists.items()
-             if lst.sites and not lst.short and (c := build_cost(w, role, p)) is not None]
+    ready = [ReadyBuild(p, round(b[0]), building_name(b[1]), len(lst.sites[:MAX_SITES])) for p, lst in lists.items()
+             if lst.sites and not lst.short and (b := _cheapest(w, role, p))]
     return min(ready, key=lambda r: r.cost, default=None)
 
 
