@@ -1726,6 +1726,27 @@ def test_shelter_and_cemetery_are_never_named_as_the_first_build(grown_env):
     assert line("health") == "- health: funds $2,000" and "needs $2,500 for a fire station" in line("fire")
 
 
+def test_the_budget_line_falls_back_to_a_supplementary_price(grown_env, monkeypatch):
+    """With no primary site ready (fire: no station site, a shelter site), the mayor's line names nothing, since no
+    first build is in reach, while fire's budget line names the shelter: nothing it has ready is affordable."""
+    import civitas.fleet.briefing as B
+    from civitas.fleet.tools import SiteList
+    real = B.site_lists
+
+    def no_station(w, role, obs):
+        lists = real(w, role, obs)
+        return {**lists, "station": SiteList([], "nothing needs it right now", "")} if role == "fire" else lists
+    monkeypatch.setattr(B, "site_lists", no_station)   # station sites never run out in the grown city
+    env = copy.deepcopy(grown_env)
+    env.world.dept_funds["fire"] = 0
+    fire = briefing(env, "fire", mark=False)
+    assert _ready_sites(fire)[0] == "- station: none - nothing needs it right now"
+    assert _block(fire, "## Your budget")[1].startswith("- You can't pay for any ready site (cheapest: shelter "
+                                                        "$1,500).")
+    mayor = briefing(env, "mayor", mark=False).splitlines()
+    assert next(ln for ln in mayor if ln.startswith("- fire:")) == "- fire: funds $0"
+
+
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
     from civitas.fleet.tools import build_cost, site_price
     env = copy.deepcopy(grown_env)
@@ -2482,6 +2503,10 @@ def test_tool_agent_sends_no_nudge_past_turn_tokens():
     a, env = _agent(tokens=1000, turn_tokens=1000)     # the generic nudge too
     d = a.act(env.observe("police"))
     assert d.meta["finish_reason"] == "turn_tokens" and len(a.client.calls) == 1 and _nudges(d) == []
+    a, env = _agent(finish="length", tokens=600, turn_tokens=1203)    # completion tokens only (+5 prompt per call)
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "turn_tokens" and len(a.client.calls) == 3
+    assert _nudges(d) == [LENGTH_NUDGE] * 2 and d.meta["usage"] == {"prompt_tokens": 15, "completion_tokens": 1800}
 
 
 def test_text_calls_are_strings_for_the_schema_and_tolerate_broken_tags():

@@ -448,9 +448,9 @@ tasks and money, and to let people coach it.
   taken, or no roadside lot is away from homes for a landfill, cemetery or jail; a site on
   one of the last two free riverbank lots is marked to keep for a pump or sewage outlet)
   and its memory. A library (it only adds to schools), a shelter (it only matters in
-  disasters) and a cemetery (the landfill comes first) are priced on their lines but never
-  named as the cheapest, so neither line offers one as a department's first build (smoke
-  v9's mayor funded fire $1,500 for "a shelter", and fire never reached the $2,500
+  disasters) and a cemetery (the landfill comes first) are priced on their lines, but the
+  mayor's needs line never names one, and the budget line only when nothing else is ready
+  (smoke v9's mayor funded fire $1,500 for "a shelter", and fire never reached the $2,500
   station). Prices are what the build actions charge, and funds count as short
   exactly when the build action would refuse them. Both have a short Map block (size,
   highway entry, river columns by row band, the extent of the connected roads, any road
