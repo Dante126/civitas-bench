@@ -808,6 +808,7 @@ class ToolBox:
         self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
+        self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
         self.tools: dict[str, Tool] = {}
         lookups = self._lookup_tools()
         self.lookups = {t.name for t in lookups}
@@ -825,14 +826,19 @@ class ToolBox:
     def call(self, name: str, arguments: str | dict | None = None) -> dict:
         """Run one tool call. An identical repeat (same tool, same arguments after coercion) of a look-up returns
         the earlier result marked "repeat", and one of an action that failed is refused ("refused": "repeat")
-        without running, until something changes: a successful action (or plan update) for look-ups, a
-        successful action for failed actions; a failed action only refreshes `history`, which lists it. A bulldoze
-        that would cut roads off the highway is refused before it runs ("refused": "disconnect"; not executed,
-        logged or remembered as a failure) unless it passes confirm: true."""
+        without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
+        until something changes: a successful action (or plan update) for look-ups, a successful action for failed
+        actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
+        roads off the highway is refused before it runs ("refused": "disconnect"; not executed, logged or
+        remembered as a failure) unless it passes confirm: true."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
         except ToolError as e:
+            bad = (name, self._sent_key(arguments))
+            if bad in self._invalid:
+                return self._refusal(*self._invalid[bad])
+            self._invalid[bad] = (self.n_calls, str(e)[:REPEAT_ERROR_CHARS])
             return {"ok": False, "error": str(e)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -841,12 +847,7 @@ class ToolBox:
             n, res = self._seen[key]
             return {**copy.deepcopy(res), "repeat": f"same as call {n} (nothing changed since)"}
         if key in self._failed:
-            n, err = self._failed[key]
-            if "end_turn" not in err:
-                err += "; change the arguments or do something else"
-            elif not err.endswith("call end_turn"):
-                err += "; call end_turn"
-            return {"ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}"}
+            return self._refusal(*self._failed[key])
         executed = len(self.executed)
         res = self._run(tool, args)
         if name in self.lookups:
@@ -855,6 +856,7 @@ class ToolBox:
             if res.get("ok"):
                 self._seen.clear()
                 self._failed.clear()
+                self._invalid.clear()
             elif "refused" not in res:               # a guard refusal ran nothing: an identical repeat is refused again
                 self._failed[key] = (self.n_calls, str(res.get("error"))[:REPEAT_ERROR_CHARS])
                 if len(self.executed) > executed:         # logged as a failure: history shows it
@@ -862,6 +864,26 @@ class ToolBox:
         elif name == "update_plan" and res.get("ok"):
             self._seen.clear()
         return res
+
+    @staticmethod
+    def _refusal(n: int, err: str) -> dict:
+        """The refusal of an identical repeat of the call that failed at call `n` with `err`."""
+        if "call end_turn" not in err:
+            err += "; change the arguments or do something else"
+        elif not err.endswith("call end_turn"):
+            err += "; call end_turn"
+        return {"ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}"}
+
+    @staticmethod
+    def _sent_key(arguments) -> str:
+        """Arguments as sent, for the repeat check of a call that didn't resolve: JSON with sorted keys, else the
+        stripped text."""
+        try:
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments) if arguments.strip() else None
+            return json.dumps({} if arguments is None else arguments, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return str(arguments).strip()
 
     def _resolve(self, name: str, arguments) -> tuple[Tool, dict]:
         """The tool and its checked, coerced arguments; ToolError for unknown tools and bad arguments."""
@@ -960,8 +982,9 @@ class ToolBox:
         ys, xs = np.nonzero(lost)
         gone = [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
-        return (f"this would cut {len(xs)} road tiles (e.g. around ({xs[i]},{ys[i]})) off the highway; build a new link "
-                "first or pick tiles that aren't on the only route; to do it anyway repeat with confirm: true")
+        return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
+                "highway; build a new link first or pick tiles that aren't on the only route; to do it anyway repeat "
+                "with confirm: true")
 
     def _free_bank(self) -> np.ndarray:
         """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
@@ -969,9 +992,10 @@ class ToolBox:
 
     def _bank_warning(self, before: np.ndarray) -> str:
         """A warning for a zone action that took the last free riverbank lots beside roads (`before`: _free_bank()
-        before it) while the city still lacks a pump or a sewage outlet / treatment plant (both need the bank)."""
+        before it) while the city still lacks a sewage outlet / treatment plant or has neither a pump nor a water
+        tower (pumps and outlets need the bank; a tower supplies water without it)."""
         w = self.world
-        missing = [name for name, structs in (("pump", (C.PUMP,)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
+        missing = [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
                    if not any(w.facilities(s) for s in structs)]
         if not missing or not before.any() or self._free_bank().any():
             return ""

@@ -978,6 +978,8 @@ def test_bulldozing_a_dead_end_or_a_building_is_not_refused():
     box = ToolBox(env, "planning")
     res = box.call("bulldoze", {"x": 5, "y": 26})                 # the middle of the spur strands its tail
     assert res["refused"] == "disconnect" and "cut 2 road tiles (e.g. around (5,27))" in res["error"]
+    res = box.call("bulldoze", {"x": 5, "y": 27})                 # strands the last tile only
+    assert res["refused"] == "disconnect" and "cut 1 road tile (e.g. around (5,28)) off" in res["error"]
     res = box.call("bulldoze", {"x1": 5, "y1": 25, "x2": 5, "y2": 28})      # the whole spur: nothing left behind
     assert res["ok"] and res["message"] == "bulldozed 4 tiles" and "refused" not in res
     assert apply_action(w, "planning", {"type": "zone", "zone": "R", "x1": 4, "y1": 25, "x2": 4, "y2": 26}).ok
@@ -1020,6 +1022,22 @@ def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing()
     assert apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": x2, "y": y2}).ok
     res = zone(x3, y3)
     assert res["ok"] and "WARNING" not in res["message"], res
+
+
+def test_a_water_tower_counts_as_water_in_the_riverbank_warning():
+    """A city on a water tower needs no pump: zoning the last riverbank lot warns about the sewage outlet only."""
+    env = _env()
+    w = env.world
+    (x, y), *_ = _bridge_and_take_the_bank(env)
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "tower", "x": 10, "y": 25}).ok
+    assert w.facilities(C.TOWER) and not w.facilities(C.PUMP)
+    w.struct[y, x] = C.NONE
+    w.refresh()
+    res = ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
+    assert res["ok"] and res["message"].endswith(" WARNING: that zoned the last free riverbank lot(s) beside roads; "
+                                                 "utilities still needs one for its sewage outlet - dezone one near "
+                                                 f"({x},{y})"), res
 
 
 # ------------------------------------------------------------ explained failures
@@ -2349,6 +2367,45 @@ def test_refused_repeat_after_the_action_cap_says_end_turn():
     assert "change the arguments" not in again["error"]
 
 
+def test_repeated_bad_call_is_refused():
+    """An identical repeat of a call with bad arguments, bad JSON or an unknown tool (the arguments as sent, keys in
+    any order) is refused like a failed action's, until a successful action; the report counts it as refused."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.report import turn_row
+    env = _env()
+    env.world.treasury = 50000
+    box = ToolBox(env, "mayor")
+    refused = lambda n, err, tail="; change the arguments or do something else": {
+        "ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}{tail}"}
+    trace = []
+
+    def call(name, args=None):
+        res = box.call(name, args)
+        trace.append({"tool": name, "args": args, "result": _slim(res)})
+        return res
+
+    first = call("set_tax", {"sector": "R", "rate": "high"})
+    assert first["ok"] is False and first["error"].startswith("argument 'rate' must be") and "refused" not in first
+    assert call("set_tax", '{"rate": "high", "sector": "R"}') == refused(1, first["error"])
+    other = call("set_tax", {"sector": "C", "rate": "high"})                  # other arguments run
+    assert other["ok"] is False and "refused" not in other
+    bad_json = call("set_tax", '{"sector": "R", "rate": 9')
+    assert "not valid JSON" in bad_json["error"] and "refused" not in bad_json
+    assert call("set_tax", ' {"sector": "R", "rate": 9\n') == refused(4, bad_json["error"])   # the text, stripped
+    unknown = call("raise_taxes", {})
+    assert unknown["error"].startswith("unknown tool 'raise_taxes'") and "refused" not in unknown
+    assert call("raise_taxes", None)["refused"] == "repeat" and "refused" not in call("raise_taxes", {"x": 1})
+    noop = "there is no noop tool; to do nothing, call end_turn"
+    assert call("noop") == {"ok": False, "error": noop} and call("noop", "{}") == refused(9, noop, "")
+    assert call("end_turn", {})["error"] == "end_turn needs argument(s) report"
+    assert call("end_turn", {}) == refused(11, "end_turn needs argument(s) report")
+    assert box.n_calls == 12 and not box.ended and box.executed == []
+    row = turn_row({"role": "mayor", "month": 0, "tool_trace": trace})
+    assert len(row["tool_errors"]) == 7 and row["refused"] == 5 and row["repeats"] == 0
+    assert call("set_tax", {"sector": "R", "rate": 9})["ok"]                 # a success clears the refusals
+    assert call("set_tax", {"sector": "C", "rate": "high"}) == other
+
+
 def test_repeated_look_up_is_a_copy():
     env = _env()
     box = ToolBox(env, "police")
@@ -2371,8 +2428,8 @@ def test_turn_control_tools_are_not_deduplicated():
         res = box.call("update_memory", {"lessons": ["roads first"]})
         assert res["ok"] and "repeat" not in res
     assert len(box.messages) == 2
-    bad = [box.call("end_turn", {}) for _ in range(2)]                              # a failed end_turn is not refused
-    assert all(r["ok"] is False and "refused" not in r for r in bad)
+    bad = [box.call("end_turn", {}) for _ in range(2)]            # bad arguments: refused on repeat, as for any tool
+    assert bad[0]["ok"] is False and "refused" not in bad[0] and bad[1]["refused"] == "repeat"
 
 
 def test_refused_repeats_in_the_agent_trace():
