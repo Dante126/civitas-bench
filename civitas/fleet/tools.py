@@ -32,7 +32,7 @@ MAX_RADIUS = 4
 MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
-REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
+REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 RIVER_BANDS = 3              # row bands the Map block describes the river in
@@ -876,12 +876,13 @@ class ToolBox:
 
     @staticmethod
     def _sent_key(arguments) -> str:
-        """Arguments as sent, for the repeat check of a call that didn't resolve: JSON with sorted keys, else the
-        stripped text."""
+        """Arguments as sent, for the repeat check of a call that didn't resolve: JSON with sorted keys (none or
+        blank as {}, but "null" stays null), else the stripped text."""
+        if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
+            return "{}"
         try:
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments) if arguments.strip() else None
-            return json.dumps({} if arguments is None else arguments, sort_keys=True, default=str)
+            return json.dumps(json.loads(arguments) if isinstance(arguments, str) else arguments, sort_keys=True,
+                              default=str)
         except (TypeError, ValueError):
             return str(arguments).strip()
 

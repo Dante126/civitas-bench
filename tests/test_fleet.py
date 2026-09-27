@@ -2402,8 +2402,20 @@ def test_repeated_bad_call_is_refused():
     assert box.n_calls == 12 and not box.ended and box.executed == []
     row = turn_row({"role": "mayor", "month": 0, "tool_trace": trace})
     assert len(row["tool_errors"]) == 7 and row["refused"] == 5 and row["repeats"] == 0
+    assert call("allocate_budget", {"department": "fire", "amount": 10**9})["ok"] is False    # a failed action and
+    assert call("unlocks", {})["ok"]                                                          # a look-up keep them
+    assert call("set_tax", {"sector": "C", "rate": "high"}) == refused(3, other["error"])
     assert call("set_tax", {"sector": "R", "rate": 9})["ok"]                 # a success clears the refusals
     assert call("set_tax", {"sector": "C", "rate": "high"}) == other
+
+
+def test_bad_call_sent_as_json_null_is_not_a_call_without_arguments():
+    box = ToolBox(_env(), "police")
+    null = box.call("end_turn", "null")
+    assert null == {"ok": False, "error": "arguments must be a JSON object of named parameters, got NoneType"}
+    assert box.call("end_turn", "{}") == {"ok": False, "error": "end_turn needs argument(s) report"}   # not refused
+    assert box.call("end_turn", " null ")["error"].startswith("this exact call failed at call 1: arguments must")
+    assert box.call("end_turn", None)["error"].startswith("this exact call failed at call 2: end_turn needs")
 
 
 def test_repeated_look_up_is_a_copy():
@@ -2428,8 +2440,6 @@ def test_turn_control_tools_are_not_deduplicated():
         res = box.call("update_memory", {"lessons": ["roads first"]})
         assert res["ok"] and "repeat" not in res
     assert len(box.messages) == 2
-    bad = [box.call("end_turn", {}) for _ in range(2)]            # bad arguments: refused on repeat, as for any tool
-    assert bad[0]["ok"] is False and "refused" not in bad[0] and bad[1]["refused"] == "repeat"
 
 
 def test_refused_repeats_in_the_agent_trace():
