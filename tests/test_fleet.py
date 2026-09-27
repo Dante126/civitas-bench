@@ -851,7 +851,6 @@ def test_health_finds_cemetery_sites():
 
 
 def test_education_finds_library_sites(grown_env):
-    from civitas.fleet.tools import build_cost
     line = lambda env: next(ln for ln in _ready_sites(briefing(env, "education", mark=False))
                             if ln.startswith("- library:"))
     assert line(_env()) == f"- library: locked (unlocks at {C.UNLOCK_POP['library']:,} residents)"
@@ -861,7 +860,7 @@ def test_education_finds_library_sites(grown_env):
     res = box.call("find_sites", {"purpose": "library"})
     sites = res["sites"]
     assert sites and sites == box.call("find_sites", {"purpose": "school"})["sites"] and "note" not in res
-    assert build_cost(w, "education", "library") == C.TIER_LINES["library"][0]["cost"] == 1500
+    assert _building_cost(w, "education", "library") == C.TIER_LINES["library"][0]["cost"] == 1500
     w.dept_funds["education"] = 1500
     assert line(env) == f"- library: {len(sites)} sites, same list as school; $1,500"
     assert box.call("build_library", {"x": sites[0]["x"], "y": sites[0]["y"]})["ok"]
@@ -1547,6 +1546,7 @@ BUILD_ACTIONS = {
     ("transport", "train_station"): {"type": "build_train_station"},
     ("transport", "harbour"): {"type": "build_harbour"},
     ("transport", "metro_station"): {"type": "build_metro_station"},
+    ("transport", "bus_stops"): {"type": "create_bus_line"},                # stops: the first two suggested
     ("police", "station"): {"type": "build_police_station"}, ("police", "jail"): {"type": "build_jail"},
     ("fire", "station"): {"type": "build_fire_station"}, ("fire", "shelter"): {"type": "build_shelter"},
     ("health", "clinic"): {"type": "build_clinic"}, ("health", "hospital"): {"type": "build_hospital"},
@@ -1556,6 +1556,21 @@ BUILD_ACTIONS = {
     ("education", "university"): {"type": "build_school", "kind": "university"},
     ("education", "library"): {"type": "build_library"},
 }
+
+
+def _building_cost(w, role: str, purpose: str) -> int | None:
+    """site_price for a whole building (or bus line), rounded; None per tile (levees, avenue tiles) or unpriced."""
+    from civitas.fleet.tools import site_price
+    p = site_price(w, role, purpose)
+    return None if p is None or p.per_tile else round(p.cost)
+
+
+def _build_action(role: str, purpose: str, sites: list[dict]) -> dict:
+    """BUILD_ACTIONS' action on the listed site (a bus line: from the first two suggested stops)."""
+    a = BUILD_ACTIONS[role, purpose]
+    if a["type"] == "create_bus_line":
+        return {**a, "stops": [[t["x"], t["y"]] for t in sites[:2]]}
+    return {**a, "x": sites[0]["x"], "y": sites[0]["y"]}
 
 
 @pytest.fixture(scope="module")
@@ -1573,13 +1588,12 @@ def open_env(grown_env):
 
 @pytest.mark.parametrize("role,purpose", list(BUILD_ACTIONS))
 def test_build_cost_is_what_the_build_charges(open_env, role, purpose):
-    from civitas.fleet.tools import build_cost
     env = copy.deepcopy(open_env)
     w = env.world
-    cost = build_cost(w, role, purpose)
-    s = ToolBox(env, role).call("find_sites", {"purpose": purpose})["sites"][0]
+    cost = _building_cost(w, role, purpose)
+    sites = ToolBox(env, role).call("find_sites", {"purpose": purpose})["sites"]
     dept = ROLES[role]["budget"]
-    action = {**BUILD_ACTIONS[role, purpose], "x": s["x"], "y": s["y"]}
+    action = _build_action(role, purpose, sites)
     w.dept_funds[dept] = cost - 1
     res = apply_action(w, role, action)
     assert not res.ok and res.message.startswith(f"costs ${cost:,} but the {dept} budget only has ${cost - 1:,}"), \
@@ -1590,7 +1604,8 @@ def test_build_cost_is_what_the_build_charges(open_env, role, purpose):
 
 
 def test_build_cost_prices_the_cheapest_unlocked_building(grown_env, open_env):
-    from civitas.fleet.tools import build_cost
+    from civitas.fleet.tools import Price, site_price
+    build_cost = _building_cost
     w = grown_env.world                                # 2,6xx residents: hospitals, stations, 2x2 blocks locked
     cost = lambda line, tier=1: C.TIER_LINES[line][tier - 1]["cost"]
     assert build_cost(w, "utilities", "coal_or_gas") == cost("coal") < cost("gas")
@@ -1605,7 +1620,12 @@ def test_build_cost_prices_the_cheapest_unlocked_building(grown_env, open_env):
     assert build_cost(w, "utilities", "riverbank_2x2") == cost("pump", 3)     # water works
     assert build_cost(w, "transport", "harbour") == C.HARBOUR_SPEC["cost"]
     priced = {(r, p) for r in SITE_PURPOSES for p in SITE_PURPOSES[r] if build_cost(w, r, p) is not None}
-    assert priced == set(BUILD_ACTIONS)                # not planning, levees (per tile), bus stops, congested roads
+    assert priced == set(BUILD_ACTIONS)                # not planning, nor levees and avenues (per tile)
+    assert site_price(w, "transport", "bus_stops") == Price(C.BUS_LINE_COST, "bus line")
+    assert site_price(w, "transport", "congested_roads") == Price(C.ROAD_UPGRADE_COST[2], "avenue tile", True)
+    fresh = _env().world                               # avenues unlock at 1,000 residents; bus lines need no unlock
+    assert site_price(fresh, "transport", "congested_roads") is None
+    assert site_price(fresh, "transport", "bus_stops") == Price(C.BUS_LINE_COST, "bus line")
 
 
 def test_ready_sites_show_the_price_and_what_is_short():
@@ -1646,9 +1666,10 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
         "mayor for the amount with a reason (send_message) unless you already did, then end_turn.")
     assert "(cheapest: station $2,500)" in briefing(env, "fire", mark=False)       # never the $1,500 shelter
     assert "(cheapest: clinic or landfill $2,000)" in briefing(env, "health", mark=False)     # a tie names both
-    for role in ("transport", "planning"):             # only bus stops ready / nothing priced
-        text = briefing(env, role, mark=False)
-        assert "can't pay" not in text and "$" not in "".join(_ready_sites(text)), role
+    planning = briefing(env, "planning", mark=False)  # nothing priced
+    assert "can't pay" not in planning and "$" not in "".join(_ready_sites(planning))
+    transport = briefing(env, "transport", mark=False)
+    assert _ready_sites(transport)[0].endswith("; $1,500 - you have $0") and "(cheapest: bus_stops $1,500)" in transport
     w.dept_funds["police"] = 3000
     police = briefing(env, "police", mark=False)
     station, jail = _ready_sites(police)[:2]
@@ -1699,7 +1720,7 @@ def test_shelter_and_cemetery_are_never_named_as_the_first_build(grown_env):
     the $2,500 station (0% coverage). Shelter and cemetery are supplementary like the library: while a station, clinic
     or landfill has sites, the mayor's line names that, and an affordable one still keeps the budget line away."""
     from civitas.fleet.tools import SUPPLEMENTARY, Price, cheapest
-    assert SUPPLEMENTARY == {"library", "shelter", "cemetery"}
+    assert SUPPLEMENTARY == {"library", "shelter", "cemetery", "train_station", "harbour", "metro_station"}
     station, shelter = Price(2500, "fire station"), Price(1500, "shelter")
     clinic, landfill, cemetery = Price(2000, "clinic"), Price(2000, "landfill"), Price(1500, "cemetery")
     assert cheapest({"station": station, "shelter": shelter}) == (("station",), station)
@@ -1748,12 +1769,12 @@ def test_the_budget_line_falls_back_to_a_supplementary_price(grown_env, monkeypa
 
 
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
-    from civitas.fleet.tools import build_cost, site_price
+    from civitas.fleet.tools import site_price
     env = copy.deepcopy(grown_env)
     w = env.world
     w.schedule.append({"kind": "flood", "month": w.month + 2, "duration": 1, "y1": 15, "y2": 32})
     tile = C.CATALOG["levee"]["cost"]
-    assert build_cost(w, "fire", "levee") is None and site_price(w, "fire", "levee").per_tile      # not a building
+    assert _building_cost(w, "fire", "levee") is None and site_price(w, "fire", "levee").per_tile  # not a building
     fire_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- fire:"))
     w.dept_funds["fire"] = tile                        # one levee tile, less than a shelter
     fire = briefing(env, "fire", mark=False)
@@ -1770,6 +1791,79 @@ def test_levees_are_priced_per_tile_in_a_flood(grown_env):
     assert not res.ok and res.message.startswith(f"costs ${tile:,} but the fire budget only has ${tile - 1:,}")
 
 
+def test_congested_roads_are_priced_per_avenue_tile(open_env):
+    """upgrade_road charges C.ROAD_UPGRADE_COST[2] per street tile on land for an avenue: the listed stretch costs its
+    street tiles times the Ready line's per-tile price."""
+    from civitas.fleet.tools import site_price
+    env = copy.deepcopy(open_env)
+    w = env.world
+    w.congestion[40:44, 3] = 1.5                       # the new street down x=3 (all land): one congested stretch
+    s = ToolBox(env, "transport").call("find_sites", {"purpose": "congested_roads"})["sites"][0]
+    assert (s["x1"], s["y1"], s["x2"], s["y2"]) == (3, 40, 3, 43), s
+    tile = site_price(w, "transport", "congested_roads")
+    cost = 4 * tile.cost
+    line, = [ln for ln in _ready_sites(briefing(env, "transport", mark=False)) if ln.startswith("- congested_roads:")]
+    assert line.endswith(f"; ${tile.cost:,}/tile - you have $0") or line.endswith(f"; ${tile.cost:,}/tile"), line
+    action = {"type": "upgrade_road", "to": "avenue", "x1": 3, "y1": 40, "x2": 3, "y2": 43}
+    w.dept_funds["transport"] = cost - 1
+    res = apply_action(w, "transport", action)
+    assert not res.ok and res.message.startswith(f"costs ${cost:,} but the transport budget only has ${cost - 1:,}")
+    w.dept_funds["transport"] = cost
+    res = apply_action(w, "transport", action)
+    assert res.ok and res.cost == cost and w.dept_funds["transport"] == 0, res.message
+
+
+def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
+    """From 5,000 residents a train station ($8k) and a harbour ($10k) are priced; with only them priced, transport
+    holding $3,000 read "You can't pay for any ready site (cheapest: harbour $10k)" and the mayor "needs $10k for a
+    harbour" while bus stops were ready. Bus lines are priced now, and stations, harbours and metro stations are
+    supplementary (never the first build: bus lines come first)."""
+    from civitas.fleet.fmt import money
+    env = copy.deepcopy(open_env)                      # every milestone reached; bus stops, stations, harbour ready
+    w = env.world
+    ready = {ln.split(":")[0][2:]: ln for ln in _ready_sites(briefing(env, "transport", mark=False))}
+    assert all(f"; {money(c)}" in ready[p] for p, c in (
+        ("bus_stops", C.BUS_LINE_COST), ("harbour", C.HARBOUR_SPEC["cost"]), ("train_station", C.TRAIN_STATION["cost"]),
+        ("metro_station", C.METRO_STATION["cost"]))), ready
+    fleet_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines()
+                              if ln.startswith("- transport:"))
+    w.dept_funds["transport"] = 3000
+    text = briefing(env, "transport", mark=False)
+    assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text, text
+    assert fleet_line() == "- transport: funds $3,000"
+    w.dept_funds["transport"] = 0
+    n = len(ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})["sites"])
+    assert "(cheapest: bus_stops $1,500)" in briefing(env, "transport", mark=False)
+    assert fleet_line() == f"- transport: funds $0; needs $1,500 for a bus line ({n} ready sites)"
+
+
+def test_bank_top_up_ranks_as_the_observation_does():
+    """With every free bank lot beside the highway network, _bank_top_up must list what the observation's riverbank
+    lists do (its ranking is a copy of observation._candidate_sites'), crowding and plants included."""
+    from civitas.fleet.tools import _bank_top_up, free_bank, role_obs
+    env = _env()
+    w = env.world
+    w.dept_funds.update(planning=50000, utilities=50000)
+    for line in ({"x1": 19, "y1": 24, "x2": 38, "y2": 24}, {"x1": 22, "y1": 25, "x2": 22, "y2": 46},
+                 {"x1": 23, "y1": 46, "x2": 31, "y2": 46}):
+        assert apply_action(w, "planning", {"type": "build_road", **line}).ok
+
+    def same():
+        hints = role_obs(env, "utilities")["candidate_sites"]
+        for line, key in (("pump", "riverbank_next_to_road"), ("outlet", "riverbank_for_sewage")):
+            want = [{k: v for k, v in t.items() if k != "network"} for t in hints[key]]
+            n = min(6, len(want))
+            assert n >= 4 and _bank_top_up(w, [], line)[:n] == want[:n], (line, want)
+        return hints
+    assert free_bank(w).sum() == 6
+    hints = same()
+    pump, outlet = hints["riverbank_next_to_road"][0], hints["riverbank_for_sewage"][0]
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": pump["x"], "y": pump["y"]}).ok
+    assert apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": outlet["x"],
+                                         "y": outlet["y"]}).ok
+    same()                                             # ranked around the new plants, a crowded lot last
+
+
 def test_mayor_briefing_says_what_short_departments_need(grown_env):
     env = copy.deepcopy(grown_env)
     w = env.world
@@ -1784,7 +1878,8 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
     assert got["education"].startswith("- education: funds $0; needs $2,500 for an elementary school (")
     assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for a water tower (")
     assert got["fire"] == "- fire: funds $5,000"
-    assert got["transport"] == "- transport: funds $0" and got["planning"] == "- planning: funds $0"
+    assert got["transport"].startswith("- transport: funds $0; needs $1,500 for a bus line (")
+    assert got["planning"] == "- planning: funds $0"
     ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 2500}, "priorities": {"police": "cover downtown"}})
     assert lines()["police"] == (f"- police: funds $1,000 < target $2,500; needs $2,500 for a police station ({n} "
                                  "ready sites); priority: cover downtown")

@@ -439,31 +439,34 @@ tasks and money, and to let people coach it.
   reserve), and the plan. A department's briefing covers its plan slice, its budget (when
   its funds buy none of its ready sites, a line names the cheapest, all of them on a tie,
   and tells it to ask the mayor and end the turn instead of calling build tools), its key
-  metrics, a "since your last turn" digest (failed actions,
-  events, and the newest council messages addressed to it or to `all`, quoted with sender
-  and month), a Ready sites block (one line per `find_sites` purpose: the count and best
-  site with the price of the cheapest unlocked building the sites are for, `$300/tile` for
-  levees, and `; $2,500 - you have $1,000` when the funds are short; or why there is none,
-  e.g. locked, no connected road reaches the river, the riverbank beside the roads is
-  taken, or no roadside lot is away from homes for a landfill, cemetery or jail; a site on
-  one of the last two free riverbank lots is marked to keep for a pump or sewage outlet)
-  and its memory. A library (it only adds to schools), a shelter (it only matters in
-  disasters) and a cemetery (the landfill comes first) are priced on their lines, but the
-  mayor's needs line never names one, and the budget line only when nothing else is ready
-  (smoke v9's mayor funded fire $1,500 for "a shelter", and fire never reached the $2,500
-  station). Prices are what the build actions charge, and funds count as short
-  exactly when the build action would refuse them. Both have a short Map block (size,
-  highway entry, river columns by row band, the extent of the connected roads, any road
-  tiles not connected to the highway, and the built-up area) and end with the next
+  metrics, a "since your last turn" digest (failed actions, events, and the newest council
+  messages addressed to it or to `all`, quoted with sender and month), a Ready sites block
+  (one line per `find_sites` purpose: the count and best site with the price of the
+  cheapest unlocked building the sites are for (a bus line for bus stops; per tile for
+  levees, `$300/tile`, and for congested roads, `$30/tile` for an avenue), and `; $2,500 -
+  you have $1,000` when the funds are short; or why there is none, e.g. locked, no
+  connected road reaches the river, the riverbank beside the roads is taken, or no
+  roadside lot is away from homes for a landfill, cemetery or jail; a site on one of the
+  last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
+  memory. Every purpose outside planning is priced. A library (it only adds to schools), a
+  shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
+  train station, harbour or metro station (bus lines come first) are priced on their
+  lines, but the mayor's needs line never names one, and the budget line only when nothing
+  else is ready (smoke v9's mayor funded fire $1,500 for "a shelter", and fire never
+  reached the $2,500 station). Prices are what the build actions charge, and funds count
+  as short exactly when the build action would refuse them. Both have a short Map block
+  (size, highway entry, river columns by row band, the extent of the connected roads, any
+  road tiles not connected to the highway, and the built-up area) and end with the next
   milestone. Actions run immediately and return `ok`, a message, the cost and the money
   left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
   refused actions come back as `{"ok": false, "error": ...}` for the model to correct. A
-  failed `build_road` or `zone` also says how to fix it: a road blocked by empty zoned lots
-  names them and the `dezone` rectangles to run first (free; they stay on the road's line,
-  at most 2 named), one blocked by a building says to route around it, "already road" gets
-  the extent of the connected roads and a pointer to `find_sites road_extension`, and high
-  density before its unlock gets `zone with density "low" now`. These hints go to the model
-  only; the history log and the turn's action results keep the game's message.
+  failed `build_road` or `zone` also says how to fix it: a road blocked by empty zoned
+  lots names them and the `dezone` rectangles to run first (free; they stay on the road's
+  line, at most 2 named), one blocked by a building says to route around it, "already
+  road" gets the extent of the connected roads and a pointer to `find_sites
+  road_extension`, and high density before its unlock gets `zone with density "low" now`.
+  These hints go to the model only; the history log and the turn's action results keep the
+  game's message.
 - **Guards.** A `bulldoze` that would cut highway-connected road tiles off the highway
   (the road network relabelled without the removed tiles, as `World.refresh()` does) is
   refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
@@ -642,7 +645,7 @@ briefing-first playbook and the idle rule) reached 952 residents / 41.8 on seed 
 45.2 on seed 1.
 - **Funding failures:** "costs $X but the budget only has $Y" fell from 10 and 4 to 1 and 2.
 - **Tokens and calls:** prompt tokens per turn fell from 53–68k to 41–50k, and calls per turn from 11–13 to 7–9.
-- **Idle turns:** their share of prompt tokens fell from 37–48% to 15–30%. Transport's idle hint is gone.
+- **Idle turns:** their share of prompt tokens fell from 37–48% to 15–30%. Idle hints fell from 5 and 6 to 0 and 2.
 - **Hints worked:** after each road or zone hint, planning ran the suggested dezone or zoned at low density on its next call.
 - **Two new problems:**
   - Seed 0's planning lost its whole month-0 turn to two replies cut at `max_tokens` with no tool call.
@@ -652,7 +655,7 @@ briefing-first playbook and the idle rule) reached 952 residents / 41.8 on seed 
 replies get their own nudge) reached 2,076 / 47.5 and 1,028 / 45.6.
 - **Lost turns:** none. Four turns were cut at the token limit, and all recovered.
 - **Stations:** the mayor funded police and fire with $2,500 each, and both built a station (fire 69.8 and 78.6, up from 53.3 and 31.4).
-- **Tokens and calls:** 41–57k prompt tokens and 7–10 calls per turn.
+- **Tokens and calls:** 41–57k prompt tokens and 7–10 calls per turn; idle turns took 35% and 18% of prompt tokens.
 - **Failed actions: still 27–30%.** Funding failures stay low (3 and 3), but planning's road and zone attempts now make up most failures: roads along existing roads, roads through buildings, zoning taken land. Planning also ended 2–3 of its 4 turns on the step limit.
 - **Other problems:**
   - On seed 1 the mayor gave health $5,000 while education, asking for $2,500 every turn, got nothing.
@@ -716,7 +719,7 @@ on month 0. It's the fastest way to iterate on prompts.
 6. `bench/scoring.py`: add a KPI function to `ROLE_SCORERS`.
 7. `agents/scripted.py`: add a baseline to `SCRIPTED`, and let the scripted mayor fund it.
 8. Viewer: give new buildings a character in `catalog.CHAR`, a model in `scene.js` (`_buildSpecial`), a sprite recipe in `recipes.js` (`special`), and entries in `NAMES` / `MINI` in `app.js`; new map layers go in `World.frame_layers()` and `OVERLAYS` in `scene.js`.
-9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS`, or `TRANSPORT_BUILDS` / `SITE_TILES` for specs outside the tier lines and per-tile builds; list a priced purpose that is never the role's first build in `SUPPLEMENTARY`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
+9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS` (tier names, or `OFF_TIER_SPECS` entries for prices outside the tier lines, listed in `PER_TILE` when charged per tile); list a priced purpose that is never the role's first build in `SUPPLEMENTARY`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
 
 ## Ideas for next steps
 

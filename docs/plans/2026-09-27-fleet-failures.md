@@ -96,3 +96,9 @@ Checkpoint after each task: `pytest -q -m "not slow"` (276 passed at the start).
      - Fix (`fleet/agent.py`): a reply cut by length with no tool call gets its own nudge ("keep your reasoning short;
        call a tool now"), up to 2 per turn and within `turn_tokens`, separate from the one generic nudge.
    - Then run smoke v10 on both seeds.
+   - Note (final review): Task 1's unpriced purposes changed. Transport's `bus_stops` is priced at
+     `C.BUS_LINE_COST` ("bus line") and `congested_roads` per tile at `C.ROAD_UPGRADE_COST[2]` ("avenue tile", once
+     avenues unlock), like levees; `train_station`, `harbour` and `metro_station` joined `SUPPLEMENTARY` (bus lines
+     come first). Before, from 5,000 residents transport with $3,000 read "can't pay (cheapest: harbour $10k)" while
+     bus stops and congested roads were ready. Only planning's purposes are unpriced now. `build_cost` is gone (tests
+     use `site_price`); `TRANSPORT_BUILDS` / `SITE_TILES` became `OFF_TIER_SPECS` + `PER_TILE`.

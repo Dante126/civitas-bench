@@ -44,7 +44,7 @@ ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolis
 # buildings that link the road networks they touch to the region, as World.refresh() counts them (metro stations
 # don't) -> their name in a refusal
 LINKS = {C.TRAIN: "train station", C.HARBOUR: "harbour", C.AIRPORT: "airport"}
-LINK_REMOVERS = {r for r, owned in OWNED_STRUCTS.items() if owned & set(LINKS)}   # roles whose demolish takes one
+LINK_OWNERS = {r for r, owned in OWNED_STRUCTS.items() if owned & set(LINKS)}     # roles whose demolish takes one
 # guarded action -> what its refusal and confirm parameter say the roads would be cut off from
 CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
 
@@ -103,32 +103,40 @@ SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("n
                ("pollution", "pollution {}")]
 SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
 SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
-# purpose -> the buildings its sites are for (tier names, or TRANSPORT_BUILDS keys): the cheapest unlocked one prices
-# the site (site_price). Levees are priced per tile (SITE_TILES); planning, bus stops and congested roads not at all
+# purpose -> what its sites are for (tier names, or OFF_TIER_SPECS keys): the cheapest unlocked one prices the site
+# (site_price). Planning's purposes aren't priced
 SITE_BUILDS = {
     "utilities": {"coal_or_gas": ("coal", "gas"), "wind": ("wind",), "pump": ("pump",), "sewage": ("outlet",),
                   "near_homes": ("tower", "solar", "wind"),
                   "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear")},
-    "transport": {"train_station": ("train_station",), "harbour": ("harbour",), "metro_station": ("metro_station",)},
+    "transport": {"bus_stops": ("bus_line",), "train_station": ("train_station",), "harbour": ("harbour",),
+                  "metro_station": ("metro_station",), "congested_roads": ("avenue_tile",)},
     "police": {"station": ("police_station",), "jail": ("jail",)},
-    "fire": {"station": ("fire_station",), "shelter": ("shelter",)},
+    "fire": {"station": ("fire_station",), "shelter": ("shelter",), "levee": ("levee_tile",)},
     "health": {"clinic": ("clinic",), "hospital": ("hospital",), "landfill": ("landfill",), "cemetery": ("cemetery",)},
     "education": {"school": ("elementary_school",), "high_school": ("high_school",), "university": ("university",),
                   "library": ("library",)},
 }
-# transport buildings outside the tier lines -> (catalog spec, unlock key); the spec is looked up when priced, as the
-# build actions do (a balance override may replace it)
-TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
-                    "metro_station": ("METRO_STATION", "metro")}
-SITE_TILES = {"fire": {"levee": "levee"}}    # purposes priced per tile -> their CATALOG entry (read when priced)
+# prices outside the tier lines -> (what the action charges, looked up when priced as the actions do, since a balance
+# override may replace it; unlock key). A bus line: create_bus_line. Per tile (PER_TILE): build_levee charges each
+# levee tile; upgrade_road each street tile it makes an avenue on land (the cheapest class upgrade; x3 on bridges)
+OFF_TIER_SPECS = {"train_station": (lambda: C.TRAIN_STATION["cost"], "train_station"),
+                  "harbour": (lambda: C.HARBOUR_SPEC["cost"], "harbour"),
+                  "metro_station": (lambda: C.METRO_STATION["cost"], "metro"),
+                  "bus_line": (lambda: C.BUS_LINE_COST, None),
+                  "levee_tile": (lambda: C.CATALOG["levee"]["cost"], None),
+                  "avenue_tile": (lambda: C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]], "avenue")}
+PER_TILE = {"levee_tile", "avenue_tile"}
 # priced purposes that are never a department's first build: cheapest() skips them, so the mayor's needs line and the
 # budget line name the primary price (their Ready lines keep theirs; affordable, they still keep the budget line
 # away, which would be false). At $1,500 each they undercut the first build and were named instead. A library only
 # multiplies school graduation (LIBRARY_BOOST): useless without the $2,500 school's seats. A shelter only matters in
 # disasters (the playbook adds one past 3,000 residents): smoke v9's mayor read "needs $1,500 for a shelter", funded
 # fire that much, and fire never reached the $2,500 station (0% coverage, fire score 31.4). A cemetery comes after
-# the $2,000 landfill in the playbook
-SUPPLEMENTARY = {"library", "shelter", "cemetery"}
+# the $2,000 landfill in the playbook. Train stations, harbours and metro stations are never transport's first build
+# either: the playbook wants bus lines first (at 5,000+ residents, $3,000 read "can't pay (cheapest: harbour $10k)"
+# with bus stops ready)
+SUPPLEMENTARY = {"library", "shelter", "cemetery", "train_station", "harbour", "metro_station"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -340,8 +348,8 @@ def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
 
 def guarded(role: str, action: str) -> bool:
     """Whether `role`'s `action` is refused when it would cut roads off (confirm: true lets it run): a bulldoze, and
-    a demolish by a role that can take a train station, harbour or airport (transport; LINK_REMOVERS)."""
-    return action in ROAD_REMOVERS or (action == "demolish" and role in LINK_REMOVERS)
+    a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS)."""
+    return action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -380,6 +388,11 @@ def _riverbank_by_roads(w) -> tuple[np.ndarray, list[tuple[int, int]]]:
     contact = next((m for m in (heads, road & bank) if m.any()), lots)
     ys, xs = np.nonzero(contact)
     return lots, [(int(x), int(y)) for y, x in zip(ys, xs)]
+
+
+def free_bank(w) -> np.ndarray:
+    """The free riverbank lots beside highway-connected roads: where a pump or outlet can go."""
+    return _riverbank_by_roads(w)[0] & _empty_land(w)
 
 
 def _ends(points: list) -> list:
@@ -647,7 +660,7 @@ def _bank_top_up(w, listed: list[dict], line: str) -> list[dict]:
     `line` (pump: cleanest first, +0.5 at or south of an outlet, then north first; outlet: those at or north of a
     pump last, then south first; crowded spots last, marked "crowd"), with pollution as it computes it."""
     have = {(s["x"], s["y"]) for s in listed}
-    ys, xs = np.nonzero(_riverbank_by_roads(w)[0] & _empty_land(w))
+    ys, xs = np.nonzero(free_bank(w))
     more = [{"x": x, "y": y, "pollution": round(max(float(w.pollution[y, x]), w._river_near(x, y)), 2)}
             for x, y in zip(xs.tolist(), ys.tolist()) if (x, y) not in have]
     if line == "pump":
@@ -729,17 +742,15 @@ def scarce_bank(w) -> set[tuple[int, int]]:
     """The free riverbank lots beside highway-connected roads (where a pump or outlet can go) when there are at most
     SCARCE_BANK of them, else none: the Ready sites line of another purpose whose site is one of them says to keep
     it for pump / sewage."""
-    lots = _riverbank_by_roads(w)[0] & _empty_land(w)
-    ys, xs = np.nonzero(lots)
+    ys, xs = np.nonzero(free_bank(w))
     return {(int(x), int(y)) for y, x in zip(ys, xs)} if len(xs) <= SCARCE_BANK else set()
 
 
 def _price(w, name: str) -> float | None:
-    """What building `name` (a tier name or a TRANSPORT_BUILDS key) costs: the spec its build action charges. None
-    while it is locked."""
-    if name in TRANSPORT_BUILDS:
-        spec, key = TRANSPORT_BUILDS[name]
-        return getattr(C, spec)["cost"] if w.unlocked(key) else None
+    """What `name` (a tier name or an OFF_TIER_SPECS key) costs: what its action charges. None while it is locked."""
+    if name in OFF_TIER_SPECS:
+        cost, key = OFF_TIER_SPECS[name]
+        return cost() if key is None or w.unlocked(key) else None
     line, tier = C.TIER_BY_NAME[name]
     spec = C.TIER_LINES[line][tier - 1]
     return None if spec.get("unlock") and not w.unlocked(spec["unlock"]) else spec["cost"]
@@ -747,7 +758,7 @@ def _price(w, name: str) -> float | None:
 
 def building_name(name: str) -> str:
     """A SITE_BUILDS name for people: a line's base tier by its struct's name (tower -> water tower, outlet -> sewage
-    outlet), a higher tier by its own (water works: the struct is the line's), transport's as it is."""
+    outlet), a higher tier by its own (water works: the struct is the line's), the others as they are (bus line)."""
     if name in C.TIER_BY_NAME:
         line, tier = C.TIER_BY_NAME[name]
         name = C.STRUCT_NAME[C.TIER_LINES[line][0]["struct"]] if tier == 1 else name
@@ -755,8 +766,8 @@ def building_name(name: str) -> str:
 
 
 class Price(NamedTuple):
-    cost: float             # as the build action charges it, unrounded (one tile for SITE_TILES purposes)
-    building: str           # what it buys, for people (building_name, or "levee tile")
+    cost: float             # as the action charges it, unrounded (one tile for PER_TILE names)
+    building: str           # what it buys, for people (building_name: "water tower", "bus line", "levee tile")
     per_tile: bool = False
 
     def text(self) -> str:
@@ -769,22 +780,12 @@ def short_of(funds: float, cost: float) -> bool:
 
 
 def site_price(w, role: str, purpose: str) -> Price | None:
-    """What a site on `role`'s find_sites `purpose` list costs: the cheapest unlocked building the list is for
-    (SITE_BUILDS), as its build action charges it, or one tile for purposes priced per tile (SITE_TILES). None for
-    purposes without a price or while all their buildings are locked."""
-    tile = SITE_TILES.get(role, {}).get(purpose)
-    if tile:
-        return Price(C.CATALOG[tile]["cost"], f"{tile} tile", per_tile=True)
+    """What a site on `role`'s find_sites `purpose` list costs: the cheapest unlocked thing the list is for
+    (SITE_BUILDS), as its action charges it (per tile for PER_TILE names). None for purposes without a price or while
+    all of theirs are locked."""
     priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
     best = min(priced, key=lambda t: t[0], default=None)
-    return None if best is None else Price(best[0], building_name(best[1]))
-
-
-def build_cost(w, role: str, purpose: str) -> int | None:
-    """site_price rounded, for whole buildings: None for purposes priced per tile (levees) or not at all, or while
-    all their buildings are locked."""
-    p = site_price(w, role, purpose)
-    return None if p is None or p.per_tile else round(p.cost)
+    return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE)
 
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
@@ -1010,7 +1011,7 @@ class ToolBox:
             refusal = self._disconnect_refusal(name, args)
             if refusal:
                 return {"ok": False, "refused": "disconnect", "error": refusal}
-        bank = self._free_bank() if name == "zone" else None
+        bank = free_bank(self.world) if name == "zone" else None
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
@@ -1051,18 +1052,14 @@ class ToolBox:
         return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
                 f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
 
-    def _free_bank(self) -> np.ndarray:
-        """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
-        return _riverbank_by_roads(self.world)[0] & _empty_land(self.world)
-
     def _bank_warning(self, before: np.ndarray) -> str:
-        """A warning for a zone action that took the last free riverbank lots beside roads (`before`: _free_bank()
+        """A warning for a zone action that took the last free riverbank lots beside roads (`before`: free_bank()
         before it) while the city still lacks a sewage outlet / treatment plant or has neither a pump nor a water
         tower (pumps and outlets need the bank; a tower supplies water without it)."""
         w = self.world
         missing = [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
                    if not any(w.facilities(s) for s in structs)]
-        if not missing or not before.any() or self._free_bank().any():
+        if not missing or not before.any() or free_bank(self.world).any():
             return ""
         ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))
         if not len(xs):                                   # not taken by this zoning: someone else's doing
