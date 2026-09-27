@@ -121,11 +121,14 @@ SITE_BUILDS = {
 TRANSPORT_BUILDS = {"train_station": ("TRAIN_STATION", "train_station"), "harbour": ("HARBOUR_SPEC", "harbour"),
                     "metro_station": ("METRO_STATION", "metro")}
 SITE_TILES = {"fire": {"levee": "levee"}}    # purposes priced per tile -> their CATALOG entry (read when priced)
-# priced purposes that only add to another building, never the first buy: cheapest() skips them, so the mayor's
-# needs line and the budget line name the primary price (their Ready lines keep theirs; affordable, they still keep
-# the budget line away, which would be false). A library only multiplies school graduation (LIBRARY_BOOST): useless
-# without school seats, yet at $1,500 it undercut the $2,500 school
-SUPPLEMENTARY = {"library"}
+# priced purposes that are never a department's first build: cheapest() skips them, so the mayor's needs line and the
+# budget line name the primary price (their Ready lines keep theirs; affordable, they still keep the budget line
+# away, which would be false). At $1,500 each they undercut the first build and were named instead. A library only
+# multiplies school graduation (LIBRARY_BOOST): useless without the $2,500 school's seats. A shelter only matters in
+# disasters (the playbook adds one past 3,000 residents): smoke v9's mayor read "needs $1,500 for a shelter", funded
+# fire that much, and fire never reached the $2,500 station (0% coverage, fire score 31.4). A cemetery comes after
+# the $2,000 landfill in the playbook
+SUPPLEMENTARY = {"library", "shelter", "cemetery"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -790,11 +793,14 @@ def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     return {p: pr for p, lst in lists.items() if lst.sites and not lst.short and (pr := site_price(w, role, p))}
 
 
-def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[str, Price] | None:
-    """(purpose, price) of the lowest price, the first on ties, SUPPLEMENTARY purposes skipped unless
-    `supplementary` (the mayor's needs line and the budget line name it); None when there is none."""
-    return min(((p, pr) for p, pr in prices.items() if supplementary or p not in SUPPLEMENTARY),
-               key=lambda kv: kv[1].cost, default=None)
+def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[tuple[str, ...], Price] | None:
+    """(purposes, price) of the lowest price, SUPPLEMENTARY purposes skipped unless `supplementary` (the mayor's
+    needs line and the budget line name them); None when there is none. Every purpose at that price, in order:
+    health's clinic and landfill both cost $2,000, and naming the first alone would pick the clinic over the
+    playbook's landfill-first."""
+    kept = {p: pr for p, pr in prices.items() if supplementary or p not in SUPPLEMENTARY}
+    low = min(kept.values(), key=lambda pr: pr.cost, default=None)
+    return None if low is None else (tuple(p for p, pr in kept.items() if pr.cost == low.cost), low)
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),

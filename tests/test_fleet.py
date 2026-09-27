@@ -1644,8 +1644,8 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
     assert _block(police, "## Your budget")[1] == (
         "- You can't pay for any ready site (cheapest: station $2,500). Don't call build tools this turn: ask the "
         "mayor for the amount with a reason (send_message) unless you already did, then end_turn.")
-    assert "(cheapest: shelter $1,500)" in briefing(env, "fire", mark=False)
-    assert "(cheapest: cemetery $1,500)" in briefing(env, "health", mark=False)     # cheaper than a clinic
+    assert "(cheapest: station $2,500)" in briefing(env, "fire", mark=False)       # never the $1,500 shelter
+    assert "(cheapest: clinic or landfill $2,000)" in briefing(env, "health", mark=False)     # a tie names both
     for role in ("transport", "planning"):             # only bus stops ready / nothing priced
         text = briefing(env, role, mark=False)
         assert "can't pay" not in text and "$" not in "".join(_ready_sites(text)), role
@@ -1673,10 +1673,10 @@ def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
     the library included, is affordable (else it would be false)."""
     from civitas.fleet.tools import Price, cheapest
     school, library = Price(2500, "elementary school"), Price(1500, "library")
-    assert cheapest({"library": library, "school": school}) == ("school", school)
+    assert cheapest({"library": library, "school": school}) == (("school",), school)
     assert cheapest({"library": library}) is None and cheapest({"library": library}, supplementary=True) == (
-        "library", library)
-    assert cheapest({"library": library, "school": school}, supplementary=True) == ("library", library)
+        ("library",), library)
+    assert cheapest({"library": library, "school": school}, supplementary=True) == (("library",), library)
     env = copy.deepcopy(grown_env)
     w = env.world
     ready = lambda: {ln.split(":")[0][2:]: ln for ln in _ready_sites(briefing(env, "education", mark=False))}
@@ -1692,6 +1692,38 @@ def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
     w.dept_funds["education"] = 1000                   # short of both: the library's line says so too
     assert budget()[1].startswith("- You can't pay for any ready site (cheapest: school $2,500).")
     assert "$2,500 for an elementary school" in needs() and ready()["library"].endswith("; $1,500 - you have $1,000")
+
+
+def test_shelter_and_cemetery_are_never_named_as_the_first_build(grown_env):
+    """Smoke v9: the mayor read "fire: funds $0; needs $1,500 for a shelter", gave fire $1,500, and fire never reached
+    the $2,500 station (0% coverage). Shelter and cemetery are supplementary like the library: while a station, clinic
+    or landfill has sites, the mayor's line names that, and an affordable one still keeps the budget line away."""
+    from civitas.fleet.tools import SUPPLEMENTARY, Price, cheapest
+    assert SUPPLEMENTARY == {"library", "shelter", "cemetery"}
+    station, shelter = Price(2500, "fire station"), Price(1500, "shelter")
+    clinic, landfill, cemetery = Price(2000, "clinic"), Price(2000, "landfill"), Price(1500, "cemetery")
+    assert cheapest({"station": station, "shelter": shelter}) == (("station",), station)
+    assert cheapest({"clinic": clinic, "landfill": landfill, "cemetery": cemetery}) == (("clinic", "landfill"), clinic)
+    assert cheapest({"shelter": shelter}) is None and cheapest({"cemetery": cemetery}) is None
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    n = {p: len(ToolBox(env, d).call("find_sites", {"purpose": p})["sites"])
+         for d, p in (("fire", "station"), ("health", "clinic"), ("health", "landfill"))}
+    line = lambda d: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith(f"- {d}:"))
+    for funds in (0, 1000, 1499, 1500, 1999):
+        w.dept_funds.update(fire=funds, health=funds)
+        assert line("fire") == (f"- fire: funds ${funds:,}; needs $2,500 for a fire station ({n['station']} ready "
+                                "sites)")
+        assert line("health") == (f"- health: funds ${funds:,}; needs $2,000 for a clinic ({n['clinic']} ready sites) "
+                                  f"or a landfill ({n['landfill']} ready sites)")      # a tie names both
+    w.dept_funds.update(fire=1500, health=1500)        # v9: a shelter / cemetery affordable, the station / landfill not
+    for dept, cheap, dear in (("fire", "shelter", "station"), ("health", "cemetery", "landfill")):
+        text = briefing(env, dept, mark=False)
+        ready = {ln.split(":")[0][2:]: ln for ln in _ready_sites(text)}
+        assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text, dept
+        assert ready[cheap].endswith("; $1,500") and "- you have $1,500" in ready[dear], ready
+    w.dept_funds.update(fire=2000, health=2000)        # the landfill and clinic affordable: health needs nothing
+    assert line("health") == "- health: funds $2,000" and "needs $2,500 for a fire station" in line("fire")
 
 
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
@@ -1726,7 +1758,8 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
                      if ln.startswith("- ") and ": funds " in ln}
     got = lines()                                      # the building, not the find_sites purpose
     assert got["police"] == f"- police: funds $1,000; needs $2,500 for a police station ({n} ready sites)"
-    assert got["health"].startswith("- health: funds $0; needs $1,500 for a cemetery (")
+    assert re.fullmatch(r"- health: funds \$0; needs \$2,000 for a clinic \(\d ready sites\) or a landfill \(\d ready "
+                        r"sites\)", got["health"])       # both $2,000: a tie names both, never the $1,500 cemetery
     assert got["education"].startswith("- education: funds $0; needs $2,500 for an elementary school (")
     assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for a water tower (")
     assert got["fire"] == "- fire: funds $5,000"
@@ -1960,7 +1993,7 @@ from civitas.agents.llm_client import LLMError
 from pathlib import Path
 
 from civitas.config import apply_cli_overrides, build_agents, game_config, load_config, scoring_config
-from civitas.fleet.agent import ToolAgent
+from civitas.fleet.agent import LENGTH_NUDGE, LENGTH_NUDGES, NUDGE, ToolAgent
 from civitas.fleet.config import FleetAgentConfig, fleet_agent_config, fleet_version
 
 TITLES = {spec["title"]: r for r, spec in ROLES.items()}
@@ -2145,7 +2178,7 @@ def test_tool_agent_ends_after_one_nudge_without_tool_calls():
     assert "Use the tools" in a.client.calls[1]["messages"][-1]["content"]
     assert d.meta["finish_reason"] == "no_tool_calls" and not d.meta["ended"] and d.meta["steps"] == 0
     assert d.executed == [] and d.thinking == "(no report)"
-    assert d.meta["messages"][2]["content"] == "thinking aloud"
+    assert d.meta["messages"][2]["content"] == "thinking aloud" and _nudges(d) == [NUDGE]
     a, env = _agent(content="")
     d = a.act(env.observe("police"))
     asst = [m for m in d.meta["messages"] if m["role"] == "assistant"]
@@ -2405,7 +2438,50 @@ def test_text_calls_only_the_trailing_run_and_not_truncated_replies():
     a, d = _run_scripted([("", drafted, []), ("", "", []), END])            # nothing after the draft but prose
     assert d.meta["tool_trace"] == [] and d.meta["finish_reason"] == "no_tool_calls"
     a, d = _run_scripted([("", _xml_call("unlocks"), [], "length"), ("", "", []), END])
-    assert d.meta["tool_trace"] == [] and d.meta["recovered_calls"] == 0
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["end_turn"] and d.meta["recovered_calls"] == 0
+
+
+def _nudges(d) -> list[str]:
+    """The user messages the loop added after the briefing."""
+    return [m["content"] for m in d.meta["messages"][2:] if m["role"] == "user"]
+
+
+CUT = ("", "reasoning on and on", [], "length")         # a reply cut at max_tokens before any tool call
+
+
+def test_tool_agent_gives_a_reply_cut_at_max_tokens_its_own_nudge():
+    """Smoke v9: planning lost its month-0 turn to two replies cut at max_tokens mid-reasoning, with the one generic
+    nudge spent between them. A cut reply without a call gets LENGTH_NUDGE instead, and the generic nudge stays."""
+    a, d = _run_scripted([CUT] * LENGTH_NUDGES + [("", "", [_call("city_overview", {})]), END])
+    assert [c["tool"] for c in d.meta["tool_trace"]] == ["city_overview", "end_turn"]
+    assert d.meta["finish_reason"] == "end_turn" and _nudges(d) == [LENGTH_NUDGE] * LENGTH_NUDGES
+    assert d.meta["finish_reasons"] == ["length"] * LENGTH_NUDGES + ["stop", "stop"]
+    assert d.meta["length_stops"] == LENGTH_NUDGES and "short" in LENGTH_NUDGE and LENGTH_NUDGES == 2
+    a, d = _run_scripted([CUT] * LENGTH_NUDGES + [("", "", []), END])        # then a plain reply without a call
+    assert _nudges(d) == [LENGTH_NUDGE] * LENGTH_NUDGES + [NUDGE] and d.meta["finish_reason"] == "end_turn"
+
+
+def test_tool_agent_ends_the_turn_once_its_nudges_are_spent():
+    a, env = _agent(finish="length")                   # every reply cut, none with a call
+    d = a.act(env.observe("police"))
+    assert _nudges(d) == [LENGTH_NUDGE] * LENGTH_NUDGES + [NUDGE] and len(a.client.calls) == LENGTH_NUDGES + 2
+    assert d.meta["finish_reason"] == "no_tool_calls" and d.meta["steps"] == 0
+    assert d.meta["length_stops"] == LENGTH_NUDGES + 2
+    a, d = _run_scripted([("", "", [])] + [CUT] * (LENGTH_NUDGES + 1))       # generic nudge spent first
+    assert _nudges(d) == [NUDGE] + [LENGTH_NUDGE] * LENGTH_NUDGES and d.meta["finish_reason"] == "no_tool_calls"
+    assert len(a.client.calls) == LENGTH_NUDGES + 2
+    a, d = _run_scripted([("", "", []), CUT, ("", "", [])])                  # still one generic nudge a turn
+    assert _nudges(d) == [NUDGE, LENGTH_NUDGE] and d.meta["finish_reason"] == "no_tool_calls"
+
+
+def test_tool_agent_sends_no_nudge_past_turn_tokens():
+    a, env = _agent(finish="length", tokens=600, turn_tokens=1000)
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "turn_tokens" and len(a.client.calls) == 2 and _nudges(d) == [LENGTH_NUDGE]
+    assert d.meta["usage"]["completion_tokens"] == 1200
+    a, env = _agent(tokens=1000, turn_tokens=1000)     # the generic nudge too
+    d = a.act(env.observe("police"))
+    assert d.meta["finish_reason"] == "turn_tokens" and len(a.client.calls) == 1 and _nudges(d) == []
 
 
 def test_text_calls_are_strings_for_the_schema_and_tolerate_broken_tags():

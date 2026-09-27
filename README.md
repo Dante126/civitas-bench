@@ -433,11 +433,13 @@ tasks and money, and to let people coach it.
   The mayor's briefing covers the city, the finances, each department's funds, target
   (`funds $0 < target $2,500` when it still needs funding), what it needs when its funds
   are short of its cheapest ready building (`needs $2,500 for a police station (5 ready
-  sites)`) and latest report, a line with the total funding gap (ending in `allocate_budget`,
-  or in "hold" when the treasury is at or under the reserve), and the plan. A department's
-  briefing covers its plan slice, its budget (when its funds buy none of its ready sites,
-  a line names the cheapest and tells it to ask the mayor and end the turn instead of
-  calling build tools), its key metrics, a "since your last turn" digest (failed actions,
+  sites)`, or each building at that price on a tie: `needs $2,000 for a clinic (5 ready
+  sites) or a landfill (4 ready sites)`) and latest report, a line with the total funding
+  gap (ending in `allocate_budget`, or in "hold" when the treasury is at or under the
+  reserve), and the plan. A department's briefing covers its plan slice, its budget (when
+  its funds buy none of its ready sites, a line names the cheapest, all of them on a tie,
+  and tells it to ask the mayor and end the turn instead of calling build tools), its key
+  metrics, a "since your last turn" digest (failed actions,
   events, and the newest council messages addressed to it or to `all`, quoted with sender
   and month), a Ready sites block (one line per `find_sites` purpose: the count and best
   site with the price of the cheapest unlocked building the sites are for, `$300/tile` for
@@ -445,8 +447,11 @@ tasks and money, and to let people coach it.
   e.g. locked, no connected road reaches the river, the riverbank beside the roads is
   taken, or no roadside lot is away from homes for a landfill, cemetery or jail; a site on
   one of the last two free riverbank lots is marked to keep for a pump or sewage outlet)
-  and its memory. A library, which only adds to schools, is priced on its line but never
-  named as the cheapest. Prices are what the build actions charge, and funds count as short
+  and its memory. A library (it only adds to schools), a shelter (it only matters in
+  disasters) and a cemetery (the landfill comes first) are priced on their lines but never
+  named as the cheapest, so neither line offers one as a department's first build (smoke
+  v9's mayor funded fire $1,500 for "a shelter", and fire never reached the $2,500
+  station). Prices are what the build actions charge, and funds count as short
   exactly when the build action would refuse them. Both have a short Map block (size,
   highway entry, river columns by row band, the extent of the connected roads, any road
   tiles not connected to the highway, and the built-up area) and end with the next
@@ -493,6 +498,10 @@ lessons go into the fleet report, and every edit is in the tool traces.
 - the game's `max_actions_per_turn` successful actions
 
 A model that answers without a tool call gets one nudge, and a second one ends the turn.
+A reply cut off at `max_tokens` before any tool call gets its own nudge instead (keep the
+reasoning short, pick one action and call its tool now), up to 2 a turn; after those it
+counts as any other reply without a call. No nudge is sent once the turn has used
+`turn_tokens`: the turn ends there as `turn_tokens`.
 Tool calls a model leaves as text (`<tool_call>` blocks in its reasoning, which
 trinity-large-thinking sometimes does) still run, and the trajectory counts them in
 `recovered_calls`.
@@ -686,7 +695,7 @@ on month 0. It's the fastest way to iterate on prompts.
 6. `bench/scoring.py`: add a KPI function to `ROLE_SCORERS`.
 7. `agents/scripted.py`: add a baseline to `SCRIPTED`, and let the scripted mayor fund it.
 8. Viewer: give new buildings a character in `catalog.CHAR`, a model in `scene.js` (`_buildSpecial`), a sprite recipe in `recipes.js` (`special`), and entries in `NAMES` / `MINI` in `app.js`; new map layers go in `World.frame_layers()` and `OVERLAYS` in `scene.js`.
-9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS`, or `TRANSPORT_BUILDS` / `SITE_TILES` for specs outside the tier lines and per-tile builds), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
+9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS`, or `TRANSPORT_BUILDS` / `SITE_TILES` for specs outside the tier lines and per-tile builds; list a priced purpose that is never the role's first build in `SUPPLEMENTARY`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
 
 ## Ideas for next steps
 

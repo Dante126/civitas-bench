@@ -184,18 +184,24 @@ def _a(name: str) -> str:
 
 def _needs(env, dept: str) -> str:
     """The mayor's Departments line suffix when `dept`'s funds are below its cheapest ready build: "; needs $X for a
-    <building> (N ready sites)", else "". The department's observation is built only when its funds are below its
-    dearest priced purpose (else no ready build can be out of reach)."""
+    <building> (N ready sites)", else "". Every building at that price is named ("a clinic (5 ready sites) or a
+    landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). The
+    department's observation is built only when its funds are below its dearest priced purpose (else no ready build
+    can be out of reach)."""
     w = env.world
     funds = w.dept_funds[dept]
     if not short_of(funds, max((pr.cost for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))), default=0)):
         return ""
     lists = site_lists(w, dept, role_obs(env, dept))
-    purpose, low = cheapest(ready_prices(w, dept, lists)) or (None, None)
+    prices = ready_prices(w, dept, lists)
+    purposes, low = cheapest(prices) or ((), None)
     if low is None or not short_of(funds, low.cost):
         return ""
-    n = len(lists[purpose].sites[:MAX_SITES])
-    return f"; needs {money(low.cost)} for {_a(low.building)} ({n} ready site{'s' * (n != 1)})"
+    named = {}                                       # building -> ready sites of the first purpose pricing it
+    for p in purposes:
+        named.setdefault(prices[p].building, len(lists[p].sites[:MAX_SITES]))
+    return f"; needs {money(low.cost)} for " + " or ".join(f"{_a(b)} ({n} ready site{'s' * (n != 1)})"
+                                                            for b, n in named.items())
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -320,12 +326,13 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
           + (f" (plan target {money(target)})" if target is not None else "")
           + f"; spent last month {money(spent)}"]
     # smoke runs: builds tried with $0, stations funded $1,000 of $2,500. Only when funds are short of every ready
-    # price (a supplementary one too, else it's false); it names the cheapest primary one, else a supplementary one
-    purpose, low = cheapest(prices) or cheapest(prices, supplementary=True) or (None, None)
+    # price (a supplementary one too, else it's false); it names the cheapest primary ones (all on a tie: health's
+    # clinic or landfill), else a supplementary one
+    purposes, low = cheapest(prices) or cheapest(prices, supplementary=True) or ((), None)
     if low and all(short_of(funds, pr.cost) for pr in prices.values()):
-        L.append(f"- You can't pay for any ready site (cheapest: {purpose} {low.text()}). Don't call build "
-                 "tools this turn: ask the mayor for the amount with a reason (send_message) unless you already did, "
-                 "then end_turn.")
+        L.append(f"- You can't pay for any ready site (cheapest: {' or '.join(purposes)} {low.text()}). Don't call "
+                 "build tools this turn: ask the mayor for the amount with a reason (send_message) unless you already "
+                 "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
     return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
