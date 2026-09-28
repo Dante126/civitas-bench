@@ -36,6 +36,7 @@ REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed a
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
+CONTENT_KINDS = 5            # kinds of tile named when a failed zone / dezone says what the rectangle holds
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
 ROAD_LINES = 8               # the longest this many named, then "+N more"
@@ -403,6 +404,13 @@ def free_bank(w) -> np.ndarray:
     return _riverbank_by_roads(w)[0] & _empty_land(w)
 
 
+def _bank_needed(w) -> list[str]:
+    """What the city still lacks that takes a riverbank lot: a pump (neither a pump nor a water tower yet; a tower
+    supplies water without the bank) and a sewage outlet (neither an outlet nor a treatment plant)."""
+    return [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
+            if not any(w.facilities(s) for s in structs)]
+
+
 def _ends(points: list) -> list:
     """The first and last point (reading order): a bridge's two ends, a riverside road's two ends."""
     return points[:1] + points[-1:] if len(points) > 1 else points
@@ -462,35 +470,47 @@ def _on_road_line(ln: dict, x: int, y: int) -> bool:
 
 
 def _contents(w, tiles: list[tuple[int, int]]) -> str:
-    """What the tiles hold by kind, largest first: road (bridges too), highway, zoned <letter> (with how many are
-    developed), buildings, river, empty land. "all 14 tiles are road", "10 zoned R (6 developed), 4 road"."""
+    """What the tiles hold by kind, largest first, the first CONTENT_KINDS kinds then "+N other tiles": road (bridges
+    too), highway, zoned <letter> (with how many are developed), river, empty land, and any other structure by name
+    (tiles, so a 2x2 hospital is "4 hospital"). "all 14 tiles are road", "10 zoned R (6 developed), 4 road"."""
     n, dev = Counter(), Counter()
     for x, y in tiles:
         s = int(w.struct[y, x])
-        k = ("road" if s == C.ROAD else "highway" if s == C.HIGHWAY else f"zoned {C.LETTER_BY_ZONE[s]}" if s in C.ZONES
-             else "building" if s != C.NONE else "river" if w.terrain[y, x] == C.WATER else "empty land")
+        k = (f"zoned {C.LETTER_BY_ZONE[s]}" if s in C.ZONES else C.STRUCT_NAME[s].replace("_", " ") if s != C.NONE
+             else "river" if w.terrain[y, x] == C.WATER else "empty land")
         n[k] += 1
         dev[k] += bool(s in C.ZONES and w.level[y, x] > 0)
-    name = lambda k, c: k + "s" * (k == "building" and c > 1) + (f" ({dev[k]} developed)" if dev[k] else "")
+    name = lambda k: k + (f" ({dev[k]} developed)" if dev[k] else "")
     if len(n) == 1:
         (k, c), = n.items()
-        return f"all {c} tiles are {name(k, c)}" if c > 1 else f"the tile is {'a ' * (k == 'building')}{name(k, c)}"
-    return ", ".join(f"{c} {name(k, c)}" for k, c in n.most_common())
+        a = ("" if k in ("road", "highway", "river", "empty land") or k.startswith("zoned ") else
+             "an " if k[0] in "aeiou" else "a ")
+        return f"all {c} tiles are {name(k)}" if c > 1 else f"the tile is {a}{name(k)}"
+    kinds = n.most_common()
+    rest = sum(c for _, c in kinds[CONTENT_KINDS:])
+    return ", ".join(f"{c} {name(k)}" for k, c in kinds[:CONTENT_KINDS]) + (
+        f" +{rest} other tile{'s' * (rest > 1)}" if rest else "")
 
 
 def _zone_beside(w, tiles: list[tuple[int, int]]) -> list[str]:
     """Zone rects for the free roadside land (empty land touching a highway-connected road) on the lines just outside
     a rectangle's sides (`tiles` in reading order, as _rect gives them), over its span: each trimmed to its first and
-    last such tile (one line, so always a valid zone), kept with 2 such tiles or half its side, the most tiles first
-    (ties: north, west, east, south)."""
+    last such tile (one line, so always a valid zone), kept with 2 such tiles or half its side (a 1-tile side only
+    beside a 1-tile rectangle, so a row's end caps aren't offered as single lots), the most tiles first (ties: north,
+    west, east, south). While a pump or outlet is missing (_bank_needed) the free riverbank lots are left out, and a
+    side whose rect would still cover one is dropped (v7: zoning took the last bank lots and utilities had nowhere to
+    put them)."""
     (xa, ya), (xb, yb) = tiles[0], tiles[-1]
     free, sides = _roadside(w), []
+    bank = free_bank(w) if _bank_needed(w) else np.zeros_like(free)
+    free &= ~bank
     for side in ([(x, ya - 1) for x in range(xa, xb + 1)], [(xa - 1, y) for y in range(ya, yb + 1)],
                  [(xb + 1, y) for y in range(ya, yb + 1)], [(x, yb + 1) for x in range(xa, xb + 1)]):
         hits = [(x, y) for x, y in side if w.in_bounds(x, y) and free[y, x]]
-        if hits and (len(hits) >= 2 or 2 * len(hits) >= len(side)):
-            (x1, y1), (x2, y2) = hits[0], hits[-1]
-            sides.append((-len(hits), f"x1={x1},y1={y1},x2={x2},y2={y2}"))
+        if hits and (len(hits) >= 2 or 2 * len(hits) >= len(side) > 1 or len(tiles) == 1):
+            (x1, y1), (x2, y2) = hits[0], hits[-1]                 # along the side, so x1 <= x2 and y1 <= y2
+            if not bank[y1:y2 + 1, x1:x2 + 1].any():
+                sides.append((-len(hits), f"x1={x1},y1={y1},x2={x2},y2={y2}"))
     return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
 
 
@@ -1153,8 +1173,7 @@ class ToolBox:
         before it) while the city still lacks a sewage outlet / treatment plant or has neither a pump nor a water
         tower (pumps and outlets need the bank; a tower supplies water without it)."""
         w = self.world
-        missing = [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
-                   if not any(w.facilities(s) for s in structs)]
+        missing = _bank_needed(w)
         if not missing or not before.any() or free_bank(self.world).any():
             return ""
         ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))

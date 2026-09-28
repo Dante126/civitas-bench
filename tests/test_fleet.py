@@ -1322,9 +1322,8 @@ def test_zoning_high_density_before_town_says_zone_low():
     assert box.call("zone", {"zone": "O", **rect})["message"] == w.unlock_note("office_zone")    # not about density
     res = box.call("zone", {"zone": "R", "density": "low", **rect})
     assert res["ok"] and res["message"] == "zoned 6 tiles R (low density)", res
-    assert box.call("zone", {"zone": "C", **rect})["message"] == (
-        "no empty land tiles in that area - all 6 tiles are zoned R; zone beside it instead: x1=2,y1=25,x2=2,y2=25 or "
-        "x1=9,y1=25,x2=9,y2=25")                                  # 1-tile sides; row 24 is road, row 26 off the road
+    assert box.call("zone", {"zone": "C", **rect})["message"] == (   # row 24 is road, row 26 off the road, and the
+        "no empty land tiles in that area - all 6 tiles are zoned R")  # 1-tile end caps aren't offered as single lots
 
 
 NO_LAND = "no empty land tiles in that area"
@@ -1369,17 +1368,34 @@ def test_failed_zone_counts_a_mixed_area_and_ranks_the_sides():
     assert (w.terrain[23, 26:29] == C.WATER).all() and (w.terrain[25, 27:30] == C.WATER).all()
     res = box.call("zone", {"zone": "C", "x1": 25, "y1": 23, "x2": 29, "y2": 24})
     assert res["message"] == (f"{NO_LAND} - 5 road, 3 river, 2 zoned R (1 developed); zone beside it instead: "
-                              "x1=25,y1=25,x2=26,y2=25 or x1=24,y1=23,x2=24,y2=23"), res  # south (2 tiles), then west
-    assert box.call("zone", {"zone": "C", "x1": 25, "y1": 25, "x2": 26, "y2": 25})["ok"]
-    hall = {"x1": 17, "y1": 23, "x2": 17, "y2": 23}
-    res = box.call("zone", {"zone": "R", **hall})                  # one tile: the town hall
-    assert res["message"] == (f"{NO_LAND} - the tile is a building; zone beside it instead: x1=16,y1=23,x2=16,y2=23 "
+                              "x1=24,y1=23,x2=24,y2=23 or x1=30,y1=23,x2=30,y2=23"), res  # 2-tile sides: 1 lot is half
+    assert box.call("zone", {"zone": "C", "x1": 24, "y1": 23, "x2": 24, "y2": 23})["ok"]   # (south: only (25,25) is
+    hall = {"x1": 17, "y1": 23, "x2": 17, "y2": 23}                                        # free, off the bank)
+    res = box.call("zone", {"zone": "R", **hall})                  # one tile: the town hall, and 1-tile sides
+    assert res["message"] == (f"{NO_LAND} - the tile is a town hall; zone beside it instead: x1=16,y1=23,x2=16,y2=23 "
                               "or x1=18,y1=23,x2=18,y2=23"), res
     assert box.call("zone", {"zone": "R", "x1": 16, "y1": 23, "x2": 18, "y2": 23})["ok"]    # around the town hall
-    assert box.call("zone", {"zone": "C", **hall})["message"] == f"{NO_LAND} - the tile is a building"   # none free
+    assert box.call("zone", {"zone": "C", **hall})["message"] == f"{NO_LAND} - the tile is a town hall"   # none free
     res = box.call("zone", {"zone": "C", "x1": 16, "y1": 23, "x2": 18, "y2": 24})
-    assert res["message"] == (f"{NO_LAND} - 3 road, 2 zoned R, 1 building; zone beside it instead: "
+    assert res["message"] == (f"{NO_LAND} - 3 road, 2 zoned R, 1 town hall; zone beside it instead: "
                               "x1=16,y1=25,x2=18,y2=25 or x1=15,y1=23,x2=15,y2=23"), res
+
+
+def test_failed_zone_names_the_structures_and_caps_the_kinds():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 10000
+    for a in ({"type": "zone", "zone": "I", "x1": 15, "y1": 22, "x2": 16, "y2": 22},
+              {"type": "build_park", "x1": 17, "y1": 22, "x2": 18, "y2": 22},
+              {"type": "zone", "zone": "C", "x1": 19, "y1": 22, "x2": 19, "y2": 22},
+              {"type": "zone", "zone": "R", "x1": 15, "y1": 23, "x2": 16, "y2": 23},
+              {"type": "zone", "zone": "C", "x1": 18, "y1": 23, "x2": 18, "y2": 23},
+              {"type": "build_park", "x": 19, "y": 23}):
+        assert apply_action(w, "planning", a).ok, a
+    res = ToolBox(env, "planning").call("zone", {"zone": "R", "x1": 15, "y1": 22, "x2": 19, "y2": 24})
+    assert res["message"] == (f"{NO_LAND} - 5 road, 3 park, 2 zoned I, 2 zoned C, 2 zoned R +1 other tile; zone "
+                              "beside it instead: x1=15,y1=25,x2=19,y2=25 or x1=20,y1=23,x2=20,y2=24"), res
+    assert w.struct[23, 17] == C.TOWNHALL                          # the other tile; west: 1 lot of 3 is too few
 
 
 def test_failed_zone_with_no_roadside_land_beside_it_gets_the_counts_only():
@@ -1390,6 +1406,44 @@ def test_failed_zone_with_no_roadside_land_beside_it_gets_the_counts_only():
     assert (w.terrain[29:31, 28:32] == C.WATER).all() and w.terrain[29, 27] == w.terrain[30, 32] == C.LAND
     res = ToolBox(env, "planning").call("zone", {"zone": "R", "x1": 28, "y1": 29, "x2": 31, "y2": 30})
     assert res["ok"] is False and res["message"] == f"{NO_LAND} - all 8 tiles are river", res
+
+
+def test_zone_hints_keep_the_riverbank_lots_while_a_pump_or_outlet_is_missing():
+    """v7: zoning took the last free riverbank lots beside roads and utilities had nowhere for its pump or outlet. The
+    free bank lots here are (25,23) and (29,23) north of the bridge road, (26,25) and (30,25) south of it."""
+    from civitas.fleet.tools import free_bank
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
+    box = ToolBox(env, "planning")
+    assert box.call("build_road", {"x1": 19, "y1": 24, "x2": 47, "y2": 24})["ok"]
+    assert {(int(x), int(y)) for y, x in zip(*np.nonzero(free_bank(w)))} == {(25, 23), (29, 23), (26, 25), (30, 25)}
+    road = {"zone": "R", "x1": 24, "y1": 24, "x2": 30, "y2": 24}    # over the bridge
+    skip = f"{NO_LAND} - all 7 tiles are road; zone beside it instead: x1=24,y1=25,x2=25,y2=25"
+    assert box.call("zone", road)["message"] == skip     # north's rect would cover (25,23), (29,23); south: trimmed
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "tower", "x": 10, "y": 25}).ok
+    assert box.call("zone", {**road, "zone": "C"})["message"] == skip       # the outlet still needs one
+    assert apply_action(w, "utilities", {"type": "build_sewage", "kind": "outlet", "x": 30, "y": 25}).ok
+    box = ToolBox(env, "planning")                                   # a new turn: the same call isn't a repeat
+    res = box.call("zone", road)                                     # both exist: the bank is land like any other
+    assert res["message"] == (f"{NO_LAND} - all 7 tiles are road; zone beside it instead: x1=24,y1=23,x2=30,y2=23 or "
+                              "x1=24,y1=25,x2=26,y2=25"), res
+    res = box.call("zone", {"zone": "R", "x1": 24, "y1": 23, "x2": 30, "y2": 23})
+    assert res["ok"] and res["message"] == "zoned 4 tiles R (low density)", res
+
+
+def test_zone_hints_stay_on_the_map():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 10000
+    box = ToolBox(env, "planning")
+    assert box.call("build_road", {"x1": 19, "y1": 24, "x2": 47, "y2": 24})["ok"]
+    assert box.call("build_road", {"x1": 47, "y1": 23, "x2": 47, "y2": 15})["ok"]      # up the last column
+    res = box.call("zone", {"zone": "R", "x1": 47, "y1": 16, "x2": 47, "y2": 22})      # east of it: off the map
+    assert res["message"] == f"{NO_LAND} - all 7 tiles are road; zone beside it instead: x1=46,y1=16,x2=46,y2=22", res
+    res = box.call("zone", {"zone": "R", "x1": 0, "y1": 24, "x2": 0, "y2": 24})        # the highway, on column 0
+    assert res["message"] == (f"{NO_LAND} - the tile is highway; zone beside it instead: x1=0,y1=23,x2=0,y2=23 or "
+                              "x1=0,y1=25,x2=0,y2=25"), res
 
 
 def test_failed_dezone_says_what_is_there():
@@ -1404,7 +1458,7 @@ def test_failed_dezone_says_what_is_there():
     assert FleetState.of(env).history(kind="failure", role="planning")[-1]["message"] == core
     assert box.call("dezone", {"x1": 5, "y1": 24, "x2": 9, "y2": 24})["message"] == f"{core} - all 5 tiles are road"
     res = box.call("dezone", {"x1": 17, "y1": 23, "x2": 17, "y2": 23})      # one tile: the town hall
-    assert res["message"] == f"{core} - the tile is a building", res
+    assert res["message"] == f"{core} - the tile is a town hall", res
     assert box.call("zone", {"zone": "R", "x1": 1, "y1": 25, "x2": 3, "y2": 25})["ok"]
     res = box.call("dezone", {"x1": 0, "y1": 23, "x2": 3, "y2": 25})
     assert res["ok"] and res["message"] == "de-zoned 3 tiles", res
