@@ -130,3 +130,29 @@ Checkpoint after each task: `pytest -q -m "not slow"`. The full suite had 345 pa
        zoned fire's last fire station site near homes (fire holds $2,500 for it): dezone one, e.g. (12,23)".
    - **Tests** for each.
    - Then run smoke v15.
+8. **Review fixes for Tasks 6-7 (after smoke v15).**
+   - **v15.**
+     - s0: 1,508 / 43.0; s1: 1,424 / 41.1.
+     - All four services got their first building at month 3 (s0) and 6 (s1). v14 s0: fire, clinic and school never.
+     - Education 58.7 / 60.1; v13-v14 s0: 33.3.
+   - **Utilities on the leave-free line (Important).** All 8 of v15's leave-free lines named a water tower with water
+     never short. utilities' near_homes list ranks lots by homes around them, so planning is told to hold its best
+     residential lot. Fix: in `funded_firsts` and `blocked_firsts`, count utilities' non-riverbank purposes only
+     while wanted, the way `_bank_wanted` does for the bank: water tower on water, coal / gas / wind on power.
+   - **Shared sites (Important).** v15 s1 month 6 named (34,25) for four buildings; only police could build there.
+     Fix: `funded_spots` goes through departments in turn order and gives each building its first site not claimed
+     by an earlier one. `spare_funded`, `_zone_beside` and `_funded_warning` use the claimed sites: warn when a zone
+     leaves a funded department no unclaimed site.
+   - **Truncation.** v15 s0 month 9 cut the leave-free line at 240 characters in mid-word ("...: zone arou").
+     Drop whole items, never the tail; e.g. "(+2 more)".
+   - **Mature cities (Important).** A 10% share of Σserved × (1 − coverage) flags well-covered cities: scripted month
+     120 flags fire (11.5%, score 87.4), health and police. Fix: measure the share where coverage < 0.3 (the
+     observation's `uncovered_buildings` test). Apply the same need gate to NEAR_NEED purposes on the "no free
+     roadside land" path.
+   - **Minor.**
+     - Drop the shelter from NEAR_NEED.
+     - 2x2 funded spots use `C.FOOTPRINT`.
+     - The zone warning code falls back to no warning on an exception.
+     - Tests: utilities on / off the leave-free line; riverbank plus funded gives one warning; `_funded` resets on
+       a successful action and survives a failed one.
+   - Then run smoke v16.
