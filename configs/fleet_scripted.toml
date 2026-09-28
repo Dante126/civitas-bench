@@ -1,0 +1,44 @@
+# Scripted fleet: all eight roles are fleet agents (kind = "fleet") driven by the scripted baselines
+# (model = "scripted", civitas/fleet/scripted.py) instead of a model. Each turn gets the fleet briefing, reads the map
+# and messages with look-ups, and runs the scripted decision through the fleet tools (update_plan, one tool call per
+# action, send_message, update_memory, end_turn), so guards, costs, the history log, memory and fleet_report.* all
+# run. No API calls: free, about as fast as configs/baseline.toml. Game settings as configs/fleet_trinity.toml.
+# README "Agent fleets" (Scripted fleet) has its scores next to the scripted baseline.
+name = "fleet_scripted"
+
+[game]
+months = 120
+act_every = 3              # the city runs monthly; agents plan by the quarter
+max_actions_per_turn = 8   # successful actions per turn; look-ups are free
+
+[scoring]
+target_population = 30000
+
+[fleet]
+mode = "autonomous"
+model = "scripted"         # any other model name makes these LLM fleet agents
+max_steps = 20             # tool calls per turn, as in fleet_trinity.toml
+
+[agents.mayor]
+kind = "fleet"
+
+[agents.planning]
+kind = "fleet"
+
+[agents.utilities]
+kind = "fleet"
+
+[agents.transport]
+kind = "fleet"
+
+[agents.police]
+kind = "fleet"
+
+[agents.fire]
+kind = "fleet"
+
+[agents.health]
+kind = "fleet"
+
+[agents.education]
+kind = "fleet"

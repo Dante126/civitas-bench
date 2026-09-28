@@ -52,7 +52,10 @@ class ScriptedMayor(Agent):
             targets = [targets[0], ("health", 3000, 0.35), ("fire", 3000, 0.35), ("police", 3000, 0.35),
                        ("education", 3000, 0.35), ("transport", 2000, 0.3), ("planning", 7000, 0.6)]
         given = {}
+        self.targets = {}       # dept -> the working balance aimed for this turn (the scripted fleet's plan budgets)
         for dept, target, share in targets:
+            if dept in funds:
+                self.targets[dept] = max(target, asks.get(dept, 0) + 200)
             if available <= 500 or dept not in funds:
                 continue
             target = max(target, asks.get(dept, 0) + 200)
