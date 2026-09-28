@@ -20,6 +20,7 @@ import numpy as np
 from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _point,
                             _rect, action_docs, apply_action)
 from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, build_observation
+from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, shift
@@ -184,7 +185,8 @@ BRIDGE_UPGRADE = 3           # upgrade_road charges a bridge tile this many time
 # with bus stops ready)
 SUPPLEMENTARY = {"library", "shelter", "cemetery", "train_station", "harbour", "metro_station"}
 
-ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
+# every role's actions, and the region's deal actions (a region mayor's tools: fleet/region.py)
+ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]} | set(DEAL_ACTIONS)
 # int in the doc example, but the handler reads a float (actions._num)
 NUMBER_PARAMS = {("set_tax", "rate"), ("set_funding", "percent"), ("allocate_budget", "amount"),
                  ("take_loan", "amount"), ("repay_loan", "amount"), ("set_fare", "fare"), ("set_district_tax", "delta")}
@@ -1387,6 +1389,11 @@ class ToolBox:
         for a in ROLES[role]["actions"]:
             if a != "noop":
                 self.tools[a] = _action_tool(a, docs[a], partial(self._act, a), confirm=guarded(role, a))
+        from .region import region_tools                  # region mode: region_overview, send_message, deals
+        for t in region_tools(self):
+            self.tools[t.name] = t
+            if t.name not in ALL_ACTIONS and t.name != "send_message":
+                self.lookups.add(t.name)
 
     # ------------------------------------------------------------ interface
     def schemas(self) -> list[dict]:

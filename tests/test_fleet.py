@@ -3676,10 +3676,10 @@ def test_tool_agent_prompt_and_request_settings():
     assert a.describe() == "fleet:fake" and d.meta["model"] == "fake"
 
 
-def test_tool_agent_refuses_region_envs():
+def test_tool_agent_needs_its_city_in_a_region():
     from civitas.core.region import RegionEnv
     a = ToolAgent("mayor", cfg=FleetAgentConfig())
-    with pytest.raises(ValueError, match="single-city"):
+    with pytest.raises(ValueError, match="needs its city"):          # region games: tests/test_fleet_region.py
         a.bind(RegionEnv(GameConfig(seed=0, months=2, region=True)))
     with pytest.raises(RuntimeError, match="bind"):
         ToolAgent("mayor", cfg=FleetAgentConfig()).act({})
@@ -3746,8 +3746,8 @@ def test_build_agents_and_signature_for_fleets():
     assert "mayor=fleet:big" in sig and "health=fleet:small" in sig and "planning=scripted" in sig
     assert sig.endswith(" [autonomous]") and sig.count("[") == 1
     assert "[" not in agent_signature(load_config("configs/baseline.toml"), list(TURN_ORDER))
-    with pytest.raises(ValueError, match="single-city"):
-        build_agents(cfg, ["north.mayor"], game, scoring_config(cfg, game))
+    north = build_agents(cfg, ["north.mayor"], game, scoring_config(cfg, game))["north.mayor"]
+    assert (north.role, north.city, north.name) == ("mayor", "north", "north.mayor")
     cfg["agents"]["health"]["mode"] = "supervised"
     with pytest.raises(ValueError, match="mode"):
         build_agents(cfg, list(TURN_ORDER), game, scoring_config(cfg, game))

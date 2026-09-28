@@ -2,7 +2,8 @@
 
 Actions run inside `act()` (through `ToolBox`), so the returned `Decision` carries their results in `executed`
 and the council messages to post; `env.apply` only logs them. In `game.simultaneous` mode fleet agents therefore
-act on the state left by the roles before them.
+act on the state left by the roles before them. In region mode the agent binds to its own city's env (`bind`), so
+the region runs it like any other agent of that city (fleet/region.py).
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from .briefing import briefing, system_prompt
 from .config import FleetAgentConfig
 from .fmt import TOOL_MESSAGE_CHARS
 from .memory import FleetState
+from .region import link, region_of, region_rules
 from .tools import ToolBox
 
 TRACE_CHARS = 300
@@ -131,8 +133,9 @@ class ToolAgent(Agent):
     kind = "fleet"
 
     def __init__(self, role: str, *, cfg: FleetAgentConfig | None = None, provider: ProviderConfig | None = None,
-                 **kw):
+                 city: str | None = None, **kw):
         super().__init__(role, **kw)
+        self.city = city                 # region mode: the city this agent works for (role is the base role)
         self.cfg = cfg or FleetAgentConfig()
         self.provider = provider or ProviderConfig()
         self.client = ChatClient(self.provider)
@@ -141,14 +144,31 @@ class ToolAgent(Agent):
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "tool_calls": 0, "api_errors": 0,
                       "latency_s": 0.0}
 
+    @property
+    def name(self) -> str:
+        """The role as the run names it: "north.mayor" in region mode, else the role."""
+        return f"{self.city}.{self.role}" if self.city else self.role
+
     def bind(self, env) -> None:
-        if isinstance(env, RegionEnv) or getattr(env, "city", None):
-            raise ValueError("fleet agents support single-city games only")
+        """Bind to a single-city env, or in a region (a RegionEnv, or one of its city envs) to this agent's city env:
+        its fleet state, tools and briefings are that city's alone (fleet/region.py)."""
+        region = None
+        if isinstance(env, RegionEnv):
+            if self.city not in env.envs:
+                raise ValueError(f"fleet agent {self.role!r} in a region needs its city (one of {', '.join(env.envs)}), "
+                                 f"got {self.city!r}: name the role as '<city>.{self.role}'")
+            region, env = env, env.envs[self.city]
+            link(region)
+        elif getattr(env, "city", None):
+            if self.city not in (None, env.city):
+                raise ValueError(f"fleet agent {self.name!r} bound to the {env.city} city's env")
+            region, self.city = region_of(env), env.city
         self.env = env
         FleetState.of(env)
         c = env.cfg
         self.system = system_prompt(self.role, self.cfg, c.months, act_every=c.act_every,
-                                    max_actions=c.max_actions_per_turn, target_pop=env.scoring.target_population)
+                                    max_actions=c.max_actions_per_turn, target_pop=env.scoring.target_population,
+                                    region=region_rules(region, env.city, self.role) if region else "")
 
     def describe(self) -> str:
         return f"fleet:{self.cfg.model}"
@@ -230,7 +250,8 @@ class ToolAgent(Agent):
         self.usage["latency_s"] = round(self.usage["latency_s"] + latency, 3)
         d = Decision(executed=box.executed, messages=box.messages, thinking=box.report or "(no report)")
         d.parse_error = error
-        logged = [{"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{role})"}, *messages[1:]]
+        logged = [{"role": "system", "content": f"(system prompt: meta.json fleet_prompts.{self.name})"},
+                  *messages[1:]]
         said = [m["content"] for m in messages if m["role"] == "assistant" and m.get("content")
                 and m["content"] != "(no reply)"]
         d.meta = {"model": cfg.model, "messages": logged, "tool_trace": trace, "usage": usage,
