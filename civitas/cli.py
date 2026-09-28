@@ -68,25 +68,28 @@ def cmd_prompt(args):
     system prompt, the first briefing and the tool names)."""
     from .agents.prompts import system_prompt
     from .config import agent_spec, build_agents, game_config, scoring_config
-    from .core.env import CivitasEnv
+    from .core.env import make_env
     cfg = _load(args)
     game = game_config(cfg, args.seed)
-    env = CivitasEnv(game, scoring_config(cfg, game))
+    env = make_env(game, scoring_config(cfg, game))        # a region when game.region: roles are "north.mayor" etc.
+    if args.role not in env.roles:
+        sys.exit(f"unknown role {args.role!r}; this game's roles: {', '.join(env.roles)}")
     if agent_spec(cfg, args.role).get("kind") == "fleet":
         from .fleet.briefing import briefing
         from .fleet.tools import ToolBox
         agent = build_agents(cfg, [args.role], game, env.scoring)[args.role]
-        agent.bind(env)
+        agent.bind(env)                                     # in a region: its city's env (agent.env)
         print("=" * 30, "SYSTEM", "=" * 30)
         print(agent.system)
         print("=" * 30, "USER (briefing)", "=" * 30)
-        print(briefing(env, args.role, mode=agent.cfg.mode, mark=False))
+        print(briefing(agent.env, agent.role, mode=agent.cfg.mode, mark=False))
         print("=" * 30, "TOOLS", "=" * 30)
-        print(", ".join(ToolBox(env, args.role).tools))
+        print(", ".join(ToolBox(agent.env, agent.role).tools))
         return
+    city, _, base = args.role.rpartition(".")
     print("=" * 30, "SYSTEM", "=" * 30)
-    print(system_prompt(args.role, months=game.months, target_pop=env.scoring.target_population,
-                        max_actions=game.max_actions_per_turn))
+    print(system_prompt(base, months=game.months, target_pop=env.scoring.target_population,
+                        max_actions=game.max_actions_per_turn, city=city or None))
     print("=" * 30, "USER (observation)", "=" * 30)
     print(env.observe(args.role)["text"])
 

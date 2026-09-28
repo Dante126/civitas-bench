@@ -19,6 +19,7 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
+from .region import region_lines
 from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
     Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
     overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
@@ -138,7 +139,7 @@ def _listed(items: list[str], more: str) -> list[str]:
 
 def _digest(env, fleet: FleetState, role: str) -> list[str]:
     w = env.world
-    d = fleet.digest(role, w.month, env.council)
+    d = fleet.digest(role, w.month, env.council, who=env._name(role))
     L = [f"## Since your last turn ({'month ' + str(d['since']) if d['since'] is not None else 'first turn'})"]
     fails = [_action(e) for e in d["failed_actions"]]
     L.append("- failed actions:" + ("" if fails else " none"))
@@ -293,7 +294,7 @@ def _goals(goals: list[str], n: int | None = None) -> str:
 
 def _header(env, role: str, mode: str) -> list[str]:
     s = env.last_scores
-    who = "Mayor" if role == "mayor" else ROLES[role]["title"]
+    who = ("Mayor" if role == "mayor" else ROLES[role]["title"]) + (f" of {env.city.upper()}" if env.city else "")
     return [f"# {who}: {_date(env)}",
             f"Scores: city {s.get('city', 0):.1f}, yours {s.get(role, 0):.1f} | mode: {mode} | "
             f"up to {env.cfg.max_actions_per_turn} successful actions this turn", ""]
@@ -400,10 +401,10 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,
-                  max_actions: int | None = None, target_pop: int | None = None) -> str:
-    """Fixed "how to play" rules, the role's mission and the game rules, then the coach's playbooks (fleet, then
-    the role's; empty ones left out). Callers pass `act_every=env.cfg.act_every`,
-    `max_actions=env.cfg.max_actions_per_turn` (the successful-action cap) and
+                  max_actions: int | None = None, target_pop: int | None = None, region: str = "") -> str:
+    """Fixed "how to play" rules, the role's mission and the game rules (and in region mode the `region` section,
+    fleet/region.py:region_rules), then the coach's playbooks (fleet, then the role's; empty ones left out). Callers
+    pass `act_every=env.cfg.act_every`, `max_actions=env.cfg.max_actions_per_turn` (the successful-action cap) and
     `target_pop=env.scoring.target_population`."""
     spec = ROLES[role]
     side = "mayor" if role == "mayor" else "dept"
@@ -423,6 +424,8 @@ def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_ev
              f"# Your role: {spec['title']}\n{spec['mission']}",
              "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=total_months,
                                              target_pop=target_pop or ScoringConfig.target_population).rstrip()]
+    if region:
+        parts.append(region.strip())
     books = [(h, b.strip()) for h, b in (("Fleet", cfg.fleet_playbook), (spec["title"], cfg.playbook)) if b.strip()]
     if books:
         parts.append("# Coach's playbook\n" + "\n\n".join(f"## {h}\n{b}" for h, b in books))
@@ -436,7 +439,8 @@ def briefing(env, role: str, *, mode: str = "autonomous", mark: bool = True) -> 
     fleet.sync(env)
     L = _header(env, role, mode)
     L += _mayor(env, fleet) if role == "mayor" else _department(env, fleet, role)
+    L += region_lines(env, role)                  # region mode: neighbours, links, flows, deals ([] in one city)
     L += ["", _milestone(env, role)]
     if mark:
-        fleet.mark_turn(role, env.world.month, env.council)
+        fleet.mark_turn(role, env.world.month, env.council, who=env._name(role))
     return "\n".join(L)

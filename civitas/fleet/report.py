@@ -1,7 +1,8 @@
 """End-of-run fleet report: scoreboard, the plan, per-role activity and coaching hints, as JSON and Markdown.
 
 `run_episode` keeps one slim `turn_row(rec)` per fleet turn (the same rows can be rebuilt from
-`trajectories.jsonl` with `rows_from_trajectories`) and writes `fleet_report.json` / `fleet_report.md`.
+`trajectories.jsonl` with `rows_from_trajectories`) and writes `fleet_report.json` / `fleet_report.md`; a region run
+gets one report with the region scoreboard and a section per city with fleet turns (`region_report`).
 Hint rules: >= 3 failures alike (failed actions and tool errors); funds above max(2x the plan budget, $1,000) for
 3+ consecutive months; 2+ consecutive turns without a successful action spanning 6+ months (a turn with no plan
 budget and under $1 in funds at the turn is blocked, not idle, and splits the run); a negative city treasury; > 20%
@@ -194,7 +195,10 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
 
 
 def fleet_report(env, summary: dict, trajectories: list[dict]) -> tuple[dict, str]:
-    """(report, markdown) from the env after the run, the run summary and `turn_row`s of the fleet turns."""
+    """(report, markdown) from the env after the run, the run summary and `turn_row`s of the fleet turns. For a region
+    (RegionEnv) one report with a section per city that had fleet turns (region_report)."""
+    if hasattr(env, "envs"):
+        return region_report(env, summary, trajectories)
     fleet = getattr(env, "fleet", None) or FleetState()
     months = summary.get("months_played", env.world.month)
     roles = {r: _role_stats(r, [x for x in trajectories if x["role"] == r], fleet)
@@ -214,23 +218,83 @@ def fleet_report(env, summary: dict, trajectories: list[dict]) -> tuple[dict, st
     return rep, markdown(rep)
 
 
+def _city_summary(summary: dict, city: str, env) -> dict:
+    """The run summary as one city of a region saw it: its scores without the city prefix, its final metrics, and its
+    own bankruptcy (the run's average city score is the region's, so none)."""
+    pre = city + "."
+    scores = {k[len(pre):]: v for k, v in (summary.get("final_scores") or {}).items() if k.startswith(pre)}
+    fm = ((summary.get("final_metrics") or {}).get("by_city") or {}).get(city) or {}
+    return {**summary, "final_scores": scores, "avg_city_score": None, "final_metrics": fm,
+            "bankrupt": bool(env.world.bankrupt)}
+
+
+def region_report(region, summary: dict, trajectories: list[dict]) -> tuple[dict, str]:
+    """A region run's report: the region scoreboard, then for each city with fleet turns its own report (plan, roles,
+    hints) from its env's fleet state and its turns (`turn_row`s named "north.mayor" etc.). The top-level `hints` are
+    every city's, each with its `city`."""
+    cities = {}
+    for c, env in region.envs.items():
+        pre = c + "."
+        rows = [{**r, "role": r["role"][len(pre):]} for r in trajectories if r["role"].startswith(pre)]
+        if rows:
+            cities[c] = fleet_report(env, _city_summary(summary, c, env), rows)[0]
+    scores, fm = summary.get("final_scores") or {}, summary.get("final_metrics") or {}
+    by_city = fm.get("by_city") or {}
+    rep = {"run_id": summary.get("run_id"), "seed": summary.get("seed"), "signature": summary.get("signature"),
+           "months": summary.get("months_played", region.world.month), "months_configured": region.cfg.months,
+           "region": list(region.cities),
+           "scoreboard": {"city": scores.get("city"), "avg_city": summary.get("avg_city_score"),
+                          "population": fm.get("population"), "treasury": fm.get("treasury"),
+                          "bankrupt": summary.get("bankrupt"),
+                          "cities": {c: {"city": scores.get(f"{c}.city"),
+                                         "population": by_city.get(c, {}).get("population"),
+                                         "treasury": by_city.get(c, {}).get("treasury")} for c in region.cities}},
+           "cities": cities,
+           "hints": [{**h, "city": c} for c, r in cities.items() for h in r["hints"]]}
+    return rep, region_markdown(rep)
+
+
+def region_markdown(rep: dict) -> str:
+    sb = rep["scoreboard"]
+    avg = f" (average {sb['avg_city']:.1f})" if sb.get("avg_city") is not None else ""
+    L = [f"# Fleet report: {rep['run_id']}", "", _played(rep), "",
+         f"Region of {len(rep['region'])} cities ({', '.join(rep['region'])}); fleet agents in "
+         f"{', '.join(rep['cities']) or 'none'}.", "", "## Region scoreboard", "",
+         f"Region score **{sb['city'] or 0:.1f}**{avg}, population {sb['population'] or 0:,}, treasury "
+         f"{money(sb['treasury'] or 0)}" + (", **bankrupt**" if sb["bankrupt"] else ""), "",
+         "| city | score | population | treasury |", "|---|---:|---:|---:|"]
+    for c, s in sb["cities"].items():
+        L.append(f"| {c} | {s['city'] or 0:.1f} | {s['population'] or 0:,} | {money(s['treasury'] or 0)} |")
+    for c, r in rep["cities"].items():
+        L += ["", f"## {c.upper()}", "", *_body(r, "###")]
+    return "\n".join(L) + "\n"
+
+
 def _cell(v) -> str:
     return str(v).replace("|", "/").replace("\n", " ")
 
 
-def markdown(rep: dict) -> str:
-    sb, plan = rep["scoreboard"], rep["plan"]
+def _played(rep: dict) -> str:
     played, conf = rep["months"], rep.get("months_configured")
-    L = [f"# Fleet report: {rep['run_id']}", "",
-         f"Seed {rep['seed']}, {played}" + (f" of {conf}" if conf else "") + " months played"
-         + (" (ended early)" if conf and played < conf else "") + f". Agents: `{rep['signature']}`", "",
-         "## Scoreboard", "",
-         f"City score **{sb['city'] or 0:.1f}** (average {sb['avg_city'] or 0:.1f}), population {sb['population'] or 0:,}, "
+    return (f"Seed {rep['seed']}, {played}" + (f" of {conf}" if conf else "") + " months played"
+            + (" (ended early)" if conf and played < conf else "") + f". Agents: `{rep['signature']}`")
+
+
+def markdown(rep: dict) -> str:
+    return "\n".join([f"# Fleet report: {rep['run_id']}", "", _played(rep), "", *_body(rep)]) + "\n"
+
+
+def _body(rep: dict, h: str = "##") -> list[str]:
+    """Everything after the title and the seed line, headings at level `h` (a region report's city sections: ###)."""
+    sb, plan = rep["scoreboard"], rep["plan"]
+    avg = f" (average {sb['avg_city']:.1f})" if sb.get("avg_city") is not None else ""
+    L = [f"{h} Scoreboard", "",
+         f"City score **{sb['city'] or 0:.1f}**{avg}, population {sb['population'] or 0:,}, "
          f"treasury {money(sb['treasury'] or 0)}" + (", **bankrupt**" if sb["bankrupt"] else ""), "",
          "| role | score |", "|---|---:|"]
     L += [f"| {r} | {s:.1f} |" if s is not None else f"| {r} | - |" for r, s in sb["roles"].items()]
     n = plan["versions"]
-    L += ["", f"## Plan ({n} version{'s' if n != 1 else ''}"
+    L += ["", f"{h} Plan ({n} version{'s' if n != 1 else ''}"
           + (f", saved in month{'s' if n != 1 else ''} {', '.join(map(str, plan['changed']))}" if n else "") + ")", ""]
     L += [f"- {g}" for g in plan["goals"]] or ["No goals set."]
     if plan["budgets"] or plan["priorities"]:
@@ -241,7 +305,7 @@ def markdown(rep: dict) -> str:
                 L.append(f"| {d} | {money(b) if b is not None else '-'} | {_cell(plan['priorities'].get(d, ''))} |")
     if plan["notes"]:
         L += ["", f"Notes: {_cell(plan['notes'])}"]
-    L += ["", "## Roles", "",
+    L += ["", f"{h} Roles", "",
           "| role | turns | tool calls | actions | failed | tool errors | repeats (look-ups / refused) | spent "
           "| tokens (prompt / completion) | limit turns | length stops | API / briefing errors |",
           "|---|" + "---:|" * 11]
@@ -252,13 +316,13 @@ def markdown(rep: dict) -> str:
                  f"| {st['limit_turns']} | {st['length_stops']} | {st['api_errors']} |")
     fails = [(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]
     if fails:
-        L += ["", "## Top failures", ""]
+        L += ["", f"{h} Top failures", ""]
         L += [f"- {r}: " + "; ".join(f"{g['count']}x \"{_cell(g['message'])}\"" for g in gs) for r, gs in fails]
-    L += ["", "## Last reports", ""]
+    L += ["", f"{h} Last reports", ""]
     L += [f"- {r}: {_cell(st['last_report'])}" for r, st in rep["roles"].items() if st["last_report"]] or ["None."]
     lessons = [(r, st["lessons"]) for r, st in rep["roles"].items() if st["lessons"]]
-    L += ["", "## Lessons in memory", ""]
+    L += ["", f"{h} Lessons in memory", ""]
     L += [f"- {r}: " + "; ".join(_cell(x) for x in ls) for r, ls in lessons] or ["None written."]
-    L += ["", "## Coaching hints", ""]
+    L += ["", f"{h} Coaching hints", ""]
     L += [f"- {h['text']}" for h in rep["hints"]] or ["No coaching hints triggered."]
-    return "\n".join(L) + "\n"
+    return L

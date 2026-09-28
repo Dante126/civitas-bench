@@ -141,11 +141,9 @@ def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: Scoring
                 months=game.months, target_pop=scoring.target_population,
                 max_actions=game.max_actions_per_turn)
         elif kind == "fleet":
-            if city:
-                raise ValueError("fleet agents support single-city games only")
             fc = fleet_agent_config(cfg, role)
             modes.add(fc.mode)
-            agents[role] = ToolAgent(base, cfg=fc, provider=provider_config(cfg, fc.provider))
+            agents[role] = ToolAgent(base, cfg=fc, provider=provider_config(cfg, fc.provider), city=city)
         else:
             raise ValueError(f"agents.{role}: unknown kind {kind!r} (scripted|llm|fleet|remote|noop|random)")
     if len(modes) > 1:

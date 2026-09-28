@@ -144,23 +144,25 @@ class FleetState:
         out.sort(key=lambda e: e["month"])
         return out[-MAX_HISTORY:]
 
-    def mark_turn(self, role: str, month: int, council=None) -> None:
+    def mark_turn(self, role: str, month: int, council=None, who: str | None = None) -> None:
         """Remember that `role` took a turn in `month` (and how many council messages it could see then);
-        call after building the turn's digest."""
+        call after building the turn's digest. `who` is its name on the council (region mode: "north.police";
+        default `role`)."""
         self.last_turn_month[role] = month
         if council is not None:
-            self.seen_messages[role] = len(council.visible_to(role, since_month=0))
+            self.seen_messages[role] = len(council.visible_to(who or role, since_month=0))
 
-    def digest(self, role: str, now: int, council=None) -> dict:
+    def digest(self, role: str, now: int, council=None, who: str | None = None) -> dict:
         """Since the role's previous turn (inclusive of that month): its failed actions and world events, plus the
         council messages from others it can see that were posted after that turn was marked, oldest first. `since`
-        is None before its first turn (all months)."""
+        is None before its first turn (all months). `who` as for mark_turn."""
         since = self.last_turn_month.get(role)
         span = None if since is None else now - since + 1
         msgs = []
         if council is not None:
-            new = council.visible_to(role, since_month=0)[self.seen_messages.get(role, 0):]
-            msgs = [m for m in new if m["sender"] != role]
+            who = who or role
+            new = council.visible_to(who, since_month=0)[self.seen_messages.get(role, 0):]
+            msgs = [m for m in new if m["sender"] != who]
         return {"since": since,
                 "failed_actions": self.history("failure", span, role=role, now=now),
                 "events": [e["text"] for e in self.history("event", span, now=now)],
