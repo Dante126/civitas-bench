@@ -17,7 +17,7 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, a_or_an, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, best_stretch, cheapest, funding_gaps, map_facts, \
     map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
@@ -173,13 +173,13 @@ def _map(w) -> list[str]:
 
 def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
-    find_sites for every purpose each turn."""
-    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds)
+    find_sites for every purpose each turn. Planning's also says high density is locked while it is (smoke v9-v11:
+    6 x zoning high density before 1,000 residents, repeated across turns)."""
+    dense = [] if role != "planning" or w.unlocked("high_density") else [
+        f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
+        f"{w.metrics()['population']:,}): zone with density \"low\""]
+    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
-
-
-def _a(name: str) -> str:
-    return ("an " if name[:1] in ("a", "e", "i", "o") else "a ") + name     # not u: a university
 
 
 def _needs(env, dept: str) -> str:
@@ -207,7 +207,7 @@ def _needs(env, dept: str) -> str:
     named = {}                                       # what it buys -> ready sites of the first purpose pricing it
     for p in purposes:
         n, b = tiles.get(p, 1), prices[p].building
-        named.setdefault(f"{n} {b}s" if n != 1 else _a(b), len(lists[p].sites[:MAX_SITES]))
+        named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
     return f"; needs {money(low.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
                                                             for b, n in named.items())
 

@@ -23,7 +23,7 @@ from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, bu
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import label_components, shift
-from .fmt import TOOL_MESSAGE_CHARS, money
+from .fmt import TOOL_MESSAGE_CHARS, a_or_an, money
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -33,6 +33,8 @@ MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
+INSPECTS_FREE = 3            # inspects run in a turn before their results point to map_overview (smoke v9-v11:
+                             # planning made 5.4 a turn, other roles 0.4-1.2)
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
@@ -483,9 +485,8 @@ def _contents(w, tiles: list[tuple[int, int]]) -> str:
     name = lambda k: k + (f" ({dev[k]} developed)" if dev[k] else "")
     if len(n) == 1:
         (k, c), = n.items()
-        a = ("" if k in ("road", "highway", "river", "empty land") or k.startswith("zoned ") else
-             "an " if k[0] in "aeiou" else "a ")
-        return f"all {c} tiles are {name(k)}" if c > 1 else f"the tile is {a}{name(k)}"
+        bare = k in ("road", "highway", "river", "empty land") or k.startswith("zoned ")
+        return f"all {c} tiles are {name(k)}" if c > 1 else f"the tile is {name(k) if bare else a_or_an(k)}"
     kinds = n.most_common()
     rest = sum(c for _, c in kinds[CONTENT_KINDS:])
     return ", ".join(f"{c} {name(k)}" for k, c in kinds[:CONTENT_KINDS]) + (
@@ -977,6 +978,7 @@ class ToolBox:
         self.executed: list[dict] = []
         self.messages: list[dict] = []
         self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
+        self.looked: Counter = Counter()                  # look-ups run this turn by tool (repeats not counted)
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
@@ -1002,7 +1004,9 @@ class ToolBox:
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
         roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
         before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
-        confirm: true."""
+        confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
+        result notes that map_overview shows the whole map, until map_overview runs; the note isn't cached, so a
+        repeat comes without it."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -1024,6 +1028,10 @@ class ToolBox:
         res = self._run(tool, args)
         if name in self.lookups:
             self._seen[key] = (self.n_calls, copy.deepcopy(res))     # callers may change the result they get
+            self.looked[name] += 1
+            if name == "inspect" and self.looked[name] > INSPECTS_FREE and not self.looked["map_overview"]:
+                note = f"inspect #{self.looked[name]} this turn: map_overview shows the whole map in one call"
+                res["note"] = f"{res['note']}; {note}" if res.get("note") else note
         elif name in ALL_ACTIONS:
             if res.get("ok"):
                 self._seen.clear()

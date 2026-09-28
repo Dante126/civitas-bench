@@ -190,7 +190,7 @@ import numpy as np
 from civitas.agents.scripted import SCRIPTED
 from civitas.core.roles import ROLES, TURN_ORDER
 from civitas.fleet.memory import DEPARTMENTS
-from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox
+from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox, free_bank
 from civitas.sim import catalog as C
 
 
@@ -306,6 +306,33 @@ def test_inspect_clips_radius_and_names_tiers():
     tiles = ToolBox(env, "health").call("inspect", {"x": spot["x"] + 1, "y": spot["y"] + 1, "radius": 1})["tiles"]
     hosp = [t for t in tiles if t["what"] == "hospital"]
     assert len(hosp) == 1 and (hosp[0]["x"], hosp[0]["y"]) == (spot["x"], spot["y"]) and hosp[0]["size"] == "2x2"
+
+
+def test_inspect_points_to_map_overview_from_the_4th_call_in_a_turn():
+    """Smoke v9-v11: planning made 5.4 inspects a turn (other roles 0.4-1.2) and 12 of 24 turns hit the step limit.
+    From the 4th inspect in a turn the result says map_overview shows the whole map, unless it ran this turn; an
+    identical repeat returns the earlier result and isn't counted."""
+    env = _env()
+    note = lambda n: f"inspect #{n} this turn: map_overview shows the whole map in one call"
+    for role in TURN_ORDER:                                          # every role, counted per turn (per ToolBox)
+        box = ToolBox(env, role)
+        assert ["note" in box.call("inspect", {"x": x, "y": 24}) for x in (4, 8, 12)] == [False] * 3, role
+        again = box.call("inspect", {"x": 12, "y": 24})
+        assert again["repeat"] == "same as call 3 (nothing changed since)" and "note" not in again, role
+        assert box.call("inspect", {"x": 16, "y": 24})["note"] == note(4), role     # the repeat didn't count
+        again = box.call("inspect", {"x": 16, "y": 24})                             # the look-up, not the advice
+        assert again["repeat"] == "same as call 5 (nothing changed since)" and "note" not in again, role
+        assert box.call("inspect", {"x": 20, "y": 24})["note"] == note(5), role
+    box = ToolBox(env, "planning")
+    for x in (4, 8, 12):
+        box.call("inspect", {"x": x, "y": 24})
+    res = box.call("inspect", {"x": 16, "y": 24, "radius": 9})                        # joins the radius note
+    assert res["note"] == "radius 9 clipped to 4 (0-4); inspect several points to see more; " + note(4), res
+    assert box.call("map_overview", {})["ok"]
+    assert "note" not in box.call("inspect", {"x": 20, "y": 24}) and "note" not in box.call("inspect", {"x": 4, "y": 4})
+    box = ToolBox(env, "planning")
+    assert box.call("map_overview", {})["ok"]                                         # first: no note at all
+    assert not any("note" in box.call("inspect", {"x": x, "y": 20}) for x in range(0, 40, 5))
 
 
 CONDITIONAL_SITES = {"riverbank_2x2", "casino", "metro_station", "levee"}   # lists only there once unlocked / forecast
@@ -1398,6 +1425,15 @@ def test_failed_zone_names_the_structures_and_caps_the_kinds():
     assert w.struct[23, 17] == C.TOWNHALL                          # the other tile; west: 1 lot of 3 is too few
 
 
+def test_failed_zone_names_one_structure_with_its_article():
+    from civitas.fleet.tools import _contents
+    w = _env().world
+    for struct, what in ((C.UNIVERSITY, "a university"), (C.AIRPORT, "an airport"), (C.SCHOOL, "an elementary school"),
+                         (C.CLINIC, "a clinic")):
+        w.struct[5, 5] = struct
+        assert _contents(w, [(5, 5)]) == f"the tile is {what}"
+
+
 def test_failed_zone_with_no_roadside_land_beside_it_gets_the_counts_only():
     """Land beside the rectangle counts only when it touches a highway-connected road."""
     env = _env()
@@ -1411,7 +1447,6 @@ def test_failed_zone_with_no_roadside_land_beside_it_gets_the_counts_only():
 def test_zone_hints_keep_the_riverbank_lots_while_a_pump_or_outlet_is_missing():
     """v7: zoning took the last free riverbank lots beside roads and utilities had nowhere for its pump or outlet. The
     free bank lots here are (25,23) and (29,23) north of the bridge road, (26,25) and (30,25) south of it."""
-    from civitas.fleet.tools import free_bank
     env = _env()
     w = env.world
     w.dept_funds["planning"] = w.dept_funds["utilities"] = 10000
@@ -1717,7 +1752,8 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         assert text.index("## Map") < text.index("## Ready sites") < text.index("## Your memory")
         lines = _ready_sites(text)
         purposes = list(SITE_PURPOSES[role])
-        assert len(lines) == len(purposes) + 1 and lines[-1] == "find_sites <purpose> lists up to 6 with details"
+        dense = role == "planning" and not w.unlocked("high_density")                 # + the high density line
+        assert len(lines) == len(purposes) + 1 + dense and lines[-1] == "find_sites <purpose> lists up to 6 with details"
         box = ToolBox(env, role)
         for purpose, line in zip(purposes, lines):
             assert line.startswith(f"- {purpose}: ") and len(line) <= 110, (role, line)
@@ -1756,6 +1792,25 @@ def test_ready_sites_never_repeat_a_best_site(grown_env):
             assert len(shown) == len(set(shown)), (role, shown)
     zone_m, = [ln for ln in _ready_sites(briefing(grown_env, "planning", mark=False)) if ln.startswith("- zone_M:")]
     assert zone_m.endswith("same list as zone_C"), zone_m
+
+
+def test_planning_ready_sites_say_high_density_is_locked(env12):
+    """Smoke v9-v11: 6 x zoning high density before 1,000 residents, repeated across turns. Planning's Ready sites
+    say so while it's locked, last before the find_sites line; no other role's do."""
+    w = env12.world
+    pop = w.metrics()["population"]
+    assert 0 < pop < 1000 and not w.unlocked("high_density")
+    plan = _ready_sites(briefing(env12, "planning", mark=False))
+    assert plan[-2:] == [f'- high density: locked until 1,000 residents (now {pop:,}): zone with density "low"',
+                         "find_sites <purpose> lists up to 6 with details"], plan
+    assert plan[-3].startswith("- casino: "), plan                   # the last purpose
+    for role in DEPTS[1:]:                                           # the other departments
+        assert not any("high density" in ln for ln in _ready_sites(briefing(env12, role, mark=False))), role
+    env = _env()
+    env.world.milestones_reached.append("Town")                       # the 1,000 milestone
+    assert env.world.unlocked("high_density")
+    plan = _ready_sites(briefing(env, "planning", mark=False))
+    assert not any("high density" in ln for ln in plan) and plan[-1].startswith("find_sites"), plan
 
 
 def test_ready_sites_extra_fields():
@@ -2192,9 +2247,9 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
 
 
 def test_mayor_names_the_cheapest_building():
-    from civitas.fleet.briefing import _a
+    from civitas.fleet.fmt import a_or_an
     from civitas.fleet.tools import SITE_BUILDS, building_name
-    names = {n: _a(building_name(n)) for purposes in SITE_BUILDS.values() for ns in purposes.values() for n in ns}
+    names = {n: a_or_an(building_name(n)) for purposes in SITE_BUILDS.values() for ns in purposes.values() for n in ns}
     assert (names["tower"], names["outlet"], names["coal"], names["pump"]) == (
         "a water tower", "a sewage outlet", "a coal plant", "a water pump")                  # base tiers: struct names
     assert (names["water_works"], names["advanced_treatment"], names["hospital"]) == (
