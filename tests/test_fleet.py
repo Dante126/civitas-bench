@@ -769,11 +769,88 @@ def test_two_by_two_lists_say_when_no_free_block_is_left(open_env):
         assert "2x2" in lst.note and "ask planning (send_message)" in lst.note, lst.note
     assert "hospital" not in blocked_firsts(w, "health", lists["health"])       # the clinic's tier 2: an upgrade
     assert "university" in blocked_firsts(w, "education", lists["education"])
+    w.school_cov[:] = w.high_cov[:] = 1.0              # schools need no lot: the university is the cheapest blocked
     line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
     assert "education (university: a free 2x2 lot)" in line, line
     _held(env, education=(12000, 0))
     m = DeptMoney(env, "education")
     assert (m.keep, m.idle) == (12000, 0)
+
+
+def _hem_homes(env, keep=()):
+    """Seed 0, month 12 (no service built yet): a road south into open land (x=19, y 30-46), then every roadside tile
+    within 8 of a developed one parked but `keep`: free roadside land far from the homes, none near them."""
+    from civitas.fleet.tools import _roadside
+    from civitas.sim.grid import box_sum
+    w = env.world
+    w.dept_funds["planning"] += 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 30, "x2": 19, "y2": 46}).ok
+    near = _roadside(w) & (box_sum(np.isin(w.struct, C.ZONES) & (w.level > 0), 8) > 0)
+    for x, y in keep:
+        near[y, x] = False
+    w.struct[near] = C.PARK
+    w.refresh()
+
+
+NEAR = "no free roadside lot near the homes that need it (around ("
+NEED_LISTS = (("police", "station"), ("fire", "station"), ("fire", "shelter"), ("health", "clinic"),
+              ("education", "school"))
+
+
+def test_need_ranked_lists_say_when_the_lots_near_homes_are_taken(env12):
+    """Smoke v14 seed 0, months 3-12: the mayor read "fire: needs $2,500 for a fire station (4 ready sites)" and funded
+    fire, health and education; planning, acting next, zoned the lots near homes; they read "none - nothing needs it
+    right now" at coverage 0 and burned 13-20 calls a turn searching, and fire held $2,500 to month 12 unbuilt. These
+    lists only rank free roadside tiles near uncovered need: empty with free land elsewhere, the need is real."""
+    import re
+    from civitas.fleet.tools import DeptMoney, _free_roadside, role_obs, site_lists
+    from civitas.sim.grid import box_sum
+    env = copy.deepcopy(env12)                         # 916 residents, no station, clinic or school
+    _hem_homes(env)
+    w = env.world
+    assert _free_roadside(w) > 0
+    for role, purpose in NEED_LISTS:
+        lst = site_lists(w, role, role_obs(env, role))[purpose]
+        assert lst.sites == [] and lst.blocked and lst.short.startswith(NEAR), (role, purpose, lst)
+        assert lst.short.endswith("): ask planning for one") and "ask planning (send_message)" in lst.note, lst
+    line, = [ln for ln in _ready_sites(briefing(env, "fire", mark=False)) if ln.startswith("- station:")]
+    x, y = map(int, re.search(r"around \((\d+),(\d+)\)", line).groups())
+    dev = np.isin(w.struct, C.ZONES) & (w.level > 0)
+    assert box_sum(dev, 2)[y, x] > 0 and len(line) <= 110, line                  # among the homes it would cover
+    _held(env, fire=(2500, 0))
+    m = DeptMoney(env, "fire")                         # was idle $1,500 above the $1,000 floor
+    assert (m.keep, m.idle, m.blocked) == (2500, 0, ("a fire station",))
+    plan = lambda: [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
+    tail = ": extend a road into open land, or free a lot, for them"
+    assert plan() == ["- blocked for lack of land: police (police station: near homes), fire (fire station: near "
+                      "homes), health (clinic: near homes), education (elementary school: near homes)" + tail]
+    assert len(plan()[0]) == 223
+    import civitas.fleet.briefing as B
+    B.BLOCKED_LINE_CHARS, keep = 200, B.BLOCKED_LINE_CHARS
+    try:                                               # too long with the tags: without them
+        assert plan() == ["- blocked for lack of land: police (police station), fire (fire station), health (clinic), "
+                          "education (elementary school)" + tail]
+    finally:
+        B.BLOCKED_LINE_CHARS = keep
+
+
+def test_need_ranked_lists_with_little_need_left_need_nothing(env12):
+    """Everyone covered, or all but one building of 61: still "nothing needs it right now", not blocked (10% of what
+    it serves uncovered is the least that counts)."""
+    from civitas.fleet.tools import _why_empty
+    env = copy.deepcopy(env12)
+    _hem_homes(env)
+    w = env.world
+    for grid in ("police_cov", "fire_cov", "shelter_cov", "health_cov", "school_cov"):
+        getattr(w, grid)[:] = 1.0
+    for role, purpose in NEED_LISTS:
+        assert _why_empty(w, role, purpose)[::2] == ("nothing needs it right now", False), (role, purpose)
+    dev = np.isin(w.struct, C.ZONES) & (w.level > 0)
+    ys, xs = np.nonzero(dev)
+    w.fire_cov[ys[0], xs[0]] = 0.0                     # one building of 61 uncovered
+    assert _why_empty(w, "fire", "station")[::2] == ("nothing needs it right now", False)
+    w.fire_cov[dev] = 0.0
+    assert _why_empty(w, "fire", "station")[0].startswith(NEAR)
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
@@ -2201,7 +2278,8 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         lines = _ready_sites(text)
         purposes = list(SITE_PURPOSES[role])
         dense = role == "planning" and not w.unlocked("high_density")                 # + the high density line
-        land = role == "planning" and any(ln.startswith("- blocked for lack of land: ") for ln in lines)
+        land = sum(role == "planning" and ln.startswith(("- blocked for lack of land: ", "- leave free (funded): "))
+                   for ln in lines)
         assert len(lines) == len(purposes) + 1 + dense + land
         assert lines[-1] == "find_sites <purpose> lists up to 6 with details"
         box = ToolBox(env, role)
@@ -2768,13 +2846,13 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
     land = lambda env: [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
     head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
     env = _env()                                       # a fresh map: the road stops short of the river
-    assert land(env) == [head + "utilities (sewage: a road to the river)" + tail]      # the $1,200 outlet, not the pump
+    assert land(env) == [head + "utilities (sewage outlet: a road to the river)" + tail]   # $1,200, not the pump
     env.world.dept_funds["planning"] = 5000
     assert apply_action(env.world, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
     assert land(env) == []                             # across the river, free land by the roads: nothing blocked
     env = _env()
     _bridge_and_take_the_bank(env)                     # the road reaches the river, its bank lots zoned
-    assert land(env) == [head + "utilities (sewage: a free riverbank lot)" + tail]
+    assert land(env) == [head + "utilities (sewage outlet: a free riverbank lot)" + tail]
     env = CivitasEnv(GameConfig(seed=0, months=12))
     agents = {r: SCRIPTED[r](r) for r in env.roles}
     for _ in range(6):
@@ -2783,8 +2861,9 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
         env.end_month()
     _fill_roadside(env.world)                          # every roadside tile taken; pump and outlet have room
     block = _ready_sites(briefing(env, "planning", mark=False))
-    line = (head + "utilities (near homes), police (station), fire (station), health (clinic, landfill), "
-            "education (school)" + tail)               # the cheapest first buildings, all on a tie
+    line = (head + "utilities (water tower), police (police station), fire (fire station), health (clinic, landfill), "
+            "education (elementary school)" + tail)    # the cheapest first buildings, all on a tie
+    assert len(line) == 210
     assert block[-3] == line and block[-2].startswith("- high density: locked")          # before the high density
     import civitas.fleet.briefing as B
     B.BLOCKED_LINE_CHARS, keep = 150, B.BLOCKED_LINE_CHARS
@@ -2802,9 +2881,78 @@ def test_planning_blocked_line_fits_in_full_past_1000_residents(grown_env):
     env = copy.deepcopy(grown_env)                     # 2,6xx residents, water at capacity
     _fill_roadside(env.world)
     line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
-    assert line == ("- blocked for lack of land: utilities (pump: a free riverbank lot), police (station), fire "
-                    "(station), health (clinic, landfill), education (school): extend a road into open land, or free a "
-                    "lot, for them") and len(line) <= BLOCKED_LINE_CHARS
+    assert line == ("- blocked for lack of land: utilities (water pump: a free riverbank lot), police (police "
+                    "station), fire (fire station), health (clinic, landfill), education (elementary school): extend a "
+                    "road into open land, or free a lot, for them") and len(line) == 231 <= BLOCKED_LINE_CHARS
+
+
+def _best(env, role: str, purpose: str) -> str:
+    from civitas.fleet.tools import role_obs, site_lists
+    s = site_lists(env.world, role, role_obs(env, role))[purpose].sites[0]
+    return f"({s['x']},{s['y']})"
+
+
+def test_planning_ready_sites_name_what_funded_departments_will_build(env12):
+    """Smoke v14 seed 0, months 3-6: the mayor funded fire, health and education for their ready sites near homes, and
+    planning, acting next, zoned those lots. Its Ready sites now name each funded department's cheapest ready first
+    building and best site; the mayor's top-ups this month count."""
+    env = copy.deepcopy(env12)                         # police $796, utilities $1,283, education $518: short
+    w = env.world
+    w.dept_funds.update(fire=2500, health=2000)
+    leave = lambda: [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- leave")]
+    line = (f"- leave free (funded): fire station {_best(env, 'fire', 'station')}, clinic "
+            f"{_best(env, 'health', 'clinic')}, landfill {_best(env, 'health', 'landfill')}: zone around them")
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    assert block[-3] == line and block[-2].startswith("- high density: locked"), block   # nothing blocked here
+    w.treasury = 10000
+    assert apply_action(w, "mayor", {"type": "allocate_budget", "department": "police", "amount": 1704}).ok
+    assert leave() == [line.replace(": fire station", f": police station {_best(env, 'police', 'station')}, fire "
+                                                      "station")]
+    w.dept_funds.update({d: 0 for d in DEPTS})
+    assert leave() == []
+    env = copy.deepcopy(env12)
+    w = env.world
+    w.dept_funds.update(fire=2500, health=2000)
+    _hem_homes(env)                                    # nothing ready near homes: the fire station is blocked
+    assert leave() == [f"- leave free (funded): landfill {_best(env, 'health', 'landfill')}: zone around them"]
+    assert "fire (fire station: near homes)" in briefing(env, "planning", mark=False)
+
+
+def _zone(env, x: int, y: int) -> dict:
+    return ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
+
+
+def test_zoning_the_last_site_of_a_funded_building_warns(env12):
+    """Smoke v14 seed 0: planning zoned the lots near homes fire held $2,500 for. A zone that takes the last ready site
+    of a funded department's cheapest first building warns, like the riverbank warning; the log keeps the core text."""
+    from civitas.fleet.tools import role_obs, site_lists
+    fire = lambda env: [(s["x"], s["y"]) for s in site_lists(env.world, "fire", role_obs(env, "fire"))["station"].sites]
+    sites = fire(env12)
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=sites[:1])                    # one lot near homes left
+    assert fire(env) == sites[:1]
+    env.world.dept_funds["fire"] = 2500
+    (x, y), = sites[:1]
+    res = _zone(env, x, y)
+    warn = (f" WARNING: that zoned the last site for fire's fire station near homes (fire holds $2,500 for it): "
+            f"dezone one, e.g. ({x},{y})")
+    assert res["ok"] and res["message"] == "zoned 1 tiles R (low density)" + warn, res
+    assert FleetState.of(env).log[-1]["message"] == "zoned 1 tiles R (low density)"
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=sites[:1])
+    env.world.dept_funds.update(police=2500, fire=2500, health=2000)   # the last lot for all three
+    assert _zone(env, x, y)["message"].endswith(
+        " WARNING: that zoned the last site for police's police station near homes ($2,500 held), fire's fire station "
+        f"near homes ($2,500 held) and health's clinic near homes ($2,000 held): dezone one, e.g. ({x},{y})")
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=sites[:1])
+    env.world.dept_funds["fire"] = 2499                # not funded: no warning
+    assert _zone(env, x, y)["message"] == "zoned 1 tiles R (low density)"
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=sites[:2])                    # another lot near homes left: no warning
+    env.world.dept_funds["fire"] = 2500
+    assert fire(env) == sites[:2]
+    assert _zone(env, x, y)["message"] == "zoned 1 tiles R (low density)"
 
 
 def test_mayor_briefing_lists_department_reports():

@@ -20,8 +20,8 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
-    Funding, cheapest, funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, \
-    ready_prices, role_obs, scarce_bank, short_of, site_lists
+    Funding, cheapest, dept_lists, funded_firsts, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
+    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -181,32 +181,49 @@ def _map(w, role: str) -> list[str]:
 
 def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
-    find_sites for every purpose each turn. Planning's also names the first buildings blocked for lack of land
-    (_land_line) and says high density is locked while it is (smoke v9-v11: 6 x zoning high density before 1,000
-    residents, repeated across turns)."""
+    find_sites for every purpose each turn. Planning's also names what funded departments are about to build
+    (_leave_line) and the first buildings blocked for lack of land (_land_line), and says high density is locked while
+    it is (smoke v9-v11: 6 x zoning high density before 1,000 residents, repeated across turns)."""
     w = env.world
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
         f"{w.metrics()['population']:,}): zone with density \"low\""]
-    land = _land_line(env) if role == "planning" else []
+    land = []
+    if role == "planning":
+        depts = dept_lists(env)                                    # one observation per priced department
+        land = _leave_line(w, depts) + _land_line(env, depts)
     return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _land_line(env) -> list[str]:
+def _leave_line(w, depts: dict) -> list[str]:
+    """Planning's line naming what funded departments are about to build (funded_firsts) and where, cut at
+    BLOCKED_LINE_CHARS: "- leave free (funded): fire station (12,23), clinic (20,27): zone around them". Smoke v14
+    seed 0, months 3-6: the mayor funded fire, health and education for their ready sites near homes, planning (acting
+    next) zoned those lots, and they read "nothing needs it right now" at coverage 0; fire held $2,500 to month 12."""
+    found = [f"{pr.building} ({lists[p].sites[0]['x']},{lists[p].sites[0]['y']})"
+             for d, lists in depts.items() for p, pr in funded_firsts(w, d, lists).items()]
+    if not found:
+        return []
+    head, tail = "- leave free (funded): ", ": zone around them"
+    return [head + cut(", ".join(found), BLOCKED_LINE_CHARS - len(head + tail)) + tail]
+
+
+def _land_line(env, depts: dict) -> list[str]:
     """Planning's line naming each department's cheapest first buildings blocked for lack of land or roads
-    (land_blocked), each tagged with what it needs beyond a roadside lot (land_fix: "sewage: a road to the river"),
-    departments only past BLOCKED_LINE_CHARS. Smoke v13 seed 0, months 6-9: planning zoned every roadside tile despite
-    its playbook's "leave room", and utilities, police, fire, health and education all read "none - no free roadside
-    land: ask planning for a lot"."""
-    found = land_blocked(env)
+    (land_blocked), by the names the mayor sees, each tagged with what it needs beyond a roadside lot (land_fix:
+    "sewage outlet: a road to the river"); past BLOCKED_LINE_CHARS without the tags, then departments only. Smoke v13
+    seed 0, months 6-9: planning zoned every roadside tile despite its playbook's "leave room", and utilities, police,
+    fire, health and education all read "none - no free roadside land: ask planning for a lot"."""
+    found = land_blocked(env, depts)
     if not found:
         return []
     w = env.world
     head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
-    name = lambda p: p.replace("_", " ") + (f": {fix}" if (fix := land_fix(w, p)) else "")
-    full = ", ".join(f"{d} ({', '.join(map(name, ps))})" for d, ps in found.items())
-    body = full if len(head + full + tail) <= BLOCKED_LINE_CHARS else ", ".join(found)
+    name = lambda d, p, tag: site_price(w, d, p).building + (f": {fix}" if tag and (fix := land_fix(w, d, p)) else "")
+    forms = [", ".join(f"{d} ({', '.join(dict.fromkeys(name(d, p, tag) for p in ps))})" for d, ps in found.items())
+             for tag in (True, False)] + [", ".join(found)]
+    body = next((f for f in forms if len(head + f + tail) <= BLOCKED_LINE_CHARS), forms[-1])
     return [head + cut(body, BLOCKED_LINE_CHARS - len(head + tail)) + tail]
 
 
