@@ -995,6 +995,24 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
   - Utilities' needs line still names a water tower when water isn't short (v14 and v15
     seed 1: towers built with water at 4.7–4.9× demand).
 
+**v17** (2026-09-28, main at 760ea72: the planning hints naming its own earlier calls, the
+inspect note after `map_overview`, the taken-tile hint and the `map_overview` road-line
+fallback) reached 1,152 / 42.4 and 1,832 / 46.9. The mayor's needs line is unchanged, so
+education again got no school on either seed (33.3 and 33.4).
+
+- **Seed 1:** 15.6% of actions failed (the lowest on that seed) and planning failed 7 of
+  31. Police, fire and health built at month 3.
+- **Seed 0: planning boxed itself in.**
+  - By month 3 the city was one road across the whole map (`y=24 x 0-47`), with zoning or
+    buildings on every tile along both sides. That left no dead end to extend and no free
+    tile to branch a new road from.
+  - Police built at month 3. Fire, health and education held their money as blocked for the
+    rest of the run.
+  - Planning spent months 6–9 trying to build roads through buildings and past the map
+    edge. It failed 15 of 29 actions, and turns with no successful action took 64% of the
+    prompt tokens.
+  - Nothing yet tells it to give up one lot to open a branch road.
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
