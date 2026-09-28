@@ -67,7 +67,7 @@ nothing), and to education once its needs line shows school sites; transport $0 
 stays in the treasury: upkeep grows with every building.
 - Every turn: read the reports and the Departments block. First take back the idle money it names (negative \
 allocate_budget), before any new top-up or loan; then top up the departments below target from the money above \
-the reserve, most urgent first (utilities when supply is tight, a service whose needs line shows ready sites). \
+the reserve, most urgent first (utilities when supply is tight, a service whose needs line shows ready sites, from month 3). \
 Allocations add up, so allocate once per department per turn.
 - Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 months while running a deficit). \
 When the briefing or update_plan says "hold", allocate nothing new (taking idle money back is fine).
