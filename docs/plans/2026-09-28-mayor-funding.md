@@ -104,3 +104,29 @@ Checkpoint after each task: `pytest -q -m "not slow"`. The full suite had 345 pa
      - Name the jail in the `dearest == 4000` test.
      - Compute `min(...)` once in `first_build`.
    - Then run smoke v15.
+7. **After smoke v14: lots near homes (planning zones them before the services can build).**
+   - **Evidence.** Live v14 seed 0.
+     - At months 3 and 6, the mayor's briefing read "fire: needs $2,500 for a fire station (4 ready sites)" and
+       the mayor funded fire, health and education.
+     - Planning then zoned the roadside lots near homes (it acts between the mayor and the services).
+     - Fire, health and education read "station / clinic / school: none - nothing needs it right now", with
+       coverage 0.
+     - Fire held $2,500 from month 3 to 12 and never built (score 37). Health's clinic and education's school never
+       came (33.3).
+     - Across v9-v14 (12 runs), 16 turns showed "nothing needs it" on a primary list with coverage under 50%: 8 in
+       v14 s0, 4 in v9 s0.
+     - The need-ranked lists (police and fire stations within radius 6, clinic 5, school 6; observation.py ~303-433)
+       only hold free roadside tiles with uncovered need within that radius. So an empty list with free land left
+       elsewhere is a land problem, not a lack of need.
+   - **Classify it.** In `_why_empty`'s general path, for the need-ranked first-building lists: when there are
+     uncovered homes (people the building would serve) but no free roadside tile within the list's radius of them,
+     return "no free roadside lot near the homes that need it (around (x,y)): ask planning for one", blocked
+     True. Keep "nothing needs it" for real zero need (everyone covered; for schools, no children).
+   - **Prevent it.**
+     - Planning's Ready sites block names what funded departments are about to build, one short line: e.g. "-
+       leave free (funded): fire station (12,23), clinic (20,27): zone around them". Show it only when a
+       department's funds cover its cheapest ready primary first building. Reuse Task 5's per-department lists.
+     - A `zone` that takes the last ready site(s) of such a building warns, like the riverbank guard: "WARNING: that
+       zoned fire's last fire station site near homes (fire holds $2,500 for it): dezone one, e.g. (12,23)".
+   - **Tests** for each.
+   - Then run smoke v15.
