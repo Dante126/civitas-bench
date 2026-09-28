@@ -22,6 +22,13 @@ from .tools import ToolBox
 TRACE_CHARS = 300
 WRAP_UP_AT = 3               # tool results carry a wrap-up note from this many calls left
 NUDGE = "Use the tools to act, then call end_turn with a short report."
+# smoke v9: seed 0's planning lost its month-0 turn to two replies cut at max_tokens (16k) mid-reasoning, with the
+# one generic nudge spent between them. A cut reply without a call gets this instead, up to LENGTH_NUDGES a turn;
+# after those it counts as any reply without a call (the generic nudge if unused, else the turn ends). No nudge goes
+# out past turn_tokens; at most 4 replies without a call (64k tokens at the default 16k) fit in its default 80k
+LENGTH_NUDGE = ("Your reply was cut off at the token limit before any tool call. Keep your reasoning short: pick one "
+                "action and call its tool now.")
+LENGTH_NUDGES = 2
 
 
 def _norm_call(c: dict, step: int, i: int) -> tuple[dict, str]:
@@ -159,7 +166,7 @@ class ToolAgent(Agent):
             return self._failed_turn(f"briefing_error: {type(e).__name__}: {e}", "briefing_error")
         trace, reasoning, finishes = [], [], []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        nudged, error, reason, latency, step, recovered = False, None, "max_steps", 0.0, 0, 0
+        nudged, cuts, error, reason, latency, step, recovered = False, 0, None, "max_steps", 0.0, 0, 0
         while len(trace) < cfg.max_steps:
             try:
                 out = self.client.chat(cfg.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
@@ -184,14 +191,15 @@ class ToolAgent(Agent):
             calls, raws = [c for c, _ in pairs], [r for _, r in pairs]
             messages.append({"role": "assistant", "content": out.get("content") or ("" if calls else "(no reply)"),
                              **({"tool_calls": calls} if calls else {})})
+            nudge = None                             # a reply without a call gets one, sent below within turn_tokens
             if not calls:
-                if nudged:
+                if finish == "length" and cuts < LENGTH_NUDGES:
+                    cuts, nudge = cuts + 1, LENGTH_NUDGE
+                elif not nudged:
+                    nudged, nudge = True, NUDGE
+                else:
                     reason = "no_tool_calls"
                     break
-                nudged = True
-                messages.append({"role": "user", "content": NUDGE})
-                step += 1
-                continue
             for c, args in zip(calls, raws):
                 name = c["function"]["name"]
                 if box.ended:
@@ -214,6 +222,8 @@ class ToolAgent(Agent):
             if usage["completion_tokens"] >= cfg.turn_tokens:
                 reason = "turn_tokens"
                 break
+            if nudge:
+                messages.append({"role": "user", "content": nudge})
         for k in usage:
             self.usage[k] += usage[k]
         self.usage["tool_calls"] += len(trace)

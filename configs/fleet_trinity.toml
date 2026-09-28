@@ -40,11 +40,11 @@ from the treasury, so every building also costs money every month.
 need less.
 - When a milestone unlocks a higher tier (1k, 5k, 10k residents), upgrade busy buildings (upgrade_facility, \
 module "tier") instead of crowding more tier-1 buildings next to them.
-- Work fast: your tool-call limit per turn is in the system prompt and every tool result shows steps_left. \
-Your briefing plus one or two look-ups (my_facilities, city_overview, find_sites) are usually enough; then act and \
-call end_turn. The Map block in your briefing usually suffices; call map_overview only when you need \
-tile-level layout (at most once per turn). Don't scan the map with inspect: it is for checking one spot. Acting now beats a perfect \
-site next quarter.
+- Work fast: look up only what your briefing lacks, then act and call end_turn. Departments: your briefing \
+already has your plan slice, budget, new messages, map and ready sites, so don't re-read them with get_plan / \
+get_messages / history. When your briefing says you can't pay for any ready site and nothing needs an answer, send \
+at most one request and end_turn. Don't scan the map with inspect: it is for checking one spot. Acting now beats \
+a perfect site next quarter.
 - Departments build on the sites in their briefing's Ready sites block (find_sites <purpose> for details); the \
 mayor checks a department's claims with its read-only find_sites (<department>.<purpose>). Check your funds \
 before building; when they are short, ask the mayor instead of trying. When an action fails, read the error and \
@@ -170,6 +170,6 @@ kind = "fleet"
 playbook = """
 - An elementary school ($2,500) once children live in the city and enrolment is below 90% (find_sites school); \
 upgrade a full school rather than building next to it.
-- From 1k: a high school when teens go unenrolled, and a library. From 5k: a university.
+- From 1k: a high school when teens go unenrolled, and a library (find_sites library). From 5k: a university.
 - Graduates fill office and skilled jobs: tell planning when the high-school share rises so it can zone offices.
 """

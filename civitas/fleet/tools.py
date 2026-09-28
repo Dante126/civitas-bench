@@ -17,8 +17,9 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _rect, action_docs, apply_action
-from ..core.observation import MAP_LEGEND, _far_from_homes, build_observation
+from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _point,
+                            _rect, action_docs, apply_action)
+from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, build_observation
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import label_components, shift
@@ -31,15 +32,21 @@ MAX_RADIUS = 4
 MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
-REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action is refused
+REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
+BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
+DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
 ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolish takes buildings, never roads)
-CONFIRM_PARAM = {"type": "boolean", "description": "true only to repeat a bulldoze refused for cutting roads off the "
-                 "highway, once you are sure"}
+# buildings that link the road networks they touch to the region, as World.refresh() counts them (metro stations
+# don't) -> their name in a refusal
+LINKS = {C.TRAIN: "train station", C.HARBOUR: "harbour", C.AIRPORT: "airport"}
+LINK_OWNERS = {r for r, owned in OWNED_STRUCTS.items() if owned & set(LINKS)}     # roles whose demolish takes one
+# guarded action -> what its refusal and confirm parameter say the roads would be cut off from
+CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -67,12 +74,15 @@ SITE_PURPOSES = {
                # from homes, ranked by uncovered garbage nearby (which doesn't matter for a cemetery)
                "cemetery": ("health", "landfill_sites")},
     "education": {"school": ("education", "school_sites"), "high_school": ("education", "high_school_sites"),
-                  "university": ("education", "university_sites")},
+                  "university": ("education", "university_sites"),
+                  # a library speeds up schooling in the homes within its radius, so it reuses the school list:
+                  # roadside lots near homes no school covers yet
+                  "library": ("education", "school_sites")},
 }
 SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": ("casino",),
                 "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear"), "train_station": ("train_station",),
                 "harbour": ("harbour",), "metro_station": ("metro",), "jail": ("jail",), "hospital": ("hospital",),
-                "high_school": ("high_school",), "university": ("university",)}
+                "high_school": ("high_school",), "university": ("university",), "library": ("library",)}
 # purpose -> (short reason for the briefing, full note for find_sites) when its list is empty
 SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 months; riverbank stretches to protect "
                         "appear with a flood warning"),
@@ -80,7 +90,12 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
               "bus_stops": ("too few homes and jobs on the roads yet (~1,500 residents)",
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
+# purpose -> the population its list waits for (empty below it, with its SITE_NOTES reason): observation's suggested
+# stops have no floor, so from month 1 transport read "can't pay (cheapest: bus_stops $1,500)" and the mayor "needs
+# $1,500 for a bus line", against both playbooks (no bus line before ~1,500 residents)
+SITE_MIN_POP = {"bus_stops": 1500}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
+BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
 # purposes whose lists skip lots with 3+ homes within 4 tiles (observation._far_from_homes): never empty for lack
@@ -92,6 +107,41 @@ SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("n
                ("pollution", "pollution {}")]
 SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
 SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
+# purpose -> what its sites are for (tier names, or OFF_TIER_SPECS keys): the cheapest unlocked one prices the site
+# (site_price). Planning's purposes aren't priced
+SITE_BUILDS = {
+    "utilities": {"coal_or_gas": ("coal", "gas"), "wind": ("wind",), "pump": ("pump",), "sewage": ("outlet",),
+                  "near_homes": ("tower", "solar", "wind"),
+                  "riverbank_2x2": ("water_works", "advanced_treatment", "nuclear")},
+    "transport": {"bus_stops": ("bus_line",), "train_station": ("train_station",), "harbour": ("harbour",),
+                  "metro_station": ("metro_station",), "congested_roads": ("avenue_tile",)},
+    "police": {"station": ("police_station",), "jail": ("jail",)},
+    "fire": {"station": ("fire_station",), "shelter": ("shelter",), "levee": ("levee_tile",)},
+    "health": {"clinic": ("clinic",), "hospital": ("hospital",), "landfill": ("landfill",), "cemetery": ("cemetery",)},
+    "education": {"school": ("elementary_school",), "high_school": ("high_school",), "university": ("university",),
+                  "library": ("library",)},
+}
+# prices outside the tier lines -> (what the action charges, looked up when priced as the actions do, since a balance
+# override may replace it; unlock key). A bus line: create_bus_line. Per tile (PER_TILE): build_levee charges each
+# levee tile; upgrade_road each street tile it makes an avenue on land (the cheapest class upgrade; x3 on bridges)
+OFF_TIER_SPECS = {"train_station": (lambda: C.TRAIN_STATION["cost"], "train_station"),
+                  "harbour": (lambda: C.HARBOUR_SPEC["cost"], "harbour"),
+                  "metro_station": (lambda: C.METRO_STATION["cost"], "metro"),
+                  "bus_line": (lambda: C.BUS_LINE_COST, None),
+                  "levee_tile": (lambda: C.CATALOG["levee"]["cost"], None),
+                  "avenue_tile": (lambda: C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]], "avenue")}
+PER_TILE = {"levee_tile", "avenue_tile"}
+BRIDGE_UPGRADE = 3           # upgrade_road charges a bridge tile this many times a land tile's upgrade
+# priced purposes that are never a department's first build: cheapest() skips them, so the mayor's needs line and the
+# budget line name the primary price (their Ready lines keep theirs; affordable, they still keep the budget line
+# away, which would be false). At $1,500 each they undercut the first build and were named instead. A library only
+# multiplies school graduation (LIBRARY_BOOST): useless without the $2,500 school's seats. A shelter only matters in
+# disasters (the playbook adds one past 3,000 residents): smoke v9's mayor read "needs $1,500 for a shelter", funded
+# fire that much, and fire never reached the $2,500 station (0% coverage, fire score 31.4). A cemetery comes after
+# the $2,000 landfill in the playbook. Train stations, harbours and metro stations are never transport's first build
+# either: the playbook wants bus lines first (at 5,000+ residents, $3,000 read "can't pay (cheapest: harbour $10k)"
+# with bus stops ready)
+SUPPLEMENTARY = {"library", "shelter", "cemetery", "train_station", "harbour", "metro_station"}
 
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]}
 # int in the doc example, but the handler reads a float (actions._num)
@@ -227,7 +277,8 @@ def _items_schema(example: list) -> dict:
     return {"type": _JSON_TYPE[type(first)]}
 
 
-def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
+def _action_tool(name: str, doc: tuple[str, str], fn: Callable, confirm: bool = False) -> Tool:
+    """The tool for action `name`, with a confirm parameter when the action is guarded for the role (guarded())."""
     example, text = doc
     props = {}
     for k, v in json.loads(example).items():
@@ -238,8 +289,9 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable) -> Tool:
     if name.startswith("build_") and any(len(C.TIER_LINES[ln]) > 1 for ln in lines):
         props["tier"] = dict(_TIER_PARAM)
     props.update(_EXTRA_PARAMS.get(name, {}))
-    if name in ROAD_REMOVERS:
-        props["confirm"] = dict(CONFIRM_PARAM)
+    if confirm:
+        props["confirm"] = {"type": "boolean", "description": f"true only to repeat a {name} refused for cutting "
+                            f"roads off the {CUT_FROM[name]}, once you are sure"}
     return Tool(name, text, fn, props, strict=False)
 
 
@@ -271,11 +323,11 @@ def _connected_roads(w) -> np.ndarray:
     return np.isin(w.road_labels, labels) if labels else np.zeros(w.struct.shape, bool)
 
 
-def _outside_labels(w, labels: np.ndarray) -> set[int]:
+def _outside_labels(w, labels: np.ndarray, drop=frozenset()) -> set[int]:
     """The road components linked to the region, as World.refresh() finds them: those holding a highway tile, and
-    those next to (8-neighbourhood) a train station, harbour or airport."""
+    those next to (8-neighbourhood) a train station, harbour or airport (LINKS) not anchored at a tile in `drop`."""
     out = {int(labels[y, x]) for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))} - {-1}
-    for x, y in w.facilities(C.TRAIN) + w.facilities(C.HARBOUR) + w.facilities(C.AIRPORT):
+    for x, y in (a for st in LINKS for a in w.facilities(st) if a not in drop):
         for px, py in w.parts(x, y):
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
@@ -284,18 +336,25 @@ def _outside_labels(w, labels: np.ndarray) -> set[int]:
     return out
 
 
-def cut_off(w, tiles) -> np.ndarray:
-    """The highway-connected road tiles (the removed ones excluded) that removing the road tiles among `tiles` would
-    cut off the highway: the road network relabelled without them as World.refresh() labels it (4-neighbour
-    components, linked by a highway tile or a station / harbour / airport)."""
+def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
+    """The highway-connected road tiles (the removed ones excluded) that removing the road tiles among `tiles`, and
+    the link buildings anchored at the tiles in `drop`, would cut off the region: the road network relabelled
+    without them as World.refresh() labels it (4-neighbour components, linked by a highway tile or a station /
+    harbour / airport)."""
     before = _connected_roads(w)
     gone = np.zeros(before.shape, bool)
     for x, y in tiles:
         gone[y, x] = w.struct[y, x] == C.ROAD
-    if not (gone & before).any():
+    if not (gone & before).any() and not drop:
         return np.zeros_like(before)
     labels, _ = label_components(((w.struct == C.ROAD) | (w.struct == C.HIGHWAY)) & ~gone)
-    return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels)))
+    return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels, drop)))
+
+
+def guarded(role: str, action: str) -> bool:
+    """Whether `role`'s `action` is refused when it would cut roads off (confirm: true lets it run): a bulldoze, and
+    a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS)."""
+    return action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -336,6 +395,11 @@ def _riverbank_by_roads(w) -> tuple[np.ndarray, list[tuple[int, int]]]:
     return lots, [(int(x), int(y)) for y, x in zip(ys, xs)]
 
 
+def free_bank(w) -> np.ndarray:
+    """The free riverbank lots beside highway-connected roads: where a pump or outlet can go."""
+    return _riverbank_by_roads(w)[0] & _empty_land(w)
+
+
 def _ends(points: list) -> list:
     """The first and last point (reading order): a bridge's two ends, a riverside road's two ends."""
     return points[:1] + points[-1:] if len(points) > 1 else points
@@ -348,6 +412,11 @@ def _box(mask) -> tuple[list[int], list[int]] | None:
 
 def _span(a: int, b: int) -> str:
     return str(a) if a == b else f"{a}-{b}"
+
+
+def _some(items: list[str], n: int, sep: str = ", ") -> str:
+    """The first n items, and how many more there are."""
+    return sep.join(items[:n]) + (f" +{len(items) - n} more" if len(items) > n else "")
 
 
 def _roads(w) -> dict | None:
@@ -558,6 +627,13 @@ class SiteList(NamedTuple):
     note: str | None        # the same in full, with what to do: find_sites' "note"
 
 
+def role_obs(env, role: str, site_hints: bool = True) -> dict:
+    """`role`'s observation for the fleet's look-ups and briefings: no map, council messages or memory; with the
+    site hints site_lists reads unless site_hints=False."""
+    return build_observation(env.world, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
+                             include_map=False, site_hints=site_hints)
+
+
 def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
     """Every find_sites purpose of `role` from one build_observation(..., site_hints=True): the find_sites tool
     and the briefing's Ready sites block both read this, so they can't disagree."""
@@ -567,16 +643,43 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
         for key in path:
             found = found.get(key) if isinstance(found, dict) else None
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
+        if purpose in BANK_TOP_UP and len(sites) < len(found or []):
+            sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
+        if purpose == "congested_roads":         # avenues already last (kept): an avenue upgrade charges nothing there
+            sites.sort(key=lambda s: not site_tiles(w, purpose, s)[0])
         keys = SITE_UNLOCKS.get(purpose, ())
         if keys and not any(w.unlocked(k) for k in keys):
             key = min(keys, key=C.UNLOCK_POP.get)
             short, note = f"locked (unlocks at {C.UNLOCK_POP[key]:,} residents)", "locked: " + w.unlock_note(key)
+        elif w.metrics()["population"] < SITE_MIN_POP.get(purpose, 0):
+            sites, (short, note) = [], SITE_NOTES[purpose]
         elif sites:
             short = note = None
         else:                    # models told to "inspect the map" scanned it blindly for whole turns
             short, note = SITE_NOTES.get(purpose) or _why_empty(w, role, purpose)
         out[purpose] = SiteList(sites, short, note)
     return out
+
+
+def _bank_top_up(w, listed: list[dict], line: str) -> list[dict]:
+    """Free riverbank lots beside highway-connected roads (where a pump or outlet can go) not in `listed`, as many as
+    fit in MAX_SITES with it: the observation cuts its riverbank lists to 6 before site_lists drops the sites off
+    the highway network, so off-highway roads by the bank could leave pump and sewage short, or empty ("all
+    taken"), with free lots beside the connected roads. Ranked as observation._candidate_sites ranks them for
+    `line` (pump: cleanest first, +0.5 at or south of an outlet, then north first; outlet: those at or north of a
+    pump last, then south first; crowded spots last, marked "crowd"), with pollution as it computes it."""
+    have = {(s["x"], s["y"]) for s in listed}
+    ys, xs = np.nonzero(free_bank(w))
+    more = [{"x": x, "y": y, "pollution": round(max(float(w.pollution[y, x]), w._river_near(x, y)), 2)}
+            for x, y in zip(xs.tolist(), ys.tolist()) if (x, y) not in have]
+    if line == "pump":
+        outlets = w.facilities(C.OUTLET) + w.facilities(C.TREATMENT)
+        more.sort(key=lambda b: (b["pollution"] + (0.5 if any(oy <= b["y"] for _, oy in outlets) else 0), b["y"]))
+    else:
+        pumps = w.facilities(C.PUMP)
+        more.sort(key=lambda b: (any(py >= b["y"] for _, py in pumps), -b["y"]))
+    k = MAX_SITES - len(listed)
+    return _uncrowded_first(w, more, line, k) if k > 0 else []
 
 
 def _why_empty(w, role: str, purpose: str) -> tuple[str, str]:
@@ -648,21 +751,107 @@ def scarce_bank(w) -> set[tuple[int, int]]:
     """The free riverbank lots beside highway-connected roads (where a pump or outlet can go) when there are at most
     SCARCE_BANK of them, else none: the Ready sites line of another purpose whose site is one of them says to keep
     it for pump / sewage."""
-    lots = _riverbank_by_roads(w)[0] & _empty_land(w)
-    ys, xs = np.nonzero(lots)
+    ys, xs = np.nonzero(free_bank(w))
     return {(int(x), int(y)) for y, x in zip(ys, xs)} if len(xs) <= SCARCE_BANK else set()
 
 
-def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset()) -> list[str]:
+def _price(w, name: str) -> float | None:
+    """What `name` (a tier name or an OFF_TIER_SPECS key) costs: what its action charges. None while it is locked."""
+    if name in OFF_TIER_SPECS:
+        cost, key = OFF_TIER_SPECS[name]
+        return cost() if key is None or w.unlocked(key) else None
+    line, tier = C.TIER_BY_NAME[name]
+    spec = C.TIER_LINES[line][tier - 1]
+    return None if spec.get("unlock") and not w.unlocked(spec["unlock"]) else spec["cost"]
+
+
+def building_name(name: str) -> str:
+    """A SITE_BUILDS name for people: a line's base tier by its struct's name (tower -> water tower, outlet -> sewage
+    outlet), a higher tier by its own (water works: the struct is the line's), the others as they are (bus line)."""
+    if name in C.TIER_BY_NAME:
+        line, tier = C.TIER_BY_NAME[name]
+        name = C.STRUCT_NAME[C.TIER_LINES[line][0]["struct"]] if tier == 1 else name
+    return name.replace("_", " ")
+
+
+class Price(NamedTuple):
+    cost: float             # as the action charges it, unrounded (one tile for PER_TILE names)
+    building: str           # what it buys, for people (building_name: "water tower", "bus line", "levee tile")
+    per_tile: bool = False
+
+    def text(self) -> str:
+        return money(self.cost) + ("/tile" if self.per_tile else "")
+
+
+def short_of(funds: float, cost: float) -> bool:
+    """`funds` can't pay `cost`, as actions._spend decides (it lets float dust through)."""
+    return funds + 1e-9 < cost
+
+
+def site_price(w, role: str, purpose: str) -> Price | None:
+    """What a site on `role`'s find_sites `purpose` list costs: the cheapest unlocked thing the list is for
+    (SITE_BUILDS), as its action charges it (per tile for PER_TILE names). None for purposes without a price or while
+    all of theirs are locked."""
+    priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
+    best = min(priced, key=lambda t: t[0], default=None)
+    return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE)
+
+
+def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
+    """(tiles, charged units) of one site of a per-tile purpose built whole: a congested stretch's roads below avenue
+    class, as upgrade_road charges them (BRIDGE_UPGRADE units on a bridge; none on a stretch of avenues), else the
+    site's "tiles" (a levee run: empty bank land, one unit each), one when it doesn't say."""
+    if purpose == "congested_roads":
+        xs = range(min(site["x1"], site["x2"]), max(site["x1"], site["x2"]) + 1)
+        ys = range(min(site["y1"], site["y2"]), max(site["y1"], site["y2"]) + 1)
+        road = [(x, y) for y in ys for x in xs
+                if w.struct[y, x] == C.ROAD and w.road_class[y, x] < C.ROAD_CLASSES["avenue"]]
+        return len(road), sum(BRIDGE_UPGRADE if w.terrain[y, x] == C.WATER else 1 for x, y in road)
+    n = max(1, int(site.get("tiles", 1)))
+    return n, n
+
+
+def best_stretch(w, purpose: str, sites: list[dict]) -> tuple[int, int]:
+    """site_tiles of the best (first) site, one tile when it has nothing to charge: site_lists ranks congested
+    stretches that are avenues already last (seed 0's most congested roads were by month 60), so a first one with
+    nothing to charge means none has."""
+    t = site_tiles(w, purpose, sites[0])
+    return t if t[0] else (1, 1)
+
+
+def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
+    """site_price of each of `role`'s priced purposes with ready sites (listed and unlocked): the Ready sites lines
+    end with it, and funds short of every one buy no ready site."""
+    return {p: pr for p, lst in lists.items() if lst.sites and not lst.short and (pr := site_price(w, role, p))}
+
+
+def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[tuple[str, ...], Price] | None:
+    """(purposes, price) of the lowest price, SUPPLEMENTARY purposes skipped unless `supplementary` (the mayor's
+    needs line and the budget line name them); None when there is none. Every purpose at that price, in order:
+    health's clinic and landfill both cost $2,000, and naming the first alone would pick the clinic over the
+    playbook's landfill-first."""
+    kept = {p: pr for p, pr in prices.items() if supplementary or p not in SUPPLEMENTARY}
+    low = min(kept.values(), key=lambda pr: pr.cost, default=None)
+    return None if low is None else (tuple(p for p, pr in kept.items() if pr.cost == low.cost), low)
+
+
+def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
+                prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
     zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
-    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage."""
+    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. A line with
+    sites ends with its price (`prices`: ready_prices), and with `funds` (rounded down) when they are short of it."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
 
     def site(purpose: str, s: dict) -> str:
         bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
         return _where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+
+    def price(purpose: str) -> str:
+        pr = (prices or {}).get(purpose)
+        return "" if pr is None else f"; {pr.text()}" + (f" - you have {money(math.floor(funds))}"
+                                                         if funds is not None and short_of(funds, pr.cost) else "")
 
     for purpose, lst in lists.items():
         head = f"- {purpose}: "
@@ -673,20 +862,20 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
         if path in paths:
-            lines.append(head + f"same list as {paths[path]}")
+            lines.append(head + f"same list as {paths[path]}" + price(purpose))
             continue
         paths[path] = purpose
         best, first = sites[0], shown.get(_where(sites[0]))
         if first is None:
             shown[_where(best)] = purpose
-            lines.append(head + f"best {site(purpose, best)}")
+            lines.append(head + f"best {site(purpose, best)}" + price(purpose))
             continue
         nxt = next((t for t in sites[1:] if _where(t) not in shown), None)
         if nxt is None:
-            lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}")
+            lines.append(head + f"same {'strip' if 'x2' in best else 'site'} as {first}" + price(purpose))
         else:
             shown[_where(nxt)] = purpose
-            lines.append(head + f"best as {first}; next {site(purpose, nxt)}")
+            lines.append(head + f"best as {first}; next {site(purpose, nxt)}" + price(purpose))
     return lines
 
 
@@ -705,6 +894,7 @@ class ToolBox:
         self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
+        self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
         self.tools: dict[str, Tool] = {}
         lookups = self._lookup_tools()
         self.lookups = {t.name for t in lookups}
@@ -713,7 +903,7 @@ class ToolBox:
         docs = action_docs()
         for a in ROLES[role]["actions"]:
             if a != "noop":
-                self.tools[a] = _action_tool(a, docs[a], partial(self._act, a))
+                self.tools[a] = _action_tool(a, docs[a], partial(self._act, a), confirm=guarded(role, a))
 
     # ------------------------------------------------------------ interface
     def schemas(self) -> list[dict]:
@@ -722,14 +912,20 @@ class ToolBox:
     def call(self, name: str, arguments: str | dict | None = None) -> dict:
         """Run one tool call. An identical repeat (same tool, same arguments after coercion) of a look-up returns
         the earlier result marked "repeat", and one of an action that failed is refused ("refused": "repeat")
-        without running, until something changes: a successful action (or plan update) for look-ups, a
-        successful action for failed actions; a failed action only refreshes `history`, which lists it. A bulldoze
-        that would cut roads off the highway is refused before it runs ("refused": "disconnect"; not executed,
-        logged or remembered as a failure) unless it passes confirm: true."""
+        without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
+        until something changes: a successful action (or plan update) for look-ups, a successful action for failed
+        actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
+        roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
+        before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
+        confirm: true."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
         except ToolError as e:
+            bad = (name, self._sent_key(arguments))
+            if bad in self._invalid:
+                return self._refusal(*self._invalid[bad])
+            self._invalid[bad] = (self.n_calls, str(e)[:REPEAT_ERROR_CHARS])
             return {"ok": False, "error": str(e)}
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -738,12 +934,7 @@ class ToolBox:
             n, res = self._seen[key]
             return {**copy.deepcopy(res), "repeat": f"same as call {n} (nothing changed since)"}
         if key in self._failed:
-            n, err = self._failed[key]
-            if "end_turn" not in err:
-                err += "; change the arguments or do something else"
-            elif not err.endswith("call end_turn"):
-                err += "; call end_turn"
-            return {"ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}"}
+            return self._refusal(*self._failed[key])
         executed = len(self.executed)
         res = self._run(tool, args)
         if name in self.lookups:
@@ -752,6 +943,7 @@ class ToolBox:
             if res.get("ok"):
                 self._seen.clear()
                 self._failed.clear()
+                self._invalid.clear()
             elif "refused" not in res:               # a guard refusal ran nothing: an identical repeat is refused again
                 self._failed[key] = (self.n_calls, str(res.get("error"))[:REPEAT_ERROR_CHARS])
                 if len(self.executed) > executed:         # logged as a failure: history shows it
@@ -759,6 +951,27 @@ class ToolBox:
         elif name == "update_plan" and res.get("ok"):
             self._seen.clear()
         return res
+
+    @staticmethod
+    def _refusal(n: int, err: str) -> dict:
+        """The refusal of an identical repeat of the call that failed at call `n` with `err`."""
+        if "call end_turn" not in err:
+            err += "; change the arguments or do something else"
+        elif not err.endswith("call end_turn"):
+            err += "; call end_turn"
+        return {"ok": False, "refused": "repeat", "error": f"this exact call failed at call {n}: {err}"}
+
+    @staticmethod
+    def _sent_key(arguments) -> str:
+        """Arguments as sent, for the repeat check of a call that didn't resolve: JSON with sorted keys (none or
+        blank as {}, but "null" stays null), else the stripped text."""
+        if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
+            return "{}"
+        try:
+            return json.dumps(json.loads(arguments) if isinstance(arguments, str) else arguments, sort_keys=True,
+                              default=str)
+        except (TypeError, ValueError):
+            return str(arguments).strip()
 
     def _resolve(self, name: str, arguments) -> tuple[Tool, dict]:
         """The tool and its checked, coerced arguments; ToolError for unknown tools and bad arguments."""
@@ -825,55 +1038,115 @@ class ToolBox:
         t = args.pop("type", None)
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
-        if not args.pop("confirm", False) and name in ROAD_REMOVERS:
-            refusal = self._disconnect_refusal(args)
+        if not args.pop("confirm", False) and guarded(self.role, name):
+            refusal = self._disconnect_refusal(name, args)
             if refusal:
                 return {"ok": False, "refused": "disconnect", "error": refusal}
-        bank = self._free_bank() if name == "zone" else None
+        bank = free_bank(self.world) if name == "zone" else None
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
         dept = ROLES[self.role]["budget"]
-        msg = res["message"] + (self._bank_warning(bank) if bank is not None and res["ok"] else "")
-        return {"ok": res["ok"], "message": msg, "cost": res["cost"],
+        if res["ok"]:                                     # advice goes to the model only; the log keeps the core text
+            note = self._bank_warning(bank) if bank is not None else ""
+        else:
+            note = self._explain(name, args, res["message"])
+        return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
                 "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
 
-    def _disconnect_refusal(self, args: dict) -> str | None:
-        """Why a bulldoze with these arguments must not run: it would cut highway-connected road tiles off the
-        highway (seed 1, v7: planning cleared the 2-tile link to the highway and the city emptied). None when it
+    def _disconnect_refusal(self, name: str, args: dict) -> str | None:
+        """Why a bulldoze or demolish (guarded()) with these arguments must not run: it would cut highway-connected
+        road tiles off the region (seed 1, v7: planning cleared the 2-tile link to the highway and the city emptied;
+        a demolished train station, harbour or airport unlinks the roads it was the only link of). None when it
         wouldn't, or when the arguments are bad (the action reports those)."""
         w = self.world
         try:
-            tiles = _rect(w, args)
+            tiles = _rect(w, args) if name in ROAD_REMOVERS else [_point(w, args)]
         except Exception:
             return None
-        lost = cut_off(w, tiles)
+        if name in ROAD_REMOVERS:
+            lost, gone = cut_off(w, tiles), [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
+            why = "; build a new link first or pick tiles that aren't on the only route"
+        else:
+            (x, y), = tiles
+            link = LINKS.get(int(w.struct[y, x]))
+            if link is None:                              # not a link: nothing to relabel
+                return None
+            lost, gone = cut_off(w, (), drop={w._anchor_of(x, y)}), w.parts(x, y)
+            why = (f": the {link} is their only link; ask planning to connect them to the highway by road first, or "
+                   "build another link")
         if not lost.any():
             return None
         ys, xs = np.nonzero(lost)
-        gone = [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
-        return (f"this would cut {len(xs)} road tiles (e.g. around ({xs[i]},{ys[i]})) off the highway; build a new link "
-                "first or pick tiles that aren't on the only route; to do it anyway repeat with confirm: true")
-
-    def _free_bank(self) -> np.ndarray:
-        """The free riverbank lots beside highway-connected roads (where a pump or outlet can go)."""
-        return _riverbank_by_roads(self.world)[0] & _empty_land(self.world)
+        return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
+                f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
 
     def _bank_warning(self, before: np.ndarray) -> str:
-        """A warning for a zone action that took the last free riverbank lots beside roads (`before`: _free_bank()
-        before it) while the city still lacks a pump or a sewage outlet / treatment plant (both need the bank)."""
+        """A warning for a zone action that took the last free riverbank lots beside roads (`before`: free_bank()
+        before it) while the city still lacks a sewage outlet / treatment plant or has neither a pump nor a water
+        tower (pumps and outlets need the bank; a tower supplies water without it)."""
         w = self.world
-        missing = [name for name, structs in (("pump", (C.PUMP,)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
+        missing = [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
                    if not any(w.facilities(s) for s in structs)]
-        if not missing or not before.any() or self._free_bank().any():
+        if not missing or not before.any() or free_bank(self.world).any():
             return ""
         ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))
         if not len(xs):                                   # not taken by this zoning: someone else's doing
             return ""
         return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
+
+    def _explain(self, name: str, args: dict, message: str) -> str:
+        """How to fix a failed build_road or zone, appended to the core message in the tool result (v8, seed 0 month
+        0: planning zoned row 23, then ran four roads north through those lots, still empty, told only "occupied by
+        residential" and never that dezoning is free; it also re-built a road twice and zoned high density before
+        'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile building once),
+        and dezones that stay on the line: per straight leg, one per run of lots between buildings, from its first to
+        its last lot (dezone razes developed tiles, and a box off the line would take other lots). "" otherwise."""
+        w = self.world
+        if name == "zone" and message == w.unlock_note("high_density"):
+            return ' - zone with density "low" now'
+        if name != "build_road":
+            return ""
+        if message == "every tile on that line is already road":
+            return f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites road_extension)"
+        if " is occupied by " not in message:
+            return ""
+        line = _line(w, args)                             # build_road got this far, so the arguments parse
+        kind = {}                                         # what build_road can't take, as it walks the line
+        for x, y in line:
+            if w.struct[y, x] not in (C.NONE, C.ROAD, C.HIGHWAY):
+                kind[x, y] = "lot" if w.struct[y, x] in C.ZONES and w.level[y, x] == 0 else "built"
+        lots = [p for p, k in kind.items() if k == "lot"]
+        firsts = {}                                       # a building once, at its first tile on the line
+        for p, k in kind.items():
+            if k == "built":
+                firsts.setdefault(w._anchor_of(*p), p)
+        built = list(firsts.values())
+        ls, bs = "s" * (len(lots) > 1), "s" * (len(built) > 1)
+        tiles = lambda pts: _some([f"({x},{y})" for x, y in pts], BLOCKERS_NAMED)
+        tail = f"; route around the building{bs} (the Map block has the road extent)"
+        if not lots:
+            return f" - in the way: building{bs} {tiles(built)}{tail}"
+        n = next((i for i, (_, y) in enumerate(line) if y != line[0][1]), len(line))    # the horizontal leg comes first
+        rects = []
+        for leg in (line[:n], line[n:]) if n > 1 else (line,):
+            run = []
+            for p in leg + [None]:                        # a run of lots ends at a building or the leg's end
+                if p is None or kind.get(p) == "built":
+                    if run:
+                        (xa, ya), (xb, yb) = run[0], run[-1]
+                        rects.append(f"dezone x1={min(xa, xb)},y1={min(ya, yb)},x2={max(xa, xb)},y2={max(ya, yb)}")
+                    run = []
+                elif kind.get(p) == "lot":
+                    run.append(p)
+        head = f" - in the way: empty zoned lot{ls} {tiles(lots)}"
+        fix = f"dezone the lot{ls} first (free): {_some(rects, DEZONES_NAMED, '; ')}"
+        if not built:
+            return f"{head}; {fix}, then retry"
+        return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:
@@ -983,9 +1256,7 @@ class ToolBox:
             raise ToolError("give both near_x and near_y, or neither")
         w = self.world
         role, key = purpose.split(".", 1) if self.role == "mayor" else (self.role, purpose)
-        obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
-                                include_map=False, site_hints=True)
-        lst = site_lists(w, role, obs)[key]
+        lst = site_lists(w, role, role_obs(self.env, role))[key]
         sites = lst.sites
         if near_x is not None:
             near = (int(near_x), int(near_y))
@@ -997,8 +1268,7 @@ class ToolBox:
 
     def my_facilities(self) -> dict:
         w, role = self.world, self.role
-        obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=self.env.cfg.months,
-                                include_map=False, site_hints=False)
+        obs = role_obs(self.env, role, site_hints=False)
         if role == "mayor":
             return {"ok": True, **{k: obs[k] for k in ("funding_pct", "policies", "service_imports",
                                                        "department_upkeep")}}

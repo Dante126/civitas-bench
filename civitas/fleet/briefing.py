@@ -10,17 +10,17 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 
 from ..agents.prompts import GAME_RULES
 from ..bench.scoring import ScoringConfig
-from ..core.observation import build_observation
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, funding_gaps, map_facts, map_lines, overview, plan_slice, \
-    ready_lines, scarce_bank, site_lists
+from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, best_stretch, cheapest, funding_gaps, map_facts, \
+    map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -64,9 +64,9 @@ HOW_TO_PLAY = """\
 You are the {title} in a fleet of AI agents that runs a city. The mayor is the manager: it sets the city plan \
 (goals, a budget target and a priority per department) and moves the money; the departments ({depts}) carry the \
 plan out. {cadence}, and you start each turn from a short briefing.
-- Each turn you work by calling tools. Look things up before acting ({lookups}). The Map block in your \
-briefing usually suffices; call map_overview only when you need tile-level layout (at most once per turn); \
-inspect for details.{coords}
+- Each turn you work by calling tools. Your briefing covers most of what you need; look things up only for what \
+it lacks ({lookups}). The Map block in your briefing usually suffices; call map_overview only when you need \
+tile-level layout (at most once per turn); inspect for details.{coords}
 - Action tools run immediately and report success or failure, the cost and the money left. When an action fails, \
 read the error and fix the cause (another site, a cheaper option, wait for an unlock) instead of repeating it.
 - {budget}
@@ -77,7 +77,7 @@ lessons) and the game's history log. Write down what you learn.
 - Limits per turn: at most {max_steps} tool calls; at that limit the turn ends and completed actions stay. \
 {actions}
 - Each tool result shows steps_left; repeating an identical call returns the earlier result (look-ups) or is \
-refused (a failed action).
+refused (a failed action or an invalid call).
 - The mode in your briefing header: autonomous = no coach will intervene during the game; supervised = your coach \
 may revise the playbook between sessions."""
 LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilities", "unlocks", "get_plan",
@@ -171,11 +171,45 @@ def _map(w) -> list[str]:
     return ["## Map"] + map_lines(map_facts(w))
 
 
-def _ready_sites(w, role: str, obs: dict) -> list[str]:
-    """One line per find_sites purpose (count and best site, or why there is none), so agents don't re-run
+def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
+    """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
     find_sites for every purpose each turn."""
-    return (["## Ready sites"] + ready_lines(role, site_lists(w, role, obs), scarce_bank(w))
+    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds)
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
+
+
+def _a(name: str) -> str:
+    return ("an " if name[:1] in ("a", "e", "i", "o") else "a ") + name     # not u: a university
+
+
+def _needs(env, dept: str) -> str:
+    """The mayor's Departments line suffix when `dept`'s funds are below its cheapest ready build: "; needs $X for a
+    <building> (N ready sites)", else "". Every building at that price is named ("a clinic (5 ready sites) or a
+    landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). A
+    per-tile purpose counts its best site whole ("$90 for 3 avenue tiles", best_stretch), also when picking the
+    cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line. The department's observation is built
+    only when its funds are below its dearest priced purpose (else no ready build can be out of reach), or when it
+    has a per-tile one (a stretch has no such bound)."""
+    w = env.world
+    funds = w.dept_funds[dept]
+    priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
+    if not any(pr.per_tile for pr in priced) and not short_of(funds, max((pr.cost for pr in priced), default=0)):
+        return ""
+    lists = site_lists(w, dept, role_obs(env, dept))
+    prices, tiles = ready_prices(w, dept, lists), {}
+    for p, pr in prices.items():
+        if pr.per_tile:
+            tiles[p], units = best_stretch(w, p, lists[p].sites)
+            prices[p] = pr._replace(cost=pr.cost * units)
+    purposes, low = cheapest(prices) or ((), None)
+    if low is None or not short_of(funds, low.cost):
+        return ""
+    named = {}                                       # what it buys -> ready sites of the first purpose pricing it
+    for p in purposes:
+        n, b = tiles.get(p, 1), prices[p].building
+        named.setdefault(f"{n} {b}s" if n != 1 else _a(b), len(lists[p].sites[:MAX_SITES]))
+    return f"; needs {money(low.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
+                                                            for b, n in named.items())
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -252,9 +286,9 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     L += ["", "## Departments"
           + (" (cut reports: history kind=report)" if clipped else "")]
     for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(w.dept_funds[d])}"
+        L.append(f"- {d}: funds {money(math.floor(w.dept_funds[d]))}"
                  + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
+                 + _needs(env, d) + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
             L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
     if not latest:
@@ -291,15 +325,25 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
         if p.get("notes"):
             L.append(f"- mayor's notes: {cut(p['notes'], 200)}")
     spent = w.history[-1]["dept_spent"].get(dept, 0) if w.history else 0
+    funds = w.dept_funds[dept]
+    obs = role_obs(env, role)             # the one build: metrics and ready sites
+    lists = site_lists(w, role, obs)
+    prices = ready_prices(w, role, lists)
     L += ["", "## Your budget",
-          f"- {money(w.dept_funds[dept])} in department funds" + (f" (plan target {money(target)})"
-                                                                   if target is not None else "")
+          f"- {money(math.floor(funds))} in department funds"      # rounded down, as against a price (short_of)
+          + (f" (plan target {money(target)})" if target is not None else "")
           + f"; spent last month {money(spent)}"]
-    obs = build_observation(w, role, council_msgs=[], memory={}, scores={}, months_total=env.cfg.months,
-                            include_map=False, site_hints=True)          # the one build: metrics and ready sites
+    # smoke runs: builds tried with $0, stations funded $1,000 of $2,500. Only when funds are short of every ready
+    # price (a supplementary one too, else it's false); it names the cheapest primary ones (all on a tie: health's
+    # clinic or landfill), else a supplementary one
+    purposes, low = cheapest(prices) or cheapest(prices, supplementary=True) or ((), None)
+    if low and all(short_of(funds, pr.cost) for pr in prices.values()):
+        L.append(f"- You can't pay for any ready site (cheapest: {' or '.join(purposes)} {low.text()}). Don't call "
+                 "build tools this turn: ask the mayor for the amount with a reason (send_message) unless you already "
+                 "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _map(w) + [""] + _ready_sites(w, role, obs) + [""] + _memory(fleet, role)
+    return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,

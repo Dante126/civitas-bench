@@ -3,8 +3,9 @@
 `run_episode` keeps one slim `turn_row(rec)` per fleet turn (the same rows can be rebuilt from
 `trajectories.jsonl` with `rows_from_trajectories`) and writes `fleet_report.json` / `fleet_report.md`.
 Hint rules: >= 3 failures alike (failed actions and tool errors); funds above max(2x the plan budget, $1,000) for
-3+ consecutive months; 2+ consecutive turns without a successful action spanning 6+ months; a negative city
-treasury; > 20% of turns ended on the step or token limit.
+3+ consecutive months; 2+ consecutive turns without a successful action spanning 6+ months (a turn with no plan
+budget and under $1 in funds at the turn is blocked, not idle, and splits the run); a negative city treasury; > 20%
+of turns ended on the step or token limit.
 """
 from __future__ import annotations
 
@@ -27,8 +28,8 @@ MSG_CHARS = 160
 
 def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
-    look-up that failed, an action tool refused before the action ran. A repeated failed action or a guarded
-    bulldoze refused without running is counted in `refused`, not here."""
+    look-up that failed, an action tool refused before the action ran. A repeated failed action or bad call and a
+    guarded bulldoze or demolish, refused without running, are counted in `refused`, not here."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
@@ -114,8 +115,8 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
 
 
 def _idle(turns: list[tuple[int, bool]], months: int) -> tuple[int, int, int] | None:
-    """Longest (turns, first month, end month) run of turns without a successful action that fires the rule; a run
-    lasts until the department's next turn (or the end of the run)."""
+    """Longest (turns, first month, end month) run of idle turns (`(month, False)`: no successful action and not
+    blocked) that fires the rule; a run lasts until the department's next turn (or the end of the run)."""
     best, i = None, 0
     while i < len(turns):
         if turns[i][1]:
@@ -141,11 +142,11 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
                               "text": f"{role}: {g['count']} failures like \"{g['message']}\" - add a lesson to its "
                                       "playbook (e.g. check find_sites / inspect before acting)"})
     versions = [v for v in fleet.plan_versions if v.get("month") is not None]
+    def target(dept, m):
+        live = [v for v in versions if v["month"] < m]          # history entry m = the state after month m - 1
+        return live[-1]["budgets"].get(dept) if live else None
     for dept in (d for d in DEPARTMENTS if d in roles):
-        def target(m):
-            live = [v for v in versions if v["month"] < m]      # history entry m = the state after month m - 1
-            return live[-1]["budgets"].get(dept) if live else None
-        entries = [(m["month"], (m.get("dept_funds") or {}).get(dept), target(m["month"])) for m in history]
+        entries = [(m["month"], (m.get("dept_funds") or {}).get(dept), target(dept, m["month"])) for m in history]
         over = lambda e: (e[1] is not None and e[2] is not None
                           and e[1] > max(FUNDS_MULTIPLE * e[2], UNUSED_FLOOR))
         runs = [r for r in _runs(entries, over) if len(r) >= FUNDS_MONTHS]
@@ -157,14 +158,24 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
                                   f"({money(run[-1][2])}) for {len(run)} months ({_span(a, b)}, up to "
                                   f"{money(max(e[1] for e in run))}) - have it spend, or lower its allocation"})
     for dept in (d for d in DEPARTMENTS if d in roles):
-        turns = sorted((row["month"], any(r["ok"] for r in row["results"])) for row in rows if row["role"] == dept)
+        # a turn in month t ends in history entry t + 1 (after the mayor's turn, which comes first, and its own). Only
+        # actions move dept funds, so after a turn without a success the funds there are the funds it had at its turn;
+        # under $1 with no plan budget either, it was blocked, not idle: such turns split idle runs like successful ones
+        after = {m["month"] - 1: ((m.get("dept_funds") or {}).get(dept), target(dept, m["month"])) for m in history}
+        broke = lambda t: t in after and after[t][0] is not None and after[t][0] < 1
+        blocked = lambda t: broke(t) and not after[t][1]
+        turns = sorted((row["month"], any(r["ok"] for r in row["results"]) or blocked(row["month"]))
+                       for row in rows if row["role"] == dept)
         idle = _idle(turns, months)
         if idle:
             n, a, end = idle
+            run = [t for t, _ in turns if a <= t < end]
             hints.append({"kind": "idle", "role": dept, "turns": n, "months": end - a, "first": a, "last": end - 1,
                           "text": f"{dept}: {n} turns / {end - a} months without a successful action "
-                                  f"({_span(a, end - 1)}) - check its playbook and whether it is blocked (funds, "
-                                  "unlocks, failures)"})
+                                  f"({_span(a, end - 1)}) - "
+                                  + (f"its funds stayed at $0 against a {money(after[run[-1]][1])} target: check the "
+                                     "mayor's allocations" if all(broke(t) for t in run) else
+                                     "check its playbook and whether it is blocked (funds, unlocks, failures)")})
     neg = [m for m in history if m.get("treasury", 0) < 0]
     if neg:
         low = min(m["treasury"] for m in neg)
