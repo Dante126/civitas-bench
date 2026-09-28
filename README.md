@@ -461,14 +461,18 @@ tasks and money, and to let people coach it.
   their straight road lines, e.g. `y=24 x 0-47; x=19 y 19-29`, up to 8 with the longest
   first, any road tiles not connected to the highway, and the built-up area) and end with
   the next milestone. While high density is locked, planning's Ready sites block says so
-  and tells it to zone at low density. Actions run immediately and return `ok`, a message, the cost and the money
-  left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
+  and tells it to zone at low density. Actions run immediately and return `ok`, a message,
+  the cost and the money left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
   refused actions come back as `{"ok": false, "error": ...}` for the model to correct. A
-  failed `build_road` or `zone` also says how to fix it: a road blocked by empty zoned
+  failed `build_road`, `zone` or `dezone` also says how to fix it: a road blocked by empty zoned
   lots names them and the `dezone` rectangles to run first (free; they stay on the road's
   line, at most 2 named), and one blocked by a building says to route around it.
-  - "Already road" names the road line it runs along ("branch off it into free land") and points to `find_sites road_extension`.
-  - A zone on land that isn't free says what the rectangle holds ("all 14 tiles are road", "6 zoned C (4 developed), 2 road"). Where free roadside land lies beside it, the hint suggests up to 2 one-tile-wide strips there to zone instead. While the city lacks a pump or a sewage outlet, those strips skip free riverbank lots.
+  - "Already road" names the road line it runs along ("branch off it into free land") and
+    points to `find_sites road_extension`.
+  - A zone on land that isn't free says what the rectangle holds ("all 14 tiles are road",
+    "6 zoned C (4 developed), 2 road"). Where free roadside land lies beside it, the hint
+    suggests up to 2 one-tile-wide strips there to zone instead. While the city lacks a pump
+    or a sewage outlet, those strips skip free riverbank lots.
   - A failed dezone says what is there.
   - High density before its unlock gets `zone with density "low" now`.
 
@@ -488,7 +492,7 @@ tasks and money, and to let people coach it.
 
 | tools | |
 |---|---|
-| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block, or a pointer to it when the map alone fills the result, as late in a long game), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
+| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block, or a pointer to it when the map and the facts together don't fit, as from about month 72 of a long game), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
 | turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
@@ -687,8 +691,8 @@ note, the high-density line and the planning playbook) reached 1,564 / 43.8 and 
 - **Hints followed:** it zoned the suggested strip after trying to zone its new road, and it ran the suggested dezone before rebuilding a road through lots it had just zoned.
 - **Still failing:**
   - It rebuilt its own new road twice.
-  - It zoned a second type over a rectangle it had just zoned, 4 times; the hint now names what is there.
-  - The inspect note never fired, because planning calls `map_overview` first and then inspects anyway.
+  - It zoned a second type over a rectangle it had just zoned, 4 times, even though the hint named what was there.
+  - The inspect note fired once for planning (seed 1, month 6) and twice for utilities. On its other turns planning called `map_overview` before a 4th inspect and kept inspecting afterwards (up to 8 a turn), which the note doesn't cover.
 - **Fleet-wide:** 16% and 26% of actions failed, with 44–49k prompt tokens and about 9 calls per turn. On seed 0 education only ever got $1,500, short of a $2,500 school (score 33.3), and at month 3 the mayor sent the same allocations two or three times each.
 
 **Not built yet:**
