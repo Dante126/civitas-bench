@@ -1143,6 +1143,29 @@ def test_a_department_keeps_its_dearest_ready_first_building(grown_env, open_env
                        "transport": 1500}              # not a train station, harbour or metro (supplementary)
 
 
+def test_keep_never_drops_below_the_needs_line(open_env, monkeypatch):
+    """With only an upgrade ready (health: the $8,000 hospital, the clinic's tier 2) the dearest first building was
+    $0, so money saved for the hospital read as idle while the needs line named it."""
+    import civitas.fleet.briefing as B
+    import civitas.fleet.tools as T
+    from civitas.fleet.tools import MAX_SITES, DeptMoney, SiteList
+    real = T.site_lists
+    none = SiteList([], "nothing needs it right now", "")
+
+    def only_hospital(w, role, obs):
+        lists = real(w, role, obs)
+        return {p: lst if role != "health" or p == "hospital" else none for p, lst in lists.items()}
+    monkeypatch.setattr(T, "site_lists", only_hospital)
+    monkeypatch.setattr(B, "site_lists", only_hospital)
+    env = copy.deepcopy(open_env)                      # every milestone reached: the hospital is unlocked
+    _held(env, health=(6000, 0))
+    m = DeptMoney(env, "health")
+    assert (m.build.cost, m.build.dearest, m.keep, m.idle) == (8000, 8000, 8000, 0)
+    n = len(real(env.world, "health", T.role_obs(env, "health"))["hospital"].sites[:MAX_SITES])
+    line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- health:"))
+    assert n and line == f"- health: funds $6,000, spent $0; needs $8,000 for a hospital ({n} ready sites)"
+
+
 def _quarter(env, spent: dict) -> None:
     """Departments spend at their turn (funds and ledger, as actions._spend does), then 3 months pass."""
     for d, v in spent.items():

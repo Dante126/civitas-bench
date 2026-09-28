@@ -46,8 +46,8 @@ RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' 
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 SPEND_MONTHS = 3             # the mayor's Departments block: what each department spent over this many months
-IDLE_MULT, IDLE_MIN = 2, 1000   # a department keeps max(IDLE_MULT x that, its cheapest ready site, IDLE_MIN); funds
-                                # above it by IDLE_MIN or more are idle
+IDLE_MULT, IDLE_MIN = 2, 1000   # a department keeps max(IDLE_MULT x that, its dearest ready first building,
+                                # IDLE_MIN); funds above it by IDLE_MIN or more are idle
 USED_SHARE = 0.5             # below its target only if it spent more than this share of the most it held (or never
                              # held what it keeps): DeptMoney.wants_more
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
@@ -753,7 +753,8 @@ class DeptMoney:
     @property
     def wants_more(self) -> bool:
         """Whether a top-up would be used: before the first month always; then only when it used more than USED_SHARE
-        of the most it held over the last SPEND_MONTHS months, or never held what it keeps (its first build).
+        of the most it held over the last SPEND_MONTHS months, or never held what it keeps (its dearest ready first
+        building).
         After a take-back planning held its keep, 2 x its spending, below its $9,000 target, and read "below
         target" again: topped up, then idle, then taken back. More than, not at least: a take-back leaves exactly
         1 / IDLE_MULT = USED_SHARE used over the next quarter (test_a_take_back_starts_no_top_up_cycle)."""
@@ -1022,7 +1023,8 @@ class FirstBuild(NamedTuple):
     cost: float                 # the cheapest ready site (cheapest), a per-tile purpose's best stretch whole
     named: dict[str, int]       # what it buys ("a clinic", "3 avenue tiles") -> ready sites of the first purpose
                                 # pricing it
-    dearest: float              # the dearest ready first building (Price.first, SUPPLEMENTARY skipped): what it keeps
+    dearest: float              # the dearest ready first building (Price.first, SUPPLEMENTARY skipped), at least
+                                # `cost`: what it keeps
 
 
 def first_build(env, dept: str) -> FirstBuild | None:
@@ -1047,8 +1049,9 @@ def first_build(env, dept: str) -> FirstBuild | None:
     for p in purposes:
         n, b = tiles.get(p, 1), prices[p].building
         named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
-    return FirstBuild(low.cost, named, max((pr.cost for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first),
-                                           default=0))
+    # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
+    return FirstBuild(low.cost, named, max([low.cost] + [pr.cost for p, pr in prices.items()
+                                                         if p not in SUPPLEMENTARY and pr.first]))
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
