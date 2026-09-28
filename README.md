@@ -115,6 +115,7 @@ thinking model:
   answer, which is useful for studying or training on how the model plans.
 - **Speed.** Calls are slow, so a full game with several LLM roles can take hours. Start
   with `smoke.toml`, or set `game.act_every` to 2–3.
+- **Stalls.** A call attempt is retried after `timeout` s (300) without data or `deadline` s (1,800) in all, both timed on the wall clock: after a laptop sleep the attempt ends on waking and its `[llm] ... retrying` log line says `system slept ~N s`.
 
 Any role can be switched from the CLI, and any value overridden:
 
