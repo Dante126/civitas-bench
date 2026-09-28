@@ -112,9 +112,11 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
 SITE_MIN_POP = {"bus_stops": 1500}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
-# one-tile riverbank purposes -> (their _bank_needed name, the supply they add to): blocked, one counts only while the
-# city lacks it or demand reaches BANK_BUSY x that supply (_bank_wanted)
-BANK_SUPPLY = {"pump": ("pump", "water"), "sewage": ("sewage outlet", "sewage")}
+# utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
+# and, for the one-tile riverbank ones, their _bank_needed name: blocked or funded, one counts only while the city lacks
+# it or demand reaches BANK_BUSY x that supply (_wanted)
+SUPPLY_OF = {"pump": ("water", "pump"), "sewage": ("sewage", "sewage outlet"), "near_homes": ("water", None),
+             "coal_or_gas": ("power", None), "wind": ("power", None)}
 BANK_BUSY = 0.9
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
@@ -128,16 +130,18 @@ TWO_BY_TWO = {"hospital", "university"}
 # (role, purpose) -> (what its building serves, the coverage grid, the list's radius): the lists observation ranks by
 # uncovered need within that radius (people, buildings, residents or school-age residents x (1 - coverage), times a
 # positive weight). Empty with real need, the free roadside tiles are all too far from it (_why_empty). A library
-# reads the school list
+# reads the school list. Not the shelter: supplementary, and its coverage stays about 0 all game
 NEAR_NEED = {("police", "station"): ("people", "police_cov", 6), ("fire", "station"): ("buildings", "fire_cov", 6),
-             ("fire", "shelter"): ("residents", "shelter_cov", 5), ("health", "clinic"): ("residents", "health_cov", 5),
+             ("health", "clinic"): ("residents", "health_cov", 5),
              ("education", "school"): ("children", "school_cov", 6),
              ("education", "high_school"): ("teenagers", "high_cov", 8),
              ("education", "library"): ("children", "school_cov", 6)}
-# real need: at least this share of what the building serves uncovered. One uncovered house at the edge of a
-# 99%-covered town is 1%, and past 90% coverage the rest is edge scraps; the 16 misread turns of v9-v14 were all under
-# 50% coverage
-NEED_SHARE = 0.1
+# real need: at least NEED_SHARE of what the building serves under NEED_COVERED coverage (the observation's
+# uncovered_buildings test). Summing 1 - coverage flagged well-covered cities (coverage fades from 60% of the radius and
+# with congestion): scripted month 120 read 11.5% for fire (score 87.4). Under 0.3, mature scripted cities (months
+# 72-120, seeds 0-1) sit at police 5-17%, fire 0-5%, clinics 2-12%, schools 10-27%; month 60 had clinics at 12%
+# (health 91.0) and fire at 10% (76.4), so 15%, not 10%. The 16 misread turns of v9-v14 were all over 50%
+NEED_SHARE, NEED_COVERED = 0.15, 0.3
 # the best site's most useful field for the briefing's Ready sites line, first match wins
 SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("need", "need {}"),
                ("opens_land", "opens {} land tiles"), ("load_vs_capacity", "load {}x capacity"), ("tiles", "{} tiles"),
@@ -952,6 +956,13 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
         return ("no free roadside strip: extend the roads (find_sites road_extension)",
                 f"no free strip along a highway-connected road ({roads()}; {free} free roadside tiles); "
                 "extend the roads first (find_sites road_extension lists dead ends to build from)", True)
+    near = (role, purpose) in NEAR_NEED
+    need = _uncovered_need(w, role, purpose) if near else None
+    if near and need is None:            # well covered: no lot needed, whether or not there is land
+        return ("nothing needs it right now",
+                f"nothing needs this right now: under {NEED_SHARE:.0%} of the {NEAR_NEED[role, purpose][0]} it would "
+                f"serve are poorly covered (coverage under {NEED_COVERED}); check coverage in city_overview / "
+                "my_facilities before building", False)
     if not free:
         return ("no free roadside land: ask planning for a lot",
                 f"no free land next to a highway-connected road ({roads()}); ask planning (send_message) to extend a "
@@ -966,12 +977,12 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
                 f"no free 2x2 block of empty land beside a highway-connected road ({roads()}; {free} free roadside "
                 f"tiles, none in a free 2x2 block), and a {purpose} takes 2x2 tiles; ask planning (send_message) to "
                 "leave a 2x2 lot by a road, or to extend a road into open land", True)
-    if (need := _uncovered_need(w, role, purpose)) is not None:
+    if need is not None:
         (x, y), share = need
         what = NEAR_NEED[role, purpose][0]
         return (f"no free roadside lot near the homes that need it (around ({x},{y})): ask planning for one",
                 f"no free roadside tile within {NEAR_NEED[role, purpose][2]} tiles of the uncovered {what} "
-                f"({share:.0%} of them uncovered, most around ({x},{y})); the {free} free roadside tiles are all "
+                f"({share:.0%} of them poorly covered, most around ({x},{y})); the {free} free roadside tiles are all "
                 f"farther away: ask planning (send_message) to leave or free (dezone) a lot by a road near ({x},{y}), "
                 f"or to extend a road there ({roads()})", True)
     return ("nothing needs it right now",
@@ -993,15 +1004,15 @@ def _served(w, what: str) -> np.ndarray:
 
 
 def _uncovered_need(w, role: str, purpose: str) -> tuple[tuple[int, int], float] | None:
-    """For a NEAR_NEED list with real need (at least NEED_SHARE of what it serves uncovered): the tile a building
-    would serve the most of it from (within the list's radius) and the uncovered share; else None. Smoke v14 seed 0,
-    months 3-12: planning zoned the lots near homes after the mayor funded fire, health and education, and all three
-    read "nothing needs it right now" at coverage 0 (16 such turns in v9-v14); fire held $2,500 to month 12 unbuilt."""
+    """For a NEAR_NEED list with real need (at least NEED_SHARE of what it serves under NEED_COVERED coverage): the
+    tile a building would serve the most of that from (within the list's radius) and the share; else None. Smoke v14
+    seed 0, months 3-12: planning zoned the lots near homes after the mayor funded fire, health and education, and all
+    three read "nothing needs it right now" at coverage 0 (16 such turns in v9-v14); fire held $2,500 to month 12."""
     if (role, purpose) not in NEAR_NEED:
         return None
     what, grid, radius = NEAR_NEED[role, purpose]
     served = _served(w, what)
-    uncovered = served * (1.0 - getattr(w, grid))
+    uncovered = served * (getattr(w, grid) < NEED_COVERED)
     total, left = float(served.sum()), float(uncovered.sum())
     if total <= 0 or left < NEED_SHARE * total:
         return None
@@ -1056,6 +1067,7 @@ class Price(NamedTuple):
     building: str           # what it buys, for people (building_name: "water tower", "bus line", "levee tile")
     per_tile: bool = False
     first: bool = True      # a line's base tier or an off-tier spec: a first building (not a clinic's hospital)
+    size: tuple[int, int] = (1, 1)      # its footprint (the tier's, as C.footprint gives it): a university 2x2
 
     def text(self) -> str:
         return money(self.cost) + ("/tile" if self.per_tile else "")
@@ -1072,8 +1084,11 @@ def site_price(w, role: str, purpose: str) -> Price | None:
     all of theirs are locked."""
     priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
     best = min(priced, key=lambda t: t[0], default=None)
-    return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE,
-                                           first=best[1] in OFF_TIER_SPECS or C.TIER_BY_NAME[best[1]][1] == 1)
+    if best is None:
+        return None
+    tier = C.TIER_BY_NAME.get(best[1])
+    return Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE, first=tier is None or tier[1] == 1,
+                 size=tuple(C.TIER_LINES[tier[0]][tier[1] - 1]["footprint"]) if tier else (1, 1))
 
 
 def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
@@ -1126,23 +1141,25 @@ class FirstBuild(NamedTuple):
 
 def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     """`dept`'s unlocked first buildings (Price.first, SUPPLEMENTARY skipped) whose lists are blocked for lack of land
-    or roads (SiteList.blocked), priced: purpose -> site_price. A pump or outlet only while the city needs one
-    (_bank_wanted)."""
-    return {p: pr for p, lst in lists.items() if lst.blocked and p not in SUPPLEMENTARY and _bank_wanted(w, p)
+    or roads (SiteList.blocked), priced: purpose -> site_price. A utilities building only while the city needs it
+    (_wanted)."""
+    return {p: pr for p, lst in lists.items() if lst.blocked and p not in SUPPLEMENTARY and _wanted(w, p)
             and (pr := site_price(w, dept, p)) and pr.first}
 
 
-def _bank_wanted(w, purpose: str) -> bool:
-    """False for a pump or outlet (BANK_SUPPLY) while the city has one and uses under BANK_BUSY of that supply (a
-    fresh map, supply 0, wants both); True for other purposes. Smoke v14 seed 1, months 6 and 9: pump and outlet built,
-    water 370-490 and sewage 250 against demand of 99-116, the bank lots beside the roads taken, and planning read
-    "blocked for lack of land: utilities (pump, sewage) ... dezone a roadside lot for them" (its playbook frees a bank
-    lot when asked). Their own lists still say the bank is taken."""
-    if purpose not in BANK_SUPPLY:
+def _wanted(w, purpose: str) -> bool:
+    """False for a utilities purpose (SUPPLY_OF) while its supply has room: demand under BANK_BUSY of it, and for a
+    pump or outlet the city has one (a fresh map, supply 0, wants them all); True for other purposes. Smoke v14 seed 1,
+    months 6 and 9: pump and outlet built, water 370-490 and sewage 250 against demand of 99-116, the bank lots beside
+    the roads taken, and planning read "blocked for lack of land: utilities (pump, sewage) ... dezone a roadside lot for
+    them" (its playbook frees a bank lot when asked); their own lists still say the bank is taken. Smoke v15: all 8
+    leave-free lines named a water tower with water never short (e.g. 125 of 250): the near_homes list ranks every
+    roadside lot by the homes around it."""
+    if purpose not in SUPPLY_OF:
         return True
-    name, supply = BANK_SUPPLY[purpose]
+    supply, bank = SUPPLY_OF[purpose]
     m = w.metrics()
-    return name in _bank_needed(w) or m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
+    return bank in _bank_needed(w) or m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
 
 
 def dept_lists(env) -> dict[str, dict[str, SiteList]]:
@@ -1183,12 +1200,12 @@ def land_fix(w, dept: str, purpose: str) -> str:
 
 def funded_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     """`dept`'s cheapest ready primary first building(s) on a lot (Price.first; SUPPLEMENTARY, PER_TILE and road-tile
-    sites such as bus stops skipped; a pump or outlet only while _bank_wanted), all on a tie, when its funds cover
-    them (a top-up this month counts): purpose -> price; else {}. Planning's leave-free line names them and a zone
-    that takes their last site warns. Smoke v14 seed 0, months 3-6: the mayor funded fire, health and education for
-    their ready sites near homes, planning zoned those lots on its turn, and none of them built."""
+    sites such as bus stops skipped; a utilities building only while _wanted), all on a tie, when its funds cover
+    them (a top-up this month counts): purpose -> price; else {}. Planning's leave-free line names them (claim_spots)
+    and a zone that leaves one no site warns. Smoke v14 seed 0, months 3-6: the mayor funded fire, health and
+    education for their ready sites near homes, planning zoned those lots on its turn, and none of them built."""
     prices = {p: pr for p, pr in ready_prices(w, dept, lists).items()
-              if pr.first and not pr.per_tile and _bank_wanted(w, p) and _on_lot(w, lists[p].sites[0])}
+              if pr.first and not pr.per_tile and _wanted(w, p) and _on_lot(w, lists[p].sites[0])}
     low = cheapest(prices)
     return {} if low is None or short_of(w.dept_funds[dept], low[1].cost) else {p: prices[p] for p in low[0]}
 
@@ -1197,22 +1214,58 @@ def _on_lot(w, site: dict) -> bool:
     return bool(w.struct[site["y"], site["x"]] == C.NONE and w.terrain[site["y"], site["x"]] == C.LAND)
 
 
-def funded_spots(w, depts: dict[str, dict[str, SiteList]]) -> list[tuple[str, tuple[int, int]]]:
-    """(building, best site) of each funded_firsts building, in turn order: planning's leave-free line names them and
-    its zone strips spare them (spare_funded)."""
-    return [(pr.building, (lists[p].sites[0]["x"], lists[p].sites[0]["y"]))
-            for d, lists in depts.items() for p, pr in funded_firsts(w, d, lists).items()]
+class Spot(NamedTuple):
+    dept: str
+    purpose: str
+    building: str               # Price.building
+    xy: tuple[int, int]         # the site (a multi-tile building's top-left tile)
+    size: tuple[int, int] = (1, 1)
+
+    @property
+    def tiles(self) -> set[tuple[int, int]]:
+        return {(self.xy[0] + i, self.xy[1] + j) for i in range(self.size[0]) for j in range(self.size[1])}
 
 
-def spare_funded(lists: dict[str, SiteList], spots: list[tuple[str, tuple[int, int]]]) -> dict[str, SiteList]:
-    """Planning's lists with its zone strips sparing the funded sites (funded_spots): strips covering none first, and
-    those covering some marked "leave": "(20,22) for the fire station" ("(10,18), (20,22) free" for several), as a
-    bank lot is kept for pump / sewage.
-    Planning zones what it is suggested: next to "leave free (funded): fire station (20,22)", its best zone_R strip
-    was (20,20)-(21,22)."""
+def funded_sites(w, depts: dict[str, dict[str, SiteList]]) -> dict[tuple[str, str], tuple[Price, list]]:
+    """(department, purpose) -> price and ready sites (x, y) of each funded_firsts building, in turn order."""
+    return {(d, p): (pr, [(s["x"], s["y"]) for s in lists[p].sites])
+            for d, lists in depts.items() for p, pr in funded_firsts(w, d, lists).items()}
+
+
+def claim_spots(funded: dict[tuple[str, str], tuple[Price, list]], keep: dict | None = None) -> dict[tuple, Spot]:
+    """Each funded building's site (funded_sites), in turn order: its first one whose footprint no earlier claim
+    covers; none when every one is claimed. With `keep` (an earlier claim), a building whose claimed site is still
+    listed keeps it first. Smoke v15 seed 1, month 6: "leave free (funded): water tower (22,23), police station (34,25),
+    fire station (34,25), clinic (34,25), elementary school (34,25)", one lot for four buildings."""
+    taken, out = set(), {}
+    order = [k for k in funded if keep and k in keep and keep[k].xy in funded[k][1]]
+    for k in order + [k for k in funded if k not in order]:
+        pr, sites = funded[k]
+        for xy in sites:
+            spot = Spot(*k, pr.building, xy, pr.size)
+            if not spot.tiles & taken:
+                taken |= spot.tiles
+                out[k] = spot
+                break
+    return {k: out[k] for k in funded if k in out}
+
+
+def funded_spots(w, depts: dict[str, dict[str, SiteList]]) -> list[Spot]:
+    """Each funded building's claimed site (claim_spots): planning's leave-free line names them and its zone strips
+    spare them (spare_funded)."""
+    return list(claim_spots(funded_sites(w, depts)).values())
+
+
+def spare_funded(lists: dict[str, SiteList], spots: list[Spot]) -> dict[str, SiteList]:
+    """Planning's lists with its zone strips sparing the funded sites (funded_spots, whole footprints): strips covering
+    none first, and those covering some marked "leave": "(20,22) for the fire station" ("(10,18), (20,22) free" for
+    several), as a bank lot is kept for pump / sewage. Planning zones what it is suggested: next to "leave free
+    (funded): fire station (20,22)", its best zone_R strip was (20,20)-(21,22)."""
     keep = {}
-    for b, xy in spots:
-        keep.setdefault(xy, []).append(b)
+    for sp in spots:
+        keep.setdefault(sp.xy, (set(), []))
+        keep[sp.xy][0].update(sp.tiles)
+        keep[sp.xy][1].append(sp.building)
     if not keep:
         return lists
     out = dict(lists)
@@ -1221,9 +1274,10 @@ def spare_funded(lists: dict[str, SiteList], spots: list[tuple[str, tuple[int, i
             continue
         marked = []
         for s in lst.sites:
-            hit = [xy for xy in keep if s["x1"] <= xy[0] <= s["x2"] and s["y1"] <= xy[1] <= s["y2"]]
+            hit = [xy for xy, (tiles, _) in keep.items()
+                   if any(s["x1"] <= x <= s["x2"] and s["y1"] <= y <= s["y2"] for x, y in tiles)]
             where = ", ".join(f"({x},{y})" for x, y in hit)
-            marked.append({**s, "leave": f"{where} for the {', '.join(keep[hit[0]])}" if len(hit) == 1 else
+            marked.append({**s, "leave": f"{where} for the {', '.join(keep[hit[0]][1])}" if len(hit) == 1 else
                            f"{where} free"} if hit else s)          # several: the leave-free line names them
         out[p] = lst._replace(sites=sorted(marked, key=lambda s: "leave" in s))
     return out
@@ -1555,53 +1609,63 @@ class ToolBox:
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
 
     def _funded_sites(self) -> dict[tuple[str, str], tuple[Price, list[tuple[int, int]]]]:
-        """(department, purpose) -> price and ready sites of each funded_firsts building, kept until an action
-        succeeds: a zone's warning, planning's find_sites zone_* and a failed zone's suggestions read it. Only
-        departments holding at least their cheapest priced first building's price get an observation."""
+        """funded_sites, kept until an action succeeds: a zone's warning, planning's find_sites zone_* and a failed
+        zone's suggestions read it. Only departments holding at least their cheapest priced first building's price
+        get an observation. {} on any error: it is advice, and a zone must never fail for it."""
         if self._funded is not None:
             return self._funded
-        w, out = self.world, {}
-        for d in DEPARTMENTS:
-            low = min((pr.cost for p in SITE_PURPOSES[d] if p not in SUPPLEMENTARY
-                       and (pr := site_price(w, d, p)) and pr.first and not pr.per_tile), default=None)
-            if d not in self.env.roles or low is None or short_of(w.dept_funds[d], low):
-                continue
-            lists = site_lists(w, d, role_obs(self.env, d))
-            for p, pr in funded_firsts(w, d, lists).items():
-                out[d, p] = (pr, [(s["x"], s["y"]) for s in lists[p].sites])
-        self._funded = out
-        return out
+        w, lists = self.world, {}
+        try:
+            for d in DEPARTMENTS:
+                low = min((pr.cost for p in SITE_PURPOSES[d] if p not in SUPPLEMENTARY
+                           and (pr := site_price(w, d, p)) and pr.first and not pr.per_tile), default=None)
+                if d in self.env.roles and low is not None and not short_of(w.dept_funds[d], low):
+                    lists[d] = site_lists(w, d, role_obs(self.env, d))
+            self._funded = funded_sites(w, lists)
+        except Exception:
+            self._funded = {}
+        return self._funded
 
-    def _funded_spots(self) -> list[tuple[str, tuple[int, int]]]:
-        """funded_spots from _funded_sites(): each funded building and its best site."""
-        return [(pr.building, sites[0]) for pr, sites in self._funded_sites().values()]
+    def _funded_spots(self) -> list[Spot]:
+        """funded_spots from _funded_sites(): each funded building's claimed site."""
+        return list(claim_spots(self._funded_sites()).values())
 
     def _funded_warning(self, before: dict, bank: bool = False) -> str:
-        """A warning for a zone action that took the last ready site(s) of a funded department's cheapest first
-        building (`before`: _funded_sites() before it), naming a taken site to dezone; pump and outlet left to the
-        riverbank warning when it fired (`bank`). Smoke v14 seed 0, months 3-6: planning zoned the lots near homes the
-        mayor had just funded fire, health and education to build on."""
-        w, after, hit, where = self.world, {}, [], []
-        for (d, p), (pr, sites) in before.items():
-            if bank and p in BANK_SUPPLY:
-                continue
-            if d not in after:
-                after[d] = site_lists(w, d, role_obs(self.env, d))
-            taken = [xy for xy in sites if w.struct[xy[1], xy[0]] in C.ZONES]
-            if after[d][p].sites or not taken:            # a site left, or not this zoning's doing
-                continue
-            own, near = f"{d}'" + "s" * (not d.endswith("s")), " near homes" * ((d, p) in NEAR_NEED)
-            hit.append((f"{own} {pr.building}{near}", d, money(math.floor(w.dept_funds[d]))))
-            xy = f"({taken[0][0]},{taken[0][1]})"
-            where += [xy] * (xy not in where)
-        if not hit:
+        """A warning for a zone action that took a claimed site (claim_spots of `before`, _funded_sites() before it)
+        and so left a funded building no unclaimed site (buildings keep their claims where they can), naming the
+        taken sites to dezone; pump and outlet left to the riverbank warning when it fired (`bank`). "" on any error.
+        Smoke v14 seed 0, months 3-6: planning zoned the lots near homes the mayor had just funded fire, health and
+        education to build on; v15 seed 1, month 6: four buildings named one lot, and with the rest zoned no warning
+        came (each still had a site)."""
+        try:
+            w = self.world
+            was = claim_spots(before)
+            taken = [sp.xy for sp in was.values() if any(w.struct[y, x] in C.ZONES for x, y in sp.tiles)]
+            if not taken:                                 # no claimed site zoned: not this zoning's doing
+                return ""
+            after, lists = {}, {}
+            for (d, p), (pr, _) in before.items():
+                if d not in lists:
+                    lists[d] = site_lists(w, d, role_obs(self.env, d))
+                after[d, p] = (pr, [(s["x"], s["y"]) for s in lists[d][p].sites])
+            now = claim_spots(after, keep=was)
+            hit = [(sp, (d, p)) for (d, p), sp in was.items() if (d, p) not in now and not (bank and p in BANK_TOP_UP)]
+            if not hit:
+                return ""
+            where = list(dict.fromkeys([sp.xy for sp, _ in hit if sp.xy in taken] + taken))[:len(hit)]
+            names = []
+            for sp, (d, p) in hit:
+                own, near = f"{d}'" + "s" * (not d.endswith("s")), " near homes" * ((d, p) in NEAR_NEED)
+                names.append((f"{own} {sp.building}{near}", d, money(math.floor(w.dept_funds[d]))))
+            if len(names) == 1:                           # several: each with what it holds, kept short
+                what = f"{names[0][0]} ({names[0][1]} holds {names[0][2]} for it)"
+            else:
+                items = [f"{b} ({held} held)" for b, _, held in names]
+                what = ", ".join(items[:-1]) + " and " + items[-1]
+            return (f" WARNING: that zoned the last site for {what}: dezone one, e.g. "
+                    f"{' or '.join(f'({x},{y})' for x, y in where)}")
+        except Exception:
             return ""
-        if len(hit) == 1:                                 # several: each with what it holds, kept short
-            what = f"{hit[0][0]} ({hit[0][1]} holds {hit[0][2]} for it)"
-        else:
-            items = [f"{b} ({held} held)" for b, _, held in hit]
-            what = ", ".join(items[:-1]) + " and " + items[-1]
-        return f" WARNING: that zoned the last site for {what}: dezone one, e.g. {' or '.join(where)}"
 
     def _explain(self, name: str, args: dict, message: str) -> str:
         """How to fix a failed build_road, zone or dezone, appended to the core message in the tool result (v8, seed 0
@@ -1623,7 +1687,8 @@ class ToolBox:
                 tiles = _rect(w, args)
             except Exception:
                 return ""
-            beside = _zone_beside(w, tiles, [xy for _, xy in self._funded_spots()]) if name == "zone" else []
+            beside = _zone_beside(w, tiles, [t for sp in self._funded_spots() for t in sp.tiles]) if name == "zone" \
+                else []
             return f" - {_contents(w, tiles)}" + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
         if name != "build_road":
             return ""

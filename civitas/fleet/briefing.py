@@ -200,15 +200,17 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
 
 
 def _leave_line(spots: list) -> list[str]:
-    """Planning's line naming what funded departments are about to build (funded_spots) and where, cut at
-    BLOCKED_LINE_CHARS: "- leave free (funded): fire station (12,23), clinic (20,27): zone around them". Smoke v14
-    seed 0, months 3-6: the mayor funded fire, health and education for their ready sites near homes, planning (acting
-    next) zoned those lots, and they read "nothing needs it right now" at coverage 0; fire held $2,500 to month 12."""
-    found = [f"{b} ({x},{y})" for b, (x, y) in spots]
+    """Planning's line naming what funded departments are about to build and where (funded_spots, each its own site):
+    "- leave free (funded): fire station (12,23), clinic (20,27): zone around them"; past BLOCKED_LINE_CHARS whole
+    items drop from the end, counted ("(+2 more)"). Smoke v14 seed 0, months 3-6: the mayor funded fire, health and
+    education for their ready sites near homes, planning (acting next) zoned those lots, and they read "nothing needs it
+    right now" at coverage 0; fire held $2,500 to month 12. v15 seed 0, month 9: cut mid-word at 240 ("zone arou")."""
+    found = [f"{sp.building} ({sp.xy[0]},{sp.xy[1]})" for sp in spots]
     if not found:
         return []
     head, tail = "- leave free (funded): ", ": zone around them"
-    return [head + cut(", ".join(found), BLOCKED_LINE_CHARS - len(head + tail)) + tail]
+    line = lambda n: head + ", ".join(found[:n]) + (f" (+{len(found) - n} more)" if n < len(found) else "") + tail
+    return [next((line(n) for n in range(len(found), 1, -1) if len(line(n)) <= BLOCKED_LINE_CHARS), line(1))]
 
 
 def _land_line(env, depts: dict) -> list[str]:
