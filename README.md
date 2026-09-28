@@ -136,6 +136,9 @@ civitas bench -c configs/arcee.toml --seeds 0-4 --workers 3
 civitas bench -c configs/eval_planning.toml --seeds 0-4
 civitas bench -c configs/eval_planning.toml --seeds 0-4 --agent planning=llm:arcee/trinity-mini   # compare models
 
+# the fleet reference: the scripted baselines played through the fleet tools on the fleet's settings (free)
+civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5
+
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
 
@@ -144,6 +147,9 @@ Baseline reference (all scripted, seeds 0–4): **city 77.5 ± 1.5**, mayor 88.1
 population ≈ 14.5k, no bankruptcies, ~4–5 s per game (seeds 5–9: city 75.9 ± 0.8). `noop` and
 `random` line-ups score 0. Building tiers changed these numbers. Just before tiers were
 added, the same baseline scored city 78.1 ± 1.8 with population ≈ 14.7k.
+Acting every 3 months, as the fleet configs do, the same agents reach city 67.0 ± 2.8 and
+population ≈ 7.3k; `configs/fleet_scripted.toml` plays them through the fleet tools and
+scores exactly that (see [Agent fleets](#agent-fleets), "Scripted fleet").
 The scripted agents leave obvious room: they never use districts, mixed use, historic
 listings or soil clean-up, rarely use policies or funding levels, build services by simple
 coverage rules, hoard money late in the game and never make neighbour deals.
@@ -645,6 +651,66 @@ any ready site they should send at most one request and end the turn.
 leaderboard groups fleet runs by signature and `fleet_version` (shown in its own column). The
 signature reads `role=fleet:<model> ... [mode]`.
 
+**Scripted fleet.** `model = "scripted"` makes a fleet agent play the role's scripted
+baseline (`agents/scripted.py`) through the fleet tools instead of calling a model
+(`fleet/scripted.py`). It costs nothing and runs a 120-month game in about 5 s (10 s acting
+monthly). Each turn:
+
+- it gets the briefing (logged as the turn's first message, like a model's);
+- it reads what the policy needs with look-ups on top of `role_obs()`: `map_overview` for
+  the departments that read the map, `get_messages` for the mayor's council requests;
+- it runs the scripted decision as tool calls, arguments sent as JSON text. The mayor first
+  writes its working balances into the plan with `update_plan` (goals, a budget and a
+  priority per department). Each action is one call (a duplicate allocation the policy
+  means is repeated with `confirm: true`), then come `send_message`, `update_memory` (open
+  requests, one lesson per kind of failed action) and `end_turn` with a report.
+
+`configs/fleet_scripted.toml` plays all eight roles with the game settings of
+`fleet_trinity.toml` (120 months, `act_every = 3`). `--agent police=fleet:scripted` puts
+one scripted fleet role into any line-up, for example an LLM fleet department with scripted
+colleagues that talk to it through the same plan, messages and reports.
+
+It plays exactly as the scripted baselines: on seeds 0–4, at both cadences, every turn
+has the same actions, results, costs and council messages
+(`tests/test_fleet_scripted.py` checks a 24-month game). The tool layer changes nothing
+for these policies.
+
+| seeds 0–4, 120 months | city | population | mayor | planning | utilities | transport | police | fire | health | education |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| monthly: `baseline.toml`, or `fleet_scripted.toml --set game.act_every=1` | 77.5 ± 1.5 | 14,466 | 88.1 | 68.4 | 89.4 | 75.9 | 74.9 | 85.7 | 86.6 | 83.2 |
+| every 3 months: `fleet_scripted.toml`, or `baseline.toml --set game.act_every=3` | 67.0 ± 2.8 | 7,319 | 84.3 | 65.1 | 88.7 | 92.3 | 74.5 | 83.8 | 85.5 | 70.0 |
+
+So compare a fleet with 67.0, not the monthly 77.5. The 10.5 points are the quarterly
+cadence, since the scripted policies do about a month's work per turn:
+
+- **Planning** lays about one road and up to three zone strips per type a turn. It built 18
+  road segments and 160 zone strips instead of 46 and 311, and spent $9.6k instead of $31k.
+- **The mayor** reads only the requests posted the month before its turn. At `act_every =
+  3` that is none of the 146 that departments sent (monthly: 529 of 531).
+- **Money:** the mayor moved $166k to departments instead of $435k. Police and education
+  asked for their first building from month 6–9 and built it in months 33–48 and 39–63
+  (monthly: 34–40 and 35–48, the baseline's own slow start).
+- **Transport** scores higher (92.3) because it spends little in a smaller city.
+
+What the runs showed about the tools:
+
+- No guard fired. The policies never bulldoze or demolish, and never send the same
+  allocation twice.
+- There were no tool errors, no result was trimmed, and briefings stayed under 4,700
+  characters for all 120 months.
+- All 47 "zone beside it instead" suggestions after a failed zone worked when applied.
+- Both funded-site warnings were right. A zone took utilities' only sewage-outlet lot, and
+  sewage coverage then fell to 81–85% for months (the scripted planner doesn't read
+  results).
+- No briefing said "can't pay" on a turn the policy built something, and none said "no
+  site" for a building the policy then built, except once: health's policy falls back to a
+  clinic lot for a landfill when, as the briefing said, no lot away from homes is left.
+- The coaching hints are noisy on a long game. The idle rule fired for 6 or 7 departments
+  per run. That covers departments waiting for money they asked for every turn (police
+  held $1,494–2,436 against a $2,500 station in months 6–33 of seed 0) and departments with
+  nothing left to do (fire at 83–98% coverage). Planning's repeated failures (a plaza spot
+  off the road, zones and parks on taken land) gave 3–4 repeated-failure hints per run.
+
 **Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
 next to its summary. They contain:
 
@@ -847,7 +913,6 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 
 **Not built yet:**
 
-- a scripted fleet that plays through the tools (the scripted baselines still read the observation)
 - fleets in region mode (a fleet agent refuses a region game)
 - supervised scheduling (pause, edit the playbook, resume)
 - a viewer panel for tool traces (the Agents tab shows a fleet turn's briefing, the model's reasoning and its end-of-turn report, or its last reply when it never called `end_turn`; the full trace is in `trajectories.jsonl`)
@@ -878,13 +943,15 @@ civitas/
   core/       env.py (the hub) · region.py (2-6 linked cities) · observation.py · actions.py · council.py · roles.py · decision.py
   agents/     llm.py · llm_client.py · prompts.py · scripted.py · remote.py · base.py (noop, random)
   bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard)
-  fleet/      agent.py (ToolAgent tool loop) · tools.py · briefing.py · memory.py (plan, memory, history) · config.py · report.py · fmt.py
+  fleet/      agent.py (ToolAgent tool loop) · scripted.py (the scripted baselines through the tools) · tools.py · briefing.py
+              · memory.py (plan, memory, history) · config.py · report.py · fmt.py
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
               · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
   cli.py      civitas run | bench | serve | leaderboard | prompt | check-llm
 configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
+              · fleet_scripted
 docs/         MECHANICS.md (the design roadmap and what is implemented)
 examples/     remote_agent.py · rl_loop.py · export_sft.py
 tests/
@@ -903,7 +970,7 @@ on month 0. It's the fastest way to iterate on prompts.
 6. `bench/scoring.py`: add a KPI function to `ROLE_SCORERS`.
 7. `agents/scripted.py`: add a baseline to `SCRIPTED`, and let the scripted mayor fund it.
 8. Viewer: give new buildings a character in `catalog.CHAR`, a model in `scene.js` (`_buildSpecial`), a sprite recipe in `recipes.js` (`special`), and entries in `NAMES` / `MINI` in `app.js`; new map layers go in `World.frame_layers()` and `OVERLAYS` in `scene.js`.
-9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS` (tier names, or `OFF_TIER_SPECS` entries for prices outside the tier lines, listed in `PER_TILE` when charged per tile); list a priced purpose that is never the role's first build in `SUPPLEMENTARY`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both fleet configs.
+9. Fleet: add the role's `find_sites` purposes to `fleet/tools.py:SITE_PURPOSES` (`{}` if it places no buildings; gate locked ones in `SITE_UNLOCKS`; price each in `SITE_BUILDS` (tier names, or `OFF_TIER_SPECS` entries for prices outside the tier lines, listed in `PER_TILE` when charged per tile); list a priced purpose that is never the role's first build in `SUPPLEMENTARY`), its briefing metrics to `fleet/briefing.py:KEY_METRICS`, and the role to `UNLOCK_ROLES` for the milestone unlocks it uses. (`fleet/memory.py:DEPARTMENTS` follows `TURN_ORDER`.) Give it an `[agents.<role>]` block with a playbook in both LLM fleet configs, a `kind = "fleet"` block in `fleet_scripted.toml`, and its plan priority line in `fleet/scripted.py:PRIORITIES` (and a map look-up in `MAP_ROLES` if its scripted baseline reads the map).
 
 ## Ideas for next steps
 
