@@ -4,6 +4,9 @@ Endpoints
   GET  /api/runs                     list runs with status (running / finished / stopped / incomplete)
   GET  /api/runs/<id>/meta|summary   run metadata / final summary
   GET  /api/runs/<id>/frames?since=N replay frames from index N
+  GET  /api/runs/<id>/turns?month=M  every agent turn of month M: prompt / briefing, reasoning, reply (+ a
+                                     fleet turn's tool-call summary under "trace")
+  GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -30,7 +33,114 @@ VIEWER_DIR = Path(__file__).parent / "viewer"
 STALE_AFTER_S = 45 * 60      # a run with no new frame for this long is "incomplete"
 # kind[:provider/model], as `--agent role=...` takes it; fleet without a model keeps the config's
 AGENT_SPEC = re.compile(r"^(scripted|noop|random|(llm|fleet)(:[A-Za-z0-9._/-]+)?)$")
-from .core.roles import TURN_ORDER as ROLES  # noqa: E402
+from .core.roles import ROLES as ROLE_SPECS, TURN_ORDER as ROLES  # noqa: E402
+
+ACTIONS = {a for spec in ROLE_SPECS.values() for a in spec["actions"]}   # fleet tools that run a game action
+# how the runner writes a trajectory record's first keys; a line that doesn't start like this is parsed whole
+TURN_HEAD = re.compile(rb'\{"run_id": "(?:[^"\\]|\\.)*", "seed": [^,]*, "month": (-?\d+), "role": "((?:[^"\\]|\\.)*)"')
+
+
+def _turn_key(line: bytes) -> tuple[int, str] | None:
+    """(month, role) of one trajectories.jsonl line, from its head when it has the runner's key order."""
+    try:
+        m = TURN_HEAD.match(line)
+        if m:
+            return int(m.group(1)), json.loads(b'"' + m.group(2) + b'"')
+        rec = json.loads(line)
+        return int(rec["month"]), str(rec["role"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+class TurnIndex:
+    """Where each record of a run's trajectories.jsonl starts, by month and by (month, role), so a request reads
+    only the lines it returns. Built on a run's first request and extended as a live run appends (complete lines
+    only); a file that shrank or was replaced is indexed again, as is one whose record doesn't match its entry."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.files: dict[str, dict] = {}
+
+    def _update(self, path: Path, fresh: bool) -> dict:
+        st = path.stat()
+        ix = self.files.get(str(path))
+        if fresh or ix is None or ix["ino"] != st.st_ino or st.st_size < ix["end"]:
+            ix = self.files[str(path)] = {"ino": st.st_ino, "end": 0, "month": {}, "turn": {}}
+        if st.st_size > ix["end"]:
+            with open(path, "rb") as fh:
+                fh.seek(ix["end"])
+                pos = ix["end"]
+                for line in fh:
+                    if not line.endswith(b"\n"):     # still being written
+                        break
+                    key = _turn_key(line)
+                    if key is not None:
+                        ix["month"].setdefault(key[0], []).append(pos)
+                        ix["turn"].setdefault(key, pos)
+                    pos += len(line)
+                ix["end"] = pos
+        return ix
+
+    def records(self, path: Path, month: int, role: str | None = None) -> list[dict]:
+        """Month `month`'s records in file order, or just `role`'s turn (a list of at most one)."""
+        if not path.exists():
+            return []
+        for fresh in (False, True):
+            with self.lock:
+                ix = self._update(path, fresh)
+                offs = list(ix["month"].get(month, [])) if role is None else \
+                    [ix["turn"][(month, role)]] if (month, role) in ix["turn"] else []
+            out = []
+            with open(path, "rb") as fh:
+                for off in offs:
+                    fh.seek(off)
+                    try:
+                        out.append(json.loads(fh.readline()))
+                    except ValueError:
+                        out.append(None)
+            if all(isinstance(r, dict) and r.get("month") == month and role in (None, r.get("role")) for r in out):
+                return out
+        return [r for r in out if isinstance(r, dict) and r.get("month") == month and role in (None, r.get("role"))]
+
+
+def trace_call(n: int, call: dict) -> dict:
+    """One tool_trace entry for the viewer: parsed args, whether it is a game action and ran, and its outcome:
+    ok, failed (a failed action or a tool error), refused (a repeated failed call or a guard) or repeat (a look-up
+    answered with an earlier result). `n` counts from 1, as the tools' "same as call N" notes do."""
+    res = call.get("result") if isinstance(call.get("result"), dict) else {}
+    args = call.get("args")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            pass                                    # the raw text the model sent
+    tool = str(call.get("tool") or "")
+    outcome = ("refused" if "refused" in res else "repeat" if "repeat" in res else
+               "failed" if res.get("ok") is False else "ok")
+    text = str(res.get("error") or res.get("message") or "")
+    if outcome == "repeat":
+        text = str(res["repeat"]) + (f": {text}" if text else "")
+    out = {"n": n, "step": call.get("step"), "tool": tool, "args": args, "action": tool in ACTIONS,
+           "ran": tool in ACTIONS and "message" in res and "refused" not in res, "outcome": outcome, "text": text,
+           "finish_reason": call.get("finish_reason")}
+    out.update({k: res[k] for k in ("cost", "budget_left", "refused") if k in res})
+    return out
+
+
+def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
+    """Counts for a fleet turn's header: calls, actions that ran (and failed), tool errors, refusals, repeats,
+    money spent, model replies and how the turn ended."""
+    if calls is None:
+        calls = [trace_call(i + 1, c) for i, c in enumerate(rec.get("tool_trace") or [])]
+    ran = [c for c in calls if c["ran"]]
+    count = lambda outcome, cs=calls: sum(c["outcome"] == outcome for c in cs)
+    return {"calls": len(calls), "actions": len(ran), "failed_actions": count("failed", ran),
+            "errors": sum(c["outcome"] == "failed" and not c["ran"] for c in calls),
+            "refused": count("refused"), "repeats": count("repeat"),
+            "spent": round(sum(float(c.get("cost") or 0) for c in ran if c["outcome"] == "ok"), 2),
+            "model_calls": len(rec.get("finish_reasons") or []), "finish_reason": rec.get("finish_reason"),
+            "ended": rec.get("ended"), "length_stops": rec.get("length_stops") or 0,
+            "recovered_calls": rec.get("recovered_calls") or 0}
 
 
 class Launcher:
@@ -149,6 +259,8 @@ class Launcher:
 
 
 def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
+    index = TurnIndex()
+
     class Handler(SimpleHTTPRequestHandler):
         extensions_map = {**SimpleHTTPRequestHandler.extensions_map, ".js": "text/javascript",
                           ".mjs": "text/javascript", ".css": "text/css"}
@@ -215,26 +327,34 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                     if parts[3] == "turns":         # full LLM traces for one month
                         month = int(q.get("month", ["0"])[0])
                         out = []
-                        f = d / "trajectories.jsonl"
-                        if f.exists():
-                            with open(f) as fh:
-                                for line in fh:
-                                    if f'"month": {month},' not in line:
-                                        continue
-                                    t = json.loads(line)
-                                    if t.get("month") != month:
-                                        continue
-                                    prompt = t.get("prompt") or []
-                                    fleet = str(t.get("agent", "")).startswith("fleet:")   # briefing = 1st user msg
-                                    user = next((m["content"] for m in (prompt if fleet else reversed(prompt))
-                                                 if m.get("role") == "user"), t.get("observation_text", ""))
-                                    out.append({"role": t["role"], "agent": t.get("agent"), "reward": t.get("reward"),
-                                                "response": (t.get("response") or "")[:20000],
-                                                "reasoning": (t.get("reasoning") or "")[:40000],
-                                                "observation": (user or "")[:30000], "usage": t.get("usage"),
-                                                "latency_s": t.get("latency_s"), "finish_reason": t.get("finish_reason"),
-                                                "notes": t.get("notes")})
+                        for t in index.records(d / "trajectories.jsonl", month):
+                            prompt = t.get("prompt") or []
+                            fleet = str(t.get("agent", "")).startswith("fleet:")   # briefing = 1st user msg
+                            user = next((m["content"] for m in (prompt if fleet else reversed(prompt))
+                                         if m.get("role") == "user"), t.get("observation_text", ""))
+                            out.append({"role": t["role"], "agent": t.get("agent"), "reward": t.get("reward"),
+                                        "response": (t.get("response") or "")[:20000],
+                                        "reasoning": (t.get("reasoning") or "")[:40000],
+                                        "observation": (user or "")[:30000], "usage": t.get("usage"),
+                                        "latency_s": t.get("latency_s"), "finish_reason": t.get("finish_reason"),
+                                        "notes": t.get("notes"),
+                                        **({"trace": trace_summary(t)} if "tool_trace" in t else {})})
                         return self._json(out)
+                    if parts[3] == "trace":         # one fleet turn's tool calls
+                        try:
+                            month, role = int(q["month"][0]), q["role"][0]
+                        except (KeyError, ValueError):
+                            return self._json({"error": "trace needs ?month=<int>&role=<role>"}, 400)
+                        recs = index.records(d / "trajectories.jsonl", month, role)
+                        if not recs:
+                            return self._json({"error": f"no turn for {role} in month {month}"}, 404)
+                        t = recs[0]
+                        if "tool_trace" not in t:
+                            return self._json({"error": f"{role}'s month-{month} turn has no tool trace "
+                                                        f"(agent {t.get('agent')})"}, 404)
+                        calls = [trace_call(i + 1, c) for i, c in enumerate(t.get("tool_trace") or [])]
+                        return self._json({"run_id": d.name, "month": month, "role": role, "agent": t.get("agent"),
+                                           "summary": trace_summary(t, calls), "calls": calls})
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []

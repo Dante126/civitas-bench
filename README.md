@@ -64,7 +64,10 @@ Everything happens in the browser from here. You can:
   automatically.
 - **See why things happen.** The Agents tab shows each month's decisions with ✓/✗
   results. Click an action to fly the camera to where it happened. For LLM agents you
-  can expand the model's full reasoning, its raw reply and the exact prompt it saw. The
+  can expand the model's full reasoning, its raw reply and the exact prompt it saw. A fleet
+  turn also has a **Tool calls** panel: every call in order with its arguments, outcome (ok,
+  failed, refused or repeat), cost and result, one line each (click one to expand it), under
+  a header counting calls, actions, failures and how the turn ended. The
   Events tab starts with what residents complain about this month.
 - **Inspect** any tile by clicking it: stats, services, wealth or industry type, its
   building level over time, and which agent zoned or built it.
@@ -667,7 +670,10 @@ A hint fires on any of these:
 
 `summary.json` gets a `fleet` entry with the report name and the number of hints. In
 `trajectories.jsonl`, each fleet turn carries its full `tool_trace` (tool, arguments and a
-slim result) along with the messages, reasoning, token usage and finish reasons.
+slim result) along with the messages, reasoning, token usage and finish reasons. The viewer's
+Agents tab shows the trace in each fleet turn's Tool calls panel, fetched when the panel is
+opened from `GET /api/runs/<id>/trace?month=M&role=R` (the server keeps an index of where each
+turn starts in the file).
 
 **First smoke runs** (2026-09-25, `fleet_smoke.toml`, seed 0) took 9–11 minutes for 32
 turns. Three runs (v2–v4) used revised playbooks on intermediate code, as the fixes from
@@ -851,7 +857,6 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
 - fleets in region mode (a fleet agent refuses a region game)
 - supervised scheduling (pause, edit the playbook, resume)
-- a viewer panel for tool traces (the Agents tab shows a fleet turn's briefing, the model's reasoning and its end-of-turn report, or its last reply when it never called `end_turn`; the full trace is in `trajectories.jsonl`)
 
 ### Output files (`runs/<run_id>/`)
 
