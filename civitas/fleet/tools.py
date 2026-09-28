@@ -56,8 +56,13 @@ ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolis
 # don't) -> their name in a refusal
 LINKS = {C.TRAIN: "train station", C.HARBOUR: "harbour", C.AIRPORT: "airport"}
 LINK_OWNERS = {r for r, owned in OWNED_STRUCTS.items() if owned & set(LINKS)}     # roles whose demolish takes one
-# guarded action -> what its refusal and confirm parameter say the roads would be cut off from
+# guarded action that removes roads or links -> what its refusal and confirm parameter say they'd be cut off from
 CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
+# guarded action -> its confirm parameter's description
+CONFIRM = {**{a: f"true only to repeat a {a} refused for cutting roads off the {c}, once you are sure"
+              for a, c in CUT_FROM.items()},
+           "allocate_budget": "true only to repeat an allocation refused because the same one already ran this turn "
+                              "and you mean to add it again (allocations add up)"}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -301,8 +306,7 @@ def _action_tool(name: str, doc: tuple[str, str], fn: Callable, confirm: bool = 
         props["tier"] = dict(_TIER_PARAM)
     props.update(_EXTRA_PARAMS.get(name, {}))
     if confirm:
-        props["confirm"] = {"type": "boolean", "description": f"true only to repeat a {name} refused for cutting "
-                            f"roads off the {CUT_FROM[name]}, once you are sure"}
+        props["confirm"] = {"type": "boolean", "description": CONFIRM[name]}
     return Tool(name, text, fn, props, strict=False)
 
 
@@ -363,9 +367,19 @@ def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
 
 
 def guarded(role: str, action: str) -> bool:
-    """Whether `role`'s `action` is refused when it would cut roads off (confirm: true lets it run): a bulldoze, and
-    a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS)."""
-    return action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
+    """Whether `role`'s `action` can be refused before it runs (confirm: true lets it run): a bulldoze, and a
+    demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would cut
+    roads off; the mayor's allocate_budget identical to one that succeeded this turn."""
+    return (action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
+            or (action == "allocate_budget" and role == "mayor"))
+
+
+def _allocation(p: dict) -> tuple[str, float] | None:
+    """An allocate_budget's department and amount as actions.allocate_budget reads them; None if it can't."""
+    try:
+        return str(p.get("department", "")).lower(), float(p["amount"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -1135,8 +1149,9 @@ class ToolBox:
         without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
         until something changes: a successful action (or plan update) for look-ups, a successful action for failed
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
-        roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
-        before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
+        roads off the highway, transport's demolish of their only station / harbour / airport link ("refused":
+        "disconnect"), or the mayor's allocate_budget identical to one that succeeded this turn ("refused":
+        "duplicate") is refused before it runs (not executed, logged or remembered as a failure) unless it passes
         confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
         result notes that map_overview shows the whole map (only the count when its radius note says so), until
         map_overview runs; the note isn't cached, so a repeat comes without it."""
@@ -1266,9 +1281,10 @@ class ToolBox:
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
         if not args.pop("confirm", False) and guarded(self.role, name):
-            refusal = self._disconnect_refusal(name, args)
+            kind, refusal = (("duplicate", self._duplicate_refusal(args)) if name == "allocate_budget"
+                             else ("disconnect", self._disconnect_refusal(name, args)))
             if refusal:
-                return {"ok": False, "refused": "disconnect", "error": refusal}
+                return {"ok": False, "refused": kind, "error": refusal}
         bank = free_bank(self.world) if name == "zone" else None
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         self.executed.append(res)
@@ -1309,6 +1325,22 @@ class ToolBox:
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
         return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
                 f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
+
+    def _duplicate_refusal(self, args: dict) -> str | None:
+        """Why an allocate_budget (guarded()) must not run: one with the same department and amount, as the handler
+        reads them, succeeded this turn. Allocations add up and a success clears the repeat cache (v10 seed 0:
+        utilities +$5,500 and health +$2,000 twice; v12 seed 0 month 3: a batch of three sent three times; the
+        treasury drained and loans followed). None for another amount or department, a negative or zero amount
+        (taking money back again is fine), a retry of one that failed, and bad arguments (the action reports
+        those)."""
+        key = _allocation(args)
+        if key is None or key[1] <= 0 or not any(r["ok"] and r["action"].get("type") == "allocate_budget"
+                                                 and _allocation(r["action"]) == key for r in self.executed):
+            return None
+        dept, amount = key
+        return (f"you already moved {money(amount)} to {dept} this turn (it now has "
+                f"{money(self.world.dept_funds[dept])}); allocations add up - repeat with confirm: true only to add it "
+                "again")
 
     def _bank_warning(self, before: np.ndarray) -> str:
         """A warning for a zone action that took the last free riverbank lots beside roads (`before`: free_bank()

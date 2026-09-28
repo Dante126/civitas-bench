@@ -486,7 +486,10 @@ tasks and money, and to let people coach it.
   first or repeat with `confirm: true`. Transport's `demolish` of a train station, harbour or
   airport that is some roads' only link to the region (metro stations don't link) is refused
   the same way; the refusal suggests asking planning for a road to the highway or building
-  another link first. A `zone` that takes the last free riverbank lot beside the connected
+  another link first. The mayor's `allocate_budget` identical to one that already succeeded
+  this turn (same department and amount; allocations add up) is refused too
+  (`refused: "duplicate"`), naming what the department now holds; other amounts and taking
+  money back pass. A `zone` that takes the last free riverbank lot beside the connected
   roads while the city still has no pump or water tower, or no sewage outlet / treatment
   plant, succeeds, with a warning naming what utilities still needs the bank for.
 

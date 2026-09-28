@@ -1460,6 +1460,69 @@ def test_demolishing_an_airport_checks_the_whole_building_and_other_links(monkey
     assert box.call("demolish", {"x": 30, "y": 30})["message"].startswith("no transport facility at (30,30)")
 
 
+def test_a_repeated_allocation_in_one_turn_is_refused_until_confirmed():
+    """v12 seed 0, month 3: the mayor sent utilities +400, planning +1,112, health +2,000 three times in one turn
+    (v10 seed 0: utilities +5,500 and health +2,000 twice). Allocations add up and a success clears the repeat
+    cache, so nothing stopped it; the treasury drained and loans followed."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.report import _tool_error, turn_row
+    env = _env()
+    w = env.world
+    box = ToolBox(env, "mayor")
+    batch = [{"department": "utilities", "amount": 400}, {"department": "planning", "amount": 1112},
+             {"department": "health", "amount": 2000}]
+    for a in batch:
+        assert box.call("allocate_budget", a)["ok"]
+    funds, treasury = dict(w.dept_funds), w.treasury
+    assert funds["utilities"] == 400 and treasury == 30000 - 3512
+    refusal = lambda dept, amount: {"ok": False, "refused": "duplicate", "error": (
+        f"you already moved {amount} to {dept} this turn (it now has {amount}); allocations add up - repeat with "
+        "confirm: true only to add it again")}
+    again = ['{"amount": 400.0, "department": "Utilities"}', {"department": "planning", "amount": "1112"}, batch[2]]
+    trace = []
+    for args, (dept, amount) in zip(again, [("utilities", "$400"), ("planning", "$1,112"), ("health", "$2,000")]):
+        res = box.call("allocate_budget", args)                 # the same after the handler's normalisation
+        assert res == refusal(dept, amount), res
+        trace.append({"tool": "allocate_budget", "args": args, "result": _slim(res)})
+    assert box.call("allocate_budget", batch[0]) == refusal("utilities", "$400")    # checked, and refused, again
+    assert w.dept_funds == funds and w.treasury == treasury and box.n_calls == 7
+    assert len(box.executed) == 3 and box._failed == {}
+    assert len(FleetState.of(env).history(kind="action", months=12)) == 3
+    assert all(_tool_error(c) is None for c in trace)
+    assert turn_row({"role": "mayor", "month": 3, "tool_trace": trace})["refused"] == 3
+    props = lambda tool: next(s["function"]["parameters"]["properties"] for s in box.schemas()
+                              if s["function"]["name"] == tool)
+    assert props("allocate_budget")["confirm"]["type"] == "boolean"
+    assert "allocation" in props("allocate_budget")["confirm"]["description"]
+    assert "confirm" not in props("set_tax") and "confirm" not in props("take_loan")
+    res = box.call("allocate_budget", {**batch[0], "confirm": "true"})
+    assert res["ok"] and res["message"] == "transferred $400 to utilities (now $800)", res
+    assert box.executed[-1]["action"] == {**batch[0], "type": "allocate_budget"}   # confirm is not an action param
+    assert box.call("allocate_budget", batch[0])["error"].startswith(               # counts as moved: still refused
+        "you already moved $400 to utilities this turn (it now has $800);")
+
+
+def test_other_allocations_pass_the_duplicate_guard():
+    """Another amount or department, taking money back (a negative amount) again, and a retry of an allocation
+    that failed all run."""
+    env = _env()
+    w = env.world
+    box = ToolBox(env, "mayor")
+    ok = lambda dept, amount: box.call("allocate_budget", {"department": dept, "amount": amount})
+    assert ok("utilities", 400)["ok"]
+    for dept, amount in (("utilities", 500), ("fire", 400), ("utilities", -100), ("utilities", -100)):
+        res = ok(dept, amount)
+        assert res["ok"] and "refused" not in res, (dept, amount, res)
+    assert w.dept_funds["utilities"] == 700 and w.dept_funds["fire"] == 400
+    big = ok("health", 40000)
+    assert big["ok"] is False and "treasury only has" in big["error"]
+    assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]           # clears the failed-action cache
+    w.treasury = 50000
+    res = ok("health", 40000)
+    assert res["ok"] and "refused" not in res and w.dept_funds["health"] == 40000, res
+    assert len(box.executed) == 8
+
+
 def test_zoning_the_last_riverbank_lot_warns_while_a_pump_or_outlet_is_missing():
     env = _env()
     w = env.world
