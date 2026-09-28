@@ -326,13 +326,23 @@ def test_inspect_points_to_map_overview_from_the_4th_call_in_a_turn():
     box = ToolBox(env, "planning")
     for x in (4, 8, 12):
         box.call("inspect", {"x": x, "y": 24})
-    res = box.call("inspect", {"x": 16, "y": 24, "radius": 9})                        # joins the radius note
-    assert res["note"] == "radius 9 clipped to 4 (0-4); inspect several points to see more; " + note(4), res
+    res = box.call("inspect", {"x": 16, "y": 24, "radius": 9})                  # the radius note gives the advice
+    assert res["note"] == "radius 9 clipped to 4 (0-4); map_overview shows the whole map; inspect #4 this turn", res
     assert box.call("map_overview", {})["ok"]
     assert "note" not in box.call("inspect", {"x": 20, "y": 24}) and "note" not in box.call("inspect", {"x": 4, "y": 4})
     box = ToolBox(env, "planning")
     assert box.call("map_overview", {})["ok"]                                         # first: no note at all
     assert not any("note" in box.call("inspect", {"x": x, "y": 20}) for x in range(0, 40, 5))
+    box = ToolBox(env, "planning")                                                    # an off-map inspect counts
+    assert box.call("inspect", {"x": 99, "y": 24})["ok"] is False
+    assert ["note" in box.call("inspect", {"x": x, "y": 24}) for x in (4, 8)] == [False] * 2
+    assert box.call("inspect", {"x": 12, "y": 24})["note"] == note(4)
+    env.world.dept_funds["planning"] = 1000                                           # after a successful action an
+    box = ToolBox(env, "planning")                                                    # identical inspect runs again
+    assert ["note" in box.call("inspect", {"x": x, "y": 24}) for x in (4, 8, 12)] == [False] * 3
+    assert box.call("zone", {"zone": "R", "x1": 3, "y1": 25, "x2": 8, "y2": 25})["ok"]
+    res = box.call("inspect", {"x": 4, "y": 24})
+    assert "repeat" not in res and res["note"] == note(4), res
 
 
 CONDITIONAL_SITES = {"riverbank_2x2", "casino", "metro_station", "levee"}   # lists only there once unlocked / forecast

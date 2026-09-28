@@ -1005,8 +1005,8 @@ class ToolBox:
         roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
         before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
         confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
-        result notes that map_overview shows the whole map, until map_overview runs; the note isn't cached, so a
-        repeat comes without it."""
+        result notes that map_overview shows the whole map (only the count when its radius note says so), until
+        map_overview runs; the note isn't cached, so a repeat comes without it."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -1030,8 +1030,9 @@ class ToolBox:
             self._seen[key] = (self.n_calls, copy.deepcopy(res))     # callers may change the result they get
             self.looked[name] += 1
             if name == "inspect" and self.looked[name] > INSPECTS_FREE and not self.looked["map_overview"]:
-                note = f"inspect #{self.looked[name]} this turn: map_overview shows the whole map in one call"
-                res["note"] = f"{res['note']}; {note}" if res.get("note") else note
+                count = f"inspect #{self.looked[name]} this turn"
+                res["note"] = (f"{res['note']}; {count}" if res.get("note")     # a radius note names map_overview
+                               else f"{count}: map_overview shows the whole map in one call")
         elif name in ALL_ACTIONS:
             if res.get("ok"):
                 self._seen.clear()
@@ -1357,7 +1358,7 @@ class ToolBox:
         out = {"ok": True, "x": x, "y": y, "radius": r, "window": [x0, y0, x1, y1],
                "tiles": buildings + zones + ground, "empty_land": empty}
         if r != int(round(radius)):          # models ask for 10 or 20 to see more; say they got less
-            out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); inspect several points to see more"
+            out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); map_overview shows the whole map"
         return out
 
     def map_overview(self) -> dict:
