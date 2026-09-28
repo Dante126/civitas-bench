@@ -729,7 +729,8 @@ def test_map_block_names_the_road_lines():
     times ("every tile on that line is already road") and made 5.4 inspect calls a turn; the network was three
     lines, y=19, y=24 and x=19."""
     from civitas.fleet.tools import _connected_roads, map_facts, map_lines
-    w = _road_world((1, 24, 40, 24),                      # the main road, bridging the river at x 26-28
+    w = _road_world((1, 24, 47, 24),                      # the main road to the east edge, bridging the river
+                    (40, 25, 40, 47),                     # a street to the south edge
                     (19, 19, 19, 29), (3, 19, 25, 19),    # a cross street, and a road it links to the network
                     (5, 25, 5, 26), (7, 25, 7, 25),       # stubs of 2 and 1 tiles off the main road
                     (2, 40, 12, 40))                      # a road off the network
@@ -737,15 +738,16 @@ def test_map_block_names_the_road_lines():
     w.refresh()
     assert (w.terrain[24, 26:29] == C.WATER).all() and (w.struct[24, 26:29] == C.ROAD).all()
     f = map_facts(w)
-    main, cross = {"y": 24, "x": [0, 40]}, {"x": 19, "y": [19, 29]}
-    assert f["road_lines"] == [main, {"y": 19, "x": [3, 25]}, cross, {"x": 5, "y": [24, 26]}]   # 3 with its junction
+    main, cross = {"y": 24, "x": [0, 47]}, {"x": 19, "y": [19, 29]}
+    assert f["road_lines"] == [main, {"x": 40, "y": [24, 47]}, {"y": 19, "x": [3, 25]}, cross,
+                               {"x": 5, "y": [24, 26]}]                                       # 3 with its junction
     assert [ln for ln in f["road_lines"] if (19, 24) in _line_tiles(ln)] == [main, cross]      # a crossing: both
     named = set().union(*map(_line_tiles, f["road_lines"]))
     assert all(_connected_roads(w)[y, x] for x, y in named)
-    assert (7, 25) not in named and not any(y == 40 for _, y in named) and f["unconnected"]["tiles"] == 11
+    assert (7, 25) not in named and not named & {(x, 40) for x in range(2, 13)} and f["unconnected"]["tiles"] == 11
     lines = map_lines(f)
-    i = next(i for i, ln in enumerate(lines) if ln.startswith("- highway-connected roads: x 0-40, y 19-29, "))
-    assert lines[i + 1:i + 3] == ["- road lines: y=24 x 0-40; y=19 x 3-25; x=19 y 19-29; x=5 y 24-26",
+    i = next(i for i, ln in enumerate(lines) if ln.startswith("- highway-connected roads: x 0-47, y 19-47, "))
+    assert lines[i + 1:i + 3] == ["- road lines: y=24 x 0-47; x=40 y 24-47; y=19 x 3-25; x=19 y 19-29; x=5 y 24-26",
                                   "- roads not connected to the highway: 11 tiles (x 2-12, y 40) - reconnect them"]
 
 
@@ -2222,17 +2224,18 @@ def test_briefings_stay_bounded_at_the_limits():
     env.end_month()
     w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
     w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
+    road_lines = "- road lines: y=24 x 0-25; " + "; ".join(f"x={x} y 24-40" for x in range(10, 23, 2)) + " +1 more\n"
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
         assert len(text) - len(memory) < 7500 - 50, (role, len(text) - len(memory))    # memory is shown in full
+        assert road_lines in text, role                                          # a full road lines line
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
         assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
     assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
     assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
-    assert "; x=22 y 24-40 +1 more\n" in mayor                                   # a full road lines line
     assert "(cut reports: history kind=report)" in mayor
 
 
