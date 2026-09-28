@@ -23,7 +23,7 @@ from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, bu
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import label_components, shift
-from .fmt import TOOL_MESSAGE_CHARS, money
+from .fmt import TOOL_MESSAGE_CHARS, a_or_an, money
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -33,9 +33,15 @@ MAX_MONTHS = 12
 MAX_ENTRIES = 20             # history entries / council messages per call
 REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
+INSPECTS_FREE = 3            # inspects run in a turn before their results point to map_overview (smoke v9-v11:
+                             # planning made 5.4 a turn, other roles 0.4-1.2)
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
+ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
+CONTENT_KINDS = 5            # kinds of tile named when a failed zone / dezone says what the rectangle holds
 RIVER_BANDS = 3              # row bands the Map block describes the river in
+ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
+ROAD_LINES = 8               # the longest this many named, then "+N more"
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
@@ -400,6 +406,13 @@ def free_bank(w) -> np.ndarray:
     return _riverbank_by_roads(w)[0] & _empty_land(w)
 
 
+def _bank_needed(w) -> list[str]:
+    """What the city still lacks that takes a riverbank lot: a pump (neither a pump nor a water tower yet; a tower
+    supplies water without the bank) and a sewage outlet (neither an outlet nor a treatment plant)."""
+    return [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
+            if not any(w.facilities(s) for s in structs)]
+
+
 def _ends(points: list) -> list:
     """The first and last point (reading order): a bridge's two ends, a riverside road's two ends."""
     return points[:1] + points[-1:] if len(points) > 1 else points
@@ -431,6 +444,77 @@ def _roads_text(r: dict | None) -> str:
             "no roads connected to the highway yet")
 
 
+def _road_lines(w) -> list[dict]:
+    """The maximal straight runs of highway-connected road, along rows ({"y", "x": [x0, x1]}) and down columns
+    ({"x", "y": [y0, y1]}), of at least ROAD_LINE_MIN tiles: the highway tile, bridges and avenues count, and a
+    crossing is in both its lines. Longest first, then by the first tile's y and x, rows before columns. Smoke
+    v9-v11: given only the network's box (x 0-25, y 19-29; really y=19, y=24 and x=19), planning rebuilt existing
+    road 13 times and made 5.4 inspect calls a turn."""
+    roads = _connected_roads(w)
+    runs = []
+    for down, grid in ((False, roads), (True, roads.T)):
+        for i, row in enumerate(grid):
+            edges = np.flatnonzero(np.diff(np.concatenate(([0], row.astype(np.int8), [0]))))
+            for a, b in zip(edges[::2].tolist(), (edges[1::2] - 1).tolist()):      # each run's first and last tile
+                if b - a + 1 >= ROAD_LINE_MIN:
+                    y, x = (a, i) if down else (i, a)
+                    runs.append(((a - b, y, x, down), {"x": i, "y": [a, b]} if down else {"y": i, "x": [a, b]}))
+    return [ln for _, ln in sorted(runs, key=lambda r: r[0])]
+
+
+def _road_line_text(ln: dict) -> str:
+    return f"y={ln['y']} x {_span(*ln['x'])}" if isinstance(ln["x"], list) else f"x={ln['x']} y {_span(*ln['y'])}"
+
+
+def _on_road_line(ln: dict, x: int, y: int) -> bool:
+    return (y == ln["y"] and ln["x"][0] <= x <= ln["x"][1]) if isinstance(ln["x"], list) else (
+        x == ln["x"] and ln["y"][0] <= y <= ln["y"][1])
+
+
+def _contents(w, tiles: list[tuple[int, int]]) -> str:
+    """What the tiles hold by kind, largest first, the first CONTENT_KINDS kinds then "+N other tiles": road (bridges
+    too), highway, zoned <letter> (with how many are developed), river, empty land, and any other structure by name
+    (tiles, so a 2x2 hospital is "4 hospital"). "all 14 tiles are road", "10 zoned R (6 developed), 4 road"."""
+    n, dev = Counter(), Counter()
+    for x, y in tiles:
+        s = int(w.struct[y, x])
+        k = (f"zoned {C.LETTER_BY_ZONE[s]}" if s in C.ZONES else C.STRUCT_NAME[s].replace("_", " ") if s != C.NONE
+             else "river" if w.terrain[y, x] == C.WATER else "empty land")
+        n[k] += 1
+        dev[k] += bool(s in C.ZONES and w.level[y, x] > 0)
+    name = lambda k: k + (f" ({dev[k]} developed)" if dev[k] else "")
+    if len(n) == 1:
+        (k, c), = n.items()
+        bare = k in ("road", "highway", "river", "empty land") or k.startswith("zoned ")
+        return f"all {c} tiles are {name(k)}" if c > 1 else f"the tile is {name(k) if bare else a_or_an(k)}"
+    kinds = n.most_common()
+    rest = sum(c for _, c in kinds[CONTENT_KINDS:])
+    return ", ".join(f"{c} {name(k)}" for k, c in kinds[:CONTENT_KINDS]) + (
+        f" +{rest} other tile{'s' * (rest > 1)}" if rest else "")
+
+
+def _zone_beside(w, tiles: list[tuple[int, int]]) -> list[str]:
+    """Zone rects for the free roadside land (empty land touching a highway-connected road) on the lines just outside
+    a rectangle's sides (`tiles` in reading order, as _rect gives them), over its span: each trimmed to its first and
+    last such tile (one line, so always a valid zone), kept with 2 such tiles or half its side (a 1-tile side only
+    beside a 1-tile rectangle, so a row's end caps aren't offered as single lots), the most tiles first (ties: north,
+    west, east, south). While a pump or outlet is missing (_bank_needed) the free riverbank lots are left out, and a
+    side whose rect would still cover one is dropped (v7: zoning took the last bank lots and utilities had nowhere to
+    put them)."""
+    (xa, ya), (xb, yb) = tiles[0], tiles[-1]
+    free, sides = _roadside(w), []
+    bank = free_bank(w) if _bank_needed(w) else np.zeros_like(free)
+    free &= ~bank
+    for side in ([(x, ya - 1) for x in range(xa, xb + 1)], [(xa - 1, y) for y in range(ya, yb + 1)],
+                 [(xb + 1, y) for y in range(ya, yb + 1)], [(x, yb + 1) for x in range(xa, xb + 1)]):
+        hits = [(x, y) for x, y in side if w.in_bounds(x, y) and free[y, x]]
+        if hits and (len(hits) >= 2 or 2 * len(hits) >= len(side) > 1 or len(tiles) == 1):
+            (x1, y1), (x2, y2) = hits[0], hits[-1]                 # along the side, so x1 <= x2 and y1 <= y2
+            if not bank[y1:y2 + 1, x1:x2 + 1].any():
+                sides.append((-len(hits), f"x1={x1},y1={y1},x2={x2},y2={y2}"))
+    return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
+
+
 def _river_cols(w) -> tuple[int, int, int, int] | None:
     """(x0, x1, y0, y1): the river's columns within the rows the connected roads span (the whole map before
     there are roads, or when the river misses those rows); None without a river."""
@@ -456,8 +540,8 @@ def _edge(w, x: int, y: int) -> str:
 def map_facts(w) -> dict:
     """Orientation for the briefing's Map block and map_overview: size, highway entries, the river per row band
     (RIVER_BANDS; each [[x0, x1, first row], [x0, x1, last row]], the columns at the band's ends), the
-    highway-connected roads' extent, the road tiles off the highway network (None when there are none) and the
-    built-up box."""
+    highway-connected roads' extent and straight lines (_road_lines; map_lines names ROAD_LINES), the road tiles off
+    the highway network (None when there are none) and the built-up box."""
     hw = [{"x": int(x), "y": int(y), "edge": _edge(w, x, y)} for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
     water = w.terrain == C.WATER
     rows = np.nonzero(water.any(axis=1))[0]
@@ -471,7 +555,7 @@ def map_facts(w) -> dict:
     bb = _box(built)
     loose = (w.struct == C.ROAD) & ~_connected_roads(w)
     lb = _box(loose)
-    return {"size": [w.w, w.h], "highway": hw, "river": river, "roads": _roads(w),
+    return {"size": [w.w, w.h], "highway": hw, "river": river, "roads": _roads(w), "road_lines": _road_lines(w),
             "unconnected": lb and {"x": lb[0], "y": lb[1], "tiles": int(loose.sum())},
             "built": bb and {"x": bb[0], "y": bb[1], "zoned": int(zoned.sum()),
                              "developed": int((zoned & (w.level > 0)).sum()), "buildings": int(anchors.sum())}}
@@ -487,6 +571,8 @@ def map_lines(f: dict) -> list[str]:
             "- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
             if f["river"] else "- no river",
             "- " + _roads_text(f["roads"]),
+            *(["- road lines: " + _some([_road_line_text(ln) for ln in lns], ROAD_LINES, "; ")]
+              if (lns := f.get("road_lines")) else []),
             *([f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y {_span(*u['y'])}) "
                "- reconnect them"] if (u := f.get("unconnected")) else []),
             f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, {b['developed']} "
@@ -892,6 +978,7 @@ class ToolBox:
         self.executed: list[dict] = []
         self.messages: list[dict] = []
         self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
+        self.looked: Counter = Counter()                  # look-ups run this turn by tool (repeats not counted)
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
@@ -917,7 +1004,9 @@ class ToolBox:
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
         roads off the highway, or transport's demolish of their only station / harbour / airport link, is refused
         before it runs ("refused": "disconnect"; not executed, logged or remembered as a failure) unless it passes
-        confirm: true."""
+        confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
+        result notes that map_overview shows the whole map (only the count when its radius note says so), until
+        map_overview runs; the note isn't cached, so a repeat comes without it."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -939,6 +1028,11 @@ class ToolBox:
         res = self._run(tool, args)
         if name in self.lookups:
             self._seen[key] = (self.n_calls, copy.deepcopy(res))     # callers may change the result they get
+            self.looked[name] += 1
+            if name == "inspect" and self.looked[name] > INSPECTS_FREE and not self.looked["map_overview"]:
+                count = f"inspect #{self.looked[name]} this turn"
+                res["note"] = (f"{res['note']}; {count}" if res.get("note")     # a radius note names map_overview
+                               else f"{count}: map_overview shows the whole map in one call")
         elif name in ALL_ACTIONS:
             if res.get("ok"):
                 self._seen.clear()
@@ -1088,8 +1182,7 @@ class ToolBox:
         before it) while the city still lacks a sewage outlet / treatment plant or has neither a pump nor a water
         tower (pumps and outlets need the bank; a tower supplies water without it)."""
         w = self.world
-        missing = [name for name, structs in (("pump", (C.PUMP, C.TOWER)), ("sewage outlet", (C.OUTLET, C.TREATMENT)))
-                   if not any(w.facilities(s) for s in structs)]
+        missing = _bank_needed(w)
         if not missing or not before.any() or free_bank(self.world).any():
             return ""
         ys, xs = np.nonzero(before & np.isin(w.struct, list(C.ZONES)))
@@ -1099,19 +1192,39 @@ class ToolBox:
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
 
     def _explain(self, name: str, args: dict, message: str) -> str:
-        """How to fix a failed build_road or zone, appended to the core message in the tool result (v8, seed 0 month
-        0: planning zoned row 23, then ran four roads north through those lots, still empty, told only "occupied by
-        residential" and never that dezoning is free; it also re-built a road twice and zoned high density before
-        'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile building once),
-        and dezones that stay on the line: per straight leg, one per run of lots between buildings, from its first to
-        its last lot (dezone razes developed tiles, and a box off the line would take other lots). "" otherwise."""
+        """How to fix a failed build_road, zone or dezone, appended to the core message in the tool result (v8, seed 0
+        month 0: planning zoned row 23, then ran four roads north through those lots, still empty, told only
+        "occupied by residential" and never that dezoning is free; it also re-built a road twice and zoned high
+        density before 'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile
+        building once), and dezones that stay on the line: per straight leg, one per run of lots between buildings,
+        from its first to its last lot (dezone razes developed tiles, and a box off the line would take other lots).
+        Smoke v9-v11: 11 x zone "no empty land tiles in that area", often on the road just built (build_road
+        (35,23)-(35,8), then zone R x=35 y 9-22), and 13 x "every tile on that line is already road" (e.g. the main
+        road (0,24)-(47,24) again), told nothing more. So a zone or dezone that found nothing to do says what the
+        rectangle holds, a zone adds the free roadside land beside it, and a road on existing road names the road
+        lines it runs along (else, off every line, the connected roads' extent). "" otherwise."""
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
+        if (name, message) in (("zone", "no empty land tiles in that area"), ("dezone", "no zoned tiles in that area")):
+            try:
+                tiles = _rect(w, args)
+            except Exception:
+                return ""
+            beside = _zone_beside(w, tiles) if name == "zone" else []
+            return f" - {_contents(w, tiles)}" + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
         if name != "build_road":
             return ""
         if message == "every tile on that line is already road":
-            return f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites road_extension)"
+            line = _line(w, args)
+            on = [_road_line_text(ln) for ln in _road_lines(w)       # lines it runs along (a crossing tile isn't)
+                  if sum(_on_road_line(ln, x, y) for x, y in line) >= min(2, len(line))]
+            if not on:
+                return (f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites "
+                        "road_extension)")
+            many = len(on) > 1                                    # at most 2: one per leg, or a crossing tile's two
+            return (f" - the road line{'s' * many} {' and '.join(on)} {'are' if many else 'is'} already built; branch "
+                    f"off {'them' if many else 'it'} into free land (find_sites road_extension)")
         if " is occupied by " not in message:
             return ""
         line = _line(w, args)                             # build_road got this far, so the arguments parse
@@ -1245,7 +1358,7 @@ class ToolBox:
         out = {"ok": True, "x": x, "y": y, "radius": r, "window": [x0, y0, x1, y1],
                "tiles": buildings + zones + ground, "empty_land": empty}
         if r != int(round(radius)):          # models ask for 10 or 20 to see more; say they got less
-            out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); inspect several points to see more"
+            out["note"] = f"radius {radius} clipped to {r} (0-{MAX_RADIUS}); map_overview shows the whole map"
         return out
 
     def map_overview(self) -> dict:

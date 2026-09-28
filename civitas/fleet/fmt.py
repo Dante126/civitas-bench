@@ -34,3 +34,7 @@ def months(n: int) -> str:
 
 def signed(v, fmt=num) -> str:
     return ("+" if v >= 0 else "-") + fmt(abs(v))
+
+
+def a_or_an(name: str) -> str:
+    return ("an " if name[:1] in ("a", "e", "i", "o") else "a ") + name     # not u: a university

@@ -89,16 +89,18 @@ the city runs a surplus with more than $15,000 in the treasury.
 kind = "fleet"
 playbook = """
 - First turn: extend the main road from the highway east until it reaches the river (road_extension), then zone \
-R along the roads with C and I nearby. Zones develop only within 2 tiles of a road connected to the highway.
+R beside it with C and I nearby. Zones develop only within 2 tiles of a road connected to the highway.
 - Utilities needs free riverbank tiles beside a road for a pump and a sewage outlet: never zone the bank tiles \
-next to the road where it meets the river, and free (dezone) one when utilities says the bank is taken.
+where a road meets the river, and free (dezone) one when utilities says the bank is taken.
 - Answer the requests in your briefing first (road access, a free roadside lot for a service) and then zone. \
-Keep roads inside the map (the Map block gives its size).
+Keep roads inside the map (the Map block gives its size). For the layout, call map_overview once, not several \
+inspects.
 - Zone by demand: the largest positive demand first; skip a type whose demand is <= 0 or that already has 10+ \
 zoned tiles waiting to develop.
 - Keep industry away from homes and upriver pumps (its pollution spreads ~5 tiles).
-- Extend roads (find_sites road_extension) when zones run out of road access; bridges ($60/tile) open the east \
-bank.
+- Build a road first, then zone the tiles beside it, never the road itself. For more road access, branch roads \
+off the road lines in your Map block into free land (road_extension; bridges at $60/tile open the east bank), and \
+lay side streets before zoning beside them: a road can't cross zoned lots or buildings.
 - Leave room for the other departments: police and fire stations, clinics, schools and landfills need an empty \
 tile touching a road. Zone runs of at most 6 tiles along a road and leave the next roadside tile empty; leave one \
 for each service that asks.
