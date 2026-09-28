@@ -35,6 +35,7 @@ REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
+ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
 ROAD_LINES = 8               # the longest this many named, then "+N more"
@@ -453,6 +454,44 @@ def _road_lines(w) -> list[dict]:
 
 def _road_line_text(ln: dict) -> str:
     return f"y={ln['y']} x {_span(*ln['x'])}" if isinstance(ln["x"], list) else f"x={ln['x']} y {_span(*ln['y'])}"
+
+
+def _on_road_line(ln: dict, x: int, y: int) -> bool:
+    return (y == ln["y"] and ln["x"][0] <= x <= ln["x"][1]) if isinstance(ln["x"], list) else (
+        x == ln["x"] and ln["y"][0] <= y <= ln["y"][1])
+
+
+def _contents(w, tiles: list[tuple[int, int]]) -> str:
+    """What the tiles hold by kind, largest first: road (bridges too), highway, zoned <letter> (with how many are
+    developed), buildings, river, empty land. "all 14 tiles are road", "10 zoned R (6 developed), 4 road"."""
+    n, dev = Counter(), Counter()
+    for x, y in tiles:
+        s = int(w.struct[y, x])
+        k = ("road" if s == C.ROAD else "highway" if s == C.HIGHWAY else f"zoned {C.LETTER_BY_ZONE[s]}" if s in C.ZONES
+             else "building" if s != C.NONE else "river" if w.terrain[y, x] == C.WATER else "empty land")
+        n[k] += 1
+        dev[k] += bool(s in C.ZONES and w.level[y, x] > 0)
+    name = lambda k, c: k + "s" * (k == "building" and c > 1) + (f" ({dev[k]} developed)" if dev[k] else "")
+    if len(n) == 1:
+        (k, c), = n.items()
+        return f"all {c} tiles are {name(k, c)}" if c > 1 else f"the tile is {'a ' * (k == 'building')}{name(k, c)}"
+    return ", ".join(f"{c} {name(k, c)}" for k, c in n.most_common())
+
+
+def _zone_beside(w, tiles: list[tuple[int, int]]) -> list[str]:
+    """Zone rects for the free roadside land (empty land touching a highway-connected road) on the lines just outside
+    a rectangle's sides (`tiles` in reading order, as _rect gives them), over its span: each trimmed to its first and
+    last such tile (one line, so always a valid zone), kept with 2 such tiles or half its side, the most tiles first
+    (ties: north, west, east, south)."""
+    (xa, ya), (xb, yb) = tiles[0], tiles[-1]
+    free, sides = _roadside(w), []
+    for side in ([(x, ya - 1) for x in range(xa, xb + 1)], [(xa - 1, y) for y in range(ya, yb + 1)],
+                 [(xb + 1, y) for y in range(ya, yb + 1)], [(x, yb + 1) for x in range(xa, xb + 1)]):
+        hits = [(x, y) for x, y in side if w.in_bounds(x, y) and free[y, x]]
+        if hits and (len(hits) >= 2 or 2 * len(hits) >= len(side)):
+            (x1, y1), (x2, y2) = hits[0], hits[-1]
+            sides.append((-len(hits), f"x1={x1},y1={y1},x2={x2},y2={y2}"))
+    return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
 
 
 def _river_cols(w) -> tuple[int, int, int, int] | None:
@@ -1125,19 +1164,39 @@ class ToolBox:
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
 
     def _explain(self, name: str, args: dict, message: str) -> str:
-        """How to fix a failed build_road or zone, appended to the core message in the tool result (v8, seed 0 month
-        0: planning zoned row 23, then ran four roads north through those lots, still empty, told only "occupied by
-        residential" and never that dezoning is free; it also re-built a road twice and zoned high density before
-        'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile building once),
-        and dezones that stay on the line: per straight leg, one per run of lots between buildings, from its first to
-        its last lot (dezone razes developed tiles, and a box off the line would take other lots). "" otherwise."""
+        """How to fix a failed build_road, zone or dezone, appended to the core message in the tool result (v8, seed 0
+        month 0: planning zoned row 23, then ran four roads north through those lots, still empty, told only
+        "occupied by residential" and never that dezoning is free; it also re-built a road twice and zoned high
+        density before 'Town'). A blocked road names the empty zoned lots and the buildings on its line (a multi-tile
+        building once), and dezones that stay on the line: per straight leg, one per run of lots between buildings,
+        from its first to its last lot (dezone razes developed tiles, and a box off the line would take other lots).
+        Smoke v9-v11: 11 x zone "no empty land tiles in that area", often on the road just built (build_road
+        (35,23)-(35,8), then zone R x=35 y 9-22), and 13 x "every tile on that line is already road" (e.g. the main
+        road (0,24)-(47,24) again), told nothing more. So a zone or dezone that found nothing to do says what the
+        rectangle holds, a zone adds the free roadside land beside it, and a road on existing road names the road
+        lines it runs along (else, off every line, the connected roads' extent). "" otherwise."""
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
+        if (name, message) in (("zone", "no empty land tiles in that area"), ("dezone", "no zoned tiles in that area")):
+            try:
+                tiles = _rect(w, args)
+            except Exception:
+                return ""
+            beside = _zone_beside(w, tiles) if name == "zone" else []
+            return f" - {_contents(w, tiles)}" + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
         if name != "build_road":
             return ""
         if message == "every tile on that line is already road":
-            return f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites road_extension)"
+            line = _line(w, args)
+            on = [_road_line_text(ln) for ln in _road_lines(w)       # lines it runs along (a crossing tile isn't)
+                  if sum(_on_road_line(ln, x, y) for x, y in line) >= min(2, len(line))]
+            if not on:
+                return (f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites "
+                        "road_extension)")
+            many = len(on) > 1                                    # at most 2: one per leg, or a crossing tile's two
+            return (f" - the road line{'s' * many} {' and '.join(on)} {'are' if many else 'is'} already built; branch "
+                    f"off {'them' if many else 'it'} into free land (find_sites road_extension)")
         if " is occupied by " not in message:
             return ""
         line = _line(w, args)                             # build_road got this far, so the arguments parse
