@@ -183,7 +183,124 @@ def test_server_configs_launch_validation(tmp_path):
     assert len(frames["frames"]) == 7
     turns = json.loads(urllib.request.urlopen(f"{base}/api/runs/{r['run_id']}/turns?month=0").read())
     assert {t["role"] for t in turns} == set(TURN_ORDER)
+    assert not any("trace" in t for t in turns)                         # scripted turns have no tool trace
     httpd.shutdown()
+
+
+def _turn_rec(month, role, trace=None, **kw):
+    """A trajectories.jsonl record with the runner's key order; a fleet turn when `trace` is given."""
+    rec = {"run_id": "r1", "seed": 0, "month": month, "role": role,
+           "agent": "fleet:fake" if trace is not None else "scripted", "results": [], **kw}
+    if trace is not None:
+        rec.update(prompt=[{"role": "system", "content": "sys"}, {"role": "user", "content": f"briefing {month}"}],
+                   response="report", reasoning="thinking", finish_reason="end_turn", tool_trace=trace,
+                   steps=len(trace), ended=True, finish_reasons=["tool_calls"] * 3, length_stops=0, recovered_calls=0)
+    else:
+        rec["observation_text"] = "obs"
+    return json.dumps(rec) + "\n"
+
+
+def _get(url, gzip_ok=False):
+    import gzip
+    import urllib.error
+    req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"} if gzip_ok else {})
+    try:
+        r = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read()), None
+    body, enc = r.read(), r.headers.get("Content-Encoding")
+    return r.status, json.loads(gzip.decompress(body) if enc == "gzip" else body), enc
+
+
+def test_server_fleet_tool_trace(tmp_path):
+    """/trace returns one fleet turn's calls with outcomes, found through a byte-offset index that follows a live
+    run's appends; /turns carries the same summary."""
+    d = tmp_path / "r1"
+    d.mkdir()
+    (d / "meta.json").write_text(json.dumps({"name": "t", "roles": ["mayor", "planning"]}))
+    trace = [
+        {"step": 0, "finish_reason": "tool_calls", "tool": "map_overview", "args": "{}", "result": {"ok": True}},
+        {"step": 0, "finish_reason": "tool_calls", "tool": "zone", "args": '{"zone": "R", "x1": 1, "y1": 2}',
+         "result": {"ok": True, "message": "zoned 4 tiles R", "cost": 40.0, "budget_left": 960.0}},
+        {"step": 1, "finish_reason": "tool_calls", "tool": "build_road", "args": '{"x1": 0, "y1": 0}',
+         "result": {"ok": False, "error": "tile (0,0) is taken; route around", "message": "tile (0,0) is taken",
+                    "cost": 0.0, "budget_left": 960.0}},
+        {"step": 1, "finish_reason": "tool_calls", "tool": "find_sites", "args": '{"purpose": "x"}',
+         "result": {"ok": False, "error": "argument 'purpose' must be one of ..."}},
+        {"step": 2, "finish_reason": "tool_calls", "tool": "build_road", "args": '{"x1": 0, "y1": 0}',
+         "result": {"ok": False, "refused": "repeat", "error": "this exact call failed at call 3: tile taken"}},
+        {"step": 2, "finish_reason": "tool_calls", "tool": "map_overview", "args": "{}",
+         "result": {"ok": True, "repeat": "same as call 1 (nothing changed since)"}},
+        {"step": 2, "finish_reason": "stop", "tool": "zone", "args": "zone R please", "result": {"ok": False,
+         "error": "arguments must be a JSON object"}},
+        {"step": 3, "finish_reason": "tool_calls", "tool": "end_turn", "args": '{"report": "done"}',
+         "result": {"ok": True, "message": "turn ended"}},
+    ]
+    big = [{"step": i, "finish_reason": "tool_calls", "tool": "inspect", "args": json.dumps({"x": i, "y": i}),
+            "result": {"ok": True, "message": f"tile {i}: " + "x" * 280}} for i in range(120)]
+    traj = d / "trajectories.jsonl"
+    traj.write_text(_turn_rec(0, "mayor", trace) + _turn_rec(0, "planning") + _turn_rec(1, "planning", big))
+    httpd = serve(tmp_path, port=0, background=True, allow_launch=False)
+    base = f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/r1"
+    try:
+        code, t, _ = _get(f"{base}/trace?month=0&role=mayor")
+        assert code == 200 and t["agent"] == "fleet:fake" and t["month"] == 0 and t["role"] == "mayor"
+        calls = t["calls"]
+        assert [c["n"] for c in calls] == list(range(1, 9))
+        assert [c["outcome"] for c in calls] == ["ok", "ok", "failed", "failed", "refused", "repeat", "failed", "ok"]
+        assert [c["action"] for c in calls] == [False, True, True, False, True, False, True, False]
+        assert [c["ran"] for c in calls] == [False, True, True, False, False, False, False, False]
+        assert calls[1]["args"] == {"zone": "R", "x1": 1, "y1": 2} and calls[1]["cost"] == 40.0
+        assert calls[2]["text"] == "tile (0,0) is taken; route around"          # the error the model read
+        assert calls[4]["refused"] == "repeat" and calls[5]["text"].startswith("same as call 1")
+        assert calls[6]["args"] == "zone R please" and calls[6]["finish_reason"] == "stop"
+        assert t["summary"] == {"calls": 8, "actions": 2, "failed_actions": 1, "errors": 2, "refused": 1,
+                                "repeats": 1, "spent": 40.0, "model_calls": 3, "finish_reason": "end_turn",
+                                "ended": True, "length_stops": 0, "recovered_calls": 0}
+        code, turns, _ = _get(f"{base}/turns?month=0")
+        assert [x["role"] for x in turns] == ["mayor", "planning"]
+        assert turns[0]["trace"] == t["summary"] and turns[0]["observation"] == "briefing 0"
+        assert "trace" not in turns[1] and turns[1]["observation"] == "obs"
+        # a large trace comes gzipped
+        code, t1, enc = _get(f"{base}/trace?month=1&role=planning", gzip_ok=True)
+        assert code == 200 and enc == "gzip" and len(t1["calls"]) == 120
+        # errors
+        assert _get(f"{base}/trace?month=0&role=planning")[0] == 404                # scripted: no tool trace
+        assert _get(f"{base}/trace?month=5&role=mayor")[0] == 404
+        assert _get(f"{base}/trace?month=x&role=mayor")[0] == 400
+        assert _get(f"{base}/trace?month=0")[0] == 400
+        assert _get(f"http://127.0.0.1:{httpd.server_address[1]}/api/runs/nope/trace?month=0&role=mayor")[0] == 404
+        # a live run appends: complete lines are indexed on the next request, a line still being written is not
+        tail = _turn_rec(2, "mayor", trace[:2])
+        with open(traj, "a") as fh:
+            fh.write(_turn_rec(1, "mayor", trace[:1]) + tail[:40])
+        assert _get(f"{base}/trace?month=1&role=mayor")[1]["summary"]["calls"] == 1
+        assert _get(f"{base}/trace?month=2&role=mayor")[0] == 404
+        with open(traj, "a") as fh:
+            fh.write(tail[40:])
+        code, t2, _ = _get(f"{base}/trace?month=2&role=mayor")
+        assert code == 200 and [c["tool"] for c in t2["calls"]] == ["map_overview", "zone"]
+        assert [x["role"] for x in _get(f"{base}/turns?month=1")[1]] == ["planning", "mayor"]
+        # a rewritten file is indexed again
+        traj.write_text(_turn_rec(0, "mayor", trace[:3]))
+        assert _get(f"{base}/trace?month=0&role=mayor")[1]["summary"]["calls"] == 3
+        assert _get(f"{base}/trace?month=1&role=planning")[0] == 404
+    finally:
+        httpd.shutdown()
+
+
+def test_turn_index_reads_only_the_lines_it_returns(tmp_path):
+    from civitas.server import TurnIndex
+    f = tmp_path / "trajectories.jsonl"
+    odd = json.dumps({"role": "fire", "month": 4, "run_id": "r1"}) + "\n"      # not the runner's key order
+    f.write_text(_turn_rec(3, "north.police", []) + odd + "not json\n" + _turn_rec(4, "fire", []))
+    ix = TurnIndex()
+    assert [r["role"] for r in ix.records(f, 3)] == ["north.police"]
+    assert ix.records(f, 4, "fire")[0] == json.loads(odd)          # the first record of a (month, role) wins
+    assert [r.get("agent") for r in ix.records(f, 4)] == [None, "fleet:fake"]
+    assert ix.records(f, 9) == [] and ix.records(tmp_path / "missing.jsonl", 0) == []
+    entry = ix.files[str(f)]
+    assert entry["end"] == f.stat().st_size and sorted(entry["month"]) == [3, 4]
 
 
 def test_simultaneous_mode_runs(tmp_path):

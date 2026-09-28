@@ -425,15 +425,82 @@ async function loadTraces(month) {
   for (const tr of S.traces[key]) {
     if (S.city && !tr.role.startsWith(S.city + ".")) continue;
     const el = document.querySelector(`.trace[data-role="${tr.role.split(".").pop()}"]`); if (!el) continue;
-    const u = tr.usage || {}, parts = [];
+    const u = tr.usage || {}, parts = [], fleet = !!tr.trace;
     if (tr.reasoning) parts.push(["Model reasoning", tr.reasoning]);
-    if (tr.response) parts.push(["Raw reply", tr.response]);
-    if (tr.observation) parts.push(["What the agent saw (prompt)", tr.observation]);
+    if (tr.response) parts.push([fleet ? "End-of-turn report (or last reply)" : "Raw reply", tr.response]);
+    if (tr.observation) parts.push([fleet ? "Briefing (first prompt)" : "What the agent saw (prompt)", tr.observation]);
     const stats = [tr.latency_s ? `${tr.latency_s.toFixed(1)} s` : "", u.prompt_tokens ? `${u.prompt_tokens}→${u.completion_tokens} tokens` : "",
-      tr.finish_reason && tr.finish_reason !== "stop" ? `finish: ${tr.finish_reason}` : "", tr.reward != null ? `reward ${tr.reward >= 0 ? "+" : ""}${tr.reward.toFixed(4)}` : ""].filter(Boolean).join(" · ");
-    el.innerHTML = (stats ? `<div class="small muted" style="margin-top:6px">${esc(stats)}</div>` : "") +
+      tr.finish_reason && tr.finish_reason !== "stop" && !fleet ? `finish: ${tr.finish_reason}` : "", tr.reward != null ? `reward ${tr.reward >= 0 ? "+" : ""}${tr.reward.toFixed(4)}` : ""].filter(Boolean).join(" · ");
+    el.innerHTML = (stats ? `<div class="small muted" style="margin-top:6px">${esc(stats)}</div>` : "") + (fleet ? callsPanel(month, tr) : "") +
       parts.map(([t, v]) => `<details><summary>${t} <span class="muted">(${v.length.toLocaleString()} chars)</span></summary><pre class="log big">${esc(v)}</pre></details>`).join("");
+    if (fleet) bindCalls(el.querySelector("details.calls"));
   }
+}
+
+// a fleet turn's tool calls (/trace), fetched when its panel is first opened; open panels stay open across re-renders
+S.calls = {}; S.callsOpen = new Set();
+const OUTCOME = { ok: ["✓", "ok"], failed: ["✗", "failed"], refused: ["⊘", "refused"], repeat: ["↺", "repeat"] };
+const plural = (n, w, ws = w + "s") => `${n} ${n === 1 ? w : ws}`;
+function callsHeader(s) {
+  const bad = (t) => `<span class="bad">${t}</span>`;
+  return [plural(s.calls, "call") + (s.model_calls ? ` <span class="muted">in ${plural(s.model_calls, "reply", "replies")}</span>` : ""),
+    plural(s.actions, "action") + (s.failed_actions ? ` (${bad(`${s.failed_actions} failed`)})` : ""),
+    s.errors ? bad(plural(s.errors, "error")) : "", s.refused ? `<span class="warn">${s.refused} refused</span>` : "",
+    s.repeats ? plural(s.repeats, "repeat") : "", s.spent ? `${fmt$(s.spent)} spent` : "",
+    s.finish_reason === "end_turn" ? `<span class="muted">ended with end_turn</span>` : `<span class="warn">stopped: ${esc(s.finish_reason || "?")}</span>`,
+  ].filter(Boolean).join(" · ");
+}
+function callsPanel(month, tr) {
+  const key = `${S.runId}:${month}:${tr.role}`;
+  return `<details class="calls" data-key="${esc(key)}" data-month="${month}" data-role="${esc(tr.role)}" ${S.callsOpen.has(key) ? "open" : ""}>
+    <summary>Tool calls <span class="callsum">${callsHeader(tr.trace)}</span></summary><div class="calllist"></div></details>`;
+}
+function argsText(a) {
+  if (a == null || typeof a !== "object") return String(a ?? "");
+  return Object.entries(a).map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? JSON.stringify(v) : v}`).join(" ");
+}
+function callRows(d) {
+  if (!d.calls.length) return `<div class="small muted">No tool calls: the turn ended before the model called a tool (${esc(d.summary.finish_reason)}).</div>`;
+  return d.calls.map((c, i) => {
+    const [glyph, word] = OUTCOME[c.outcome] || ["·", c.outcome], raw = typeof c.args === "string";
+    const nested = !raw && c.args && Object.values(c.args).some(v => v && typeof v === "object");   // flat args read fine on the line
+    const step = `model reply ${(c.step ?? 0) + 1}${c.finish_reason && c.finish_reason !== "tool_calls" ? ` (finish: ${c.finish_reason})` : ""}`;
+    const extra = [step, c.budget_left != null ? `budget left ${fmt$(c.budget_left)}` : "", c.refused ? `refused: ${c.refused}` : "",
+      c.action && !c.ran && c.outcome === "failed" ? "the action did not run" : ""].filter(Boolean).join(" · ");
+    return `<div class="call o-${esc(c.outcome)}${nested ? " nested" : ""}${i && c.step !== d.calls[i - 1].step ? " newstep" : ""}" title="call ${c.n} · ${esc(step)} · click to expand">
+      <span class="cn">${c.n}</span><span class="st">${glyph}</span>
+      <span class="cb"><span class="cl"><b class="${c.action ? "gact" : ""}" title="${c.action ? "game action" : "look-up, memory or turn tool"}">${esc(c.tool)}</b> <code>${esc(raw ? c.args : argsText(c.args))}</code></span>
+        ${c.text ? `<span class="cm">${esc(c.text)}</span>` : ""}
+        <span class="cx small muted">${esc(extra)}${raw ? " · arguments were not a JSON object" : ""}</span>
+        ${nested ? `<pre class="log cx">${esc(JSON.stringify(c.args, null, 1))}</pre>` : ""}</span>
+      <span class="co">${c.outcome === "ok" ? "" : `<span class="tag ${c.outcome === "repeat" ? "" : "warn"}">${word}</span>`}${c.cost ? `<span class="cost">${fmt$(c.cost)}</span>` : ""}</span></div>`;
+  }).join("");
+}
+function fillCalls(det, d) {
+  const list = det.querySelector(".calllist");
+  if (d.error) { list.innerHTML = `<div class="small bad">Could not load the tool calls: ${esc(d.error)}</div>`; return; }
+  det.querySelector(".callsum").innerHTML = callsHeader(d.summary);
+  list.innerHTML = callRows(d);
+  list.querySelectorAll(".call").forEach(el => el.onclick = (ev) => { if (!window.getSelection().toString()) el.classList.toggle("open"); ev.stopPropagation(); });
+}
+S.callsLoading = {};
+async function showCalls(det) {
+  const key = det.dataset.key;
+  if (S.calls[key]) return fillCalls(det, S.calls[key]);
+  det.querySelector(".calllist").innerHTML = `<div class="small muted">loading…</div>`;
+  S.callsLoading[key] = S.callsLoading[key] || api(`/api/runs/${encodeURIComponent(S.runId)}/trace?month=${det.dataset.month}&role=${encodeURIComponent(det.dataset.role)}`)
+    .then(d => (S.calls[key] = d), e => ({ error: e.message }))      // an error isn't cached: opening again retries
+    .finally(() => delete S.callsLoading[key]);
+  const d = await S.callsLoading[key];
+  const cur = [...document.querySelectorAll("details.calls")].find(x => x.dataset.key === key);   // re-rendered meanwhile?
+  if (cur && cur.open) fillCalls(cur, d);
+}
+function bindCalls(det) {
+  if (!det) return;
+  det.addEventListener("toggle", () => {
+    if (det.open) { S.callsOpen.add(det.dataset.key); showCalls(det); } else S.callsOpen.delete(det.dataset.key);
+  });
+  if (det.open) showCalls(det);
 }
 
 async function renderRunsTab() {
