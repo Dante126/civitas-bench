@@ -672,6 +672,9 @@ def test_map_facts_on_a_fresh_world():
     (a0, a1, _), (b0, b1, by) = f["river"][0]
     assert f"river: x {a0}-{a1} at row 0 to x {b0}-{b1} at row {by}," in text
     assert f"highway-connected roads: x 0-{int(xs.max())}, y {hy}, {len(xs)} tiles" in text
+    assert f["road_lines"] == [{"y": hy, "x": [0, int(xs.max())]}]                  # the highway tile starts it
+    assert lines[lines.index(f"- highway-connected roads: x 0-{int(xs.max())}, y {hy}, {len(xs)} tiles") + 1] == \
+        f"- road lines: y={hy} x 0-{int(xs.max())}"
 
 
 def test_map_facts_on_an_empty_map():
@@ -682,7 +685,7 @@ def test_map_facts_on_an_empty_map():
     w.anchor[:] = -1
     w.refresh()
     f = map_facts(w)
-    assert f["highway"] == [] and f["roads"] is None and f["built"] is None
+    assert f["highway"] == [] and f["roads"] is None and f["built"] is None and f["road_lines"] == []
     assert map_lines(f)[1:] == ["- highway entry: none", map_lines(f)[2], "- no roads connected to the highway yet",
                                 "- built-up area: none yet"]
 
@@ -695,11 +698,70 @@ def test_map_facts_grow_and_without_a_river(grown_env):
     assert r["x"][1] - r["x"][0] >= fresh["roads"]["x"][1] - fresh["roads"]["x"][0] and r["y"][0] < r["y"][1]
     b = grown["built"]
     assert b["zoned"] > 0 and b["developed"] > 0 and b["buildings"] > 1 and b["x"][0] < b["x"][1]
-    assert len("\n".join(map_lines(grown))) <= 400
+    assert len(grown["road_lines"]) > len(fresh["road_lines"])
+    assert len("\n".join(map_lines(grown))) <= 550             # 400 + the road lines (8 named at most: ~135 chars)
     env = _env()
     env.world.terrain[env.world.terrain == C.WATER] = C.LAND
     f = map_facts(env.world)
     assert f["river"] == [] and "- no river" in map_lines(f)
+
+
+def _road_world(*rects):
+    """Seed 0's map cleared to its highway tile (0,24) and these road rectangles (x1, y1, x2, y2, inclusive)."""
+    w = _env().world
+    w.struct[:] = C.NONE
+    w.anchor[:] = -1
+    w.struct[24, 0] = C.HIGHWAY
+    for x1, y1, x2, y2 in rects:
+        w.struct[y1:y2 + 1, x1:x2 + 1] = C.ROAD
+    w.refresh()
+    return w
+
+
+def _line_tiles(ln: dict) -> set:
+    if isinstance(ln["x"], list):
+        return {(x, ln["y"]) for x in range(ln["x"][0], ln["x"][1] + 1)}
+    return {(ln["x"], y) for y in range(ln["y"][0], ln["y"][1] + 1)}
+
+
+def test_map_block_names_the_road_lines():
+    """Smoke v9-v11: the Map block gave the network's box ("x 0-25, y 19-29") and planning rebuilt existing road 13
+    times ("every tile on that line is already road") and made 5.4 inspect calls a turn; the network was three
+    lines, y=19, y=24 and x=19."""
+    from civitas.fleet.tools import _connected_roads, map_facts, map_lines
+    w = _road_world((1, 24, 40, 24),                      # the main road, bridging the river at x 26-28
+                    (19, 19, 19, 29), (3, 19, 25, 19),    # a cross street, and a road it links to the network
+                    (5, 25, 5, 26), (7, 25, 7, 25),       # stubs of 2 and 1 tiles off the main road
+                    (2, 40, 12, 40))                      # a road off the network
+    w.road_class[19, 3:10] = C.ROAD_CLASSES["avenue"]
+    w.refresh()
+    assert (w.terrain[24, 26:29] == C.WATER).all() and (w.struct[24, 26:29] == C.ROAD).all()
+    f = map_facts(w)
+    main, cross = {"y": 24, "x": [0, 40]}, {"x": 19, "y": [19, 29]}
+    assert f["road_lines"] == [main, {"y": 19, "x": [3, 25]}, cross, {"x": 5, "y": [24, 26]}]   # 3 with its junction
+    assert [ln for ln in f["road_lines"] if (19, 24) in _line_tiles(ln)] == [main, cross]      # a crossing: both
+    named = set().union(*map(_line_tiles, f["road_lines"]))
+    assert all(_connected_roads(w)[y, x] for x, y in named)
+    assert (7, 25) not in named and not any(y == 40 for _, y in named) and f["unconnected"]["tiles"] == 11
+    lines = map_lines(f)
+    i = next(i for i, ln in enumerate(lines) if ln.startswith("- highway-connected roads: x 0-40, y 19-29, "))
+    assert lines[i + 1:i + 3] == ["- road lines: y=24 x 0-40; y=19 x 3-25; x=19 y 19-29; x=5 y 24-26",
+                                  "- roads not connected to the highway: 11 tiles (x 2-12, y 40) - reconnect them"]
+
+
+def test_road_lines_are_capped_longest_first():
+    from civitas.fleet.tools import ROAD_LINE_MIN, ROAD_LINES, map_facts, map_lines
+    assert (ROAD_LINE_MIN, ROAD_LINES) == (3, 8)
+    streets = [(3, y, 6, y) for y in range(4, 45, 4) if y != 24]             # 10 side streets off a spine down x 2
+    f = map_facts(_road_world((1, 24, 10, 24), (2, 4, 2, 44), *streets))
+    assert len(f["road_lines"]) == 12
+    road_lines, = [ln for ln in map_lines(f) if ln.startswith("- road lines: ")]
+    assert road_lines == ("- road lines: x=2 y 4-44; y=24 x 0-10; y=4 x 2-6; y=8 x 2-6; y=12 x 2-6; y=16 x 2-6; "
+                          "y=20 x 2-6; y=28 x 2-6 +4 more")
+    # equal lengths: the first tile's y, then x, then rows before columns
+    f = map_facts(_road_world((1, 24, 9, 24), (4, 15, 4, 23), (9, 20, 13, 20), (9, 21, 9, 23), (13, 21, 13, 24)))
+    assert f["road_lines"] == [{"x": 4, "y": [15, 24]}, {"y": 24, "x": [0, 9]}, {"y": 20, "x": [9, 13]},
+                               {"x": 9, "y": [20, 24]}, {"x": 13, "y": [20, 24]}]
 
 
 def _map_body(res):
@@ -2154,6 +2216,8 @@ def test_briefings_stay_bounded_at_the_limits():
         w.event(f"event {i} " + "e" * 300)
     w.struct[36:48, 37:47] = C.ROAD                     # 121 road tiles off the highway, spanning x 10-46, y 10-47
     w.struct[10, 10] = C.ROAD
+    w.struct[24, 1:26] = C.ROAD                         # 9 road lines: the main road to the river and 8 streets off it
+    w.struct[25:41, 10:25:2] = C.ROAD
     w.refresh()
     env.end_month()
     w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
@@ -2161,13 +2225,14 @@ def test_briefings_stay_bounded_at_the_limits():
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 7500 - 200, (role, len(text) - len(memory))   # memory is shown in full
+        assert len(text) - len(memory) < 7500 - 50, (role, len(text) - len(memory))    # memory is shown in full
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
         assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
     mayor = briefing(env, "mayor", mark=False)
     assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
     assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
+    assert "; x=22 y 24-40 +1 more\n" in mayor                                   # a full road lines line
     assert "(cut reports: history kind=report)" in mayor
 
 

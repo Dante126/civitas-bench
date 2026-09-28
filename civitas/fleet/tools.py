@@ -36,6 +36,8 @@ REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed a
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 RIVER_BANDS = 3              # row bands the Map block describes the river in
+ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
+ROAD_LINES = 8               # the longest this many named, then "+N more"
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
@@ -431,6 +433,28 @@ def _roads_text(r: dict | None) -> str:
             "no roads connected to the highway yet")
 
 
+def _road_lines(w) -> list[dict]:
+    """The maximal straight runs of highway-connected road, along rows ({"y", "x": [x0, x1]}) and down columns
+    ({"x", "y": [y0, y1]}), of at least ROAD_LINE_MIN tiles: the highway tile, bridges and avenues count, and a
+    crossing is in both its lines. Longest first, then by the first tile's y and x, rows before columns. Smoke
+    v9-v11: given only the network's box (x 0-25, y 19-29; really y=19, y=24 and x=19), planning rebuilt existing
+    road 13 times and made 5.4 inspect calls a turn."""
+    roads = _connected_roads(w)
+    runs = []
+    for down, grid in ((False, roads), (True, roads.T)):
+        for i, row in enumerate(grid):
+            edges = np.flatnonzero(np.diff(np.concatenate(([0], row.astype(np.int8), [0]))))
+            for a, b in zip(edges[::2].tolist(), (edges[1::2] - 1).tolist()):      # each run's first and last tile
+                if b - a + 1 >= ROAD_LINE_MIN:
+                    y, x = (a, i) if down else (i, a)
+                    runs.append(((a - b, y, x, down), {"x": i, "y": [a, b]} if down else {"y": i, "x": [a, b]}))
+    return [ln for _, ln in sorted(runs, key=lambda r: r[0])]
+
+
+def _road_line_text(ln: dict) -> str:
+    return f"y={ln['y']} x {_span(*ln['x'])}" if isinstance(ln["x"], list) else f"x={ln['x']} y {_span(*ln['y'])}"
+
+
 def _river_cols(w) -> tuple[int, int, int, int] | None:
     """(x0, x1, y0, y1): the river's columns within the rows the connected roads span (the whole map before
     there are roads, or when the river misses those rows); None without a river."""
@@ -456,8 +480,8 @@ def _edge(w, x: int, y: int) -> str:
 def map_facts(w) -> dict:
     """Orientation for the briefing's Map block and map_overview: size, highway entries, the river per row band
     (RIVER_BANDS; each [[x0, x1, first row], [x0, x1, last row]], the columns at the band's ends), the
-    highway-connected roads' extent, the road tiles off the highway network (None when there are none) and the
-    built-up box."""
+    highway-connected roads' extent and straight lines (_road_lines; map_lines names ROAD_LINES), the road tiles off
+    the highway network (None when there are none) and the built-up box."""
     hw = [{"x": int(x), "y": int(y), "edge": _edge(w, x, y)} for y, x in zip(*np.nonzero(w.struct == C.HIGHWAY))]
     water = w.terrain == C.WATER
     rows = np.nonzero(water.any(axis=1))[0]
@@ -471,7 +495,7 @@ def map_facts(w) -> dict:
     bb = _box(built)
     loose = (w.struct == C.ROAD) & ~_connected_roads(w)
     lb = _box(loose)
-    return {"size": [w.w, w.h], "highway": hw, "river": river, "roads": _roads(w),
+    return {"size": [w.w, w.h], "highway": hw, "river": river, "roads": _roads(w), "road_lines": _road_lines(w),
             "unconnected": lb and {"x": lb[0], "y": lb[1], "tiles": int(loose.sum())},
             "built": bb and {"x": bb[0], "y": bb[1], "zoned": int(zoned.sum()),
                              "developed": int((zoned & (w.level > 0)).sum()), "buildings": int(anchors.sum())}}
@@ -487,6 +511,8 @@ def map_lines(f: dict) -> list[str]:
             "- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
             if f["river"] else "- no river",
             "- " + _roads_text(f["roads"]),
+            *(["- road lines: " + _some([_road_line_text(ln) for ln in lns], ROAD_LINES, "; ")]
+              if (lns := f.get("road_lines")) else []),
             *([f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y {_span(*u['y'])}) "
                "- reconnect them"] if (u := f.get("unconnected")) else []),
             f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, {b['developed']} "
