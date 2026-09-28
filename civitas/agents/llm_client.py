@@ -31,16 +31,31 @@ class LLMError(RuntimeError):
     pass
 
 
-def _read_events(resp, idle: float) -> dict:
+# Thread.join and socket timeouts wait on the monotonic clock, which stops while macOS sleeps (and
+# while Linux suspends), so both limits are also checked on the wall clock, every JOIN_SLICE seconds.
+JOIN_SLICE = 5.0
+SLEEP_GAP = 60.0      # wall clock this far ahead of the monotonic clock over one attempt: the machine slept
+
+
+def _slept(wall0: float, mono0: float) -> float:
+    """Seconds the machine slept since `time.time()` read wall0 and `time.monotonic()` mono0, or 0."""
+    gap = (time.time() - wall0) - (time.monotonic() - mono0)
+    return gap if gap > SLEEP_GAP else 0.0
+
+
+def _read_events(resp, idle: float, watch: dict | None = None) -> dict:
     """Reassemble a server-sent-events answer into the shape of a non-streamed one.
 
     Keep-alive comments reset the socket timeout, so a stream whose generation has stalled is caught
     here: no data line for `idle` seconds, or a stream that ends without a finish reason, is an error
-    (and the attempt is retried) rather than a truncated answer.
+    (and the attempt is retried) rather than a truncated answer. That check only runs when a line
+    arrives, so `watch["quiet"]` holds the time of the last data line for `_post` to check too.
     """
     content, reasoning, usage, finish, done = [], [], {}, None, False
     calls: dict[int, dict] = {}
+    watch = {} if watch is None else watch
     last = time.time()
+    watch["quiet"] = (last, "stream stalled: no data")
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line.startswith("data:"):
@@ -48,6 +63,7 @@ def _read_events(resp, idle: float) -> dict:
                 raise TimeoutError(f"stream stalled: no data for {idle:.0f} s")
             continue
         last = time.time()
+        watch["quiet"] = (last, "stream stalled: no data")
         data = line[5:].strip()
         if data == "[DONE]":
             done = True
@@ -81,24 +97,40 @@ def _post(req: urllib.request.Request, idle: float, deadline: float) -> dict:
     `idle` is urllib's socket timeout (fires only when no data arrives); `deadline` caps the whole
     attempt, because a non-streamed request can be held open for a very long time without an answer
     (seen with Arcee on generations longer than ~100 s).
+
+    Both are also checked here on the wall clock, so a machine that slept past either limit ends the
+    attempt within JOIN_SLICE seconds of waking; the idle check allows one extra slice, so the socket
+    timeout and `_read_events` still fire first when nothing slept. A plain JSON body is idle-checked
+    only up to its headers: after that the socket timeout and the deadline watch it, as before.
     """
     box: dict = {}
 
     def work():
         try:
+            box["quiet"] = (time.time(), "no response")
             with urllib.request.urlopen(req, timeout=idle) as resp:
                 if "event-stream" in (resp.headers.get("Content-Type") or ""):
-                    box["payload"] = _read_events(resp, idle)
+                    box["payload"] = _read_events(resp, idle, box)
                 else:                        # providers / test servers that ignore "stream"
+                    box.pop("quiet", None)
                     box["payload"] = json.loads(resp.read().decode())
         except BaseException as e:           # re-raised in the caller's thread
             box["err"] = e
 
+    wall0, mono0 = time.time(), time.monotonic()
     t = threading.Thread(target=work, daemon=True)
     t.start()
-    t.join(deadline)
-    if t.is_alive():
-        raise TimeoutError(f"no complete response after {deadline:.0f} s")
+    while True:
+        spent = max(time.time() - wall0, time.monotonic() - mono0)
+        t.join(max(0.0, min(JOIN_SLICE, deadline - spent)))
+        if not t.is_alive():
+            break
+        now = time.time()
+        if max(now - wall0, time.monotonic() - mono0) >= deadline:
+            raise TimeoutError(f"no complete response after {deadline:.0f} s")
+        since, what = box.get("quiet") or (now, "")
+        if now - since > idle + JOIN_SLICE:
+            raise TimeoutError(f"{what} for {idle:.0f} s")
     if "err" in box:
         raise box["err"]
     return box["payload"]
@@ -130,7 +162,7 @@ class ChatClient:
         url = self.p.base_url.rstrip("/") + "/chat/completions"
         last_err = None
         for attempt in range(self.p.max_retries + 1):
-            t0 = time.time()
+            t0, m0 = time.time(), time.monotonic()
             try:
                 req = urllib.request.Request(url, data=data, headers=headers, method="POST")
                 payload = _post(req, self.p.timeout, self.p.deadline)
@@ -150,6 +182,9 @@ class ChatClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError,
                     IndexError) as e:
                 last_err = f"{type(e).__name__}: {e}"
+            slept = _slept(t0, m0)
+            if slept:                                  # explains an attempt that ran far past its deadline
+                last_err = f"system slept ~{slept:.0f} s; {last_err}"
             if attempt < self.p.max_retries:          # visible in the run log: slow runs are otherwise opaque
                 print(f"[llm] {model}: attempt {attempt + 1} failed after {time.time() - t0:.0f} s ({last_err[:160]}); "
                       "retrying", file=sys.stderr, flush=True)

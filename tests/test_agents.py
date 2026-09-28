@@ -1,8 +1,11 @@
 import json
+import re
 import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
 
 from civitas.agents.llm import LLMAgent, extract_json
 from civitas.agents.llm_client import ProviderConfig
@@ -309,7 +312,7 @@ class _FlakyStream(BaseHTTPRequestHandler):
             pass
 
 
-def test_chat_client_retries_stalled_and_truncated_streams():
+def test_chat_client_retries_stalled_and_truncated_streams(capsys):
     from civitas.agents.llm_client import ChatClient
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _FlakyStream)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -320,6 +323,12 @@ def test_chat_client_retries_stalled_and_truncated_streams():
     assert out["content"] == "done" and out["finish_reason"] == "stop"
     assert _FlakyStream.calls == 3
     assert time.time() - t0 < 12         # the ping stream would last 20 s; it is cut after ~1 s of no data
+    log = capsys.readouterr().err.splitlines()     # nothing slept: the retry lines carry no sleep note
+    assert re.fullmatch(r"\[llm\] fake: attempt 1 failed after \d s \(TimeoutError: stream stalled: "
+                        r"no data for 1 s\); retrying", log[0])
+    assert re.fullmatch(r"\[llm\] fake: attempt 2 failed after \d s \(ConnectionError: stream ended "
+                        r"before the answer was finished\); retrying", log[1])
+    assert len(log) == 2
     srv.shutdown()
 
 
@@ -364,3 +373,119 @@ def test_chat_client_returns_tool_calls_streamed_and_plain():
         assert out["tool_calls"] == [{"id": "call_1", "type": "function",
                                       "function": {"name": "get_budget", "arguments": '{"department":"health"}'}}]
         srv.shutdown()
+
+
+class _SleepyClock:
+    """Stands in for llm_client's `time` module. The clocks are the real ones, except that `nap(s)`
+    puts the wall clock s seconds ahead of the monotonic one, as a laptop that slept for s seconds
+    finds on waking. `sleep` (the retry backoff) is cut short to keep the tests fast."""
+
+    def __init__(self):
+        self.napped = 0.0
+
+    def nap(self, s):
+        self.napped += s
+
+    def time(self):
+        return time.time() + self.napped
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def sleep(self, s):
+        time.sleep(min(s, 0.01))
+
+
+class _SleepsMidAnswer(BaseHTTPRequestHandler):
+    """With `nap` set, the 1st request starts its answer, the client machine then sleeps for `nap` s
+    and the connection goes silent (it died in the sleep) until the test ends. Other requests: a
+    normal answer. `stream` picks server-sent events or a plain JSON body."""
+    clock, nap, stream, calls, release = None, 0.0, True, 0, None
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        cls = type(self)
+        cls.calls += 1
+        stall = cls.nap and cls.calls == 1
+        body = json.dumps({"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                           "usage": {"completion_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream" if cls.stream else "application/json")
+        if not cls.stream:
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            if cls.stream:
+                self.wfile.write(b'data: {"choices": [{"delta": {"content": "do"}}]}\n\n')
+            self.wfile.flush()
+            if stall:
+                time.sleep(0.2)              # the client has read what came so far
+                cls.clock.nap(cls.nap)
+                cls.release.wait(10)
+                return
+            if cls.stream:
+                self.wfile.write(b'data: {"choices": [{"delta": {"content": "ne"}, "finish_reason": "stop"}], '
+                                 b'"usage": {"completion_tokens": 1}}\n\ndata: [DONE]\n\n')
+            else:
+                self.wfile.write(body)
+        except OSError:
+            pass
+
+
+def _sleepy_chat(monkeypatch, *, nap, stream, max_retries=1):
+    """chat() against _SleepsMidAnswer on the sleepy clock; returns (answer or LLMError, real seconds)."""
+    from civitas.agents import llm_client
+    clock = _SleepyClock()
+    monkeypatch.setattr(llm_client, "time", clock)
+    monkeypatch.setattr(llm_client, "JOIN_SLICE", 0.05)
+    h = _SleepsMidAnswer
+    h.clock, h.nap, h.stream, h.calls, h.release = clock, nap, stream, 0, threading.Event()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), h)
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    client = llm_client.ChatClient(ProviderConfig(base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+                                                  api_key_env="", stream=stream, max_retries=max_retries))
+    t0 = time.time()
+    try:
+        out = client.chat("fake", [{"role": "user", "content": "hi"}])
+    except llm_client.LLMError as e:
+        out = e
+    finally:
+        h.release.set()
+        srv.shutdown()
+    return out, time.time() - t0
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_chat_client_deadline_runs_on_the_wall_clock(monkeypatch, capsys, stream):
+    # 35 minutes asleep: past the 1,800 s deadline on the wall clock, though the monotonic clock
+    # (and so Thread.join and the socket timeout) saw well under a second
+    out, took = _sleepy_chat(monkeypatch, nap=2100, stream=stream)
+    assert out["content"] == "done" and _SleepsMidAnswer.calls == 2
+    assert took < 3                      # ended on waking, not 10 s later when the server let go
+    assert re.fullmatch(r"\[llm\] fake: attempt 1 failed after 210\d s \(system slept ~2100 s; "
+                        r"TimeoutError: no complete response after 1800 s\); retrying\n", capsys.readouterr().err)
+
+
+def test_chat_client_idle_check_runs_on_the_wall_clock(monkeypatch, capsys):
+    # 10 minutes asleep: inside the deadline, but past the 300 s idle limit while no line arrives,
+    # so _read_events' own check never runs
+    out, took = _sleepy_chat(monkeypatch, nap=600, stream=True)
+    assert out["content"] == "done" and _SleepsMidAnswer.calls == 2 and took < 3
+    assert re.fullmatch(r"\[llm\] fake: attempt 1 failed after 60\d s \(system slept ~600 s; "
+                        r"TimeoutError: stream stalled: no data for 300 s\); retrying\n", capsys.readouterr().err)
+
+
+def test_chat_client_notes_the_sleep_when_giving_up(monkeypatch):
+    out, took = _sleepy_chat(monkeypatch, nap=2100, stream=True, max_retries=0)
+    assert str(out) == ("giving up after 1 attempts: system slept ~2100 s; "
+                        "TimeoutError: no complete response after 1800 s") and took < 3
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_chat_client_answers_as_before_when_nothing_slept(monkeypatch, capsys, stream):
+    out, took = _sleepy_chat(monkeypatch, nap=0, stream=stream)
+    assert (out["content"], out["finish_reason"], out["usage"]) == ("done", "stop", {"completion_tokens": 1})
+    assert _SleepsMidAnswer.calls == 1 and took < 1 and capsys.readouterr().err == ""
