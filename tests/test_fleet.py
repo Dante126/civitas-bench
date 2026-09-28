@@ -488,9 +488,9 @@ def test_sites_away_from_homes_say_when_every_roadside_lot_is_near_homes():
     assert len(lines) == 2
     for line in lines:
         assert "away from homes" in line and "town edge" in line and len(line) <= 110, line
-    short, note = _why_empty(w, "police", "jail")
-    assert "away from homes" in short and "a jail must stay away" in note
-    assert _why_empty(w, "health", "clinic")[0] == "nothing needs it right now"     # other purposes: unchanged
+    short, note, blocked = _why_empty(w, "police", "jail")
+    assert "away from homes" in short and "a jail must stay away" in note and blocked
+    assert _why_empty(w, "health", "clinic")[::2] == ("nothing needs it right now", False)   # other purposes: unchanged
 
 
 def _isolated_riverside_road(w):
@@ -667,6 +667,34 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     assert "find_sites" not in note and "build_road" in note                   # not circular
     res = ToolBox(env, "mayor").call("find_sites", {"purpose": "school"})     # the mayor names the department
     assert not res["ok"] and "education.school" in res["error"] and "utilities.sewage" in res["error"]
+
+
+def test_empty_site_lists_say_whether_land_or_roads_block_them():
+    """A list empty for lack of land or roads is blocked (planning can fix it: DeptMoney keeps money for it, the mayor's
+    line and planning's Ready sites say so); nothing needing it, a SITE_NOTES reason, no river or a lock isn't."""
+    from civitas.fleet.tools import _why_empty, role_obs, site_lists
+    env = _env()
+    blocked = lambda role: sorted(p for p, lst in site_lists(env.world, role, role_obs(env, role)).items()
+                                  if lst.blocked)
+    assert blocked("utilities") == ["pump", "sewage"]            # a fresh map: no road reaches the river
+    assert blocked("police") == blocked("fire") == blocked("health") == blocked("transport") == []   # need, notes,
+                                                                                                      # locks
+    env.world.dept_funds["planning"] = 5000
+    assert apply_action(env.world, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    assert blocked("utilities") == []                            # across the river: free bank lots by the road
+    env = CivitasEnv(GameConfig(seed=0, months=12))              # residents, then every roadside tile taken
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(6):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    _fill_roadside(env.world)
+    assert blocked("police") == ["station"] and blocked("education") == ["school"]     # jail, library: locked
+    assert blocked("health") == ["cemetery", "clinic", "landfill"] and blocked("fire") == ["shelter", "station"]
+    assert blocked("transport") == []                            # bus stops: a SITE_NOTES reason (population)
+    w = _road_world((1, 24, 20, 24))
+    w.terrain[:] = C.LAND
+    assert _why_empty(w, "utilities", "pump") == ("no river on this map", "this map has no river", False)
 
 
 def test_road_span_ignores_unconnected_roads_and_no_river_maps():
@@ -1164,6 +1192,65 @@ def test_keep_never_drops_below_the_needs_line(open_env, monkeypatch):
     n = len(real(env.world, "health", T.role_obs(env, "health"))["hospital"].sites[:MAX_SITES])
     line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- health:"))
     assert n and line == f"- health: funds $6,000, spent $0; needs $8,000 for a hospital ({n} ready sites)"
+
+
+def _empty_lists(monkeypatch, dept: str, short: str, blocked: bool) -> None:
+    """`dept`'s unlocked site lists come back empty for `short`: blocked for lack of land or roads, or not."""
+    import civitas.fleet.briefing as B
+    import civitas.fleet.tools as T
+    real = T.site_lists
+
+    def empty(w, role, obs):
+        lists = real(w, role, obs)
+        return lists if role != dept else {p: lst if (lst.short or "").startswith("locked") else
+                                           T.SiteList([], short, short, blocked) for p, lst in lists.items()}
+    monkeypatch.setattr(T, "site_lists", empty)
+    monkeypatch.setattr(B, "site_lists", empty)
+
+
+LAND = "no free roadside land: ask planning for a lot"
+
+
+def test_money_for_a_blocked_first_building_is_not_idle(grown_env, monkeypatch):
+    """Smoke v13 seed 0, month 6: planning had zoned every roadside lot; police, fire, health and education held
+    their first building's price with nothing spent, their lists read "no free roadside land", the keep fell to the
+    $1,000 floor, and the mayor took back "idle $1,500 / $1,000". Police and fire built at month 9; health and
+    education never did."""
+    from civitas.fleet.tools import DeptMoney
+    env = copy.deepcopy(grown_env)
+    _held(env, police=(2500, 0))
+    _empty_lists(monkeypatch, "police", LAND, blocked=True)
+    m = DeptMoney(env, "police")
+    assert (m.build.cost, m.build.dearest, m.keep, m.idle, m.blocked) == (None, 4000, 4000, 0, ("a police station",))
+    line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- police:"))
+    assert line() == "- police: funds $2,500, spent $0; blocked: a police station - ask planning"
+    _empty_lists(monkeypatch, "police", "nothing needs it right now", blocked=False)
+    m = DeptMoney(env, "police")                       # not needed: as before, idle above the $1,000 floor
+    assert (m.build, m.keep, m.idle, m.blocked) == (None, 1000, 1500, ())
+    assert line() == "- police: funds $2,500, spent $0; idle $1,500"
+
+
+def test_blocked_plants_count_in_the_keep(grown_env, monkeypatch):
+    from civitas.fleet.tools import DeptMoney
+    env = copy.deepcopy(grown_env)
+    _held(env, utilities=(7000, 0))
+    _empty_lists(monkeypatch, "utilities", LAND, blocked=True)
+    m = DeptMoney(env, "utilities")                    # coal $4,000 (riverbank_2x2 is locked, and an upgrade)
+    assert (m.keep, m.idle, m.blocked) == (4000, 3000, ("a sewage outlet",))
+    line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- utilities:"))
+    assert line == "- utilities: funds $7,000, spent $0; idle $3,000"          # one suffix: idle first
+
+
+def test_a_blocked_department_that_never_held_its_keep_is_a_gap(grown_env, monkeypatch):
+    from civitas.fleet.tools import funding_gaps
+    env = copy.deepcopy(grown_env)
+    fleet = FleetState.of(env)
+    fleet.update_plan(env.world.month, budgets={"police": 2500})
+    _held(env, police=(1500, 0))
+    _empty_lists(monkeypatch, "police", "nothing needs it right now", blocked=False)
+    assert "police" not in funding_gaps(env, fleet).gaps          # held $1,500 above the floor and used none of it
+    _empty_lists(monkeypatch, "police", LAND, blocked=True)
+    assert funding_gaps(env, fleet).gaps["police"] == {"funds": 1500, "target": 2500, "gap": 1000}   # keep $4,000
 
 
 def _quarter(env, spent: dict) -> None:
@@ -2032,7 +2119,9 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         lines = _ready_sites(text)
         purposes = list(SITE_PURPOSES[role])
         dense = role == "planning" and not w.unlocked("high_density")                 # + the high density line
-        assert len(lines) == len(purposes) + 1 + dense and lines[-1] == "find_sites <purpose> lists up to 6 with details"
+        land = role == "planning" and any(ln.startswith("- blocked for lack of land: ") for ln in lines)
+        assert len(lines) == len(purposes) + 1 + dense + land
+        assert lines[-1] == "find_sites <purpose> lists up to 6 with details"
         box = ToolBox(env, role)
         for purpose, line in zip(purposes, lines):
             assert line.startswith(f"- {purpose}: ") and len(line) <= 110, (role, line)
@@ -2082,7 +2171,8 @@ def test_planning_ready_sites_say_high_density_is_locked(env12):
     plan = _ready_sites(briefing(env12, "planning", mark=False))
     assert plan[-2:] == [f'- high density: locked until 1,000 residents (now {pop:,}): zone with density "low"',
                          "find_sites <purpose> lists up to 6 with details"], plan
-    assert plan[-3].startswith("- casino: "), plan                   # the last purpose
+    assert plan[-3].startswith(("- casino: ", "- blocked for lack of land: ")), plan     # the last purpose, or
+    assert plan[-4 if plan[-3].startswith("- blocked") else -3].startswith("- casino: "), plan   # the blocked line
     for role in DEPTS[1:]:                                           # the other departments
         assert not any("high density" in ln for ln in _ready_sites(briefing(env12, role, mark=False))), role
     env = _env()
@@ -2553,7 +2643,11 @@ def test_mayor_names_the_cheapest_building():
 
 
 def test_department_briefing_builds_one_observation(monkeypatch):
+    """One observation per department briefing; planning's blocked line and the mayor's Departments block add one per
+    department with a priced purpose, never two; funding_gaps alone (update_plan) builds one only where its money
+    decision needs a price."""
     import civitas.fleet.tools as T
+    from civitas.fleet.tools import funding_gaps
     env = _env()
     calls = []
     real = T.build_observation
@@ -2562,28 +2656,59 @@ def test_department_briefing_builds_one_observation(monkeypatch):
         calls.append(k.get("site_hints"))
         return real(*a, **k)
     monkeypatch.setattr(T, "build_observation", counted)           # briefings build it through tools.role_obs
+    n = sum(any(T.site_price(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS)
+    assert n == 6                                      # every department but planning
     for role in DEPTS:
         calls.clear()
         briefing(env, role, mark=False)
-        assert calls == [True], (role, calls)
-    calls.clear()                                      # the mayor: one per department that may lack money for a site
-    briefing(env, "mayor", mark=False)
-    n = sum(any(T.site_price(env.world, d, p) for p in SITE_PURPOSES[d]) for d in DEPTS)
-    assert n and calls == [True] * n
-    env.world.dept_funds.update({d: 50000 for d in DEPTS})
-    calls.clear()                                      # rich: only where a per-tile stretch has no upper bound (levees)
-    briefing(env, "mayor", mark=False)
-    tiles = sum(any((pr := T.site_price(env.world, d, p)) and pr.per_tile for p in SITE_PURPOSES[d]) for d in DEPTS)
-    assert calls == [True] * tiles and tiles == 1
+        assert calls == [True] * (1 + n * (role == "planning")), (role, calls)
+    fleet = FleetState.of(env)
+    for funds in (0, 50000):
+        env.world.dept_funds.update({d: funds for d in DEPTS})
+        calls.clear()                                  # the blocked marker needs every priced department's sites
+        briefing(env, "mayor", mark=False)
+        assert calls == [True] * n
+        calls.clear()                                  # month 0, no plan: nothing idle, no gap to check
+        funding_gaps(env, fleet)
+        assert calls == []
     _months_spent(env, {}, {}, {})
     calls.clear()                                      # rich after a turn: maybe idle, so each priced one looks once
-    briefing(env, "mayor", mark=False)
+    funding_gaps(env, fleet)
     assert calls == [True] * n
     env.world.dept_funds.update({d: 1999 for d in DEPTS})
-    calls.clear()                                      # can't be idle ($999 over $1,000) nor short of $1,999 or less
-    briefing(env, "mayor", mark=False)
-    assert len(calls) == sum(any((pr := T.site_price(env.world, d, p)) and (pr.per_tile or pr.cost > 1999)
-                                 for p in SITE_PURPOSES[d]) for d in DEPTS) < n
+    calls.clear()                                      # can't be idle ($999 over $1,000), no targets: no look
+    funding_gaps(env, fleet)
+    assert calls == []
+
+
+def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land():
+    """Smoke v13 seed 0, months 6-9: planning zoned every roadside tile despite its playbook's "leave room"; utilities,
+    police, fire, health and education all read "none - no free roadside land: ask planning for a lot"."""
+    land = lambda env: [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
+    tail = ": extend a road into open land or dezone a roadside lot for them"
+    env = _env()                                       # a fresh map: the road stops short of the river
+    assert land(env) == ["- blocked for lack of land: utilities (pump, sewage)" + tail]
+    env.world.dept_funds["planning"] = 5000
+    assert apply_action(env.world, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
+    assert land(env) == []                             # across the river, free land by the roads: nothing blocked
+    env = CivitasEnv(GameConfig(seed=0, months=12))
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(6):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    _fill_roadside(env.world)                          # every roadside tile taken
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    line = ("- blocked for lack of land: utilities (coal or gas, wind, pump, sewage, near homes), police (station), "
+            "fire (station), health (clinic, landfill), education (school)" + tail)     # first buildings only
+    assert block[-3] == line and block[-2].startswith("- high density: locked")          # before the high density
+    import civitas.fleet.briefing as B
+    B.BLOCKED_LINE_CHARS, keep = 150, B.BLOCKED_LINE_CHARS
+    try:                                               # too long: the departments alone
+        assert land(env) == ["- blocked for lack of land: utilities, police, fire, health, education" + tail]
+    finally:
+        B.BLOCKED_LINE_CHARS = keep
+    assert not any(ln.startswith("- blocked") for ln in _ready_sites(briefing(env, "police", mark=False)))
 
 
 def test_mayor_briefing_lists_department_reports():
@@ -2813,6 +2938,16 @@ def test_briefings_stay_bounded_at_the_limits():
     assert "\n## Departments (spent = last 3 months; cut reports: history kind=report)\n" in mayor
     assert mayor.count("; idle $3,210") == 5
     assert "- $16.1k idle in planning, transport, police, fire, education: take it back" in mayor
+    _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
+    w.dept_funds.update(police=0, fire=0, education=0)                # the worst mix: 2 idle, 5 blocked
+    for role in TURN_ORDER:
+        text = briefing(env, role, mark=False)
+        memory = text[text.index("## Your memory"):].split("\n\n")[0]
+        assert len(text) - len(memory) < 7500 - 50, (role, len(text) - len(memory))
+    mayor = briefing(env, "mayor", mark=False)
+    assert mayor.count("; idle $3,210") == 2 and mayor.count(" - ask planning") == 5, mayor
+    assert "; blocked: a clinic or a landfill - ask planning" in mayor
+    assert "\n- blocked for lack of land: utilities (" in briefing(env, "planning", mark=False)
 
 
 
