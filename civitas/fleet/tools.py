@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property, partial
@@ -17,8 +18,8 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _line, _point,
-                            _rect, action_docs, apply_action)
+from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _kind_name, _line,
+                            _point, _rect, action_docs, apply_action)
 from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, build_observation
 from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
@@ -36,6 +37,9 @@ REPORT_MAX_CHARS = 1000      # end_turn reports are cut to this
 REPEAT_ERROR_CHARS = 300     # the earlier error quoted when a repeated failed action or bad call is refused
 INSPECTS_FREE = 3            # inspects run in a turn before their results point to map_overview (smoke v9-v11:
                              # planning made 5.4 a turn, other roles 0.4-1.2)
+INSPECTS_AFTER_MAP = 2       # inspects run after map_overview before their results say its map shows the layout
+                             # (smoke v12-v16: planning ran it on 35 of 40 turns, then inspected 3.8 times a turn)
+OWN_NAMED = 2                # this turn's own build_road calls named when a road rebuilds them
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
@@ -187,6 +191,8 @@ SUPPLEMENTARY = {"library", "shelter", "cemetery", "train_station", "harbour", "
 
 # every role's actions, and the region's deal actions (a region mayor's tools: fleet/region.py)
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]} | set(DEAL_ACTIONS)
+# a build refused for its tile, as World.footprint_tiles, build_train_station and build_harbour word it
+NOT_EMPTY = re.compile(r"\((\d+),(\d+)\) is not an empty (land|river|riverbank) tile")
 # int in the doc example, but the handler reads a float (actions._num)
 NUMBER_PARAMS = {("set_tax", "rate"), ("set_funding", "percent"), ("allocate_budget", "amount"),
                  ("take_loan", "amount"), ("repay_loan", "amount"), ("set_fare", "fare"), ("set_district_tax", "delta")}
@@ -517,6 +523,43 @@ def _on_road_line(ln: dict, x: int, y: int) -> bool:
         x == ln["x"] and ln["y"][0] <= y <= ln["y"][1])
 
 
+class Leg(NamedTuple):
+    """One straight leg of a build_road line: along a row (axis "y": `at` = y, x from `lo` to `hi`), down a column
+    (axis "x": `at` = x), or a single tile (axis None, along a row)."""
+    axis: str | None
+    at: int
+    lo: int
+    hi: int
+
+    @property
+    def tiles(self) -> set[tuple[int, int]]:
+        return {(self.at, t) if self.axis == "x" else (t, self.at) for t in range(self.lo, self.hi + 1)}
+
+    def along(self, other: Leg) -> bool:
+        """On the same row or column as `other` and sharing a tile with it (a single tile: any leg through it)."""
+        return (self.axis == other.axis or None in (self.axis, other.axis)) and bool(self.tiles & other.tiles)
+
+    def text(self) -> str:
+        if self.axis is None:
+            return f"({self.lo},{self.at})"
+        return _road_line_text({"x": self.at, "y": [self.lo, self.hi]} if self.axis == "x" else
+                               {"y": self.at, "x": [self.lo, self.hi]})
+
+
+def _legs(w, args: dict) -> list[Leg]:
+    """The legs of the line build_road draws for `args` (_line: an L runs along its row first, then down x2; both
+    legs hold the corner)."""
+    (x1, y1), (x2, y2) = _point(w, args, "x1", "y1"), _point(w, args, "x2", "y2")
+    if (x1, y1) == (x2, y2):
+        return [Leg(None, y1, x1, x1)]
+    return ([Leg("y", y1, min(x1, x2), max(x1, x2))] if x1 != x2 else []) + (
+        [Leg("x", x2, min(y1, y2), max(y1, y2))] if y1 != y2 else [])
+
+
+def _and(items: list[str]) -> str:
+    return ", ".join(items[:-1]) + " and " + items[-1] if len(items) > 1 else "".join(items)
+
+
 def _contents(w, tiles: list[tuple[int, int]]) -> str:
     """What the tiles hold by kind, largest first, the first CONTENT_KINDS kinds then "+N other tiles": road (bridges
     too), highway, zoned <letter> (with how many are developed), river, empty land, and any other structure by name
@@ -616,8 +659,9 @@ MAP_PARTS = ("size", "highway", "river", "roads", "road_lines", "unconnected", "
 MAYOR_MAP = ("roads", "unconnected", "built")
 
 
-def map_lines(f: dict, parts: tuple = MAP_PARTS) -> list[str]:
-    """The map_facts lines, only `parts` (MAP_PARTS keys, in MAP_PARTS order)."""
+def map_lines(f: dict, parts: tuple = MAP_PARTS, road_lines: int = ROAD_LINES) -> list[str]:
+    """The map_facts lines, only `parts` (MAP_PARTS keys, in MAP_PARTS order), naming the longest `road_lines` road
+    lines (none: no road lines line)."""
     W, H = f["size"]
     end = lambda e: f"x {_span(e[0], e[1])} at row {e[2]}"
     b = f["built"]
@@ -628,8 +672,8 @@ def map_lines(f: dict, parts: tuple = MAP_PARTS) -> list[str]:
         "river": ["- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
                   if f["river"] else "- no river"],
         "roads": ["- " + _roads_text(f["roads"])],
-        "road_lines": ["- road lines: " + _some([_road_line_text(ln) for ln in lns], ROAD_LINES, "; ")]
-                      if (lns := f.get("road_lines")) else [],
+        "road_lines": ["- road lines: " + _some([_road_line_text(ln) for ln in lns], road_lines, "; ")]
+                      if (lns := f.get("road_lines")) and road_lines > 0 else [],
         "unconnected": [f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y "
                         f"{_span(*u['y'])}) - reconnect them"] if (u := f.get("unconnected")) else [],
         "built": [f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, "
@@ -667,23 +711,30 @@ def _ascii(w, k: int) -> list[str]:
 
 def map_overview(w, limit: int = RESULT_CHARS, parts: tuple = MAP_PARTS) -> dict:
     """The whole map as ASCII rows with the map_facts summary, downsampled until the result fits `limit`. At full
-    size the summary goes first: it shrinks to what the role's Map block (`parts`) leaves out, then to that without
-    the road lines (the mayor's leaves out size, highway, river and road lines: MAYOR_MAP)."""
+    size the summary goes first. The mayor's shrinks to what its Map block (`parts`: MAYOR_MAP) leaves out (size,
+    highway, river and road lines), a department's (its Map block has it all) stays whole; then the road lines go,
+    the longest kept while they fit, and a department's summary last gives way to a pointer to the Map block.
+    Scripted seed 0: from month 66 the map, legend (growing with the city) and summary took 3,803 of the 3,800
+    characters (3,894 at month 120), and a department's map_overview went straight to the pointer; now it keeps 7
+    of the 12 road lines at month 72 and none at month 120 (3,768)."""
     facts = map_facts(w)
-    summary = [ln[2:] for ln in map_lines(facts)]
-    left = [p for p in MAP_PARTS if p not in parts]
-    note = ["the rest: see the Map block in your briefing" if left else "see the Map block in your briefing"]
-    short = [[ln[2:] for ln in map_lines(facts, ps)] + note
-             for ps in dict.fromkeys([tuple(left), tuple(p for p in left if p != "road_lines")])]
+    left = tuple(p for p in MAP_PARTS if p not in parts)
+    lines = lambda ps, n=ROAD_LINES: [ln[2:] for ln in map_lines(facts, ps, n)]
+    note = ["the rest: see the Map block in your briefing"] if left else []
+    steps = [lines(MAP_PARTS)] + [lines(left or MAP_PARTS, n) + note for n in range(ROAD_LINES, -1, -1)]
+    if not left:
+        steps.append(["see the Map block in your briefing"])
+    steps = [list(s) for s in dict.fromkeys(map(tuple, steps))]     # cuts that still name every road line are no step
     read = "top two rows: x (tens, units); rows start with y; higher tiers keep the letter"
-    for k, lines in [(1, summary)] + [(1, s) for s in short] + [(k, summary) for k in range(2, max(w.w, w.h) + 1)]:
+    for k in range(1, max(w.w, w.h) + 1):
         grid = _ascii(w, k)
         body = {c for row in grid[2:] for c in row[4:]}
-        res = {"ok": True, "summary": lines, "legend": _legend(body), "read": read, "map": grid}
-        if k > 1:
-            res["scale"] = f"each character is a {k}x{k} block, shown at its top-left x, y; inspect for detail"
-        if _size(res) <= limit:
-            break
+        for summary in steps if k == 1 else steps[:1]:
+            res = {"ok": True, "summary": summary, "legend": _legend(body), "read": read, "map": grid}
+            if k > 1:
+                res["scale"] = f"each character is a {k}x{k} block, shown at its top-left x, y; inspect for detail"
+            if _size(res) <= limit:
+                return res
     return res
 
 
@@ -1064,6 +1115,27 @@ def building_name(name: str) -> str:
     return name.replace("_", " ")
 
 
+def build_purpose(role: str, action: str, args: dict) -> str | None:
+    """`role`'s find_sites purpose for what a build action asks for: its tier name (the "kind", else the building the
+    action is named after; "tier" picks another of its line) in SITE_BUILDS, else another tier of its line there,
+    else the action's building when that is a purpose itself (build_casino); None when none fits."""
+    builds, own = SITE_BUILDS.get(role, {}), action.removeprefix("build_")
+    kind = _kind_name(args.get("kind"))
+    if action == "build_school":
+        kind = SCHOOL_KINDS.get(kind or "elementary", kind)
+    name = kind if kind in C.TIER_BY_NAME else own
+    line = C.TIER_BY_NAME.get(name, (None,))[0]
+    try:
+        tier = int(args["tier"]) if line and args.get("tier") is not None else None
+    except (TypeError, ValueError):
+        tier = None
+    if tier and 1 <= tier <= len(C.TIER_LINES[line]):
+        name = C.TIER_LINES[line][tier - 1]["name"]
+    exact = [p for p, names in builds.items() if name in names]
+    same = [p for p, names in builds.items() if line and any(C.TIER_BY_NAME.get(n, (None,))[0] == line for n in names)]
+    return next(iter(exact + same + [own] * (own in SITE_PURPOSES.get(role, {}))), None)
+
+
 class Price(NamedTuple):
     cost: float             # as the action charges it, unrounded (one tile for PER_TILE names)
     building: str           # what it buys, for people (building_name: "water tower", "bus line", "levee tile")
@@ -1363,6 +1435,15 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
 
 
 # ------------------------------------------------------------------ toolbox
+class Took(NamedTuple):
+    """A successful action of this turn: its call, action and arguments, and the tiles it took (a build_road its
+    whole line, road already or not; anything else the tiles it filled)."""
+    call: int
+    action: str
+    args: dict
+    tiles: frozenset
+
+
 class ToolBox:
     def __init__(self, env, role: str):
         if role not in ROLES:
@@ -1375,7 +1456,9 @@ class ToolBox:
         self.executed: list[dict] = []
         self.messages: list[dict] = []
         self.n_calls = 0                                  # tool calls this turn; "call N" counts from 1
+        self.took: list[Took] = []                        # this turn's successful actions, oldest first
         self.looked: Counter = Counter()                  # look-ups run this turn by tool (repeats not counted)
+        self._mapped: int | None = None                   # inspects run before map_overview first ran this turn
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
@@ -1410,7 +1493,8 @@ class ToolBox:
         "duplicate") is refused before it runs (not executed, logged or remembered as a failure) unless it passes
         confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
         result notes that map_overview shows the whole map (only the count when its radius note says so), until
-        map_overview runs; the note isn't cached, so a repeat comes without it."""
+        map_overview runs; after its first run, once INSPECTS_AFTER_MAP more have run, each further one notes that
+        its map already shows the layout. The notes aren't cached, so a repeat comes without them."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -1433,10 +1517,10 @@ class ToolBox:
         if name in self.lookups:
             self._seen[key] = (self.n_calls, copy.deepcopy(res))     # callers may change the result they get
             self.looked[name] += 1
-            if name == "inspect" and self.looked[name] > INSPECTS_FREE and not self.looked["map_overview"]:
-                count = f"inspect #{self.looked[name]} this turn"
-                res["note"] = (f"{res['note']}; {count}" if res.get("note")     # a radius note names map_overview
-                               else f"{count}: map_overview shows the whole map in one call")
+            if name == "map_overview" and self._mapped is None:
+                self._mapped = self.looked["inspect"]
+            elif name == "inspect":
+                self._inspect_note(res)
         elif name in ALL_ACTIONS:
             if res.get("ok"):
                 self._seen.clear()
@@ -1449,6 +1533,24 @@ class ToolBox:
         elif name == "update_plan" and res.get("ok"):
             self._seen.clear()
         return res
+
+    def _inspect_note(self, res: dict) -> None:
+        """The note on an inspect result (see call): before map_overview, from the (INSPECTS_FREE + 1)th, that it
+        shows the whole map; after it, from the (INSPECTS_AFTER_MAP + 1)th since, that its map already shows the
+        layout. Either after the radius note when there is one (that one names map_overview)."""
+        n = self.looked["inspect"]
+        if self._mapped is None:
+            if n <= INSPECTS_FREE:
+                return
+            count = f"inspect #{n} this turn"
+            res["note"] = f"{res['note']}; {count}" if res.get("note") else \
+                f"{count}: map_overview shows the whole map in one call"
+            return
+        if n - self._mapped <= INSPECTS_AFTER_MAP:
+            return
+        note = (f"inspect #{n - self._mapped} since map_overview: its map already shows the layout; inspect only a "
+                "tile you are about to act on")
+        res["note"] = f"{res['note']}; {note}" if res.get("note") else note
 
     @staticmethod
     def _refusal(n: int, err: str) -> dict:
@@ -1542,9 +1644,11 @@ class ToolBox:
             if refusal:
                 return {"ok": False, "refused": kind, "error": refusal}
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
+        before = w.struct.copy()
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         if res["ok"]:
             self._funded = None
+            self.took.append(Took(self.n_calls, name, dict(args), self._taken(name, args, before)))
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
@@ -1556,6 +1660,15 @@ class ToolBox:
             note = self._explain(name, args, res["message"])
         return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
                 "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
+
+    def _taken(self, name: str, args: dict, before: np.ndarray) -> frozenset:
+        """The tiles a successful action took (Took.tiles): a build_road's whole line, else the tiles it filled
+        (`before`: the structures before it ran)."""
+        w = self.world
+        if name == "build_road":
+            return frozenset(_line(w, args))
+        ys, xs = np.nonzero((w.struct != before) & (w.struct != C.NONE))
+        return frozenset(zip(xs.tolist(), ys.tolist()))
 
     def _disconnect_refusal(self, name: str, args: dict) -> str | None:
         """Why a bulldoze or demolish (guarded()) with these arguments must not run: it would cut highway-connected
@@ -1685,7 +1798,10 @@ class ToolBox:
         (35,23)-(35,8), then zone R x=35 y 9-22), and 13 x "every tile on that line is already road" (e.g. the main
         road (0,24)-(47,24) again), told nothing more. So a zone or dezone that found nothing to do says what the
         rectangle holds, a zone adds the free roadside land beside it, and a road on existing road names the road
-        lines it runs along (else, off every line, the connected roads' extent). "" otherwise."""
+        lines it runs along (else, off every line, the connected roads' extent). Smoke v12-v16: 14 of 25 such zones
+        and 4 of 13 such roads went over the role's own zone or road of that turn, so those name its calls
+        (_own_zones, _own_roads). A build on a taken tile says what took it and the next free site (_taken_hint). ""
+        otherwise."""
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
@@ -1696,19 +1812,25 @@ class ToolBox:
                 return ""
             beside = _zone_beside(w, tiles, [t for sp in self._funded_spots() for t in sp.tiles]) if name == "zone" \
                 else []
-            return f" - {_contents(w, tiles)}" + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
+            mine = self._own_zones(tiles) if name == "zone" else ""
+            return (f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
+                    + (f"; zone beside it instead: {' or '.join(beside)}" if beside else ""))
         if name != "build_road":
-            return ""
+            m = NOT_EMPTY.match(message)
+            return self._taken_hint(name, args, (int(m[1]), int(m[2])), m[3]) if m else ""
         if message == "every tile on that line is already road":
             line = _line(w, args)
             on = [_road_line_text(ln) for ln in _road_lines(w)       # lines it runs along (a crossing tile isn't)
                   if sum(_on_road_line(ln, x, y) for x, y in line) >= min(2, len(line))]
+            own = self._own_roads(args)
+            mine = f"you built {_some(own, OWN_NAMED, ' and ')} this turn" if own else ""
             if not on:
-                return (f" - {_roads_text(_roads(w))}; start on the road and run into free land (find_sites "
-                        "road_extension)")
+                return (f" - {mine + '; ' if mine else ''}{_roads_text(_roads(w))}; start on the road and run into free "
+                        "land (find_sites road_extension)")
             many = len(on) > 1                                    # at most 2: one per leg, or a crossing tile's two
-            return (f" - the road line{'s' * many} {' and '.join(on)} {'are' if many else 'is'} already built; branch "
-                    f"off {'them' if many else 'it'} into free land (find_sites road_extension)")
+            return (f" - the road line{'s' * many} {' and '.join(on)} {'are' if many else 'is'} already built"
+                    + (f" ({mine})" if mine else "")
+                    + f"; branch off {'them' if many else 'it'} into free land (find_sites road_extension)")
         if " is occupied by " not in message:
             return ""
         line = _line(w, args)                             # build_road got this far, so the arguments parse
@@ -1744,6 +1866,76 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _own_roads(self, args: dict) -> list[str]:
+        """This turn's successful build_road calls along the failed line `args` names, each as the legs of it that
+        are ("y=24 x 19-34 at call 2"; Leg.along: a road it only crosses isn't). Smoke v15 seed 0 month 3: planning
+        built (19,43)-(28,43) at call 5 and again at call 10; v16 seed 0 month 0: (19,24)-(34,24), then the old road
+        up to it, (0,24)-(19,24)."""
+        w, failed, out = self.world, _legs(self.world, args), []
+        for t in self.took:
+            if t.action == "build_road":
+                legs = [leg.text() for leg in _legs(w, t.args) if any(leg.along(f) for f in failed)]
+                if legs:
+                    out.append(f"{' and '.join(legs)} at call {t.call}")
+        return out
+
+    def _own_zones(self, tiles: list[tuple[int, int]]) -> str:
+        """For a zone on a rectangle (`tiles`) with no empty land: this turn's zone calls that zoned tiles there still
+        zoned (each tile to the latest), "" for none: "you zoned them at call 17 this turn" (every tile), "you zoned 2
+        of them at call 1 and 2 at call 3 this turn". Smoke v14 seed 0 month 6: zone C (45,27)-(46,30) at call 17,
+        zone I there at call 18, "all 8 tiles are zoned C"."""
+        w = self.world
+        left, calls = {(x, y) for x, y in tiles if w.struct[y, x] in C.ZONES}, []
+        for t in reversed(self.took):
+            if t.action == "zone" and (mine := left & t.tiles):
+                calls.insert(0, (t.call, len(mine)))
+                left -= mine
+        if not calls:
+            return ""
+        if sum(n for _, n in calls) == len(tiles):
+            return f"you zoned them at call{'s' * (len(calls) > 1)} {_and([str(c) for c, _ in calls])} this turn"
+        each = [f"{n} at call {c}" for c, n in calls]
+        return f"you zoned {_and([each[0].replace(' at', ' of them at', 1)] + each[1:])} this turn"
+
+    def _taken_hint(self, name: str, args: dict, xy: tuple[int, int], want: str) -> str:
+        """For a build refused because its tile (`xy`, the first one of its footprint not free) isn't empty `want`
+        land / river / riverbank: what the tile is or holds, a building as "now holds your water pump (call 5 this
+        turn)" when this turn's own action put it there, "holds your water pump" when it is the role's, else "holds
+        a water pump"; then the next free site on the role's list for what it builds (build_purpose), or why the
+        list is empty. "" on any error: it is advice. Smoke v14 seed 1 month 0: utilities built its pump at (29,23)
+        at call 5 and its outlet there at call 6, told only "(29,23) is not an empty land tile"; in v12-v16, 15 of
+        the 19 builds on a taken tile went where the role's own build had gone that turn."""
+        try:
+            w, (x, y) = self.world, xy
+            s, water = int(w.struct[y, x]), bool(w.terrain[y, x] == C.WATER)
+            if s in C.ZONES:
+                what = f"is zoned {C.LETTER_BY_ZONE[s]}" + (" (developed)" if w.level[y, x] > 0 else "")
+            elif s in (C.ROAD, C.HIGHWAY, C.NONE):
+                what = "is " + ({C.ROAD: "a bridge" if water else "road", C.HIGHWAY: "the highway"}.get(s) or (
+                    "river" if water else "off the riverbank" if want == "riverbank" else "land"))
+            else:
+                spec = w.facility_spec(*w._anchor_of(x, y))
+                b = building_name(spec["name"]) if spec else C.STRUCT_NAME.get(s, "building").replace("_", " ")
+                call = next((t.call for t in reversed(self.took) if (x, y) in t.tiles), None)
+                what = (f"now holds your {b} (call {call} this turn)" if call is not None else
+                        "holds " + (f"your {b}" if s in OWNED_STRUCTS.get(self.role, ()) else a_or_an(b)))
+            nxt = self._next_site(name, args, xy)
+            return f" - ({x},{y}) {what}" + (f"; {nxt}" if nxt else "")
+        except Exception:
+            return ""
+
+    def _next_site(self, name: str, args: dict, xy: tuple[int, int]) -> str:
+        """The first free site on the role's find_sites list for what a build asks for (build_purpose), or why the list
+        is empty; "" when it has no list or the list is locked."""
+        purpose = build_purpose(self.role, name, args)
+        if purpose is None:
+            return ""
+        lst = site_lists(self.world, self.role, role_obs(self.env, self.role))[purpose]
+        site = next((s for s in lst.sites if (s["x"], s["y"]) != xy), None)
+        if site is not None:
+            return f"next free {purpose} site: {_where(site)}"
+        return f"no free {purpose} site listed ({lst.short})" if lst.short and not lst.short.startswith("locked") else ""
 
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:

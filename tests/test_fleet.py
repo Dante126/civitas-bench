@@ -331,8 +331,9 @@ def test_inspect_points_to_map_overview_from_the_4th_call_in_a_turn():
     assert box.call("map_overview", {})["ok"]
     assert "note" not in box.call("inspect", {"x": 20, "y": 24}) and "note" not in box.call("inspect", {"x": 4, "y": 4})
     box = ToolBox(env, "planning")
-    assert box.call("map_overview", {})["ok"]                                         # first: no note at all
-    assert not any("note" in box.call("inspect", {"x": x, "y": 20}) for x in range(0, 40, 5))
+    assert box.call("map_overview", {})["ok"]                                         # first: never this note
+    assert not any(box.call("inspect", {"x": x, "y": 20}).get("note", "").endswith("in one call")
+                   for x in range(0, 40, 5))
     box = ToolBox(env, "planning")                                                    # an off-map inspect counts
     assert box.call("inspect", {"x": 99, "y": 24})["ok"] is False
     assert ["note" in box.call("inspect", {"x": x, "y": 24}) for x in (4, 8)] == [False] * 2
@@ -343,6 +344,31 @@ def test_inspect_points_to_map_overview_from_the_4th_call_in_a_turn():
     assert box.call("zone", {"zone": "R", "x1": 3, "y1": 25, "x2": 8, "y2": 25})["ok"]
     res = box.call("inspect", {"x": 4, "y": 24})
     assert "repeat" not in res and res["note"] == note(4), res
+
+
+def test_inspects_after_map_overview_say_its_map_shows_the_layout():
+    """Smoke v12-v16: planning called map_overview on 35 of its 40 turns and then inspected 134 times (3.8 a turn, up
+    to 10), and the note, which only pointed to map_overview, stayed silent. From the 3rd inspect after map_overview
+    (counted from its first run; repeats don't count) the result says its map already shows the layout."""
+    env = _env()
+    note = lambda n: (f"inspect #{n} since map_overview: its map already shows the layout; inspect only a tile you are "
+                      "about to act on")
+    box = ToolBox(env, "planning")
+    assert ["note" in box.call("inspect", {"x": x, "y": 24}) for x in (4, 8, 12)] == [False] * 3
+    assert box.call("map_overview", {})["ok"]
+    assert ["note" in box.call("inspect", {"x": x, "y": 30}) for x in (4, 8)] == [False] * 2    # counted afresh
+    assert box.call("inspect", {"x": 8, "y": 30})["repeat"]
+    assert box.call("inspect", {"x": 12, "y": 30})["note"] == note(3)
+    res = box.call("inspect", {"x": 16, "y": 30, "radius": 9})
+    assert res["note"] == "radius 9 clipped to 4 (0-4); map_overview shows the whole map; " + note(4), res
+    env.world.dept_funds["planning"] = 1000
+    assert box.call("zone", {"zone": "R", "x1": 3, "y1": 25, "x2": 8, "y2": 25})["ok"]
+    assert box.call("map_overview", {})["ok"]                                           # runs again: no fresh count
+    assert box.call("inspect", {"x": 4, "y": 30})["note"] == note(5)
+    for role in TURN_ORDER:                                                             # every role
+        box = ToolBox(env, role)
+        box.call("map_overview", {})
+        assert [box.call("inspect", {"x": x, "y": 20}).get("note") for x in (0, 5, 10)] == [None, None, note(3)], role
 
 
 CONDITIONAL_SITES = {"riverbank_2x2", "casino", "metro_station", "levee"}   # lists only there once unlocked / forecast
@@ -1053,8 +1079,11 @@ def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
     assert res["summary"] == [ln[2:] for ln in map_lines(map_facts(grown_env.world))]
     assert "higher tiers keep the letter" in res["read"] and "higher tiers" not in res["legend"]
     from civitas.fleet.tools import map_overview
-    tight = map_overview(grown_env.world, limit=len(json.dumps(res)) - 1)     # a full legend: summary goes first
-    assert "briefing" in tight["summary"][0] and tight["map"] == res["map"] and "scale" not in tight
+    tight = map_overview(grown_env.world, limit=len(json.dumps(res)) - 1)     # a full legend: the summary shrinks
+    assert tight["summary"] != res["summary"] and tight["map"] == res["map"] and "scale" not in tight
+    tight = map_overview(grown_env.world, limit=len(json.dumps({**res, "summary": ["see the Map block in your "
+                                                                                    "briefing"]})))
+    assert tight["summary"] == ["see the Map block in your briefing"] and tight["map"] == res["map"], tight["summary"]
 
 
 def test_the_mayor_map_overview_fallback_lists_what_its_briefing_leaves_out(grown_env, monkeypatch):
@@ -1071,14 +1100,58 @@ def test_the_mayor_map_overview_fallback_lists_what_its_briefing_leaves_out(grow
     tight = map_overview(w, limit=len(json.dumps(full)) - 1, parts=MAYOR_MAP)
     assert tight["summary"] == lines(("size", "highway", "river", "road_lines")) + [rest]
     assert tight["map"] == full["map"] and "scale" not in tight
-    tighter = map_overview(w, limit=len(json.dumps(tight)) - 1, parts=MAYOR_MAP)     # then without the road lines
-    assert tighter["summary"] == lines(("size", "highway", "river")) + [rest] and "scale" not in tighter
-    assert map_overview(w, limit=len(json.dumps(full)) - 1)["summary"] == ["see the Map block in your briefing"]
+    tighter = map_overview(w, limit=len(json.dumps(tight)) - 1, parts=MAYOR_MAP)     # then fewer road lines
+    n = min(len(facts["road_lines"]), T.ROAD_LINES)
+    assert n > 1 and tighter["summary"] == [ln[2:] for ln in map_lines(facts, ("size", "highway", "river",
+                                                                               "road_lines"), n - 1)] + [rest]
+    none = [ln[2:] for ln in map_lines(facts, ("size", "highway", "river"))] + [rest]
+    limit = len(json.dumps({**tighter, "summary": none}))                           # room for none of them
+    assert map_overview(w, limit=limit, parts=MAYOR_MAP)["summary"] == none
     seen, real = [], T.map_overview
     monkeypatch.setattr(T, "map_overview", lambda w, **k: seen.append(k.get("parts")) or real(w, **k))
     ToolBox(grown_env, "mayor").call("map_overview", {})
     ToolBox(grown_env, "police").call("map_overview", {})
     assert seen == [MAYOR_MAP, MAP_PARTS]
+
+
+@pytest.fixture(scope="module")
+def env72():
+    """Scripted seed 0 at month 72 of a 120-month game (about 2 s)."""
+    env = CivitasEnv(GameConfig(seed=0, months=120))
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(72):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    return env
+
+
+def test_map_overview_drops_road_lines_before_the_summary(env72):
+    """Scripted seed 0: from month 66 the map, legend and summary no longer fit in one result (3,803 of 3,800
+    characters at month 72, 3,894 at month 120: the legend grows with the city), and a department's map_overview gave
+    only "see the Map block in your briefing". Now the road lines go first, the longest kept while they fit (month 72:
+    7 of 12, 3,790), then all of them (month 120: 3,768), and only then the summary."""
+    from civitas.fleet.tools import RESULT_CHARS, ROAD_LINES, map_facts, map_lines, map_overview
+    w = env72.world
+    facts = map_facts(w)
+    full = [ln[2:] for ln in map_lines(facts)]
+    road = lambda summary: [ln for ln in summary if ln.startswith("road lines: ")]
+    rest = [ln for ln in full if not road([ln])]
+    res = ToolBox(env72, "planning").call("map_overview", {})
+    assert res["ok"] and len(json.dumps(res)) <= RESULT_CHARS and "scale" not in res
+    assert len(json.dumps({**res, "summary": full})) > RESULT_CHARS                  # the whole summary doesn't fit
+    kept, = road(res["summary"])
+    n = kept.count(";") + 1
+    assert 0 < n < ROAD_LINES < len(facts["road_lines"]), kept
+    assert res["summary"] == [ln[2:] for ln in map_lines(facts, road_lines=n)]      # in place, "+N more" at the end
+    assert kept.endswith(f" +{len(facts['road_lines']) - n} more")
+    steps, limit = [], RESULT_CHARS                                                  # tighter and tighter: the steps
+    while "scale" not in (r := map_overview(w, limit=limit)):
+        steps.append(r["summary"])
+        limit = len(json.dumps(r)) - 1
+    assert steps[0] == res["summary"]
+    assert [road(s)[0].count(";") + 1 for s in steps[:-2]] == list(range(n, 0, -1))  # one road line fewer each time
+    assert steps[-2:] == [rest, ["see the Map block in your briefing"]]
 
 
 def test_map_overview_downsamples_big_maps():
@@ -1876,8 +1949,8 @@ def test_road_through_empty_zoned_lots_says_to_dezone_them_first():
     assert box.call("build_road", row)["ok"]
     res = box.call("build_road", row)
     assert res["ok"] is False and res["message"] == (
-        "every tile on that line is already road - the road line y=24 x 0-28 is already built; branch off it into free "
-        "land (find_sites road_extension)"), res
+        "every tile on that line is already road - the road line y=24 x 0-28 is already built (you built y=24 x 19-28 "
+        "at call 1 this turn); branch off it into free land (find_sites road_extension)"), res
     assert box.call("zone", {"zone": "R", "x1": 19, "y1": 21, "x2": 28, "y2": 23})["ok"]
     core = "tile (19,23) is occupied by residential; bulldoze it or route around"
     road = {"x1": 19, "y1": 24, "x2": 19, "y2": 20}
@@ -1917,7 +1990,8 @@ def test_zoning_high_density_before_town_says_zone_low():
     res = box.call("zone", {"zone": "R", "density": "low", **rect})
     assert res["ok"] and res["message"] == "zoned 6 tiles R (low density)", res
     assert box.call("zone", {"zone": "C", **rect})["message"] == (   # row 24 is road, row 26 off the road, and the
-        "no empty land tiles in that area - all 6 tiles are zoned R")  # 1-tile end caps aren't offered as single lots
+        "no empty land tiles in that area - all 6 tiles are zoned R; you zoned them at call 3 this turn")  # 1-tile end
+                                                                     # caps aren't offered as single lots
 
 
 NO_LAND = "no empty land tiles in that area"
@@ -1961,18 +2035,48 @@ def test_failed_zone_counts_a_mixed_area_and_ranks_the_sides():
     w.level[23, 25] = 1
     assert (w.terrain[23, 26:29] == C.WATER).all() and (w.terrain[25, 27:30] == C.WATER).all()
     res = box.call("zone", {"zone": "C", "x1": 25, "y1": 23, "x2": 29, "y2": 24})
-    assert res["message"] == (f"{NO_LAND} - 5 road, 3 river, 2 zoned R (1 developed); zone beside it instead: "
-                              "x1=24,y1=23,x2=24,y2=23 or x1=30,y1=23,x2=30,y2=23"), res  # 2-tile sides: 1 lot is half
+    assert res["message"] == (f"{NO_LAND} - 5 road, 3 river, 2 zoned R (1 developed); you zoned 2 of them at call 2 "
+                              "this turn; zone beside it instead: x1=24,y1=23,x2=24,y2=23 or x1=30,y1=23,x2=30,y2=23"
+                              ), res                                                          # 2-tile sides: 1 lot is half
     assert box.call("zone", {"zone": "C", "x1": 24, "y1": 23, "x2": 24, "y2": 23})["ok"]   # (south: only (25,25) is
     hall = {"x1": 17, "y1": 23, "x2": 17, "y2": 23}                                        # free, off the bank)
     res = box.call("zone", {"zone": "R", **hall})                  # one tile: the town hall, and 1-tile sides
     assert res["message"] == (f"{NO_LAND} - the tile is a town hall; zone beside it instead: x1=16,y1=23,x2=16,y2=23 "
                               "or x1=18,y1=23,x2=18,y2=23"), res
     assert box.call("zone", {"zone": "R", "x1": 16, "y1": 23, "x2": 18, "y2": 23})["ok"]    # around the town hall
-    assert box.call("zone", {"zone": "C", **hall})["message"] == f"{NO_LAND} - the tile is a town hall"   # none free
-    res = box.call("zone", {"zone": "C", "x1": 16, "y1": 23, "x2": 18, "y2": 24})
-    assert res["message"] == (f"{NO_LAND} - 3 road, 2 zoned R, 1 town hall; zone beside it instead: "
-                              "x1=16,y1=25,x2=18,y2=25 or x1=15,y1=23,x2=15,y2=23"), res
+    assert box.call("zone", {"zone": "C", **hall})["message"] == f"{NO_LAND} - the tile is a town hall"   # none free,
+    res = box.call("zone", {"zone": "C", "x1": 16, "y1": 23, "x2": 18, "y2": 24})                      # none its own
+    assert res["message"] == (f"{NO_LAND} - 3 road, 2 zoned R, 1 town hall; you zoned 2 of them at call 6 this turn; "
+                              "zone beside it instead: x1=16,y1=25,x2=18,y2=25 or x1=15,y1=23,x2=15,y2=23"), res
+
+
+def test_zoning_over_its_own_zone_names_the_call():
+    """Smoke v14 seed 0 month 6: planning zoned C (45,27)-(46,30) at call 17 and I on the same rectangle at call 18
+    ("all 8 tiles are zoned C"); in v12-v16, 14 of the 25 zones on land that wasn't free came after the role's own
+    zone of some of those tiles that turn. The hint names the call(s) and how many of the tiles they zoned (those
+    still zoned; "them" for all), and keeps the strips beside it; the log keeps the core message."""
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    box = ToolBox(env, "planning")
+    rect = {"x1": 3, "y1": 22, "x2": 8, "y2": 23}
+    assert box.call("zone", {"zone": "C", **rect})["ok"]                                        # call 1
+    res = box.call("zone", {"zone": "I", **rect})
+    assert res["message"] == (f"{NO_LAND} - all 12 tiles are zoned C; you zoned them at call 1 this turn; zone beside "
+                              "it instead: x1=2,y1=23,x2=2,y2=23 or x1=9,y1=23,x2=9,y2=23"), res
+    assert box.executed[-1]["message"] == NO_LAND
+    assert FleetState.of(env).history(kind="failure", role="planning")[-1]["message"] == NO_LAND
+    assert box.call("zone", {"zone": "R", "x1": 9, "y1": 23, "x2": 12, "y2": 23})["ok"]       # call 3
+    res = box.call("zone", {"zone": "I", "x1": 7, "y1": 23, "x2": 10, "y2": 24})              # two calls, and road
+    assert res["message"] == (f"{NO_LAND} - 4 road, 2 zoned C, 2 zoned R; you zoned 2 of them at call 1 and 2 at call "
+                              "3 this turn; zone beside it instead: x1=7,y1=25,x2=10,y2=25"), res
+    assert box.call("dezone", {"x1": 5, "y1": 23, "x2": 6, "y2": 23})["ok"]                   # call 5
+    assert box.call("build_road", {"x1": 5, "y1": 23, "x2": 6, "y2": 23})["ok"]               # call 6: road now
+    res = box.call("zone", {"zone": "I", "x1": 5, "y1": 22, "x2": 6, "y2": 23})
+    assert res["message"] == f"{NO_LAND} - 2 zoned C, 2 road; you zoned 2 of them at call 1 this turn", res
+    box = ToolBox(env, "planning")                                                              # a new turn: not its own
+    res = box.call("zone", {"zone": "I", **rect})
+    assert res["message"].startswith(f"{NO_LAND} - 10 zoned C, 2 road; zone beside it instead: "), res
 
 
 def test_failed_zone_names_the_structures_and_caps_the_kinds():
@@ -2080,7 +2184,8 @@ def test_rebuilding_a_road_names_the_road_line_it_is_on():
     assert res["ok"] is False and res["message"] == (
         "every tile on that line is already road - the road line y=24 x 0-19 is already built" + tail.format("it")), res
     assert box.executed[-1]["message"] == "every tile on that line is already road"
-    assert box.call("build_road", {"x1": 10, "y1": 23, "x2": 10, "y2": 18})["message"] == "built 6 road tiles"
+    road = apply_action(w, "planning", {"type": "build_road", "x1": 10, "y1": 23, "x2": 10, "y2": 18})  # not this turn's
+    assert road.message == "built 6 road tiles"
     res = box.call("build_road", {"x1": 3, "y1": 24, "x2": 10, "y2": 18})          # an L along both lines
     assert res["message"].endswith(" - the road lines y=24 x 0-19 and x=10 y 18-24 are already built"
                                    + tail.format("them")), res
@@ -2089,10 +2194,45 @@ def test_rebuilding_a_road_names_the_road_line_it_is_on():
     assert res["message"].endswith(" - the road line x=10 y 18-24 is already built" + tail.format("it")), res
     res = box.call("build_road", {"x1": 5, "y1": 24, "x2": 5, "y2": 24})           # a single tile
     assert res["message"].endswith(" - the road line y=24 x 0-19 is already built" + tail.format("it")), res
-    assert box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})["ok"]     # a 1-tile stub: on no road line
-    res = box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})
+    stub = {"x1": 7, "y1": 25, "x2": 7, "y2": 25}                                  # a 1-tile stub: on no road line
+    assert apply_action(w, "planning", {"type": "build_road", **stub}).ok
+    res = box.call("build_road", stub)
     assert res["message"] == ("every tile on that line is already road - highway-connected roads: x 0-19, y 18-25, "
                               "27 tiles; start on the road and run into free land (find_sites road_extension)"), res
+
+
+def test_rebuilding_its_own_new_road_names_the_call():
+    """Smoke v12-v16, 4 of the 13 "already road": v15 seed 0 month 3, planning built (19,43)-(28,43) at call 5 and
+    again at call 10; v16 seed 0 month 0, (19,24)-(34,24) at call 2, then (0,24)-(19,24), the old road up to it, at
+    call 6; told only the road line, it took its own new road for someone else's. The hint names this turn's
+    build_road calls along the failed line (a road it crosses isn't along it); the log keeps the core message."""
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    box = ToolBox(env, "planning")
+    core = "every tile on that line is already road"
+    tail = " into free land (find_sites road_extension)"
+    assert box.call("build_road", {"x1": 19, "y1": 24, "x2": 40, "y2": 24})["ok"]              # call 1
+    assert box.call("build_road", {"x1": 35, "y1": 23, "x2": 35, "y2": 15})["ok"]              # call 2: north off it
+    assert box.call("city_overview", {})["ok"]
+    res = box.call("build_road", {"x1": 0, "y1": 24, "x2": 19, "y2": 24})                      # the old road up to it
+    assert res["message"] == (f"{core} - the road line y=24 x 0-40 is already built (you built y=24 x 19-40 at call 1 "
+                              "this turn); branch off it" + tail), res
+    assert box.executed[-1]["message"] == core
+    assert FleetState.of(env).history(kind="failure", role="planning")[-1]["message"] == core
+    res = box.call("build_road", {"x1": 35, "y1": 24, "x2": 35, "y2": 18})                     # crosses call 1's road
+    assert res["message"] == (f"{core} - the road line x=35 y 15-24 is already built (you built x=35 y 15-23 at call 2 "
+                              "this turn); branch off it" + tail), res
+    res = box.call("build_road", {"x1": 30, "y1": 24, "x2": 35, "y2": 20})                     # an L along both
+    assert res["message"] == (f"{core} - the road lines y=24 x 0-40 and x=35 y 15-24 are already built (you built "
+                              "y=24 x 19-40 at call 1 and x=35 y 15-23 at call 2 this turn); branch off them" + tail), res
+    assert box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})["ok"]                # call 7: a 1-tile stub
+    res = box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})
+    assert res["message"] == (f"{core} - you built (7,25) at call 7 this turn; highway-connected roads: x 0-40, y "
+                              "15-25, 51 tiles; start on the road and run" + tail), res
+    box = ToolBox(env, "planning")                                                              # a new turn: not its own
+    res = box.call("build_road", {"x1": 0, "y1": 24, "x2": 19, "y2": 24})
+    assert res["message"] == f"{core} - the road line y=24 x 0-40 is already built; branch off it" + tail, res
 
 
 def _developed_below_free_land(w):
@@ -2191,6 +2331,71 @@ def test_dezone_advice_stays_between_buildings(grown_env):
         f" and buildings ({x},{y}), ({x},{y - 2}); dezone the lots first (free): dezone x1={x},y1={y + 1},x2={x},"
         f"y2={y + 1}; dezone x1={x},y1={y - 1},x2={x},y2={y - 1} +1 more; route around the buildings (the Map block "
         "has the road extent)"), res
+
+
+def test_a_build_on_a_taken_tile_says_what_took_it_and_the_next_site():
+    """Smoke v14 seed 1 month 0: utilities built its pump at (29,23) at call 5 and its outlet there at call 6, "(29,23)
+    is not an empty land tile", then asked the mayor to free a riverbank lot. In v12-v16, 15 of the 19 builds on a
+    taken tile (utilities 11, health 2, education 2) went where the role's own build had gone that turn. The hint
+    says what holds the tile (this turn's own call, the role's own building, anything else) and names the next free
+    site of that purpose from the role's list, or why there is none; the log keeps the core message."""
+    from civitas.fleet.tools import role_obs, site_lists
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = w.dept_funds["utilities"] = w.dept_funds["police"] = 20000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 47, "y2": 24}).ok
+    box = ToolBox(env, "utilities")
+    assert box.call("build_water", {"kind": "pump", "x": 25, "y": 23})["ok"]                 # call 1
+    core = "(25,23) is not an empty land tile"
+    res = box.call("build_sewage", {"kind": "outlet", "x": 25, "y": 23})
+    assert res["ok"] is False and res["message"] == res["error"] == (
+        f"{core} - (25,23) now holds your water pump (call 1 this turn); next free sewage site: (26,25)"), res
+    assert box.executed[-1]["message"] == core
+    assert FleetState.of(env).history(kind="failure", role="utilities")[-1]["message"] == core
+    res = box.call("build_power_plant", {"kind": "wind", "x": 25, "y": 23})
+    assert res["message"] == f"{core} - (25,23) now holds your water pump (call 1 this turn); next free wind site: " \
+                             f"(41,25)", res
+    res = box.call("build_water", {"kind": "tower", "x": 20, "y": 24})                       # a road
+    assert res["message"] == ("(20,24) is not an empty land tile - (20,24) is road; next free near_homes site: (0,23)"
+                              ), res
+    assert apply_action(w, "planning", {"type": "zone", "zone": "R", "x1": 3, "y1": 25, "x2": 4, "y2": 25}).ok
+    res = box.call("build_water", {"kind": "tower", "x": 3, "y": 25})
+    assert res["message"].startswith("(3,25) is not an empty land tile - (3,25) is zoned R; next free near_homes "), res
+    for x, y in ((29, 23), (26, 25), (30, 25)):                                               # the other bank lots
+        assert apply_action(w, "planning", {"type": "zone", "zone": "R", "x": x, "y": y}).ok
+    short = site_lists(w, "utilities", role_obs(env, "utilities"))["sewage"].short
+    assert short.startswith("riverbank beside roads all taken")
+    res = box.call("build_sewage", {"kind": "outlet", "x": 25, "y": 23, "tier": 1})
+    assert res["message"] == f"{core} - (25,23) now holds your water pump (call 1 this turn); no free sewage site " \
+                             f"listed ({short})", res
+    res = ToolBox(env, "utilities").call("build_sewage", {"kind": "outlet", "x": 25, "y": 23})     # a new turn
+    assert res["message"] == f"{core} - (25,23) holds your water pump; no free sewage site listed ({short})", res
+    res = ToolBox(env, "police").call("build_police_station", {"x": 25, "y": 23})                 # not its own
+    assert res["message"].startswith(f"{core} - (25,23) holds a water pump; "), res
+    res = ToolBox(env, "police").call("build_police_station", {"x": 5, "y": 5})                  # other failures:
+    assert res["message"] == "(5,5) does not touch a road; buildings must be next to a road", res   # as they are
+
+
+@pytest.mark.parametrize("role, action, args, purpose", [
+    ("utilities", "build_power_plant", {"kind": "coal"}, "coal_or_gas"),
+    ("utilities", "build_power_plant", {"kind": "wind"}, "wind"),              # its own list before near_homes'
+    ("utilities", "build_power_plant", {"kind": "Solar"}, "near_homes"),
+    ("utilities", "build_power_plant", {"kind": "hydro"}, None),               # a dam goes on the river: no list
+    ("utilities", "build_water", {"kind": "pumping station"}, "pump"),         # a higher tier: its line's list
+    ("utilities", "build_water", {"kind": "pump", "tier": 3}, "riverbank_2x2"),   # water works
+    ("utilities", "build_water", {"kind": "tower"}, "near_homes"),
+    ("utilities", "build_sewage", {"kind": "outlet"}, "sewage"),
+    ("police", "build_police_station", {}, "station"), ("police", "build_jail", {}, "jail"),
+    ("fire", "build_fire_station", {}, "station"), ("fire", "build_shelter", {}, "shelter"),
+    ("health", "build_clinic", {}, "clinic"), ("health", "build_hospital", {}, "hospital"),
+    ("health", "build_cemetery", {}, "cemetery"),
+    ("education", "build_school", {}, "school"), ("education", "build_school", {"kind": "high"}, "high_school"),
+    ("education", "build_school", {"kind": "university"}, "university"), ("education", "build_library", {}, "library"),
+    ("transport", "build_harbour", {}, "harbour"), ("transport", "build_train_station", {}, "train_station"),
+    ("planning", "build_casino", {}, "casino"), ("planning", "build_landmark", {"kind": "plaza"}, None)])
+def test_build_purpose_is_the_list_the_build_uses(role, action, args, purpose):
+    from civitas.fleet.tools import build_purpose
+    assert build_purpose(role, action, args) == purpose
 
 
 # ---------------------------------------------------------------- briefing

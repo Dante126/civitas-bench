@@ -520,17 +520,25 @@ tasks and money, and to let people coach it.
   lots names them and the `dezone` rectangles to run first (free; they stay on the road's
   line, at most 2 named), and one blocked by a building says to route around it.
   - "Already road" names the road line it runs along ("branch off it into free land") and
-    points to `find_sites road_extension`.
+    points to `find_sites road_extension`. When the line runs along the role's own
+    `build_road` of that turn, it names that call (`you built y=24 x 19-34 at call 2 this
+    turn`).
   - A zone on land that isn't free says what the rectangle holds ("all 14 tiles are road",
-    "6 zoned C (4 developed), 2 road"). Where free roadside land lies beside it, the hint
-    suggests up to 2 one-tile-wide strips there to zone instead. While the city lacks a pump
-    or a sewage outlet, those strips skip free riverbank lots.
+    "6 zoned C (4 developed), 2 road"), and names the role's own zones of that turn that
+    took those tiles (`you zoned them at call 17 this turn`). Where free roadside land lies
+    beside it, the hint suggests up to 2 one-tile-wide strips there to zone instead. While
+    the city lacks a pump or a sewage outlet, those strips skip free riverbank lots.
   - A failed dezone says what is there.
   - High density before its unlock gets `zone with density "low" now`.
+  - A build on a tile that isn't free says what is there (`(29,23) now holds your water
+    pump (call 5 this turn)` when the role's own build took it that turn) and names the next
+    free site on the role's list for that building, or why the list is empty. In smoke
+    v12–v16, 15 of 19 such builds went where the role had just built.
 
   These hints go to the model only; the history log and the turn's action results keep the
   game's message. From the 4th `inspect` in a turn, while `map_overview` hasn't been called,
-  the result points to `map_overview`.
+  the result points to `map_overview`. After it, from the 3rd further `inspect`, the result
+  says its map already shows the layout and to inspect only a tile about to be acted on.
 - **Guards.** A `bulldoze` that would cut highway-connected road tiles off the highway
   (the road network relabelled without the removed tiles, as `World.refresh()` does) is
   refused before it runs (`refused: "disconnect"`: not executed, not charged as an invalid
@@ -550,7 +558,7 @@ tasks and money, and to let people coach it.
 
 | tools | |
 |---|---|
-| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block, or a pointer to it when the map and the facts together don't fit, as from about month 72 of a long game), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
+| look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block; when the map and the facts together don't fit, as from about month 66 of a long game, the road lines go first, the longest kept while they fit, then the facts give way to a pointer to the Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
 | turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing), with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
