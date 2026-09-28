@@ -595,10 +595,49 @@ who changes the mayor playbook's reserve rule must change it there too.
 system prompt, its first briefing and its tool names.
 
 **Modes.** `mode = "autonomous"` fixes the instructions at month 0 and the fleet plays to the
-end on its own; this is the standard eval track. `"supervised"` means the coach may revise
-the playbooks between sessions. For now both modes run the same way. The mode is recorded
-in the run (the signature ends in `[autonomous]` or `[supervised]`) and shown in briefings,
-but there's no pause / resume yet. All fleet agents in a run share one mode.
+end on its own; this is the standard eval track. `"supervised"` plays in sessions, and the
+coach may revise the playbooks between them. The mode is recorded in the run (the signature
+ends in `[autonomous]` or `[supervised]`) and shown in briefings. All fleet agents in a run
+share one mode.
+
+- **Pausing.** With `[fleet].session_months = 12` (default 0: no pauses), a supervised run
+  stops every 12 months, before that month's turns, prints how to resume and leaves three
+  files in `runs/<run_id>/`:
+  - `checkpoint.pkl.gz`, the whole game: the env with its world and RNG, the council, the
+    scores history and the fleet's plan, memory and log; every agent's state; the runner's
+    stats; and where the logs ended. With a fake model, fleet_smoke's fleet paused at month
+    12 left 49 KB (1.1 MB unzipped), and 81 KB with scripted departments growing the city.
+    Chat clients aren't saved (they hold the API key) and are rebuilt on resume. It's a
+    pickle, so resume only runs you made.
+  - `playbooks.toml`, the run's current playbooks and `session_months`, ready to edit.
+  - `PAUSED`, with the month, the session and the resume command.
+- **Resuming.** `civitas resume <run_id>` merges `playbooks.toml` over the run's config, or
+  the file given with `-c` instead (an edited copy of the run's config works). Tables merge
+  key by key, and so does each `[agents.<role>]`. It then applies `--agent` / `--set`, builds
+  the fleet agents again from the merged config, keeping their usage and state, and plays the
+  next session with the new system prompts.
+  - Playbooks and the other fleet settings may change: model, limits, `session_months`
+    (`--set fleet.session_months=0` plays to the end).
+  - A change to `[game]`, `[scoring]`, the line-up or the mode is refused, naming what differs.
+- **Logs.** Frames and trajectories append; lines an interrupted session logged after the
+  checkpoint are dropped first. Each trajectory record carries its `session`. `meta.json`
+  gets a `sessions` list: months, status, `fleet_version`, a hash of each playbook, and the
+  roles whose system prompt changed with the new prompts (`sessions[i].fleet_prompts`, which
+  those roles' later turns point to; `fleet_prompts` keeps session 1's). The summary counts
+  the sessions. A run that played more than one `fleet_version` lists them in
+  `fleet_versions` and gets a `fleet_version` hashed from the sequence.
+- **Determinism.** `session_months` is left out of `fleet_version`, and a run resumed with
+  unchanged playbooks plays exactly like one that never paused: same frames, trajectories
+  and scores (`tests/test_sessions.py` resumes in a fresh process).
+- Autonomous runs and `civitas bench` ignore `session_months`. `civitas serve` lists a
+  paused run as `paused`, and `POST /api/resume {"run_id": ...}` resumes it with its
+  `playbooks.toml` (the viewer has no button for it yet).
+
+```bash
+civitas run -c coached.toml                 # [fleet] mode = "supervised", session_months = 12
+$EDITOR runs/<run_id>/playbooks.toml        # after each pause
+civitas resume <run_id>                     # or: civitas resume <run_id> -c edited.toml
+```
 
 **Config.**
 
@@ -608,6 +647,7 @@ act_every = 3                  # the city runs monthly; the fleet plans by the q
 
 [fleet]                        # every fleet agent; any key can be overridden per role
 mode = "autonomous"
+session_months = 0             # "supervised" only: pause every N months (run-wide, see Modes)
 provider = "arcee"
 model = "trinity-large-thinking"
 max_steps = 20
@@ -849,7 +889,6 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
 - fleets in region mode (a fleet agent refuses a region game)
-- supervised scheduling (pause, edit the playbook, resume)
 - a viewer panel for tool traces (the Agents tab shows a fleet turn's briefing, the model's reasoning and its end-of-turn report, or its last reply when it never called `end_turn`; the full trace is in `trajectories.jsonl`)
 
 ### Output files (`runs/<run_id>/`)
@@ -859,6 +898,7 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
 - `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets))
+- `checkpoint.pkl.gz` / `playbooks.toml` / `PAUSED` (a supervised run between sessions): the game to resume, the playbooks to edit, the resume command (see Modes under [Agent fleets](#agent-fleets))
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
 turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.
@@ -877,13 +917,13 @@ civitas/
               progress.py (milestones, landmarks; heritage, soil, wind, seasons)
   core/       env.py (the hub) · region.py (2-6 linked cities) · observation.py · actions.py · council.py · roles.py · decision.py
   agents/     llm.py · llm_client.py · prompts.py · scripted.py · remote.py · base.py (noop, random)
-  bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard)
+  bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard) · session.py (pause / resume)
   fleet/      agent.py (ToolAgent tool loop) · tools.py · briefing.py · memory.py (plan, memory, history) · config.py · report.py · fmt.py
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
               · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
-  cli.py      civitas run | bench | serve | leaderboard | prompt | check-llm
+  cli.py      civitas run | resume | bench | serve | leaderboard | prompt | check-llm
 configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
 docs/         MECHANICS.md (the design roadmap and what is implemented)
 examples/     remote_agent.py · rl_loop.py · export_sft.py
