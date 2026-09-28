@@ -3,8 +3,9 @@
 A supervised fleet run with `[fleet].session_months = N` stops every N months (`bench/runner.py:Episode`) and
 leaves in `runs/<run_id>/`:
 
-- `checkpoint.pkl.gz`: the whole game in one pickle (env with its world, RNG, council, memory, scores history and
-  fleet state; every agent's state; the runner's stats) plus the offsets of the logs at the pause;
+- `checkpoint.ckpt`: the whole game in one gzipped pickle (env with its world, RNG, council, memory, scores
+  history and fleet state; every agent's state; the runner's stats) plus the offsets of the logs at the pause,
+  after a header line with its HMAC-SHA256;
 - `playbooks.toml`: the run's current playbooks, ready to edit;
 - `PAUSED`: a marker with the month and the resume command.
 
@@ -13,17 +14,25 @@ leaves in `runs/<run_id>/`:
 agents from the merged config with their state carried over (`restore_agents()`: new system prompts, same
 memory and usage) and plays the next session. Frames and trajectories append.
 
-A checkpoint is a pickle: loading one runs whatever it holds, so resume only runs you made. It never holds API
-keys: agents' chat clients (which read the key from the environment) are dropped and rebuilt on resume.
+Unpickling runs whatever the pickle says, so a checkpoint is signed: `save_checkpoint` writes an HMAC-SHA256 of the
+payload keyed by a per-installation secret (`key_path()`: `$CIVITAS_CHECKPOINT_KEY_DIR`, else
+`$XDG_CONFIG_HOME/civitas`, else `~/.config/civitas`, file `checkpoint.key`, created on the first save with mode
+0600), and `load_checkpoint` checks it with `hmac.compare_digest` before unpickling. A checkpoint with no
+signature, a wrong one (changed, or made on another machine or by another user) or no key to check it against is
+refused: a checkpoint only resumes where it was made. It never holds API keys either: agents' chat clients (which
+read the key from the environment) are dropped and rebuilt on resume.
 """
 from __future__ import annotations
 
 import copy
 import dataclasses
 import gzip
+import hashlib
+import hmac
 import json
 import os
 import pickle
+import secrets
 import sys
 from pathlib import Path
 
@@ -35,7 +44,11 @@ except ModuleNotFoundError:  # pragma: no cover
 from ..config import agent_spec, build_agents, game_config, scoring_config
 from ..fleet.config import fleet_agent_config, session_months
 
-CHECKPOINT = "checkpoint.pkl.gz"
+CHECKPOINT = "checkpoint.ckpt"
+MAGIC = b"CIVITAS-CHECKPOINT hmac-sha256 "        # header line: MAGIC + 64 hex digits of the MAC + "\n"
+MAC_HEX = 64
+KEY_DIR_ENV = "CIVITAS_CHECKPOINT_KEY_DIR"          # tests point this at a temp dir
+KEY_FILE = "checkpoint.key"
 PLAYBOOKS = "playbooks.toml"
 PAUSED = "PAUSED"
 LOGS = ("frames.jsonl", "trajectories.jsonl")
@@ -142,23 +155,69 @@ def restore_agents(saved: dict, cfg: dict, env, hub=None) -> dict:
 
 
 # -------------------------------------------------------------- checkpoint
+def key_path() -> Path:
+    """Where this installation's checkpoint key lives: outside the repo and `runs/`."""
+    d = os.environ.get(KEY_DIR_ENV)
+    if not d:
+        d = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+                         "civitas")
+    return Path(d) / KEY_FILE
+
+
+def _key(create: bool) -> bytes | None:
+    """The secret the checkpoints are signed with; made (mode 0600) on the first save, never on a load."""
+    p = key_path()
+    if not p.exists():
+        if not create:
+            return None
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:                      # another process made it first
+            pass
+        else:
+            with os.fdopen(fd, "w") as f:
+                f.write(secrets.token_hex(32) + "\n")
+    if os.name == "posix" and p.stat().st_mode & 0o077:
+        raise ValueError(f"checkpoint key {p} can be read or written by other users: run `chmod 600 {p}`")
+    key = p.read_bytes().strip()
+    if len(key) < 32:
+        raise ValueError(f"checkpoint key {p} is damaged (too short); delete it to make a new one, which makes "
+                         "existing checkpoints unresumable")
+    return key
+
+
+def _mac(key: bytes, payload: bytes) -> bytes:
+    return hmac.new(key, payload, hashlib.sha256).hexdigest().encode()
+
+
+def split_checkpoint(data: bytes) -> tuple[bytes | None, bytes]:
+    """(MAC, payload) of a checkpoint file's bytes; MAC None when the header is missing or malformed."""
+    n = len(MAGIC)
+    if not data.startswith(MAGIC) or data[n + MAC_HEX:n + MAC_HEX + 1] != b"\n":
+        return None, data
+    return data[n:n + MAC_HEX], data[n + MAC_HEX + 1:]
+
+
 def save_checkpoint(run_dir: Path, state: dict) -> Path:
-    """Write the state atomically (a crash mid-write keeps the previous checkpoint)."""
+    """Sign and write the state atomically (a crash mid-write keeps the previous checkpoint)."""
     path = run_dir / CHECKPOINT
     tmp = path.with_name(path.name + ".tmp")
     state = {**state, "format": FORMAT, "agents": {r: strip_agent(a) for r, a in state["agents"].items()}}
-    with gzip.open(tmp, "wb", compresslevel=6) as f:
-        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    payload = gzip.compress(pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL), compresslevel=6)
+    tmp.write_bytes(MAGIC + _mac(_key(create=True), payload) + b"\n" + payload)
     os.replace(tmp, path)
     return path
 
 
 def run_dir(run: str | Path, runs_dir: str | Path = "runs") -> Path:
+    # Any folder is accepted (the CLI is local); what makes loading its checkpoint safe is the MAC check below.
     p = Path(run)
     return p if p.is_dir() and (p / "meta.json").exists() else Path(runs_dir) / str(run)
 
 
 def load_checkpoint(d: Path) -> dict:
+    """The paused run's state, unpickled only once its MAC checks out against this installation's key."""
     if not (d / "meta.json").exists():
         raise ValueError(f"no run at {d}")
     if (d / "summary.json").exists():
@@ -167,8 +226,18 @@ def load_checkpoint(d: Path) -> dict:
     if not path.exists():
         raise ValueError(f"run {d.name} has no checkpoint: only a supervised fleet run with [fleet].session_months "
                          "pauses (or it is still playing its session)")
-    with gzip.open(path, "rb") as f:
-        state = pickle.load(f)        # our own file (see the module docstring)
+    mac, payload = split_checkpoint(path.read_bytes())
+    where = "a checkpoint can only be resumed on the machine and account that made it; refusing to unpickle it"
+    if mac is None:
+        raise ValueError(f"{path} has no signature, so it wasn't written by this version of civitas: {where}")
+    key = _key(create=False)
+    if key is None:
+        raise ValueError(f"{path}: there is no checkpoint key at {key_path()}, so this installation never made a "
+                         f"checkpoint and didn't make this one: {where}")
+    if not hmac.compare_digest(mac, _mac(key, payload)):
+        raise ValueError(f"{path}: the signature doesn't match the key at {key_path()}: the file was changed, or it "
+                         f"was made with another key (another machine or account): {where}")
+    state = pickle.loads(gzip.decompress(payload))            # signed by us, see the module docstring
     if state.get("format") != FORMAT:
         raise ValueError(f"{path}: checkpoint format {state.get('format')!r}, this version reads {FORMAT}")
     return state

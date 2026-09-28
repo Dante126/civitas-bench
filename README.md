@@ -603,12 +603,20 @@ share one mode.
 - **Pausing.** With `[fleet].session_months = 12` (default 0: no pauses), a supervised run
   stops every 12 months, before that month's turns, prints how to resume and leaves three
   files in `runs/<run_id>/`:
-  - `checkpoint.pkl.gz`, the whole game: the env with its world and RNG, the council, the
-    scores history and the fleet's plan, memory and log; every agent's state; the runner's
-    stats; and where the logs ended. With a fake model, fleet_smoke's fleet paused at month
-    12 left 49 KB (1.1 MB unzipped), and 81 KB with scripted departments growing the city.
-    Chat clients aren't saved (they hold the API key) and are rebuilt on resume. It's a
-    pickle, so resume only runs you made.
+  - `checkpoint.ckpt`, the whole game as a gzipped pickle: the env with its world and RNG,
+    the council, the scores history and the fleet's plan, memory and log; every agent's
+    state; the runner's stats; and where the logs ended. With a fake model, fleet_smoke's
+    fleet paused at month 12 left 49 KB (1.1 MB unzipped), and 81 KB with scripted
+    departments growing the city. Chat clients aren't saved (they hold the API key) and are
+    rebuilt on resume.
+  - **Signed.** Unpickling runs code, so the file starts with an HMAC-SHA256 of the pickle,
+    keyed by a secret made on the first pause: `~/.config/civitas/checkpoint.key`, mode
+    0600 (`$XDG_CONFIG_HOME` moves it, and so does `CIVITAS_CHECKPOINT_KEY_DIR`, which the
+    tests use). Resume checks it before unpickling. A checkpoint with no signature or a
+    wrong one is refused, saying why: the file was changed, or it was made on another
+    machine or account. So is one with no key to check against, or a key file other users
+    can read. A checkpoint only resumes where it was made, so a shared run folder can be
+    replayed but not resumed.
   - `playbooks.toml`, the run's current playbooks and `session_months`, ready to edit.
   - `PAUSED`, with the month, the session and the resume command.
 - **Resuming.** `civitas resume <run_id>` merges `playbooks.toml` over the run's config, or
@@ -898,7 +906,7 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
 - `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets))
-- `checkpoint.pkl.gz` / `playbooks.toml` / `PAUSED` (a supervised run between sessions): the game to resume, the playbooks to edit, the resume command (see Modes under [Agent fleets](#agent-fleets))
+- `checkpoint.ckpt` / `playbooks.toml` / `PAUSED` (a supervised run between sessions): the game to resume, the playbooks to edit, the resume command (see Modes under [Agent fleets](#agent-fleets)). The checkpoint is a pickle signed with this installation's key (`~/.config/civitas/checkpoint.key`); resume refuses one whose signature is missing or doesn't match, so it only resumes on the machine and account that made it
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
 turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.

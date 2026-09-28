@@ -1,7 +1,8 @@
 """Supervised sessions: a fleet run pauses at a session boundary, the coach edits the playbooks, it resumes."""
-import contextlib
 import gzip
 import json
+import os
+import pickle
 import subprocess
 import sys
 import threading
@@ -72,6 +73,14 @@ class FakeLLM(BaseHTTPRequestHandler):
         self.wfile.write(out)
 
 
+@pytest.fixture(autouse=True)
+def key_dir(tmp_path_factory, monkeypatch):
+    """Checkpoint keys in a temp dir (resumes in subprocesses inherit it), never the real home directory."""
+    d = tmp_path_factory.mktemp("key")
+    monkeypatch.setenv(S.KEY_DIR_ENV, str(d))
+    return d
+
+
 @pytest.fixture
 def port(monkeypatch):
     monkeypatch.setenv(KEY_ENV, KEY)
@@ -133,7 +142,8 @@ def test_a_supervised_run_pauses_at_the_session_boundary(tmp_path, port):
     assert state["stats"]["police"]["turns"] == 3 and len(state["city_scores"]) == 6
     assert len(state["fleet_rows"]) == 6
     assert state["log_offsets"] == {n: (d / n).stat().st_size for n in S.LOGS}
-    assert KEY.encode() not in gzip.decompress((d / S.CHECKPOINT).read_bytes())   # no API key on disk
+    mac, payload = S.split_checkpoint((d / S.CHECKPOINT).read_bytes())
+    assert mac is not None and KEY.encode() not in gzip.decompress(payload)       # signed; no API key on disk
 
     pb = tomllib.loads((d / S.PLAYBOOKS).read_text())
     assert pb["fleet"] == {"session_months": 6, "playbook": "Grow steadily."}
@@ -280,6 +290,99 @@ def test_a_paused_and_resumed_run_plays_like_an_uninterrupted_one(tmp_path, port
         assert split[k] == whole[k], k
 
 
+# --------------------------------------------------------------- security
+def _paused(tmp_path, port) -> Path:
+    runner.run_episode(_cfg(port), 0, tmp_path, verbose=False, run_id="r")
+    return tmp_path / "r" / S.CHECKPOINT
+
+
+def test_checkpoints_are_signed_with_a_private_key(tmp_path, port, key_dir):
+    ck = _paused(tmp_path, port)
+    key = key_dir / S.KEY_FILE
+    assert S.key_path() == key and oct(key.stat().st_mode & 0o777) == "0o600" and len(key.read_text().strip()) == 64
+    mac, payload = S.split_checkpoint(ck.read_bytes())
+    assert mac == S._mac(key.read_bytes().strip(), payload)
+    key.chmod(0o644)
+    with pytest.raises(ValueError, match="chmod 600"):
+        runner.resume_episode("r", runs_dir=tmp_path, verbose=False)
+    key.chmod(0o600)
+    assert runner.resume_episode("r", runs_dir=tmp_path, verbose=False)["months_played"] == 12
+
+
+def test_the_key_follows_xdg_config_home(tmp_path, monkeypatch):
+    monkeypatch.delenv(S.KEY_DIR_ENV)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert S.key_path() == tmp_path / "xdg" / "civitas" / S.KEY_FILE
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert S.key_path() == tmp_path / "home" / ".config" / "civitas" / S.KEY_FILE
+
+
+def test_a_tampered_checkpoint_is_refused(tmp_path, port):
+    ck = _paused(tmp_path, port)
+    good = ck.read_bytes()
+    n = len(S.MAGIC)
+    for bad in (good[:-10] + bytes([good[-10] ^ 1]) + good[-9:],               # a payload byte
+                good[:n] + (b"0" if good[n:n + 1] != b"0" else b"1") + good[n + 1:],   # the MAC
+                good + b"x"):                                                   # bytes appended
+        ck.write_bytes(bad)
+        with pytest.raises(ValueError, match="signature doesn't match.*changed.*only be resumed on the machine"):
+            runner.resume_episode("r", runs_dir=tmp_path, verbose=False)
+    ck.write_bytes(good)
+    assert runner.resume_episode("r", runs_dir=tmp_path, verbose=False)["months_played"] == 12
+
+
+def test_a_checkpoint_signed_with_another_key_is_refused(tmp_path, port, monkeypatch):
+    _paused(tmp_path, port)
+    other = tmp_path / "other-machine"
+    monkeypatch.setenv(S.KEY_DIR_ENV, str(other))
+    with pytest.raises(ValueError, match="no checkpoint key at .*never made a checkpoint"):
+        runner.resume_episode("r", runs_dir=tmp_path, verbose=False)
+    assert not (other / S.KEY_FILE).exists()                                  # a load never makes a key
+    S._key(create=True)
+    with pytest.raises(ValueError, match="made with another key .*only be resumed on the machine"):
+        runner.resume_episode("r", runs_dir=tmp_path, verbose=False)
+
+
+class _Evil:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return os.mkdir, (str(self.marker),)
+
+
+def test_an_unsigned_or_forged_checkpoint_is_never_unpickled(tmp_path, port):
+    ck = _paused(tmp_path, port)
+    marker = tmp_path / "pwned"
+    evil = gzip.compress(pickle.dumps(_Evil(marker)))
+    for data, match in ((evil, "has no signature"),
+                        (S.MAGIC + b"0" * S.MAC_HEX + b"\n" + evil, "signature doesn't match"),
+                        (b"", "has no signature")):
+        ck.write_bytes(data)
+        with pytest.raises(ValueError, match=match):
+            runner.resume_episode("r", runs_dir=tmp_path, verbose=False)
+        assert not marker.exists()
+
+
+def test_the_launcher_resumes_only_runs_inside_the_runs_dir(tmp_path):
+    from civitas.server import Launcher, run_folder
+    runs = tmp_path / "runs"
+    (runs / "r").mkdir(parents=True)
+    (tmp_path / "PAUSED").write_text("{}")                                   # a marker just outside runs/
+    (runs / "PAUSED").write_text("{}")
+    (runs / "r" / "PAUSED").write_text("{}")
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "PAUSED").write_text("{}")
+    (runs / "link").symlink_to(tmp_path / "elsewhere")
+    launcher = Launcher(runs.resolve(), ROOT / "configs")
+    for bad in ("..", ".", "", "r/..", "../runs/..", str(tmp_path), "link", "missing"):
+        with pytest.raises(ValueError, match="no paused run"):
+            launcher.resume(bad)
+    assert launcher.procs == {}
+    assert run_folder(runs, "r") == (runs / "r").resolve() and run_folder(runs, "..") is None
+
+
 # -------------------------------------------------------------- helpers / CLI
 @pytest.mark.parametrize("text", ["", "one line", 'it\'s "quoted" \\ with a backslash', "- a\n- b\n", "ends in '\n",
                                   "last char '", "has ''' in it\n", "\nleading newline", "tab\tand \x01 control\n",
@@ -334,7 +437,7 @@ def test_the_server_lists_paused_runs_and_resumes_them(tmp_path, port):
         return json.loads(urllib.request.urlopen(req).read())
     try:
         assert status() == {"r": "paused"}
-        for bad in ("../r", "missing"):
+        for bad in ("../r", "missing", "..", ".", ""):
             with pytest.raises(urllib.error.HTTPError) as e:
                 resume(bad)
             assert e.value.code == 400 and "no paused run" in json.loads(e.value.read())["error"]

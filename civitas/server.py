@@ -34,6 +34,12 @@ AGENT_SPEC = re.compile(r"^(scripted|noop|random|(llm|fleet)(:[A-Za-z0-9._/-]+)?
 from .core.roles import TURN_ORDER as ROLES  # noqa: E402
 
 
+def run_folder(runs_dir: Path, run_id: str) -> Path | None:
+    """The run's folder, only when it sits directly in `runs_dir` once resolved (no "..", ".", "a/b", links out)."""
+    d = (runs_dir / run_id).resolve()
+    return d if d.parent == runs_dir.resolve() and d.is_dir() else None
+
+
 class Launcher:
     """Starts `civitas run` subprocesses on behalf of the browser."""
 
@@ -125,8 +131,10 @@ class Launcher:
 
     def resume(self, run_id: str) -> dict:
         """`civitas resume <run_id>`: the next session of a paused run, with the playbooks in its playbooks.toml."""
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id) or not (self.runs_dir / run_id / "PAUSED").exists():
+        d = run_folder(self.runs_dir, run_id)
+        if d is None or not (d / "PAUSED").exists():
             raise ValueError(f"no paused run {run_id!r}")
+        run_id = d.name
         if self.is_running(run_id):
             raise ValueError(f"run {run_id!r} is already running")
         cmd = [sys.executable, "-m", "civitas.cli", "resume", run_id, "--runs-dir", str(self.runs_dir)]
@@ -202,8 +210,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def _run_dir(self, run_id: str) -> Path | None:
-            d = (runs_dir / run_id).resolve()
-            return d if d.parent == runs_dir.resolve() and d.is_dir() else None
+            return run_folder(runs_dir, run_id)
 
         def do_OPTIONS(self):
             self.send_response(204)
