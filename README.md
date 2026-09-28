@@ -99,6 +99,7 @@ civitas run -c configs/smoke.toml --serve    # 2 years, 3 LLM roles acting every
 civitas run -c configs/arcee.toml --serve    # 10 years, mayor/planning/utilities on the LLM, the rest scripted
 civitas run -c configs/arcee_full.toml       # 10 years, all 8 roles on the LLM (~960 calls)
 civitas run -c configs/fleet_smoke.toml      # 1 year, all 8 roles as a tool-calling fleet (see Agent fleets)
+civitas run -c configs/fleet_region_smoke.toml   # 1 year, two cities: the fleet in north, scripted south
 ```
 
 The Arcee API is OpenAI-compatible (`https://api.arcee.ai/api/v1`). Notes on the
@@ -417,7 +418,8 @@ in every city, `[agents."south.planning"]` sets one city.
 - **Diplomacy.** All teams share one council board (address `"south"`, `"north.mayor"` or
   `"all"`) and mayors can agree power/water deals (`offer_deal`, `accept_deal`, `cancel_deal`).
 
-Each city is scored on its own; the region score is their average.
+Each city is scored on its own; the region score is their average. Fleet agents play region
+roles too (see [Agent fleets](#agent-fleets), "Regions").
 
 ### Agent fleets
 
@@ -645,6 +647,25 @@ any ready site they should send at most one request and end the turn.
 leaderboard groups fleet runs by signature and `fleet_version` (shown in its own column). The
 signature reads `role=fleet:<model> ... [mode]`.
 
+**Regions.** Fleets play region games too: `[agents.<role>]` puts the fleet in every city
+and `[agents."north.<role>"]` in one, so fleet and scripted cities, and fleet and non-fleet
+roles, mix freely. A fleet agent binds to its own city's env (`fleet/region.py`), so each
+city has its own plan, department memory, history log and briefings, and the north mayor
+plans and funds north's departments only. The system prompt gains a Region section (the
+other cities and where they lie, the council's addresses, the river, links and, for the
+mayor, deals). The mayor's briefing gains a Region block: per other city its population,
+specialisations, surplus and shortfall, unemployed and open jobs, links, what a connector
+would cost transport and last month's goods, commuters and tourists between the two, then
+the river's pollution and up to 4 deals with what to do about them. Transport's block has
+each neighbour's best connector site priced as `build_connector` charges it, and boat and
+air links; utilities' has the river and what the deals do to supply. Every role gets
+`region_overview`, the mayor gets `offer_deal`, `accept_deal` and `cancel_deal` (run as
+the region runs any mayor's deals, and counted in the action cap), and `send_message`
+takes a role of the city (`"mayor"`), a team (`"south"`), another city's agent
+(`"south.mayor"`) or `"all"`. The fleet report has the region scoreboard and one section
+per city with fleet agents. `configs/fleet_region_smoke.toml` runs the `fleet_smoke.toml`
+fleet in the north city against the scripted baseline in the south.
+
 **Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
 next to its summary. They contain:
 
@@ -848,7 +869,6 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 **Not built yet:**
 
 - a scripted fleet that plays through the tools (the scripted baselines still read the observation)
-- fleets in region mode (a fleet agent refuses a region game)
 - supervised scheduling (pause, edit the playbook, resume)
 - a viewer panel for tool traces (the Agents tab shows a fleet turn's briefing, the model's reasoning and its end-of-turn report, or its last reply when it never called `end_turn`; the full trace is in `trajectories.jsonl`)
 
@@ -858,7 +878,7 @@ smoke pair so far (v10: 46.6; v8 and v11: 45.8).
 - `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council). The viewer replays these.
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
-- `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets))
+- `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets)); in a region, one section per city with fleet agents
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good
 turns into a chat-format dataset for fine-tuning or as the start of a GRPO / preference loop.
@@ -878,13 +898,13 @@ civitas/
   core/       env.py (the hub) · region.py (2-6 linked cities) · observation.py · actions.py · council.py · roles.py · decision.py
   agents/     llm.py · llm_client.py · prompts.py · scripted.py · remote.py · base.py (noop, random)
   bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard)
-  fleet/      agent.py (ToolAgent tool loop) · tools.py · briefing.py · memory.py (plan, memory, history) · config.py · report.py · fmt.py
+  fleet/      agent.py (ToolAgent tool loop) · tools.py · briefing.py · memory.py (plan, memory, history) · config.py · report.py · region.py · fmt.py
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
               · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
   cli.py      civitas run | bench | serve | leaderboard | prompt | check-llm
-configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
+configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke · fleet_region_smoke
 docs/         MECHANICS.md (the design roadmap and what is implemented)
 examples/     remote_agent.py · rl_loop.py · export_sft.py
 tests/
