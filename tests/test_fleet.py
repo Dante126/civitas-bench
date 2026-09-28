@@ -830,6 +830,30 @@ def test_map_overview_fits_and_has_rulers_and_legend(grown_env):
     assert "briefing" in tight["summary"][0] and tight["map"] == res["map"] and "scale" not in tight
 
 
+def test_the_mayor_map_overview_fallback_lists_what_its_briefing_leaves_out(grown_env, monkeypatch):
+    """When the summary doesn't fit, map_overview points to the briefing's Map block; the mayor's leaves out size,
+    highway entry, river and road lines (MAYOR_MAP), so its fallback lists those."""
+    import civitas.fleet.tools as T
+    from civitas.fleet.tools import MAP_PARTS, MAYOR_MAP, map_facts, map_lines, map_overview
+    w = grown_env.world
+    facts = map_facts(w)
+    lines = lambda parts: [ln[2:] for ln in map_lines(facts, parts)]
+    full = map_overview(w, parts=MAYOR_MAP)
+    assert full["summary"] == lines(MAP_PARTS)                               # it fits: everything
+    rest = "the rest: see the Map block in your briefing"
+    tight = map_overview(w, limit=len(json.dumps(full)) - 1, parts=MAYOR_MAP)
+    assert tight["summary"] == lines(("size", "highway", "river", "road_lines")) + [rest]
+    assert tight["map"] == full["map"] and "scale" not in tight
+    tighter = map_overview(w, limit=len(json.dumps(tight)) - 1, parts=MAYOR_MAP)     # then without the road lines
+    assert tighter["summary"] == lines(("size", "highway", "river")) + [rest] and "scale" not in tighter
+    assert map_overview(w, limit=len(json.dumps(full)) - 1)["summary"] == ["see the Map block in your briefing"]
+    seen, real = [], T.map_overview
+    monkeypatch.setattr(T, "map_overview", lambda w, **k: seen.append(k.get("parts")) or real(w, **k))
+    ToolBox(grown_env, "mayor").call("map_overview", {})
+    ToolBox(grown_env, "police").call("map_overview", {})
+    assert seen == [MAYOR_MAP, MAP_PARTS]
+
+
 def test_map_overview_downsamples_big_maps():
     from civitas.fleet.tools import RESULT_CHARS
     env = CivitasEnv(GameConfig(seed=0, months=12, width=96, height=80))
@@ -1092,6 +1116,31 @@ def test_below_target_only_when_it_used_its_money_or_never_had_enough(grown_env)
     # health: held $2,900, more than its $2,000 clinic, and used none of it: $2,100 short of $5,000, but no gap
     assert ToolBox(env, "mayor").call("allocate_budget", {"department": "planning", "amount": -5502})["ok"]
     assert "planning" not in funding_gaps(env, fleet).gaps      # $2,332 of $9,000, but it used $1,166 of $9,000
+
+
+def test_a_department_keeps_its_dearest_ready_first_building(grown_env, open_env):
+    """Review replay (seed 0, act_every 3, month 9): utilities held $3,000, spent nothing, power at capacity; its
+    cheapest ready site was a $1,200 outlet (sewage had spare capacity), so the mayor read "idle $1,800" and took it
+    back, and utilities, holding its $1,200 keep, was no gap and never reached the $2,500 turbine it needed. It keeps
+    its dearest ready first building now; the needs line still names the cheapest."""
+    from civitas.fleet.tools import DeptMoney, funding_gaps
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    fleet = FleetState.of(env)
+    fleet.update_plan(w.month, budgets={"utilities": 5000})
+    _held(env, utilities=(3000, 0))
+    m = DeptMoney(env, "utilities")
+    assert (m.build.cost, m.build.dearest, m.keep, m.idle) == (2200, 4000, 4000, 0)     # coal_or_gas: a coal plant
+    assert "utilities" in funding_gaps(env, fleet).gaps                 # it never held its $4,000 keep
+    _held(env, utilities=(1200, 0))
+    assert funding_gaps(env, fleet).gaps["utilities"] == {"funds": 1200, "target": 5000, "gap": 3800}
+    line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- utilities:"))
+    assert line.startswith("- utilities: funds $1,200 < target $5,000, spent $0; needs $2,200 for a water tower (")
+    env = copy.deepcopy(open_env)                      # every milestone reached, every priced purpose has sites
+    dearest = {d: DeptMoney(env, d).build.dearest for d in ("utilities", "health", "transport")}
+    assert dearest == {"utilities": 4000,              # not the $12k water works (a tier-3 upgrade)
+                       "health": 2000,                 # not the $8,000 hospital (the clinic's tier 2)
+                       "transport": 1500}              # not a train station, harbour or metro (supplementary)
 
 
 def _quarter(env, spent: dict) -> None:
@@ -1848,8 +1897,7 @@ def test_key_metrics_come_from_the_observation():
 
 @pytest.mark.parametrize("grown", [False, True])
 def test_briefings_render_for_every_role(grown, env12):
-    from civitas.fleet.briefing import MAYOR_MAP
-    from civitas.fleet.tools import MAP_PARTS, map_facts, map_lines
+    from civitas.fleet.tools import MAP_PARTS, MAYOR_MAP, map_facts, map_lines
     env = copy.deepcopy(env12) if grown else CivitasEnv(GameConfig(seed=0, months=24))
     w = env.world
     for role in TURN_ORDER:
@@ -2528,8 +2576,7 @@ def test_mayor_departments_show_spending_and_idle_money():
 def test_the_mayor_map_block_keeps_what_it_manages_by():
     """The mayor has no map actions; its briefing needed the room for the departments' spending and idle money.
     Departments keep the whole block, road lines included."""
-    from civitas.fleet.briefing import MAYOR_MAP
-    from civitas.fleet.tools import MAP_PARTS, map_facts, map_lines
+    from civitas.fleet.tools import MAP_PARTS, MAYOR_MAP, map_facts, map_lines
     assert MAYOR_MAP == ("roads", "unconnected", "built")
     env = _env()
     w = env.world
@@ -2661,7 +2708,7 @@ def test_briefings_stay_bounded_at_the_limits():
     w.struct[25:41, 10:25:2] = C.ROAD
     w.refresh()
     _months_spent(env, spend)
-    w.dept_funds.update(planning=9876, transport=9876, police=9876, fire=9876)       # idle: they keep $6,666
+    w.dept_funds.update(planning=9876, transport=9876, police=9876, fire=9876, education=9876)   # idle: keep $6,666
     w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
     w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
     road_lines = "- road lines: y=24 x 0-25; " + "; ".join(f"x={x} y 24-40" for x in range(10, 23, 2)) + " +1 more\n"
@@ -2678,7 +2725,8 @@ def test_briefings_stay_bounded_at_the_limits():
     assert "WARNING" in mayor and "OPEN OFFER" in mayor and "under the $3,000 reserve" in mayor
     assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
     assert "\n## Departments (spent = last 3 months; cut reports: history kind=report)\n" in mayor
-    assert mayor.count("; idle $3,210") == 4 and "- $12.8k idle in planning, transport, police, fire: " in mayor
+    assert mayor.count("; idle $3,210") == 5
+    assert "- $16.1k idle in planning, transport, police, fire, education: take it back" in mayor
 
 
 

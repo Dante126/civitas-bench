@@ -567,6 +567,10 @@ def map_facts(w) -> dict:
 
 
 MAP_PARTS = ("size", "highway", "river", "roads", "road_lines", "unconnected", "built")
+# the mayor's Map block: how far the roads reach, roads cut off, the built-up area. Size, highway entry, river and
+# road lines made room for the departments' spending and idle money: with them the worst case (5 departments idle)
+# took 7,737 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows; without, 7,369
+MAYOR_MAP = ("roads", "unconnected", "built")
 
 
 def map_lines(f: dict, parts: tuple = MAP_PARTS) -> list[str]:
@@ -618,16 +622,21 @@ def _ascii(w, k: int) -> list[str]:
     return rows
 
 
-def map_overview(w, limit: int = RESULT_CHARS) -> dict:
-    """The whole map as ASCII rows with the map_facts summary, downsampled until the result fits `limit` (at full
-    size the summary goes first: the briefing's Map block has it)."""
-    summary = [ln[2:] for ln in map_lines(map_facts(w))]
+def map_overview(w, limit: int = RESULT_CHARS, parts: tuple = MAP_PARTS) -> dict:
+    """The whole map as ASCII rows with the map_facts summary, downsampled until the result fits `limit`. At full
+    size the summary goes first: it shrinks to what the role's Map block (`parts`) leaves out, then to that without
+    the road lines (the mayor's leaves out size, highway, river and road lines: MAYOR_MAP)."""
+    facts = map_facts(w)
+    summary = [ln[2:] for ln in map_lines(facts)]
+    left = [p for p in MAP_PARTS if p not in parts]
+    note = ["the rest: see the Map block in your briefing" if left else "see the Map block in your briefing"]
+    short = [[ln[2:] for ln in map_lines(facts, ps)] + note
+             for ps in dict.fromkeys([tuple(left), tuple(p for p in left if p != "road_lines")])]
     read = "top two rows: x (tens, units); rows start with y; higher tiers keep the letter"
-    for k, full in [(1, True), (1, False)] + [(k, True) for k in range(2, max(w.w, w.h) + 1)]:
+    for k, lines in [(1, summary)] + [(1, s) for s in short] + [(k, summary) for k in range(2, max(w.w, w.h) + 1)]:
         grid = _ascii(w, k)
         body = {c for row in grid[2:] for c in row[4:]}
-        res = {"ok": True, "summary": summary if full else ["see the Map block in your briefing"],
-               "legend": _legend(body), "read": read, "map": grid}
+        res = {"ok": True, "summary": lines, "legend": _legend(body), "read": read, "map": grid}
         if k > 1:
             res["scale"] = f"each character is a {k}x{k} block, shown at its top-left x, y; inspect for detail"
         if _size(res) <= limit:
@@ -691,8 +700,8 @@ def reserve(w) -> float:
 
 class DeptMoney:
     """What a department holds and spent, and how much of it is idle: it keeps max(IDLE_MULT x its spending over the
-    last SPEND_MONTHS months, its cheapest ready site (first_build, the needs line's figure), IDLE_MIN), and the rest,
-    when it is IDLE_MIN or more, is idle. Smoke v9-v12: planning held $7,000-10,700 unspent all game in 7 of 8 runs,
+    last SPEND_MONTHS months, its dearest ready first building (first_build), IDLE_MIN), and the rest, when it is
+    IDLE_MIN or more, is idle. Smoke v9-v12: planning held $7,000-10,700 unspent all game in 7 of 8 runs,
     spending about $1,000 a quarter, while the mayor took loans in 6 and education got no school in 5. Money moved to
     it this month doesn't count: the mayor acts first, so the rest sat through at least one of its turns (at month 0
     none has had one). Its observation (`build`) is built once, on first use, and only asked for when a site's price
@@ -709,7 +718,9 @@ class DeptMoney:
         # the most it had in one of those months: month-end funds plus that month's spending (the mayor moves money
         # first), so a station bought in the month counts as held
         self.held_max = max((h["dept_funds"].get(dept, 0) + h["dept_spent"].get(dept, 0) for h in window), default=0)
-        self.held = self.funds - max(0.0, w.ledger["allocated"].get(dept, 0.0))     # without this month's top-ups
+        # without this month's top-ups; the ledger nets the month, so a take-back and a top-up in one turn can leave
+        # part of the top-up counted as idle (rare)
+        self.held = self.funds - max(0.0, w.ledger["allocated"].get(dept, 0.0))
         self.floor = max(IDLE_MULT * self.spent, IDLE_MIN)         # what it keeps whatever its sites cost
         priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
         self.bound = None if any(pr.per_tile for pr in priced) else max((pr.cost for pr in priced), default=0)
@@ -722,7 +733,7 @@ class DeptMoney:
     def keep(self) -> float:
         if self.bound is not None and self.bound <= self.floor:
             return self.floor
-        return max(self.floor, self.build.cost if self.build else 0)
+        return max(self.floor, self.build.dearest if self.build else 0)
 
     @cached_property
     def idle(self) -> int:
@@ -746,8 +757,8 @@ class DeptMoney:
         After a take-back planning held its keep, 2 x its spending, below its $9,000 target, and read "below
         target" again: topped up, then idle, then taken back. More than, not at least: a take-back leaves exactly
         1 / IDLE_MULT = USED_SHARE used over the next quarter (test_a_take_back_starts_no_top_up_cycle)."""
-        return (not self.months or self.spent > USED_SHARE * self.held_max or self.held_max < self.floor
-                or self.held_max < self.keep)
+        return (not self.months or self.spent > USED_SHARE * self.held_max
+                or self.held_max < self.floor or self.held_max < self.keep)     # floor first: keep may need a build
 
 
 class Funding(NamedTuple):
@@ -948,6 +959,7 @@ class Price(NamedTuple):
     cost: float             # as the action charges it, unrounded (one tile for PER_TILE names)
     building: str           # what it buys, for people (building_name: "water tower", "bus line", "levee tile")
     per_tile: bool = False
+    first: bool = True      # a line's base tier or an off-tier spec: a first building (not a clinic's hospital)
 
     def text(self) -> str:
         return money(self.cost) + ("/tile" if self.per_tile else "")
@@ -964,7 +976,8 @@ def site_price(w, role: str, purpose: str) -> Price | None:
     all of theirs are locked."""
     priced = [(c, n) for n in SITE_BUILDS.get(role, {}).get(purpose, ()) if (c := _price(w, n)) is not None]
     best = min(priced, key=lambda t: t[0], default=None)
-    return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE)
+    return None if best is None else Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE,
+                                           first=best[1] in OFF_TIER_SPECS or C.TIER_BY_NAME[best[1]][1] == 1)
 
 
 def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
@@ -1009,13 +1022,17 @@ class FirstBuild(NamedTuple):
     cost: float                 # the cheapest ready site (cheapest), a per-tile purpose's best stretch whole
     named: dict[str, int]       # what it buys ("a clinic", "3 avenue tiles") -> ready sites of the first purpose
                                 # pricing it
+    dearest: float              # the dearest ready first building (Price.first, SUPPLEMENTARY skipped): what it keeps
 
 
 def first_build(env, dept: str) -> FirstBuild | None:
-    """`dept`'s cheapest ready site from one observation, None when none is ready: the mayor's needs line names it and
-    DeptMoney keeps its price. A per-tile purpose counts its best site whole ("$90 for 3 avenue tiles",
-    best_stretch), also when picking the cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line.
-    Every building at that price is named, with the ready sites of the first purpose pricing it."""
+    """`dept`'s cheapest ready site from one observation, None when none is ready: the mayor's needs line names it.
+    With it the dearest ready first building, which DeptMoney keeps: review replay (seed 0, month 9), utilities held
+    $3,000 for a $2,500 turbine with power at capacity, read idle above its $1,200 outlet, and lost it. A tier 2+
+    purpose (hospital, riverbank_2x2's water works) is an upgrade, not a first building. A per-tile purpose counts its
+    best site whole ("$90 for 3 avenue tiles", best_stretch), also when picking the cheapest: one $30 tile undersold
+    an upgrade and beat the $1,500 bus line. Every building at the lowest price is named, with the ready sites of the
+    first purpose pricing it."""
     w = env.world
     lists = site_lists(w, dept, role_obs(env, dept))
     prices, tiles = ready_prices(w, dept, lists), {}
@@ -1030,7 +1047,8 @@ def first_build(env, dept: str) -> FirstBuild | None:
     for p in purposes:
         n, b = tiles.get(p, 1), prices[p].building
         named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
-    return FirstBuild(low.cost, named)
+    return FirstBuild(low.cost, named, max((pr.cost for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first),
+                                           default=0))
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
@@ -1474,7 +1492,7 @@ class ToolBox:
         return out
 
     def map_overview(self) -> dict:
-        return map_overview(self.world)
+        return map_overview(self.world, parts=MAYOR_MAP if self.role == "mayor" else MAP_PARTS)
 
     def find_sites(self, purpose: str, near_x: int | None = None, near_y: int | None = None) -> dict:
         if (near_x is None) != (near_y is None):

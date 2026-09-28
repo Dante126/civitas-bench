@@ -19,8 +19,8 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, Funding, \
-    cheapest, funding_gaps, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, \
+from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
+    Funding, cheapest, funding_gaps, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, \
     scarce_bank, short_of, site_lists
 
 # paths into build_observation(...)["city"]
@@ -55,10 +55,6 @@ MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
 # the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
 GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
-# the mayor's Map block: how far the roads reach, roads cut off, the built-up area. Size, highway entry, river and
-# road lines made room for the departments' spending and idle money: with them the worst case (4 departments idle)
-# took 7,576 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows; without, 7,340
-MAYOR_MAP = ("roads", "unconnected", "built")
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
