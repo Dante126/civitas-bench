@@ -1,4 +1,4 @@
-"""Command line: civitas run | bench | serve | leaderboard | prompt | check-llm"""
+"""Command line: civitas run | resume | bench | serve | leaderboard | prompt | check-llm"""
 from __future__ import annotations
 
 import argparse
@@ -24,23 +24,45 @@ def _load(args):
     return apply_cli_overrides(cfg, args.agent, args.set)
 
 
-def cmd_run(args):
+def _hub(args):
+    """With --serve: the viewer + live API in the background, and the hub remote agents talk through."""
+    if not args.serve:
+        return None
     from .agents.remote import LiveHub
-    from .bench.runner import run_episode
-    cfg = _load(args)
-    hub = None
-    if args.serve:
-        from .server import serve
-        hub = LiveHub()
-        serve(args.runs_dir, args.port, hub=hub, background=True)
-    run_episode(cfg, args.seed, args.runs_dir, hub=hub, verbose=not args.quiet, run_id=args.run_id)
+    from .server import serve
+    hub = LiveHub()
+    serve(args.runs_dir, args.port, hub=hub, background=True)
+    return hub
+
+
+def _linger(args, out: dict) -> None:
     if args.serve and not args.exit:
-        print("Run finished. Viewer still running; Ctrl+C to quit.")
+        print(f"Run {'paused' if out.get('paused') else 'finished'}. Viewer still running; Ctrl+C to quit.")
         try:
             while True:
                 time.sleep(3600)
         except KeyboardInterrupt:
             pass
+
+
+def cmd_run(args):
+    from .bench.runner import run_episode
+    cfg = _load(args)
+    hub = _hub(args)
+    out = run_episode(cfg, args.seed, args.runs_dir, hub=hub, verbose=not args.quiet, run_id=args.run_id)
+    _linger(args, out)
+
+
+def cmd_resume(args):
+    """Continue a paused supervised run with its (edited) playbooks."""
+    from .bench.runner import resume_episode
+    hub = _hub(args)
+    try:
+        out = resume_episode(args.run, args.config, runs_dir=args.runs_dir, agents=args.agent, sets=args.set,
+                             hub=hub, verbose=not args.quiet)
+    except ValueError as e:
+        sys.exit(f"civitas resume: {e}")
+    _linger(args, out)
 
 
 def cmd_bench(args):
@@ -140,6 +162,19 @@ def main(argv=None):
     sp.add_argument("--quiet", action="store_true")
     sp.add_argument("--run-id", default=None, help="name of the run folder (default: timestamp_name_seed)")
     sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("resume", help="continue a paused supervised fleet run (see [fleet].session_months)")
+    sp.add_argument("run", help="run id in --runs-dir (or the run's folder)")
+    sp.add_argument("--config", "-c", default=None,
+                    help="TOML merged over the run's config (default: the run's playbooks.toml); [game] can't change")
+    sp.add_argument("--agent", action="append", default=[], help="override a role, as for run")
+    sp.add_argument("--set", action="append", default=[], help="override a value, e.g. fleet.session_months=0")
+    sp.add_argument("--runs-dir", default="runs")
+    sp.add_argument("--serve", action="store_true", help="start the viewer + live API while running")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--exit", action="store_true", help="with --serve: exit when the session ends")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(fn=cmd_resume)
 
     sp = sub.add_parser("bench", help="run several seeds and aggregate scores")
     common(sp)

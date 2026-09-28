@@ -1,6 +1,9 @@
 """Run episodes, log replays + trajectories, and aggregate benchmarks."""
 from __future__ import annotations
 
+import copy
+import dataclasses
+import hashlib
 import json
 import os
 import statistics
@@ -9,10 +12,11 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from ..config import agent_spec, build_agents, game_config, scoring_config
+from ..config import agent_spec, apply_cli_overrides, build_agents, game_config, scoring_config
 from ..core.env import make_env
-from ..fleet.config import fleet_agent_config, fleet_version
+from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version, playbook_versions, session_months
 from ..fleet.report import fleet_report, turn_row
+from . import session as S
 
 
 def _jsonable(o):
@@ -68,8 +72,84 @@ def agent_signature(cfg: dict, roles: list[str]) -> str:
     return " ".join(parts)
 
 
+def _fleet_settings(run: dict) -> None:
+    """What the run's config says about its fleet: signature, system prompts, version, mode and sessions."""
+    cfg, env, agents = run["cfg"], run["env"], run["agents"]
+    run["sig"] = agent_signature(cfg, env.roles)
+    run["prompts"] = {r: a.system for r, a in agents.items() if a.kind == "fleet"}   # logged turns refer to these
+    run["fv"] = fleet_version(cfg) if run["prompts"] else None                    # only when a role is a fleet agent
+    run["mode"] = S.fleet_mode(cfg, env.roles) if run["prompts"] else None
+    months = session_months(cfg) if run["prompts"] else 0
+    run["session_months"] = months if run["mode"] == "supervised" and run["sessions_on"] else 0
+    if months and run["mode"] == "autonomous" and run["verbose"]:
+        print(f"[{run['run_id']}] note: [fleet].session_months only pauses supervised runs; this one plays through")
+
+
+def _open_session(run: dict, *, previous: dict | None = None, config_file=None) -> None:
+    """Start a session record (meta.json `sessions`); `previous` = the paused run's prompts and signature."""
+    if not run["session_months"] and not run["sessions"]:
+        return                                   # a run without sessions keeps its meta as it always was
+    k = len(run["sessions"])
+    s = {"session": k + 1, "start_month": run["env"].world.month, "end_month": None, "status": "running",
+         "started": time.time(), "session_months": run["session_months"], "fleet_version": run["fv"],
+         "playbooks": playbook_versions(run["cfg"], list(run["prompts"]))}
+    if config_file:
+        s["config_file"] = str(config_file)
+    if previous is not None:
+        changed = [r for r, p in run["prompts"].items() if p != previous["prompts"].get(r)]
+        s["changed"] = changed
+        if changed:
+            s["fleet_prompts"] = {r: run["prompts"][r] for r in changed}
+            run["prompt_ref"].update({r: f"sessions[{k}].fleet_prompts.{r}" for r in changed})
+        if run["fv"] != run["sessions"][-1]["fleet_version"]:
+            s["fleet_config"] = {"fleet": run["cfg"].get("fleet") or {}, "agents": fleet_agents(run["cfg"])}
+        if run["sig"] != previous["sig"]:
+            s["signature"] = run["sig"]
+    run["sessions"].append(s)
+
+
+def _save_sessions(run: dict) -> None:
+    path = run["log"].dir / "meta.json"
+    meta = json.loads(path.read_text())
+    meta["sessions"] = run["sessions"]
+    run["log"].meta(meta)
+
+
+def _resume_cmd(run: dict) -> str:
+    runs_dir = run["log"].dir.parent
+    return f"civitas resume {run['run_id']}" + ("" if runs_dir == Path("runs") else f" --runs-dir {runs_dir}")
+
+
+def _pause(run: dict) -> dict:
+    """End the session at its boundary: checkpoint, editable playbooks, PAUSED marker, resume instructions."""
+    env, d, s = run["env"], run["log"].dir, run["sessions"][-1]
+    s.update(status="paused", end_month=env.world.month, ended=time.time())
+    _save_sessions(run)
+    run["log"].close()
+    keep = ("cfg", "seed", "run_id", "env", "agents", "stats", "city_scores", "fleet_rows", "wall_s", "sessions",
+            "prompts", "prompt_ref", "sig", "mode", "settings", "log_observations")
+    ck = S.save_checkpoint(d, {**{k: run[k] for k in keep}, "lineup": S.lineup(run["cfg"], env.roles),
+                               "month": env.world.month, "log_offsets": S.log_offsets(d), "saved": time.time()})
+    cmd = _resume_cmd(run)
+    pb = S.write_playbooks(d / S.PLAYBOOKS, run["cfg"], list(run["prompts"]), run_id=run["run_id"],
+                           month=env.world.month, session=s["session"], resume=cmd)
+    out = {"run_id": run["run_id"], "paused": True, "session": s["session"], "month": env.world.month,
+           "checkpoint": str(ck), "checkpoint_bytes": ck.stat().st_size, "playbooks": str(pb), "resume": cmd}
+    (d / S.PAUSED).write_text(json.dumps(out, indent=2))
+    size = out["checkpoint_bytes"]
+    print(f"[{run['run_id']}] paused at month {env.world.month} after session {s['session']} "
+          f"(checkpoint {f'{size / 1e6:.1f} MB' if size >= 1e6 else f'{size / 1e3:.0f} KB'})\n"
+          f"  edit the playbooks in {pb}, then resume with:\n    {cmd}\n"
+          f"  (or pass -c edited.toml: merged over the run's config; [game] can't change)")
+    return out
+
+
 def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None,
-                verbose: bool = True, log_observations: bool = True, run_id: str | None = None) -> dict:
+                verbose: bool = True, log_observations: bool = True, run_id: str | None = None,
+                sessions: bool = True) -> dict:
+    """Play a run to the end and return its summary. A supervised fleet run with `[fleet].session_months` stops
+    at the first session boundary instead and returns `{"paused": True, ...}` (`sessions=False` plays through);
+    `resume_episode` continues it."""
     game = game_config(cfg, seed)
     scoring = scoring_config(cfg, game)
     env = make_env(game, scoring)
@@ -80,24 +160,97 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
 
     run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg['name']}_s{seed}_{os.getpid() % 1000:03d}"
     log = RunLogger(Path(runs_dir) / run_id)
-    sig = agent_signature(cfg, env.roles)
-    prompts = {r: a.system for r, a in agents.items() if a.kind == "fleet"}      # logged turns refer to these
-    fv = fleet_version(cfg) if prompts else None                               # only when a role is a fleet agent
+    run = {"cfg": cfg, "seed": seed, "run_id": run_id, "env": env, "agents": agents, "log": log, "hub": hub,
+           "verbose": verbose, "log_observations": log_observations, "sessions_on": sessions, "sessions": [],
+           "prompt_ref": {}, "wall_s": 0.0, "city_scores": [], "fleet_rows": [],
+           "settings": {"game": dataclasses.asdict(game), "scoring": dataclasses.asdict(scoring)},
+           "stats": {r: {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0,
+                         "parse_errors": 0, "reward": 0.0} for r in env.roles}}
+    _fleet_settings(run)
+    _open_session(run)
+    sig, prompts, fv = run["sig"], run["prompts"], run["fv"]
     log.meta({"run_id": run_id, "name": cfg["name"], "seed": seed, "width": game.width,
               "height": game.height, "months": game.months, "roles": env.roles,
               "agents": {r: agents[r].describe() for r in env.roles}, "signature": sig,
               "config": cfg, "started": time.time(), **env.meta(),
               **({"fleet_version": fv} if fv else {}),
-              **({"fleet_prompts": prompts} if prompts else {})})
+              **({"fleet_prompts": prompts} if prompts else {}),
+              **({"sessions": run["sessions"]} if run["sessions"] else {})})
     if hub is not None:
         hub.run_id = run_id
     log.frame(env.frame())
     if verbose:
         print(f"[{run_id}] {sig}")
+    return _play(run)
 
-    stats = {r: {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0,
-                 "parse_errors": 0, "reward": 0.0} for r in env.roles}
-    city_scores, fleet_rows, t0 = [], [], time.time()
+
+def resume_episode(run: str | Path, config: str | Path | None = None, *, runs_dir: str | Path = "runs",
+                   agents: list[str] | None = None, sets: list[str] | None = None, hub=None,
+                   verbose: bool = True) -> dict:
+    """Continue a paused run (a run id in `runs_dir`, or its folder) with the playbooks of `config`, else of the
+    run's `playbooks.toml`, merged over its config (`session.overlay`), then `--agent` / `--set` overrides. The
+    game, scoring, line-up and mode must not change (ValueError). Returns what `run_episode` does."""
+    d = S.run_dir(run, runs_dir)
+    state = S.load_checkpoint(d)
+    source = Path(config) if config else (d / S.PLAYBOOKS if (d / S.PLAYBOOKS).exists() else None)
+    if source and not source.is_file():
+        raise ValueError(f"no config file {source}")
+    cfg = S.overlay(state["cfg"], S.read_toml(source)) if source else copy.deepcopy(state["cfg"])
+    cfg = apply_cli_overrides(cfg, agents, sets)
+    for w in S.check_resume(state, cfg, str(source) if source else None):
+        S.warn(w)
+    env = state["env"]
+    S.apply_balance(env)
+    cut = S.rewind_logs(d, state["log_offsets"])
+    if cut:
+        S.warn(f"{', '.join(cut)}: dropped lines logged after the checkpoint (an interrupted session)")
+    for marker in (S.PAUSED, "STOPPED"):
+        (d / marker).unlink(missing_ok=True)
+    run = {**{k: state[k] for k in ("seed", "run_id", "stats", "city_scores", "fleet_rows", "wall_s", "sessions",
+                                    "prompt_ref", "settings", "log_observations")},
+           "cfg": cfg, "env": env, "agents": S.restore_agents(state["agents"], cfg, env, hub),
+           "log": RunLogger(d), "hub": hub, "verbose": verbose, "sessions_on": True}
+    _fleet_settings(run)
+    _open_session(run, previous=state, config_file=source)
+    _save_sessions(run)
+    if hub is not None:
+        hub.run_id = run["run_id"]
+    if verbose:
+        s = run["sessions"][-1]
+        changed = ", ".join(s.get("changed") or []) or "none"
+        print(f"[{run['run_id']}] resumed at month {env.world.month}, session {s['session']} "
+              f"(new system prompts: {changed})")
+    return _play(run)
+
+
+def _prompt(run: dict, role: str, messages: list[dict]) -> list[dict]:
+    """A fleet turn's logged prompt points at the meta.json entry holding the system prompt it was played with."""
+    ref = run["prompt_ref"].get(role)
+    if ref and messages and str(messages[0].get("content", "")).startswith("(system prompt:"):
+        return [{"role": "system", "content": f"(system prompt: meta.json {ref})"}, *messages[1:]]
+    return messages
+
+
+def _versions(run: dict) -> list:
+    """The fleet versions the sessions played, in order, a run of sessions with the same one listed once."""
+    s = run["sessions"]
+    return [x["fleet_version"] for i, x in enumerate(s) if i == 0 or x["fleet_version"] != s[i - 1]["fleet_version"]]
+
+
+def _fleet_version(run: dict) -> str | None:
+    """The run's fleet version; one whose sessions played several is a hash of their sequence."""
+    seq = _versions(run)
+    if len(seq) <= 1:
+        return run["fv"]
+    return hashlib.sha1("|".join(map(str, seq)).encode()).hexdigest()[:12]
+
+
+def _play(run: dict) -> dict:
+    """Months until the end of the game (-> summary) or of the session (-> `_pause`)."""
+    cfg, env, agents, stats, log, hub = run["cfg"], run["env"], run["agents"], run["stats"], run["log"], run["hub"]
+    run_id, seed, game, verbose = run["run_id"], run["seed"], env.cfg, run["verbose"]
+    log_observations, prompts, sig = run["log_observations"], run["prompts"], run["sig"]
+    city_scores, fleet_rows, t0, start = run["city_scores"], run["fleet_rows"], time.time(), env.world.month
     while not env.done:
         pending = []
         acting = [r for r in env.roles if env.acts_this_month(r)]
@@ -119,8 +272,10 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                    "actions": [r["action"] for r in decision.executed] + decision.actions,
                    "messages": decision.messages, "notes": decision.notes,
                    "results": results, "parse_error": decision.parse_error}
+            if run["sessions"]:
+                rec["session"] = run["sessions"][-1]["session"]
             if "messages" in decision.meta:
-                rec["prompt"] = decision.meta["messages"]
+                rec["prompt"] = _prompt(run, role, decision.meta["messages"])
                 rec["response"] = decision.meta.get("response")
                 rec["reasoning"] = decision.meta.get("reasoning")
                 rec["finish_reason"] = decision.meta.get("finish_reason")
@@ -150,7 +305,12 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
         if verbose and (m["month"] % 12 == 0 or env.done):
             print(f"  month {m['month']:>3}: pop {m['population']:>6}  treasury {m['treasury']:>10,.0f}  "
                   f"happy {m['happiness']:.2f}  scores " + " ".join(f"{k}={v:.1f}" for k, v in info["scores"].items()))
+        if run["session_months"] and not env.done and env.world.month - start >= run["session_months"]:
+            run["wall_s"] += time.time() - t0
+            return _pause(run)
 
+    run["wall_s"] += time.time() - t0
+    fv = _fleet_version(run)
     final = env.final_metrics()
     if "cities" in env.meta():
         fm = final
@@ -182,9 +342,18 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
                                                    "pollution_res", "land_value_dev", "developed_total", "by_city")
                           if k in final},
         "agent_stats": stats,
-        "wall_time_s": round(time.time() - t0, 2),
+        "wall_time_s": round(run["wall_s"], 2),        # playing time; a paused run's sessions add up
         **({"fleet_version": fv} if fv else {}),
     }
+    if run["sessions"]:
+        s = run["sessions"][-1]
+        s.update(status="finished", end_month=env.world.month, ended=time.time())
+        _save_sessions(run)
+        summary["sessions"] = len(run["sessions"])
+        if fv != run["fv"]:
+            summary["fleet_versions"] = _versions(run)
+        for name in (S.CHECKPOINT, S.PAUSED):
+            (log.dir / name).unlink(missing_ok=True)
     if prompts:
         try:
             report, md = fleet_report(env, summary, fleet_rows)
@@ -204,10 +373,12 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
 
 def _run_one(args):
     cfg, seed, runs_dir, verbose = args
-    return run_episode(cfg, seed, runs_dir, verbose=verbose)
+    return run_episode(cfg, seed, runs_dir, verbose=verbose, sessions=False)
 
 
 def run_benchmark(cfg: dict, seeds: list[int], runs_dir="runs", workers: int = 1, verbose=True) -> dict:
+    if verbose and fleet_agents(cfg) and session_months(cfg):
+        print("note: bench plays supervised runs through without pausing ([fleet].session_months ignored)")
     jobs = [(cfg, s, runs_dir, verbose) for s in seeds]
     if workers > 1:
         with ProcessPoolExecutor(workers) as ex:

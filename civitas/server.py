@@ -12,6 +12,7 @@ Endpoints
   GET  /api/processes                runs started from the browser
   POST /api/launch                   {config, seed, months?, act_every?, agents: {role: "kind[:provider/model]"}}
   POST /api/stop                     {run_id}
+  POST /api/resume                   {run_id}: continue a "paused" supervised run with its playbooks.toml
   GET  /api/live/turn?role=R         remote agents (only with `civitas run --serve`)
   POST /api/live/act
 """
@@ -143,6 +144,12 @@ def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
             "recovered_calls": rec.get("recovered_calls") or 0}
 
 
+def run_folder(runs_dir: Path, run_id: str) -> Path | None:
+    """The run's folder, only when it sits directly in `runs_dir` once resolved (no "..", ".", "a/b", links out)."""
+    d = (runs_dir / run_id).resolve()
+    return d if d.parent == runs_dir.resolve() and d.is_dir() else None
+
+
 class Launcher:
     """Starts `civitas run` subprocesses on behalf of the browser."""
 
@@ -232,6 +239,25 @@ class Launcher:
             (d / "STOPPED").write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
         return True
 
+    def resume(self, run_id: str) -> dict:
+        """`civitas resume <run_id>`: the next session of a paused run, with the playbooks in its playbooks.toml."""
+        d = run_folder(self.runs_dir, run_id)
+        if d is None or not (d / "PAUSED").exists():
+            raise ValueError(f"no paused run {run_id!r}")
+        run_id = d.name
+        if self.is_running(run_id):
+            raise ValueError(f"run {run_id!r} is already running")
+        cmd = [sys.executable, "-m", "civitas.cli", "resume", run_id, "--runs-dir", str(self.runs_dir)]
+        logs = self.runs_dir / "_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log_path = logs / f"{run_id}.log"
+        log = open(log_path, "a")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=os.getcwd(),
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        with self.lock:
+            self.procs[run_id] = {"proc": proc, "log": log_path, "started": time.time(), "cmd": cmd[3:]}
+        return {"run_id": run_id, "pid": proc.pid}
+
     def status(self) -> list[dict]:
         out = []
         with self.lock:
@@ -296,8 +322,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def _run_dir(self, run_id: str) -> Path | None:
-            d = (runs_dir / run_id).resolve()
-            return d if d.parent == runs_dir.resolve() and d.is_dir() else None
+            return run_folder(runs_dir, run_id)
 
         def do_OPTIONS(self):
             self.send_response(204)
@@ -397,6 +422,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                 if path == "/api/stop":
                     ok = bool(launcher and launcher.stop(str(body.get("run_id", ""))))
                     return self._json({"ok": ok}, 200 if ok else 404)
+                if path == "/api/resume":
+                    if launcher is None:
+                        return self._json({"ok": False, "error": "launching is disabled"}, 403)
+                    return self._json({"ok": True, **launcher.resume(str(body.get("run_id", "")))})
                 if path == "/api/live/act":
                     if hub is None:
                         return self._json({"error": "no live game"}, 404)
@@ -410,6 +439,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
         def _status(self, d: Path) -> str:
             if (d / "summary.json").exists():
                 return "finished"
+            if (d / "PAUSED").exists():            # a supervised run between sessions (civitas resume)
+                return "paused"
             if (d / "STOPPED").exists():
                 return "stopped"
             if launcher:

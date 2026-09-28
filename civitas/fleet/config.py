@@ -2,7 +2,8 @@
 
 A run config's `[fleet]` table holds fleet-wide settings (`playbook` is the fleet playbook) and every
 `[agents.<role>]` with `kind = "fleet"` can override any of them (its `playbook` is the role's playbook; its
-`extra_body` replaces `[fleet].extra_body` as a whole).
+`extra_body` replaces `[fleet].extra_body` as a whole). `[fleet].session_months` is run-wide: a supervised run
+pauses after that many months (see `bench/session.py`).
 """
 from __future__ import annotations
 
@@ -60,7 +61,32 @@ def fleet_agents(cfg: dict) -> dict:
     return {r: a for r, a in (cfg.get("agents") or {}).items() if _table(a, f"agents.{r}").get("kind") == "fleet"}
 
 
-def fleet_version(cfg: dict) -> str:
-    """Short hash of the fleet's coaching and limits: `[fleet]` plus the fleet agents' specs."""
-    obj = {"fleet": _table(cfg.get("fleet") or {}, "fleet"), "agents": fleet_agents(cfg)}
+SCHEDULING = ("session_months",)     # [fleet] keys about when a run pauses, not how the fleet plays
+
+
+def _sha(obj) -> str:
     return hashlib.sha1(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
+
+
+def fleet_version(cfg: dict) -> str:
+    """Short hash of the fleet's coaching and limits: `[fleet]` plus the fleet agents' specs. Scheduling keys are
+    left out, so a supervised run that pauses between sessions keeps the version of one that plays through."""
+    fleet = {k: v for k, v in _table(cfg.get("fleet") or {}, "fleet").items() if k not in SCHEDULING}
+    return _sha({"fleet": fleet, "agents": fleet_agents(cfg)})
+
+
+def session_months(cfg: dict) -> int:
+    """`[fleet].session_months`: months per session of a supervised run (0 = no pauses, the default)."""
+    v = _table(cfg.get("fleet") or {}, "fleet").get("session_months", 0)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ValueError(f"fleet.session_months must be a whole number of months (0 = no pauses), got {v!r}")
+    return v
+
+
+def playbook_versions(cfg: dict, roles) -> dict:
+    """Short hashes of the fleet playbook and each fleet role's own playbook (None when empty)."""
+    h = lambda text: _sha(text) if str(text or "").strip() else None
+    out = {"fleet": h(_table(cfg.get("fleet") or {}, "fleet").get("playbook", ""))}
+    for r in roles:
+        out[r] = h(fleet_agent_config(cfg, r).playbook)
+    return out
