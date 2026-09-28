@@ -67,3 +67,16 @@ Checkpoint after each task: `pytest -q -m "not slow"`. The full suite had 345 pa
    - duplicate allocations;
    - when police, fire, health and education got their first building, and education's score;
    - population and score.
+5. **After smoke v13: blocked is not idle.**
+   - v13 seed 0, month 6: planning had zoned every roadside lot. Police, fire, health and education each held exactly
+     their first building's price with nothing spent. With no ready sites the keep fell to the $1,000 floor, so
+     each was flagged "idle $1,500 / $1,000" and the mayor took the money back. Utilities at month 9: "idle
+     $6,000" while no plant site was free.
+   - Fix:
+     - Money for an unlocked primary first building whose list is empty for lack of land or roads ("no free
+       roadside land", "no roadside lot away from homes", riverbank taken, "no road reaches the river") still
+       counts toward the keep, at that building's price.
+     - "Nothing needs it", locked, and the SITE_NOTES reasons don't count.
+     - The mayor's line says "; blocked: no free lot for a <building> - ask planning" when a department's first
+       buildings are all blocked, so the mayor pushes planning rather than taking money back.
+   - Then run smoke v14.
