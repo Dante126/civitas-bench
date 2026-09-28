@@ -2,7 +2,7 @@
 
 `system_prompt()` is the same every turn: how to play, the role's mission and the game rules, then the coach's
 playbooks, so coaches steer strategy but cannot change rules or tools. `briefing()` is a compact status for the
-turn: the mayor gets the city, finances, department reports and the plan; a department gets its plan slice,
+turn: the mayor gets the city, finances, department money and reports, and the plan; a department gets its plan slice,
 budget, key metrics, a "since your last turn" digest, the map, its ready sites and its memory. Everything else is a
 tool call away.
 """
@@ -17,10 +17,12 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, a_or_an, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, best_stretch, cheapest, funding_gaps, map_facts, \
-    map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
+from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
+    Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
+    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
+    spare_funded
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -54,6 +56,11 @@ MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
 # the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
 GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
+BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this, department names only (then cut)
+# the mayor's Departments block, once below any line with a blocked suffix: " - ask planning" on each blocked line took
+# the worst case (2 idle, 5 blocked) to 7,445 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows;
+# said once here, 7,420
+BLOCKED_NOTE = "- blocked for lack of land: ask planning for lots"
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -167,49 +174,91 @@ def _older_reach(env, role: str, older: list[dict]) -> str:
     return f", {beyond} get_messages' {window}-month window"
 
 
-def _map(w) -> list[str]:
-    return ["## Map"] + map_lines(map_facts(w))
+def _map(w, role: str) -> list[str]:
+    """The Map block; the mayor's keeps only MAYOR_MAP: it has no map actions (its system prompt has no coordinates
+    either), and its briefing needed the room for the departments' money."""
+    return ["## Map"] + map_lines(map_facts(w), MAYOR_MAP if role == "mayor" else MAP_PARTS)
 
 
-def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
+def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
-    find_sites for every purpose each turn. Planning's also says high density is locked while it is (smoke v9-v11:
-    6 x zoning high density before 1,000 residents, repeated across turns)."""
+    find_sites for every purpose each turn. Planning's also names what funded departments are about to build
+    (_leave_line; its zone strips spare those sites: spare_funded) and the first buildings blocked for lack of land
+    (_land_line), and says high density is locked while it is (smoke v9-v11: 6 x zoning high density before 1,000
+    residents, repeated across turns)."""
+    w = env.world
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
         f"{w.metrics()['population']:,}): zone with density \"low\""]
-    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + dense
+    land = []
+    if role == "planning":
+        depts = dept_lists(env)                                    # one observation per priced department
+        spots = funded_spots(w, depts)
+        lists, land = spare_funded(lists, spots), _leave_line(spots) + _land_line(env, depts)
+    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _needs(env, dept: str) -> str:
-    """The mayor's Departments line suffix when `dept`'s funds are below its cheapest ready build: "; needs $X for a
-    <building> (N ready sites)", else "". Every building at that price is named ("a clinic (5 ready sites) or a
-    landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). A
-    per-tile purpose counts its best site whole ("$90 for 3 avenue tiles", best_stretch), also when picking the
-    cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line. The department's observation is built
-    only when its funds are below its dearest priced purpose (else no ready build can be out of reach), or when it
-    has a per-tile one (a stretch has no such bound)."""
+def _leave_line(spots: list) -> list[str]:
+    """Planning's line naming what funded departments are about to build and where (funded_spots, each its own site):
+    "- leave free (funded): fire station (12,23), clinic (20,27): zone around them"; past BLOCKED_LINE_CHARS whole
+    items drop from the end, counted ("(+2 more)"). Smoke v14 seed 0, months 3-6: the mayor funded fire, health and
+    education for their ready sites near homes, planning (acting next) zoned those lots, and they read "nothing needs it
+    right now" at coverage 0; fire held $2,500 to month 12. v15 seed 0, month 9: cut mid-word at 240 ("zone arou")."""
+    found = [f"{sp.building} ({sp.xy[0]},{sp.xy[1]})" for sp in spots]
+    if not found:
+        return []
+    head, tail = "- leave free (funded): ", ": zone around them"
+    line = lambda n: head + ", ".join(found[:n]) + (f" (+{len(found) - n} more)" if n < len(found) else "") + tail
+    return [next((line(n) for n in range(len(found), 1, -1) if len(line(n)) <= BLOCKED_LINE_CHARS), line(1))]
+
+
+def _land_line(env, depts: dict) -> list[str]:
+    """Planning's line naming each department's cheapest first buildings blocked for lack of land or roads
+    (land_blocked), by the names the mayor sees, each tagged with what it needs beyond a roadside lot (land_fix:
+    "sewage outlet: a road to the river"); past BLOCKED_LINE_CHARS without the tags, then departments only. Smoke v13
+    seed 0, months 6-9: planning zoned every roadside tile despite its playbook's "leave room", and utilities, police,
+    fire, health and education all read "none - no free roadside land: ask planning for a lot"."""
+    found = land_blocked(env, depts)
+    if not found:
+        return []
     w = env.world
-    funds = w.dept_funds[dept]
-    priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
-    if not any(pr.per_tile for pr in priced) and not short_of(funds, max((pr.cost for pr in priced), default=0)):
-        return ""
-    lists = site_lists(w, dept, role_obs(env, dept))
-    prices, tiles = ready_prices(w, dept, lists), {}
-    for p, pr in prices.items():
-        if pr.per_tile:
-            tiles[p], units = best_stretch(w, p, lists[p].sites)
-            prices[p] = pr._replace(cost=pr.cost * units)
-    purposes, low = cheapest(prices) or ((), None)
-    if low is None or not short_of(funds, low.cost):
-        return ""
-    named = {}                                       # what it buys -> ready sites of the first purpose pricing it
-    for p in purposes:
-        n, b = tiles.get(p, 1), prices[p].building
-        named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
-    return f"; needs {money(low.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
-                                                            for b, n in named.items())
+    head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
+    name = lambda d, p, tag: site_price(w, d, p).building + (f": {fix}" if tag and (fix := land_fix(w, d, p)) else "")
+    forms = [", ".join(f"{d} ({', '.join(dict.fromkeys(name(d, p, tag) for p in ps))})" for d, ps in found.items())
+             for tag in (True, False)] + [", ".join(found)]
+    body = next((f for f in forms if len(head + f + tail) <= BLOCKED_LINE_CHARS), forms[-1])
+    return [head + cut(body, BLOCKED_LINE_CHARS - len(head + tail)) + tail]
+
+
+def _needs(m: DeptMoney) -> str:
+    """The mayor's Departments line suffix when a department's funds are below its cheapest ready build
+    (first_build): "; needs $X for a <building> (N ready sites)", else "". Every building at that price is named ("a
+    clinic (5 ready sites) or a landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9:
+    "Build first shelter")."""
+    b = m.needs
+    return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(
+        f"{what} ({n} ready site{'s' * (n != 1)})" for what, n in b.named.items())
+
+
+def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
+    """One department on the mayor's Departments block: funds, the plan target ("<" when below it and it would use a
+    top-up: funding_gaps), what it spent (the block's header says over how many months), then one of its idle money
+    or what is blocked (summary lines say what to do), or what it needs. Smoke v9-v12: nothing showed what a
+    department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 < target $9,000" and was
+    topped up."""
+    return (f"- {d}: funds {money(math.floor(m.funds))}"
+            + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
+            + (f", spent {money(m.spent)}" if m.months else "")
+            + (f"; idle {money(m.idle)}" if m.idle else _needs(m) or _blocked(m)))
+
+
+def _blocked(m: DeptMoney) -> str:
+    """The mayor's line suffix when a department has no ready site but a first building blocked for lack of land or
+    roads: "; blocked: a police station" (BLOCKED_NOTE, once below, says to ask planning; planning's Ready sites say
+    why and what each needs). Smoke v13 seed 0, month 6: police, fire, health and education held their first
+    building's price with every roadside lot zoned, and the mayor took it back instead of pushing planning."""
+    return f"; blocked: {' or '.join(m.blocked)}" if m.blocked else ""
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -283,16 +332,20 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     f = funding_gaps(env, fleet)
     clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
-    L += ["", "## Departments"
-          + (" (cut reports: history kind=report)" if clipped else "")]
-    for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(math.floor(w.dept_funds[d]))}"
-                 + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-                 + _needs(env, d) + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
+    spent = min(len(w.history), SPEND_MONTHS)
+    notes = [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped
+    L += ["", "## Departments" + (f" ({'; '.join(notes)})" if notes else "")]
+    for d, m in f.depts.items():
+        L.append(_dept_line(d, m, f, budgets)
+                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
             L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
     if not latest:
         L.append("- no reports yet")
+    if f.idle:
+        L.append(f"- {f.idle_note()}")
+    if any(m.blocked for m in f.depts.values() if not m.idle):          # a line above says "; blocked: ..."
+        L.append(BLOCKED_NOTE)
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
                  + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
@@ -306,7 +359,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
               f"- goals: {_goals(p['goals'], GOAL_CHARS)}"]
         if p["notes"]:
             L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")
-    return L + [""] + _map(w) + [""] + _memory(fleet, "mayor")
+    return L + [""] + _map(w, "mayor") + [""] + _memory(fleet, "mayor")
 
 
 def _department(env, fleet: FleetState, role: str) -> list[str]:
@@ -343,7 +396,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                  "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
+    return L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,

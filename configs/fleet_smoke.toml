@@ -55,20 +55,19 @@ end_turn report.
 [agents.mayor]
 kind = "fleet"
 playbook = """
-- First turn: write the plan with update_plan: 3-4 goals, a budget for every department for the next quarter \
-and a one-line priority each. Then, in the same turn, fund it with allocate_budget: update_plan's result lists \
-the departments below their target and the gaps. A good start from $30,000: planning $9,000 and \
-utilities $7,000; the services get nothing until people move in (from month 3: $2,500 each for health, fire, \
-police and education, since their first buildings cost $2,000-2,500 and less buys nothing); transport $0 until \
-~1,500 residents. The rest stays in the treasury: upkeep grows with every building.
-- Every turn: read the department reports and the funds table, then top each department up to its plan budget \
-from the money above the reserve, most urgent first (utilities when supply is tight, planning when zones wait \
-for roads). Each allocate_budget adds to what the department already has, so check its funds first and allocate \
-once. Don't top up a department that is sitting on unspent funds; take money back (negative amount) if the \
-treasury needs it.
+- First turn: write the plan with update_plan (3-4 goals, a budget for every department for the next quarter, \
+a one-line priority each; the budgets are the targets your briefing compares funds with), then fund it with \
+allocate_budget in the same turn. A good start from $30,000: planning $3,000 (roads $10 a tile, zones $5-8: a \
+quarter's work; after that keep its budget near what it spends, about $1,000-1,500 a quarter) and utilities \
+$7,000. From month 3: $2,500 each to police, fire and health (a first building costs $2,000-2,500; less buys \
+nothing), and to education once its needs line shows school sites; transport $0 until ~1,500 residents. The rest \
+stays in the treasury: upkeep grows with every building.
+- Every turn: read the reports and the Departments block. First take back the idle money it names (negative \
+allocate_budget), before any new top-up or loan; then top up the departments below target from the money above \
+the reserve, most urgent first (utilities when supply is tight, a service whose needs line shows ready sites, from month 3). \
+Allocations add up, so allocate once per department per turn.
 - Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 months while running a deficit). \
-When the briefing or update_plan says "hold", allocate nothing new (taking money back from a department \
-with unspent funds is fine).
+When the briefing or update_plan says "hold", allocate nothing new (taking idle money back is fine).
 - Use find_sites only to verify a department's "no site" claim (e.g. utilities.sewage), at most 2 calls per \
 turn, before moving its money elsewhere; if sites exist, tell it where.
 - Taxes start at 9%. Raise R by 1 point when the city runs a deficit while happiness is above 55% and approval \

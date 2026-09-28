@@ -435,9 +435,36 @@ tasks and money, and to let people coach it.
   are short of its cheapest ready building (`needs $2,500 for a police station (5 ready
   sites)`, or each building at that price on a tie: `needs $2,000 for a clinic (5 ready
   sites) or a landfill (4 ready sites)`; a per-tile site counts its best stretch whole:
-  `needs $90 for 3 avenue tiles (5 ready sites)`) and latest report, a line with the total
-  funding gap (ending in `allocate_budget`, or in "hold" when the treasury is at or under
-  the reserve), and the plan. A department's briefing covers its plan slice, its budget
+  `needs $90 for 3 avenue tiles (5 ready sites)`), what it spent over the last 3 months,
+  its idle money, and its latest report.
+  - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
+    first building, $1,000). Funds that are $1,000 or more above that, excluding this
+    month's top-ups, show as `idle $3,400`, and a summary line says to take the money back
+    (a negative `allocate_budget`) before taking loans or giving new top-ups.
+  - **Blocked buildings.** A first building with no lot for lack of land or roads counts
+    toward the keep, because the department still needs that money. That covers:
+    - no free roadside land;
+    - no free roadside lot near the homes that need it, or no free roadside land at all,
+      for a need-ranked station, clinic or school when at least 15% of what it serves is
+      under 30% coverage (a well-covered department with no land isn't blocked);
+    - no roadside lot away from homes, for a landfill or jail;
+    - no free 2x2 roadside block;
+    - for a pump or sewage outlet, no road to the river or the bank taken, but only while
+      the city lacks one or its demand is at least 90% of supply. The 90% test also
+      applies to a water tower (on water) and a power plant or wind turbine (on power).
+
+    When a department has no ready site, its line says `; blocked: a police station`, and
+    one line under the block says `- blocked for lack of land: ask planning for lots`.
+    In smoke v13 seed 0, planning had zoned every roadside lot, and the mayor took the
+    station, clinic and school money back from four departments as idle.
+  - **Below target.** A department counts as below its plan target only if it isn't idle
+    and would use a top-up: it spent more than half of the most it held over those 3
+    months, or it never held its keep. In smoke v9–v12, planning spent about $1,000 a
+    quarter and still read "funds $7,834 < target $9,000", so the mayor topped it up.
+  - **Totals.** A line gives the total funding gap. It ends in `allocate_budget`, or in
+    "hold" when the treasury is at or under the reserve. The plan comes last.
+
+  A department's briefing covers its plan slice, its budget
   (when its funds buy none of its ready sites, a line names the cheapest, all of them on a
   tie, and tells it to ask the mayor and end the turn instead of calling build tools), its
   key metrics, a "since your last turn" digest (failed actions, events, and the newest
@@ -447,8 +474,9 @@ tasks and money, and to let people coach it.
   for levees, `$300/tile`, and for congested roads, `$30/tile` for an avenue, with
   stretches that are avenues already listed last), and `; $2,500 - you have $1,000` when
   the funds are short; or why there is none, e.g. locked, under 1,500 residents for bus
-  stops, no connected road reaches the river, the riverbank beside the roads is taken, or
-  no roadside lot is away from homes for a landfill, cemetery or jail; a site on one of
+  stops, no connected road reaches the river, the riverbank beside the roads is taken, no
+  free roadside lot near the homes that need it (around a named tile), no free 2x2
+  roadside block, or no roadside lot away from homes for a landfill, cemetery or jail; a site on one of
   the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
   memory. Every purpose outside planning is priced. A library (it only adds to schools), a
   shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
@@ -461,7 +489,25 @@ tasks and money, and to let people coach it.
   their straight road lines, e.g. `y=24 x 0-47; x=19 y 19-29`, up to 8 with the longest
   first, any road tiles not connected to the highway, and the built-up area) and end with
   the next milestone. While high density is locked, planning's Ready sites block says so
-  and tells it to zone at low density. Actions run immediately and return `ok`, a message,
+  and tells it to zone at low density. Two more lines there are about the other
+  departments' buildings:
+  - **`- leave free (funded): fire station (20,22), clinic (21,25): zone around them`**
+    covers each department whose funds already pay for its cheapest ready first
+    building (all of them on a tie; utilities' only while that supply is at least 90% used). It gives each building a site, in turn order,
+    that no earlier building has claimed. Past 240 characters whole items are dropped
+    (`(+2 more)`).
+    - Zone strips that cover a claimed site are listed after the others. When one still
+      comes first, it's marked `(leave (20,22) for the fire station)`.
+    - A failed zone's "zone beside it" suggestions skip these sites.
+  - **`- blocked for lack of land: utilities (sewage outlet: a road to the river), police
+    (police station: near homes): extend a road into open land, or free a lot, for
+    them`** gives each department's cheapest blocked first building, in turn order, and
+    what frees it. Past 240 characters the tags are dropped, then the building names.
+
+  In smoke v14 seed 0, planning zoned the lots near homes after the mayor had funded fire,
+  health and education, and fire held $2,500 for nine months without a site.
+
+  Actions run immediately and return `ok`, a message,
   the cost and the money left, so a failed action can be fixed in the same turn. Bad arguments, unknown tools and
   refused actions come back as `{"ok": false, "error": ...}` for the model to correct. A
   failed `build_road`, `zone` or `dezone` also says how to fix it: a road blocked by empty zoned
@@ -486,14 +532,20 @@ tasks and money, and to let people coach it.
   first or repeat with `confirm: true`. Transport's `demolish` of a train station, harbour or
   airport that is some roads' only link to the region (metro stations don't link) is refused
   the same way; the refusal suggests asking planning for a road to the highway or building
-  another link first. A `zone` that takes the last free riverbank lot beside the connected
+  another link first. The mayor's `allocate_budget` identical to one that already succeeded
+  this turn (same department and amount; allocations add up) is refused too
+  (`refused: "duplicate"`), naming what the department now holds; other amounts and taking
+  money back pass. A `zone` that takes the last free riverbank lot beside the connected
   roads while the city still has no pump or water tower, or no sewage outlet / treatment
-  plant, succeeds, with a warning naming what utilities still needs the bank for.
+  plant, succeeds, with a warning naming what utilities still needs the bank for. So does
+  a `zone` that leaves a department with funds for its cheapest ready first building no
+  unclaimed site for it (`WARNING: that zoned the last site for fire's fire station near homes (fire holds
+  $2,500 for it): dezone one, e.g. (20,22)`).
 
 | tools | |
 |---|---|
 | look-ups (no side effects) | `city_overview` (headline numbers and a 3-month trend), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block, or a pointer to it when the map and the facts together don't fit, as from about month 72 of a long game), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
-| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result lists the departments whose funds are below their budget target, with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
+| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing), with the gap and the treasury, and warns when the gaps exceed the treasury above the reserve, or says "hold" when there is nothing above it; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 in a deficit, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
 **Three memory layers.** Nothing else carries over between turns.
@@ -694,6 +746,104 @@ note, the high-density line and the planning playbook) reached 1,564 / 43.8 and 
   - It zoned a second type over a rectangle it had just zoned, 4 times, even though the hint named what was there.
   - The inspect note fired once for planning (seed 1, month 6) and twice for utilities. On its other turns planning called `map_overview` before a 4th inspect and kept inspecting afterwards (up to 8 a turn), which the note doesn't cover.
 - **Fleet-wide:** 16% and 26% of actions failed, with 44–49k prompt tokens and about 9 calls per turn. On seed 0 education only ever got $1,500, short of a $2,500 school (score 33.3), and at month 3 the mayor sent the same allocations two or three times each.
+
+**v13** (2026-09-28, after the mayor's money lines: spending, keep and idle money, below
+target only when a top-up would be used, the duplicate-allocation guard and a new mayor
+playbook) reached 1,836 residents / 39.7 on seed 0 and 928 / 39.9 on seed 1.
+
+Compared with v9–v12 (8 runs):
+
+- **Idle money:** planning held $1,320 and $849 at month 6 (v9–v12: $7,300–10,700 in every
+  run). The mayor took idle money back 6 and 3 times.
+- **Loans:** $0 and $15,000. On seed 1 the mayor sent utilities $7,000 at month 3 against a
+  $4,000 gap, and then borrowed.
+- **Duplicate allocations:** none (v9–v12: 7).
+- **First buildings:** seed 1 was fine, with health at month 0, police and fire at 3, and a
+  school at 6 (education 61.1). Seed 0 was not:
+  - By month 6, planning had zoned every roadside lot. Police, fire, health and education
+    each held exactly their first building's price, and they read as idle above the $1,000
+    floor.
+  - The mayor took that money back. Police and fire built only at month 9, and health and
+    education never did (education 33.3).
+  - This led to "blocked is not idle".
+- **Planning on seed 1:** it zoned the last free riverbank lot at month 0, then spent three
+  turns bulldozing and dezoning its own roads to undo it. That kept the city small.
+
+**v14** (2026-09-28, after "blocked is not idle": a first building with no lot for lack of
+land counts toward the keep, the mayor's line says `blocked: ... - ask planning`, and
+planning's Ready sites name the departments it has blocked) reached 1,956 / 45.4 and 912 /
+42.2. The laptop slept through the runs' first 35 minutes, and both first calls were
+retried, so the wall-clock times aren't comparable.
+
+- **Money:** loans were $0 and $7,500, and there were no duplicate allocations.
+- **Idle and take-backs:** only one idle line in the whole run, planning's $1,730 on seed
+  1, which the mayor took back. No blocked department's money was taken.
+- **First buildings:** on seed 1, police, fire, health and education all built at month 6
+  (education 51.4).
+- **Two new problems:**
+  - **Riverbank false alarm.** Planning's blocked line named utilities' pump and sewage
+    from month 0 to 9 on both seeds. It was right while no road reached the river, and
+    while seed 1 had no outlet. Later, with a pump and an outlet built and room to spare
+    (water 2–4× demand, sewage 1.4–2.5×), it still told planning to free a riverbank lot.
+  - **Lots near homes.** On seed 0, the mayor funded fire, health and education at months
+    3 and 6, when their sites were ready. Planning then zoned the lots near homes, so the
+    services read "station / clinic / school: none - nothing needs it right now" with
+    coverage at 0. Fire held $2,500 from month 3 to 12 without building (fire 37.0), and
+    fire and health spent 13–20 calls a turn at months 3–6 looking for sites. Turns with
+    no successful action took 46.5% of seed 0's prompt tokens (71k per turn on average).
+- **Utilities over-building:** on seed 1, utilities built three $2,200 water towers,
+  leaving water at 4.7× demand with coverage already full.
+
+**v15** (2026-09-28, after the fixes: pump and outlet blocked only while needed, 2x2
+blocks, lots near homes counted as blocked, the leave-free line, the zone warning, and
+zone strips that spare funded sites) reached 1,508 / 43.0 and 1,424 / 41.1.
+
+- **First buildings:** every service got its first building on time, the aim of this
+  work. On seed 0, police, fire, health and education all built at month 3; on seed 1,
+  all at month 6. Education scored 58.7 and 60.1 (v13–v14 seed 0: 33.3), and fire 57.1
+  and 64.6 (v14 seed 0: 37.0).
+- **Failed actions:** 20–22%.
+- **Loans:** $12,000 and $0. On seed 0 the mayor followed the needs lines into second and
+  third stations and clinics at 740–1,016 residents. The treasury fell from $20k to
+  $3.3k by month 6, and the mayor took planning's $2,310 back, leaving planning at $0 for
+  months 9–12.
+- **What the review and the runs found in the new lines (fixed afterwards):**
+  - Every leave-free line named a water tower, although water was never short. Utilities'
+    near-homes list ranks lots by the homes around them, so planning was told to hold
+    back its best residential lot.
+  - Departments shared a best site: seed 1, month 6 named (34,25) for four buildings.
+  - The line was cut at 240 characters mid-word on seed 0, month 9.
+  - A 10% share measured on fractional coverage would flag well-covered mature cities.
+- **Still open:**
+  - On seed 1, health's landfill read "blocked … away from homes" at months 6 and 9, and
+    planning never made a lot for it, so garbage coverage stayed at 0.
+  - On seed 1, the mayor funded no service at month 3, despite the playbook.
+
+**v16** (2026-09-28, after those fixes: utilities only while its supply is at least 90% used,
+claimed sites, whole-item truncation, and need measured under 30% coverage with a 15%
+share) reached 2,000 / 47.4 and 2,112 / 46.0. Its mean score of 46.7 is the best of any
+smoke pair so far (v10: 46.6; v8 and v11: 45.8).
+
+- **Failed actions:** 15.1% and 22.1%. There were 50–52k prompt tokens and about 9 calls
+  per turn.
+- **First buildings:** on seed 1, police, fire, health and education all built at month 3
+  (education 64.5). On seed 0, police and fire built at month 3 and health's clinic at 6.
+- **Leave-free line:** after month 0 it named a utilities building only while supply was
+  short: seed 0's wind turbine at month 3 (power 70.8 of 70.8) and water tower at month 9
+  (demand 197 against supply 169). Buildings no longer shared a site.
+- **Zone warning:** it fired once, on seed 0 at month 9, when a zone took health's last
+  clinic lot. Health built on the lot it named.
+- **Still open: the mayor's needs lines.**
+  - A second station reads just like a first building: `needs $2,500 for a police
+    station (5 ready sites)`, whether the department has none or one already.
+  - On seed 0 the treasury was short at months 6 and 9. The mayor funded second police and
+    fire stations and a second clinic first, and education's allocations were refused
+    ("treasury only has $500"). Education asked every quarter and never got its school
+    (33.2).
+  - On seed 1 the mayor borrowed $10,500 at month 6 (528 residents), for utilities'
+    $7,000 and second police and fire stations.
+  - Utilities' needs line still names a water tower when water isn't short (v14 and v15
+    seed 1: towers built with water at 4.7–4.9× demand).
 
 **Not built yet:**
 

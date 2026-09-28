@@ -29,7 +29,8 @@ MSG_CHARS = 160
 def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
     look-up that failed, an action tool refused before the action ran. A repeated failed action or bad call and a
-    guarded bulldoze or demolish, refused without running, are counted in `refused`, not here."""
+    guard refusal (a bulldoze or demolish that would cut roads off, a duplicate allocation), refused without
+    running, are counted in `refused`, not here."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
