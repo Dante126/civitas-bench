@@ -80,3 +80,27 @@ Checkpoint after each task: `pytest -q -m "not slow"`. The full suite had 345 pa
      - The mayor's line says "; blocked: no free lot for a <building> - ask planning" when a department's first
        buildings are all blocked, so the mayor pushes planning rather than taking money back.
    - Then run smoke v14.
+6. **Review fixes for Task 5 (after smoke v14).**
+   - **Riverbank need (Important).** `_why_empty` flags pump and sewage as blocked whenever the bank lots beside
+     roads are taken, without checking whether they're needed. Live v14 seed 1, months 6 and 9: pump and outlet
+     already built, water 370-490 against demand of 99-116, sewage 250 against 99-116. Yet planning read "blocked for
+     lack of land: utilities (pump, sewage) ... dezone a roadside lot for them" (the playbook says to free a bank
+     lot when asked). Fix: in `blocked_firsts`, count pump / sewage only when `_bank_needed(w)` names them or their
+     demand is at least 0.9 × supply. Test from a grown scripted state with the bank taken: `land_blocked == {}`.
+   - **2x2 lists.** University (and hospital) lists go empty for lack of a free 2x2 roadside block but read "nothing
+     needs it right now", so the university keep ($12,000) is flagged idle past 5,000 residents. Fix: `_why_empty`
+     checks for a free 2x2 roadside block (`w.site_candidates(..., size=2)`) and returns "no free 2x2 roadside
+     block: ask planning for one", blocked.
+   - **Planning's line.**
+     - Name only each department's cheapest blocked first building(s), as the mayor's line does, so the full form
+       fits past 1,000 residents.
+     - Riverbank purposes say what fixes them (a road to the river, a free bank lot), not just "dezone a roadside
+       lot".
+   - **Size.** The mayor's size test's blocked departments hold realistic 4-digit funds. If under ~20 characters
+       of headroom remain, say "ask planning" once in the summary line instead of on each department line.
+   - **Tests and tidy-up.**
+     - Assert the blocked flag for "riverbank all taken" and "no free 2x2 riverbank block".
+     - Drop the redundant assert.
+     - Name the jail in the `dearest == 4000` test.
+     - Compute `min(...)` once in `first_build`.
+   - Then run smoke v15.
