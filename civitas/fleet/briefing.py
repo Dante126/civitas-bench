@@ -20,8 +20,9 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
-    Funding, cheapest, dept_lists, funded_firsts, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
-    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
+    Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
+    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
+    spare_funded
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -182,8 +183,9 @@ def _map(w, role: str) -> list[str]:
 def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
     find_sites for every purpose each turn. Planning's also names what funded departments are about to build
-    (_leave_line) and the first buildings blocked for lack of land (_land_line), and says high density is locked while
-    it is (smoke v9-v11: 6 x zoning high density before 1,000 residents, repeated across turns)."""
+    (_leave_line; its zone strips spare those sites: spare_funded) and the first buildings blocked for lack of land
+    (_land_line), and says high density is locked while it is (smoke v9-v11: 6 x zoning high density before 1,000
+    residents, repeated across turns)."""
     w = env.world
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
@@ -191,18 +193,18 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
     land = []
     if role == "planning":
         depts = dept_lists(env)                                    # one observation per priced department
-        land = _leave_line(w, depts) + _land_line(env, depts)
+        spots = funded_spots(w, depts)
+        lists, land = spare_funded(lists, spots), _leave_line(spots) + _land_line(env, depts)
     return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _leave_line(w, depts: dict) -> list[str]:
-    """Planning's line naming what funded departments are about to build (funded_firsts) and where, cut at
+def _leave_line(spots: list) -> list[str]:
+    """Planning's line naming what funded departments are about to build (funded_spots) and where, cut at
     BLOCKED_LINE_CHARS: "- leave free (funded): fire station (12,23), clinic (20,27): zone around them". Smoke v14
     seed 0, months 3-6: the mayor funded fire, health and education for their ready sites near homes, planning (acting
     next) zoned those lots, and they read "nothing needs it right now" at coverage 0; fire held $2,500 to month 12."""
-    found = [f"{pr.building} ({lists[p].sites[0]['x']},{lists[p].sites[0]['y']})"
-             for d, lists in depts.items() for p, pr in funded_firsts(w, d, lists).items()]
+    found = [f"{b} ({x},{y})" for b, (x, y) in spots]
     if not found:
         return []
     head, tail = "- leave free (funded): ", ": zone around them"

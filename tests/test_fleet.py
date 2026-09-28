@@ -2918,6 +2918,32 @@ def test_planning_ready_sites_name_what_funded_departments_will_build(env12):
     assert "fire (fire station: near homes)" in briefing(env, "planning", mark=False)
 
 
+def test_planning_zone_strips_spare_funded_sites(env12):
+    """Planning zones what it is suggested: next to "leave free (funded): fire station (20,22), clinic (20,22)" its
+    best zone_R and zone_C strip was (20,20)-(21,22). Strips covering a funded site now come after those that don't,
+    marked, and a failed zone's suggestions skip the site, as they skip free riverbank lots while the bank is needed."""
+    from civitas.fleet.tools import SiteList, ready_lines, spare_funded
+    env = copy.deepcopy(env12)
+    w = env.world
+    zone = lambda: ToolBox(env, "planning").call("zone", {"zone": "R", "x1": 19, "y1": 21, "x2": 19, "y2": 23})
+    road = "no empty land tiles in that area - all 3 tiles are road"
+    assert zone()["message"] == road + "; zone beside it instead: x1=20,y1=21,x2=20,y2=22"    # nothing funded
+    w.dept_funds.update(fire=2500, health=2000)
+    assert _best(env, "fire", "station") == _best(env, "health", "clinic") == "(20,22)"
+    ready = _ready_sites(briefing(env, "planning", mark=False))
+    assert next(ln for ln in ready if ln.startswith("- zone_R:")) == "- zone_R: 2 sites, best (0,22)-(3,23), 8 tiles"
+    assert next(ln for ln in ready if ln.startswith("- zone_C:")) == (       # the other strip has the landfill's
+        "- zone_C: 2 sites, best (20,20)-(21,22), 6 tiles (leave (20,22) for the fire station, clinic)")
+    sites = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})["sites"]
+    assert [s.get("leave") for s in sites] == [None, "(20,22) for the fire station, clinic"], sites
+    assert zone()["message"] == road                   # (20,21)-(20,22) takes the funded lot
+    only = {"zone_R": SiteList([{"x": 20, "y": 20, "x1": 20, "y1": 20, "x2": 21, "y2": 22, "tiles": 6}], None, None)}
+    assert ready_lines("planning", spare_funded(only, [("fire station", (20, 22))])) == [
+        "- zone_R: 1 site, best (20,20)-(21,22), 6 tiles (leave (20,22) for the fire station)"]   # no other strip
+    assert ready_lines("planning", spare_funded(only, [("fire station", (20, 22)), ("clinic", (21, 20))])) == [
+        "- zone_R: 1 site, best (20,20)-(21,22), 6 tiles (leave (20,22), (21,20) free)"]
+
+
 def _zone(env, x: int, y: int) -> dict:
     return ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
 

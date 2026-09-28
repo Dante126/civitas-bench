@@ -533,17 +533,19 @@ def _contents(w, tiles: list[tuple[int, int]]) -> str:
         f" +{rest} other tile{'s' * (rest > 1)}" if rest else "")
 
 
-def _zone_beside(w, tiles: list[tuple[int, int]]) -> list[str]:
+def _zone_beside(w, tiles: list[tuple[int, int]], spare=()) -> list[str]:
     """Zone rects for the free roadside land (empty land touching a highway-connected road) on the lines just outside
     a rectangle's sides (`tiles` in reading order, as _rect gives them), over its span: each trimmed to its first and
     last such tile (one line, so always a valid zone), kept with 2 such tiles or half its side (a 1-tile side only
     beside a 1-tile rectangle, so a row's end caps aren't offered as single lots), the most tiles first (ties: north,
     west, east, south). While a pump or outlet is missing (_bank_needed) the free riverbank lots are left out, and a
     side whose rect would still cover one is dropped (v7: zoning took the last bank lots and utilities had nowhere to
-    put them)."""
+    put them); so are the `spare` tiles (funded_spots)."""
     (xa, ya), (xb, yb) = tiles[0], tiles[-1]
     free, sides = _roadside(w), []
     bank = free_bank(w) if _bank_needed(w) else np.zeros_like(free)
+    for x, y in spare:
+        bank[y, x] = True
     free &= ~bank
     for side in ([(x, ya - 1) for x in range(xa, xb + 1)], [(xa - 1, y) for y in range(ya, yb + 1)],
                  [(xb + 1, y) for y in range(ya, yb + 1)], [(x, yb + 1) for x in range(xa, xb + 1)]):
@@ -1195,6 +1197,38 @@ def _on_lot(w, site: dict) -> bool:
     return bool(w.struct[site["y"], site["x"]] == C.NONE and w.terrain[site["y"], site["x"]] == C.LAND)
 
 
+def funded_spots(w, depts: dict[str, dict[str, SiteList]]) -> list[tuple[str, tuple[int, int]]]:
+    """(building, best site) of each funded_firsts building, in turn order: planning's leave-free line names them and
+    its zone strips spare them (spare_funded)."""
+    return [(pr.building, (lists[p].sites[0]["x"], lists[p].sites[0]["y"]))
+            for d, lists in depts.items() for p, pr in funded_firsts(w, d, lists).items()]
+
+
+def spare_funded(lists: dict[str, SiteList], spots: list[tuple[str, tuple[int, int]]]) -> dict[str, SiteList]:
+    """Planning's lists with its zone strips sparing the funded sites (funded_spots): strips covering none first, and
+    those covering some marked "leave": "(20,22) for the fire station" ("(10,18), (20,22) free" for several), as a
+    bank lot is kept for pump / sewage.
+    Planning zones what it is suggested: next to "leave free (funded): fire station (20,22)", its best zone_R strip
+    was (20,20)-(21,22)."""
+    keep = {}
+    for b, xy in spots:
+        keep.setdefault(xy, []).append(b)
+    if not keep:
+        return lists
+    out = dict(lists)
+    for p, lst in lists.items():
+        if not p.startswith("zone_"):
+            continue
+        marked = []
+        for s in lst.sites:
+            hit = [xy for xy in keep if s["x1"] <= xy[0] <= s["x2"] and s["y1"] <= xy[1] <= s["y2"]]
+            where = ", ".join(f"({x},{y})" for x, y in hit)
+            marked.append({**s, "leave": f"{where} for the {', '.join(keep[hit[0]])}" if len(hit) == 1 else
+                           f"{where} free"} if hit else s)          # several: the leave-free line names them
+        out[p] = lst._replace(sites=sorted(marked, key=lambda s: "leave" in s))
+    return out
+
+
 def first_build(env, dept: str) -> FirstBuild | None:
     """`dept`'s cheapest ready site from one observation: the mayor's needs line names it. With it the dearest ready
     or blocked first building, which DeptMoney keeps: review replay (seed 0, month 9), utilities held $3,000 for a
@@ -1238,7 +1272,8 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
 
     def site(purpose: str, s: dict) -> str:
         bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
-        return _where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+        return (_where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+                + (f" (leave {s['leave']})" if "leave" in s else ""))
 
     def price(purpose: str) -> str:
         pr = (prices or {}).get(purpose)
@@ -1288,6 +1323,7 @@ class ToolBox:
         self._seen: dict[tuple, tuple[int, dict]] = {}    # look-up key -> (call, result) since the last change
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
+        self._funded: dict | None = None                  # _funded_sites() since the last successful action
         self.tools: dict[str, Tool] = {}
         lookups = self._lookup_tools()
         self.lookups = {t.name for t in lookups}
@@ -1446,6 +1482,8 @@ class ToolBox:
                 return {"ok": False, "refused": kind, "error": refusal}
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
+        if res["ok"]:
+            self._funded = None
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
@@ -1517,8 +1555,11 @@ class ToolBox:
                 f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
 
     def _funded_sites(self) -> dict[tuple[str, str], tuple[Price, list[tuple[int, int]]]]:
-        """Before a zone: (department, purpose) -> price and ready sites of each funded_firsts building. Only
+        """(department, purpose) -> price and ready sites of each funded_firsts building, kept until an action
+        succeeds: a zone's warning, planning's find_sites zone_* and a failed zone's suggestions read it. Only
         departments holding at least their cheapest priced first building's price get an observation."""
+        if self._funded is not None:
+            return self._funded
         w, out = self.world, {}
         for d in DEPARTMENTS:
             low = min((pr.cost for p in SITE_PURPOSES[d] if p not in SUPPLEMENTARY
@@ -1528,7 +1569,12 @@ class ToolBox:
             lists = site_lists(w, d, role_obs(self.env, d))
             for p, pr in funded_firsts(w, d, lists).items():
                 out[d, p] = (pr, [(s["x"], s["y"]) for s in lists[p].sites])
+        self._funded = out
         return out
+
+    def _funded_spots(self) -> list[tuple[str, tuple[int, int]]]:
+        """funded_spots from _funded_sites(): each funded building and its best site."""
+        return [(pr.building, sites[0]) for pr, sites in self._funded_sites().values()]
 
     def _funded_warning(self, before: dict, bank: bool = False) -> str:
         """A warning for a zone action that took the last ready site(s) of a funded department's cheapest first
@@ -1577,7 +1623,7 @@ class ToolBox:
                 tiles = _rect(w, args)
             except Exception:
                 return ""
-            beside = _zone_beside(w, tiles) if name == "zone" else []
+            beside = _zone_beside(w, tiles, [xy for _, xy in self._funded_spots()]) if name == "zone" else []
             return f" - {_contents(w, tiles)}" + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
         if name != "build_road":
             return ""
@@ -1736,6 +1782,8 @@ class ToolBox:
         w = self.world
         role, key = purpose.split(".", 1) if self.role == "mayor" else (self.role, purpose)
         lst = site_lists(w, role, role_obs(self.env, role))[key]
+        if role == "planning" and key.startswith("zone_"):
+            lst = spare_funded({key: lst}, self._funded_spots())[key]
         sites = lst.sites
         if near_x is not None:
             near = (int(near_x), int(near_y))
