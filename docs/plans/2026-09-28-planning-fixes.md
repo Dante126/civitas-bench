@@ -23,7 +23,7 @@ Checkpoint after each task: `pytest -q -m "not slow"`. The full suite had 332 pa
 
 1. **Road lines in the Map block.** `map_facts` / `map_lines` add a "road lines" line listing the maximal straight
    runs of highway-connected road, horizontal and vertical, of at least 3 tiles. List the longest first, up to 8,
-   then "+N more". Example: `- road lines: y=24 x 0-47; x=19 y 19-29; y=19 x 3-25`. Every role's Map block and
+   then "+N more". Example: `- road lines: y=24 x 0-47; y=19 x 3-25; x=19 y 19-29`. Every role's Map block and
    `map_overview`'s summary share it.
    - Tests: a hand-built road network gives the expected lines; a crossing tile appears in both lines; runs shorter
      than 3 and roads off the connected network are left out; the cap and "+N more" work.
