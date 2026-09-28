@@ -112,11 +112,19 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
 SITE_MIN_POP = {"bus_stops": 1500}
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
+# one-tile riverbank purposes -> (their _bank_needed name, the supply they add to): blocked, one counts only while the
+# city lacks it or demand reaches BANK_BUSY x that supply (_bank_wanted)
+BANK_SUPPLY = {"pump": ("pump", "water"), "sewage": ("sewage outlet", "sewage")}
+BANK_BUSY = 0.9
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
 # purposes whose lists skip lots with 3+ homes within 4 tiles (observation._far_from_homes): never empty for lack
 # of need (the landfill ranking adds 0.01 everywhere, the jail's is flat), only for lack of such a lot
 AWAY_FROM_HOMES = {"jail", "landfill", "cemetery"}
+# purposes whose lists rank free 2x2 roadside blocks (observation: site_candidates(..., size=2)) with 0.01 need added
+# everywhere: never empty for lack of need, only for lack of a block. Casino's too, but it is planning's (its own
+# reason); riverbank_2x2 is a riverbank purpose
+TWO_BY_TWO = {"hospital", "university"}
 # the best site's most useful field for the briefing's Ready sites line, first match wins
 SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("need", "need {}"),
                ("opens_land", "opens {} land tiles"), ("load_vs_capacity", "load {}x capacity"), ("tiles", "{} tiles"),
@@ -583,7 +591,7 @@ def map_facts(w) -> dict:
 MAP_PARTS = ("size", "highway", "river", "roads", "road_lines", "unconnected", "built")
 # the mayor's Map block: how far the roads reach, roads cut off, the built-up area. Size, highway entry, river and
 # road lines made room for the departments' spending, idle and blocked money: with them the worst case (2 departments
-# idle, 5 blocked) took 7,793 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows; without, 7,425
+# idle, 5 blocked) took 7,788 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows; without, 7,420
 MAYOR_MAP = ("roads", "unconnected", "built")
 
 
@@ -768,8 +776,8 @@ class DeptMoney:
 
     @property
     def blocked(self) -> tuple[str, ...]:
-        """With no ready site, the cheapest first building(s) it has no lot for (the mayor's line says to ask
-        planning); () otherwise. Asking builds its observation (planning has no priced purpose: none)."""
+        """With no ready site, the cheapest first building(s) it has no lot for (the mayor's line names them); ()
+        otherwise. Asking builds its observation (planning has no priced purpose: none)."""
         return self.build.blocked if self.priced and self.build else ()
 
     @property
@@ -892,9 +900,11 @@ def _bank_top_up(w, listed: list[dict], line: str) -> list[dict]:
 
 def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
     """(short, full, blocked): why a site list is empty and what to do: no free roadside land (roads must grow), no
-    road at the river or its bank lots taken, no free roadside lot away from homes (AWAY_FROM_HOMES purposes), or
-    nothing needs the building yet (the lists only rank spots near uncovered homes / jobs). `blocked`: for lack of
-    land or roads, which planning can fix (not a missing river, or nothing needing it)."""
+    road at the river or its bank lots taken, no free roadside lot away from homes (AWAY_FROM_HOMES purposes), no free
+    2x2 roadside block (TWO_BY_TWO purposes), or nothing needs the building yet (the lists only rank spots near
+    uncovered homes / jobs). `blocked`: for lack of land or roads, which planning can fix (not a missing river, or
+    nothing needing it). Review probe, month 60 (6,564 residents): the university list read "nothing needs it right
+    now" with no free 2x2 block, and education's $12,000 keep for it read idle."""
     roads = lambda: _roads_text(_roads(w))
     if purpose == "road_extension":
         return ("no straight extension from a dead end: build_road from any road into free land",
@@ -936,6 +946,11 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
                 f"all {free} free roadside tiles have 3 or more homes within 4 tiles, and a {purpose} must stay away "
                 "from homes; ask planning (send_message) to leave an empty lot by a road at the edge of town, away "
                 f"from the houses, or to extend a road into open land ({roads()})", True)
+    if purpose in TWO_BY_TWO and not w.site_candidates(np.ones(w.struct.shape), radius=1, k=1, size=2):
+        return ("no free 2x2 roadside block: ask planning for one",
+                f"no free 2x2 block of empty land beside a highway-connected road ({roads()}; {free} free roadside "
+                f"tiles, none in a free 2x2 block), and a {purpose} takes 2x2 tiles; ask planning (send_message) to "
+                "leave a 2x2 lot by a road, or to extend a road into open land", True)
     return ("nothing needs it right now",
             f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
             "(check coverage in city_overview / my_facilities before building)", False)
@@ -1058,21 +1073,49 @@ class FirstBuild(NamedTuple):
 
 def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
     """`dept`'s unlocked first buildings (Price.first, SUPPLEMENTARY skipped) whose lists are blocked for lack of land
-    or roads (SiteList.blocked), priced: purpose -> site_price."""
-    return {p: pr for p, lst in lists.items() if lst.blocked and p not in SUPPLEMENTARY
+    or roads (SiteList.blocked), priced: purpose -> site_price. A pump or outlet only while the city needs one
+    (_bank_wanted)."""
+    return {p: pr for p, lst in lists.items() if lst.blocked and p not in SUPPLEMENTARY and _bank_wanted(w, p)
             and (pr := site_price(w, dept, p)) and pr.first}
 
 
+def _bank_wanted(w, purpose: str) -> bool:
+    """False for a pump or outlet (BANK_SUPPLY) while the city has one and uses under BANK_BUSY of that supply (a
+    fresh map, supply 0, wants both); True for other purposes. Smoke v14 seed 1, months 6 and 9: pump and outlet built,
+    water 370-490 and sewage 250 against demand of 99-116, the bank lots beside the roads taken, and planning read
+    "blocked for lack of land: utilities (pump, sewage) ... dezone a roadside lot for them" (its playbook frees a bank
+    lot when asked). Their own lists still say the bank is taken."""
+    if purpose not in BANK_SUPPLY:
+        return True
+    name, supply = BANK_SUPPLY[purpose]
+    m = w.metrics()
+    return name in _bank_needed(w) or m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
+
+
 def land_blocked(env) -> dict[str, list[str]]:
-    """Each department with first buildings blocked for lack of land or roads -> those purposes (blocked_firsts),
-    from one observation per department with a priced purpose: planning's Ready sites block names them."""
+    """Each department with first buildings blocked for lack of land or roads -> the cheapest of them (blocked_firsts;
+    every one on a tie, as the mayor's line names them), from one observation per department with a priced purpose:
+    planning's Ready sites block names them. Review probes, months 24, 60 and 120: naming every one, the line always
+    fell back to the department names alone."""
     w = env.world
     out = {}
     for d in DEPARTMENTS:
         if d in env.roles and any(site_price(w, d, p) for p in SITE_PURPOSES[d]):
-            if found := list(blocked_firsts(w, d, site_lists(w, d, role_obs(env, d)))):
-                out[d] = found
+            if found := blocked_firsts(w, d, site_lists(w, d, role_obs(env, d))):
+                out[d] = list(cheapest(found)[0])
     return out
+
+
+def land_fix(w, purpose: str) -> str:
+    """What a purpose blocked for lack of land needs beyond a free roadside lot, "" for none: a road to the river
+    while no connected road reaches it, else a free riverbank lot (RIVERBANK_PURPOSES); a free 2x2 lot (TWO_BY_TWO).
+    Planning's blocked line tags them: smoke v14 seed 1 read "utilities (pump, sewage): extend a road into open land or
+    dezone a roadside lot for them"."""
+    if purpose in RIVERBANK_PURPOSES:
+        if not _riverbank_by_roads(w)[1]:
+            return "a road to the river"
+        return "a free 2x2 riverbank lot" if purpose == "riverbank_2x2" else "a free riverbank lot"
+    return "a free 2x2 lot" if purpose in TWO_BY_TWO else ""
 
 
 def first_build(env, dept: str) -> FirstBuild | None:
@@ -1103,8 +1146,7 @@ def first_build(env, dept: str) -> FirstBuild | None:
     # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
     firsts = [pr.cost for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first] + [
         pr.cost for pr in blocked.values()] + ([low.cost] if low else [])
-    shut = () if low else tuple(dict.fromkeys(a_or_an(pr.building) for pr in blocked.values()
-                                              if pr.cost == min(b.cost for b in blocked.values())))
+    shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
     return FirstBuild(low.cost if low else None, named, max(firsts), shut)
 
 

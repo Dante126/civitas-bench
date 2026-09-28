@@ -20,7 +20,7 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
-    Funding, cheapest, funding_gaps, land_blocked, map_facts, map_lines, overview, plan_slice, ready_lines, \
+    Funding, cheapest, funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, \
     ready_prices, role_obs, scarce_bank, short_of, site_lists
 
 # paths into build_observation(...)["city"]
@@ -56,6 +56,10 @@ MAX_MESSAGES = 5         # new council messages quoted per briefing
 # the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
 GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
 BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this, department names only (then cut)
+# the mayor's Departments block, once below any line with a blocked suffix: " - ask planning" on each blocked line took
+# the worst case (2 idle, 5 blocked) to 7,445 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows;
+# said once here, 7,420
+BLOCKED_NOTE = "- blocked for lack of land: ask planning for lots"
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -190,15 +194,18 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
 
 
 def _land_line(env) -> list[str]:
-    """Planning's line naming each department's first buildings blocked for lack of land or roads (land_blocked),
+    """Planning's line naming each department's cheapest first buildings blocked for lack of land or roads
+    (land_blocked), each tagged with what it needs beyond a roadside lot (land_fix: "sewage: a road to the river"),
     departments only past BLOCKED_LINE_CHARS. Smoke v13 seed 0, months 6-9: planning zoned every roadside tile despite
     its playbook's "leave room", and utilities, police, fire, health and education all read "none - no free roadside
     land: ask planning for a lot"."""
     found = land_blocked(env)
     if not found:
         return []
-    head, tail = "- blocked for lack of land: ", ": extend a road into open land or dezone a roadside lot for them"
-    full = ", ".join(f"{d} ({', '.join(p.replace('_', ' ') for p in ps)})" for d, ps in found.items())
+    w = env.world
+    head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
+    name = lambda p: p.replace("_", " ") + (f": {fix}" if (fix := land_fix(w, p)) else "")
+    full = ", ".join(f"{d} ({', '.join(map(name, ps))})" for d, ps in found.items())
     body = full if len(head + full + tail) <= BLOCKED_LINE_CHARS else ", ".join(found)
     return [head + cut(body, BLOCKED_LINE_CHARS - len(head + tail)) + tail]
 
@@ -216,7 +223,7 @@ def _needs(m: DeptMoney) -> str:
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
     """One department on the mayor's Departments block: funds, the plan target ("<" when below it and it would use a
     top-up: funding_gaps), what it spent (the block's header says over how many months), then one of its idle money
-    (the summary line says what to do), what it needs, or what is blocked. Smoke v9-v12: nothing showed what a
+    or what is blocked (summary lines say what to do), or what it needs. Smoke v9-v12: nothing showed what a
     department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 < target $9,000" and was
     topped up."""
     return (f"- {d}: funds {money(math.floor(m.funds))}"
@@ -227,10 +234,10 @@ def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
 
 def _blocked(m: DeptMoney) -> str:
     """The mayor's line suffix when a department has no ready site but a first building blocked for lack of land or
-    roads: "; blocked: a police station - ask planning" (planning's Ready sites say why and what each needs). Smoke v13
-    seed 0, month 6: police, fire, health and education held their first building's price with every roadside lot
-    zoned, and the mayor took it back instead of pushing planning."""
-    return f"; blocked: {' or '.join(m.blocked)} - ask planning" if m.blocked else ""
+    roads: "; blocked: a police station" (BLOCKED_NOTE, once below, says to ask planning; planning's Ready sites say
+    why and what each needs). Smoke v13 seed 0, month 6: police, fire, health and education held their first
+    building's price with every roadside lot zoned, and the mayor took it back instead of pushing planning."""
+    return f"; blocked: {' or '.join(m.blocked)}" if m.blocked else ""
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -316,6 +323,8 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append("- no reports yet")
     if f.idle:
         L.append(f"- {f.idle_note()}")
+    if any(m.blocked for m in f.depts.values() if not m.idle):          # a line above says "; blocked: ..."
+        L.append(BLOCKED_NOTE)
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
                  + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
