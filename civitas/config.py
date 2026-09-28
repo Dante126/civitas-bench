@@ -19,6 +19,7 @@ from .bench.scoring import ScoringConfig
 from .core.env import GameConfig
 from .fleet.agent import ToolAgent
 from .fleet.config import fleet_agent_config
+from .fleet.scripted import MODEL as SCRIPTED_FLEET, ScriptedFleetAgent
 
 DEFAULT_PROVIDERS = {
     "arcee": {"base_url": "https://api.arcee.ai/api/v1", "api_key_env": "ARCEE_API_KEY"},
@@ -143,6 +144,9 @@ def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: Scoring
         elif kind == "fleet":
             fc = fleet_agent_config(cfg, role)
             modes.add(fc.mode)
+            if fc.model == SCRIPTED_FLEET:                # the scripted baselines through the fleet tools
+                agents[role] = ScriptedFleetAgent(base, cfg=fc)
+                continue
             agents[role] = ToolAgent(base, cfg=fc, provider=provider_config(cfg, fc.provider), city=city)
         else:
             raise ValueError(f"agents.{role}: unknown kind {kind!r} (scripted|llm|fleet|remote|noop|random)")
