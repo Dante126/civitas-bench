@@ -45,6 +45,9 @@ ROAD_LINES = 8               # the longest this many named, then "+N more"
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
+SPEND_MONTHS = 3             # the mayor's Departments block: what each department spent over this many months
+IDLE_MULT, IDLE_MIN = 2, 1000   # a department keeps max(IDLE_MULT x that, its cheapest ready site, IDLE_MIN); funds
+                                # above it by IDLE_MIN or more are idle
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
 ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolish takes buildings, never roads)
 # buildings that link the road networks they touch to the region, as World.refresh() counts them (metro stations
@@ -677,11 +680,45 @@ def reserve(w) -> float:
     return max(RESERVE_MIN, (3 if last["income"] >= last["expenses"] else 6) * last["expenses"])
 
 
+class DeptMoney(NamedTuple):
+    funds: float
+    spent: float                # over the last SPEND_MONTHS history months (fewer early on)
+    months: int                 # how many months that is: 0 before the first one (nothing shown, nothing idle)
+    build: FirstBuild | None    # its cheapest ready site, looked up only when it can matter (dept_money)
+    idle: int                   # funds above what it keeps, rounded down, when IDLE_MIN or more; else 0
+
+
+def dept_money(env, dept: str) -> DeptMoney:
+    """What `dept` holds and spent, and how much of it is idle: it keeps max(IDLE_MULT x its spending over the last
+    SPEND_MONTHS months, its cheapest ready site (first_build, the needs line's figure), IDLE_MIN), and the rest, when
+    it is IDLE_MIN or more, is idle. Smoke v9-v12: planning held $7,000-10,700 unspent all game in 7 of 8 runs,
+    spending about $1,000 a quarter, while the mayor took loans in 6 and education got no school in 5. Money moved to
+    it this month doesn't count: the mayor acts first, so the rest sat through at least one of its turns (at month 0
+    none has had one). The observation is built only when the needs line or the idle amount can depend on it: funds
+    short of its dearest priced purpose, a per-tile purpose (a stretch has no such bound), or funds that may be idle
+    with a priced purpose above what its spending keeps."""
+    w = env.world
+    funds = w.dept_funds[dept]
+    window = w.history[-SPEND_MONTHS:]
+    spent = sum(h["dept_spent"].get(dept, 0) for h in window)
+    held = funds - max(0.0, w.ledger["allocated"].get(dept, 0.0))
+    floor = max(IDLE_MULT * spent, IDLE_MIN)
+    may_idle = bool(window) and held - floor >= IDLE_MIN
+    priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
+    dearest = max((pr.cost for pr in priced), default=0)
+    look = any(pr.per_tile for pr in priced) or short_of(funds, dearest) or (may_idle and dearest > floor)
+    build = first_build(env, dept) if look else None
+    idle = math.floor(held - max(floor, build.cost if build else 0)) if may_idle else 0
+    return DeptMoney(funds, spent, len(window), build, idle if idle >= IDLE_MIN else 0)
+
+
 class Funding(NamedTuple):
-    gaps: dict[str, dict]   # {dept: {"funds", "target", "gap"}}, in turn order
+    gaps: dict[str, dict]   # {dept: {"funds", "target", "gap"}}, in turn order; idle departments left out
     total: int              # the gaps summed
     reserve: float          # reserve(w)
     spare: float            # treasury above the reserve (negative below it)
+    idle: dict[str, int]    # {dept: idle funds} (dept_money), in turn order
+    depts: dict[str, DeptMoney]     # every department in the game
 
     @property
     def short(self) -> bool:
@@ -692,19 +729,26 @@ class Funding(NamedTuple):
         """The treasury is at or under the reserve: nothing to allocate (HOLD says what to do instead)."""
         return self.spare <= 0
 
+    def idle_note(self) -> str:
+        """The idle money and what to do with it, "" without any."""
+        return (f"{money(sum(self.idle.values()))} idle in {', '.join(self.idle)}: take it back before loans or new "
+                "top-ups") if self.idle else ""
+
 
 def funding_gaps(env, fleet: FleetState) -> Funding:
     """Departments in the game whose funds are below their plan budget target by more than max(GAP_MIN, GAP_SHARE x
     target), and whether the treasury above the reserve covers them: the update_plan result and the mayor's
-    briefing show this."""
+    briefing show this, with the idle money (dept_money). An idle department is no gap: smoke v12 seed 0 read
+    "planning: funds $7,834 < target $9,000" and topped it up to $10,721."""
     w, budgets = env.world, fleet.plan["budgets"]
+    depts = {d: dept_money(env, d) for d in DEPARTMENTS if d in env.roles}
+    idle = {d: m.idle for d, m in depts.items() if m.idle}
     gaps = {}
-    for d in DEPARTMENTS:
-        if d in env.roles and d in budgets and budgets[d] - w.dept_funds[d] >= max(GAP_MIN, GAP_SHARE * budgets[d]):
-            gaps[d] = {"funds": round(w.dept_funds[d]), "target": round(budgets[d]),
-                       "gap": round(budgets[d] - w.dept_funds[d])}
+    for d, m in depts.items():
+        if d not in idle and d in budgets and budgets[d] - m.funds >= max(GAP_MIN, GAP_SHARE * budgets[d]):
+            gaps[d] = {"funds": round(m.funds), "target": round(budgets[d]), "gap": round(budgets[d] - m.funds)}
     keep = reserve(w)
-    return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep)
+    return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep, idle, depts)
 
 
 class SiteList(NamedTuple):
@@ -919,6 +963,34 @@ def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[tup
     kept = {p: pr for p, pr in prices.items() if supplementary or p not in SUPPLEMENTARY}
     low = min(kept.values(), key=lambda pr: pr.cost, default=None)
     return None if low is None else (tuple(p for p, pr in kept.items() if pr.cost == low.cost), low)
+
+
+class FirstBuild(NamedTuple):
+    cost: float                 # the cheapest ready site (cheapest), a per-tile purpose's best stretch whole
+    named: dict[str, int]       # what it buys ("a clinic", "3 avenue tiles") -> ready sites of the first purpose
+                                # pricing it
+
+
+def first_build(env, dept: str) -> FirstBuild | None:
+    """`dept`'s cheapest ready site from one observation, None when none is ready: the mayor's needs line names it and
+    dept_money keeps its price. A per-tile purpose counts its best site whole ("$90 for 3 avenue tiles",
+    best_stretch), also when picking the cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line.
+    Every building at that price is named, with the ready sites of the first purpose pricing it."""
+    w = env.world
+    lists = site_lists(w, dept, role_obs(env, dept))
+    prices, tiles = ready_prices(w, dept, lists), {}
+    for p, pr in prices.items():
+        if pr.per_tile:
+            tiles[p], units = best_stretch(w, p, lists[p].sites)
+            prices[p] = pr._replace(cost=pr.cost * units)
+    purposes, low = cheapest(prices) or ((), None)
+    if low is None:
+        return None
+    named = {}
+    for p in purposes:
+        n, b = tiles.get(p, 1), prices[p].building
+        named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
+    return FirstBuild(low.cost, named)
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
@@ -1478,21 +1550,27 @@ class ToolBox:
             raise ToolError(str(e))
 
     def update_plan(self, **fields) -> dict:
-        """Save the plan; the result lists the departments now below their budget target (budgets are targets, the
-        money moves with allocate_budget) and says when the gaps exceed the treasury above the reserve."""
+        """Save the plan; the result lists the idle money to take back first and the departments now below their
+        budget target (budgets are targets, the money moves with allocate_budget), and says when the gaps exceed the
+        treasury above the reserve."""
         w = self.world
         try:
             out = {"ok": True, "message": self.fleet.update_plan(w.month, **fields)}
         except ValueError as e:
             raise ToolError(str(e))
         f = funding_gaps(self.env, self.fleet)
+        nxt = [f.idle_note()] if f.idle else []
+        if f.idle:
+            out["idle"] = f.idle
         if f.gaps:
-            nxt = (f"the treasury ({money(w.treasury)}) is at or under the {money(f.reserve)} reserve: {HOLD}"
-                   if f.hold else f"call allocate_budget to fund these (treasury {money(w.treasury)})")
+            nxt.append(f"the treasury ({money(w.treasury)}) is at or under the {money(f.reserve)} reserve: {HOLD}"
+                       if f.hold else f"call allocate_budget to fund these (treasury {money(w.treasury)})")
             if f.short and not f.hold:
-                nxt += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} reserve "
-                        f"({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
-            out.update(below_target=f.gaps, treasury=round(w.treasury), next=nxt)
+                nxt[-1] += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} "
+                            f"reserve ({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
+            out.update(below_target=f.gaps, treasury=round(w.treasury))
+        if nxt:
+            out["next"] = "; ".join(nxt)
         return out
 
     def end_turn(self, report: str) -> dict:

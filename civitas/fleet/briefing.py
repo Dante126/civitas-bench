@@ -2,7 +2,7 @@
 
 `system_prompt()` is the same every turn: how to play, the role's mission and the game rules, then the coach's
 playbooks, so coaches steer strategy but cannot change rules or tools. `briefing()` is a compact status for the
-turn: the mayor gets the city, finances, department reports and the plan; a department gets its plan slice,
+turn: the mayor gets the city, finances, department money and reports, and the plan; a department gets its plan slice,
 budget, key metrics, a "since your last turn" digest, the map, its ready sites and its memory. Everything else is a
 tool call away.
 """
@@ -17,10 +17,10 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, a_or_an, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, best_stretch, cheapest, funding_gaps, map_facts, \
-    map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price
+from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, DeptMoney, Funding, cheapest, funding_gaps, \
+    map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -167,8 +167,11 @@ def _older_reach(env, role: str, older: list[dict]) -> str:
     return f", {beyond} get_messages' {window}-month window"
 
 
-def _map(w) -> list[str]:
-    return ["## Map"] + map_lines(map_facts(w))
+def _map(w, role: str) -> list[str]:
+    """The Map block; the mayor's leaves out the road lines: it has no road actions, and its briefing needed the room
+    for the departments' spending (7,409 of 7,450 characters in test_briefings_stay_bounded_at_the_limits)."""
+    f = map_facts(w)
+    return ["## Map"] + map_lines(f if role != "mayor" else {**f, "road_lines": None})
 
 
 def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
@@ -182,34 +185,27 @@ def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _needs(env, dept: str) -> str:
-    """The mayor's Departments line suffix when `dept`'s funds are below its cheapest ready build: "; needs $X for a
-    <building> (N ready sites)", else "". Every building at that price is named ("a clinic (5 ready sites) or a
-    landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). A
-    per-tile purpose counts its best site whole ("$90 for 3 avenue tiles", best_stretch), also when picking the
-    cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line. The department's observation is built
-    only when its funds are below its dearest priced purpose (else no ready build can be out of reach), or when it
-    has a per-tile one (a stretch has no such bound)."""
-    w = env.world
-    funds = w.dept_funds[dept]
-    priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
-    if not any(pr.per_tile for pr in priced) and not short_of(funds, max((pr.cost for pr in priced), default=0)):
+def _needs(m: DeptMoney) -> str:
+    """The mayor's Departments line suffix when a department's funds are below its cheapest ready build
+    (first_build): "; needs $X for a <building> (N ready sites)", else "". Every building at that price is named ("a
+    clinic (5 ready sites) or a landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9:
+    "Build first shelter")."""
+    if m.build is None or not short_of(m.funds, m.build.cost):
         return ""
-    lists = site_lists(w, dept, role_obs(env, dept))
-    prices, tiles = ready_prices(w, dept, lists), {}
-    for p, pr in prices.items():
-        if pr.per_tile:
-            tiles[p], units = best_stretch(w, p, lists[p].sites)
-            prices[p] = pr._replace(cost=pr.cost * units)
-    purposes, low = cheapest(prices) or ((), None)
-    if low is None or not short_of(funds, low.cost):
-        return ""
-    named = {}                                       # what it buys -> ready sites of the first purpose pricing it
-    for p in purposes:
-        n, b = tiles.get(p, 1), prices[p].building
-        named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
-    return f"; needs {money(low.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
-                                                            for b, n in named.items())
+    return f"; needs {money(m.build.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
+                                                                for b, n in m.build.named.items())
+
+
+def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
+    """One department on the mayor's Departments block: funds, the plan target ("<" when below it, idle departments
+    aside), what it spent over the last SPEND_MONTHS months, then its idle money or what it needs. Smoke v9-v12:
+    nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
+    target $9,000" and was topped up."""
+    return (f"- {d}: funds {money(math.floor(m.funds))}"
+            + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
+            + (f", spent {money(m.spent)} in {months(m.months)}" if m.months else "")
+            + (f"; idle: {money(m.idle)} more than it uses - take it back (negative allocate_budget)" if m.idle
+               else _needs(m)))
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -285,14 +281,15 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
     L += ["", "## Departments"
           + (" (cut reports: history kind=report)" if clipped else "")]
-    for d in (r for r in DEPARTMENTS if r in env.roles):
-        L.append(f"- {d}: funds {money(math.floor(w.dept_funds[d]))}"
-                 + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-                 + _needs(env, d) + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
+    for d, m in f.depts.items():
+        L.append(_dept_line(d, m, f, budgets)
+                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
             L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
     if not latest:
         L.append("- no reports yet")
+    if f.idle:
+        L.append(f"- {f.idle_note()}")
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
                  + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
@@ -306,7 +303,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
               f"- goals: {_goals(p['goals'], GOAL_CHARS)}"]
         if p["notes"]:
             L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")
-    return L + [""] + _map(w) + [""] + _memory(fleet, "mayor")
+    return L + [""] + _map(w, "mayor") + [""] + _memory(fleet, "mayor")
 
 
 def _department(env, fleet: FleetState, role: str) -> list[str]:
@@ -343,7 +340,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                  "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
-    return L + [""] + _map(w) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
+    return L + [""] + _map(w, role) + [""] + _ready_sites(w, role, lists, prices, funds) + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,
