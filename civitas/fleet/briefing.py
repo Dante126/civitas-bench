@@ -19,8 +19,9 @@ from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
-from .tools import HOLD, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, DeptMoney, Funding, cheapest, funding_gaps, \
-    map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists
+from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, Funding, \
+    cheapest, funding_gaps, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, \
+    scarce_bank, short_of, site_lists
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -54,6 +55,10 @@ MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
 # the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
 GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
+# the mayor's Map block: how far the roads reach, roads cut off, the built-up area. Size, highway entry, river and
+# road lines made room for the departments' spending and idle money: with them the worst case (4 departments idle)
+# took 7,576 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows; without, 7,340
+MAYOR_MAP = ("roads", "unconnected", "built")
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -168,10 +173,9 @@ def _older_reach(env, role: str, older: list[dict]) -> str:
 
 
 def _map(w, role: str) -> list[str]:
-    """The Map block; the mayor's leaves out the road lines: it has no road actions, and its briefing needed the room
-    for the departments' spending (7,409 of 7,450 characters in test_briefings_stay_bounded_at_the_limits)."""
-    f = map_facts(w)
-    return ["## Map"] + map_lines(f if role != "mayor" else {**f, "road_lines": None})
+    """The Map block; the mayor's keeps only MAYOR_MAP: it has no map actions (its system prompt has no coordinates
+    either), and its briefing needed the room for the departments' money."""
+    return ["## Map"] + map_lines(map_facts(w), MAYOR_MAP if role == "mayor" else MAP_PARTS)
 
 
 def _ready_sites(w, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
@@ -190,22 +194,19 @@ def _needs(m: DeptMoney) -> str:
     (first_build): "; needs $X for a <building> (N ready sites)", else "". Every building at that price is named ("a
     clinic (5 ready sites) or a landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9:
     "Build first shelter")."""
-    if m.build is None or not short_of(m.funds, m.build.cost):
-        return ""
-    return f"; needs {money(m.build.cost)} for " + " or ".join(f"{b} ({n} ready site{'s' * (n != 1)})"
-                                                                for b, n in m.build.named.items())
+    b = m.needs
+    return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(
+        f"{what} ({n} ready site{'s' * (n != 1)})" for what, n in b.named.items())
 
 
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
-    """One department on the mayor's Departments block: funds, the plan target ("<" when below it, idle departments
-    aside), what it spent over the last SPEND_MONTHS months, then its idle money or what it needs. Smoke v9-v12:
-    nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
-    target $9,000" and was topped up."""
+    """One department on the mayor's Departments block: funds, the plan target ("<" when below it and it would use a
+    top-up: funding_gaps), what it spent (the block's header says over how many months), then its idle money (the
+    summary line says what to do) or what it needs. Smoke v9-v12: nothing showed what a department spent, and
+    planning, spending about $1,000 a quarter, read "funds $7,834 < target $9,000" and was topped up."""
     return (f"- {d}: funds {money(math.floor(m.funds))}"
             + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-            + (f", spent {money(m.spent)} in {months(m.months)}" if m.months else "")
-            + (f"; idle: {money(m.idle)} more than it uses - take it back (negative allocate_budget)" if m.idle
-               else _needs(m)))
+            + (f", spent {money(m.spent)}" if m.months else "") + (f"; idle {money(m.idle)}" if m.idle else _needs(m)))
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -279,8 +280,9 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     f = funding_gaps(env, fleet)
     clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
-    L += ["", "## Departments"
-          + (" (cut reports: history kind=report)" if clipped else "")]
+    spent = min(len(w.history), SPEND_MONTHS)
+    notes = [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped
+    L += ["", "## Departments" + (f" ({'; '.join(notes)})" if notes else "")]
     for d, m in f.depts.items():
         L.append(_dept_line(d, m, f, budgets)
                  + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))

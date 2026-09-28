@@ -12,7 +12,7 @@ import json
 import math
 from collections import Counter
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cached_property, partial
 from typing import Callable, NamedTuple
 
 import numpy as np
@@ -48,6 +48,8 @@ GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan 
 SPEND_MONTHS = 3             # the mayor's Departments block: what each department spent over this many months
 IDLE_MULT, IDLE_MIN = 2, 1000   # a department keeps max(IDLE_MULT x that, its cheapest ready site, IDLE_MIN); funds
                                 # above it by IDLE_MIN or more are idle
+USED_SHARE = 0.5             # below its target only if it spent more than this share of the most it held (or never
+                             # held what it keeps): DeptMoney.wants_more
 HOLD = "hold; lower targets or wait for income"    # the advice when the treasury is at or under the reserve
 ROAD_REMOVERS = {"bulldoze"}  # the only actions that remove road tiles (demolish takes buildings, never roads)
 # buildings that link the road networks they touch to the region, as World.refresh() counts them (metro stations
@@ -564,22 +566,29 @@ def map_facts(w) -> dict:
                              "developed": int((zoned & (w.level > 0)).sum()), "buildings": int(anchors.sum())}}
 
 
-def map_lines(f: dict) -> list[str]:
+MAP_PARTS = ("size", "highway", "river", "roads", "road_lines", "unconnected", "built")
+
+
+def map_lines(f: dict, parts: tuple = MAP_PARTS) -> list[str]:
+    """The map_facts lines, only `parts` (MAP_PARTS keys, in MAP_PARTS order)."""
     W, H = f["size"]
     end = lambda e: f"x {_span(e[0], e[1])} at row {e[2]}"
     b = f["built"]
-    return [f"- {W}x{H} tiles: x = column 0-{W - 1} (0 = west), y = row 0-{H - 1} (0 = north)",
-            "- highway entry: " + (", ".join(f"({h['x']},{h['y']}) on the {h['edge']} edge" for h in f["highway"])
-                                   or "none"),
-            "- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
-            if f["river"] else "- no river",
-            "- " + _roads_text(f["roads"]),
-            *(["- road lines: " + _some([_road_line_text(ln) for ln in lns], ROAD_LINES, "; ")]
-              if (lns := f.get("road_lines")) else []),
-            *([f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y {_span(*u['y'])}) "
-               "- reconnect them"] if (u := f.get("unconnected")) else []),
-            f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, {b['developed']} "
-            f"developed, {b['buildings']} building{'s' * (b['buildings'] != 1)})" if b else "- built-up area: none yet"]
+    lines = {
+        "size": [f"- {W}x{H} tiles: x = column 0-{W - 1} (0 = west), y = row 0-{H - 1} (0 = north)"],
+        "highway": ["- highway entry: " + (", ".join(f"({h['x']},{h['y']}) on the {h['edge']} edge"
+                                                     for h in f["highway"]) or "none")],
+        "river": ["- river: " + ", ".join(end(t) + (f" to {end(e)}" if e != t else "") for t, e in f["river"])
+                  if f["river"] else "- no river"],
+        "roads": ["- " + _roads_text(f["roads"])],
+        "road_lines": ["- road lines: " + _some([_road_line_text(ln) for ln in lns], ROAD_LINES, "; ")]
+                      if (lns := f.get("road_lines")) else [],
+        "unconnected": [f"- roads not connected to the highway: {u['tiles']} tiles (x {_span(*u['x'])}, y "
+                        f"{_span(*u['y'])}) - reconnect them"] if (u := f.get("unconnected")) else [],
+        "built": [f"- built-up area: x {_span(*b['x'])}, y {_span(*b['y'])} ({b['zoned']} zoned tiles, "
+                  f"{b['developed']} developed, {b['buildings']} building{'s' * (b['buildings'] != 1)})"
+                  if b else "- built-up area: none yet"]}
+    return [ln for p in MAP_PARTS if p in parts for ln in lines[p]]
 
 
 TIER_NOTE = " (higher tiers keep the letter)."
@@ -680,36 +689,65 @@ def reserve(w) -> float:
     return max(RESERVE_MIN, (3 if last["income"] >= last["expenses"] else 6) * last["expenses"])
 
 
-class DeptMoney(NamedTuple):
-    funds: float
-    spent: float                # over the last SPEND_MONTHS history months (fewer early on)
-    months: int                 # how many months that is: 0 before the first one (nothing shown, nothing idle)
-    build: FirstBuild | None    # its cheapest ready site, looked up only when it can matter (dept_money)
-    idle: int                   # funds above what it keeps, rounded down, when IDLE_MIN or more; else 0
-
-
-def dept_money(env, dept: str) -> DeptMoney:
-    """What `dept` holds and spent, and how much of it is idle: it keeps max(IDLE_MULT x its spending over the last
-    SPEND_MONTHS months, its cheapest ready site (first_build, the needs line's figure), IDLE_MIN), and the rest, when
-    it is IDLE_MIN or more, is idle. Smoke v9-v12: planning held $7,000-10,700 unspent all game in 7 of 8 runs,
+class DeptMoney:
+    """What a department holds and spent, and how much of it is idle: it keeps max(IDLE_MULT x its spending over the
+    last SPEND_MONTHS months, its cheapest ready site (first_build, the needs line's figure), IDLE_MIN), and the rest,
+    when it is IDLE_MIN or more, is idle. Smoke v9-v12: planning held $7,000-10,700 unspent all game in 7 of 8 runs,
     spending about $1,000 a quarter, while the mayor took loans in 6 and education got no school in 5. Money moved to
     it this month doesn't count: the mayor acts first, so the rest sat through at least one of its turns (at month 0
-    none has had one). The observation is built only when the needs line or the idle amount can depend on it: funds
-    short of its dearest priced purpose, a per-tile purpose (a stretch has no such bound), or funds that may be idle
-    with a priced purpose above what its spending keeps."""
-    w = env.world
-    funds = w.dept_funds[dept]
-    window = w.history[-SPEND_MONTHS:]
-    spent = sum(h["dept_spent"].get(dept, 0) for h in window)
-    held = funds - max(0.0, w.ledger["allocated"].get(dept, 0.0))
-    floor = max(IDLE_MULT * spent, IDLE_MIN)
-    may_idle = bool(window) and held - floor >= IDLE_MIN
-    priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
-    dearest = max((pr.cost for pr in priced), default=0)
-    look = any(pr.per_tile for pr in priced) or short_of(funds, dearest) or (may_idle and dearest > floor)
-    build = first_build(env, dept) if look else None
-    idle = math.floor(held - max(floor, build.cost if build else 0)) if may_idle else 0
-    return DeptMoney(funds, spent, len(window), build, idle if idle >= IDLE_MIN else 0)
+    none has had one). Its observation (`build`) is built once, on first use, and only asked for when a site's price
+    can matter: funds short of its dearest priced purpose, a per-tile purpose (a stretch has no such bound), or a
+    price above what its spending keeps."""
+
+    def __init__(self, env, dept: str):
+        w = env.world
+        self.env, self.dept = env, dept
+        self.funds = w.dept_funds[dept]
+        window = w.history[-SPEND_MONTHS:]
+        self.months = len(window)               # 0 before the first month: nothing shown, nothing idle
+        self.spent = sum(h["dept_spent"].get(dept, 0) for h in window)
+        # the most it had in one of those months: month-end funds plus that month's spending (the mayor moves money
+        # first), so a station bought in the month counts as held
+        self.held_max = max((h["dept_funds"].get(dept, 0) + h["dept_spent"].get(dept, 0) for h in window), default=0)
+        self.held = self.funds - max(0.0, w.ledger["allocated"].get(dept, 0.0))     # without this month's top-ups
+        self.floor = max(IDLE_MULT * self.spent, IDLE_MIN)         # what it keeps whatever its sites cost
+        priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
+        self.bound = None if any(pr.per_tile for pr in priced) else max((pr.cost for pr in priced), default=0)
+
+    @cached_property
+    def build(self) -> FirstBuild | None:
+        return first_build(self.env, self.dept)
+
+    @cached_property
+    def keep(self) -> float:
+        if self.bound is not None and self.bound <= self.floor:
+            return self.floor
+        return max(self.floor, self.build.cost if self.build else 0)
+
+    @cached_property
+    def idle(self) -> int:
+        """Funds above what it keeps, rounded down, when IDLE_MIN or more; else 0."""
+        if not self.months or self.held - self.floor < IDLE_MIN:       # not idle whatever its sites cost
+            return 0
+        idle = math.floor(self.held - self.keep)
+        return idle if idle >= IDLE_MIN else 0
+
+    @property
+    def needs(self) -> FirstBuild | None:
+        """Its cheapest ready site when its funds are short of it (the mayor's needs line), else None."""
+        if self.bound is not None and not short_of(self.funds, self.bound):
+            return None
+        return self.build if self.build and short_of(self.funds, self.build.cost) else None
+
+    @property
+    def wants_more(self) -> bool:
+        """Whether a top-up would be used: before the first month always; then only when it used more than USED_SHARE
+        of the most it held over the last SPEND_MONTHS months, or never held what it keeps (its first build).
+        After a take-back planning held its keep, 2 x its spending, below its $9,000 target, and read "below
+        target" again: topped up, then idle, then taken back. More than, not at least: a take-back leaves exactly
+        1 / IDLE_MULT = USED_SHARE used over the next quarter (test_a_take_back_starts_no_top_up_cycle)."""
+        return (not self.months or self.spent > USED_SHARE * self.held_max or self.held_max < self.floor
+                or self.held_max < self.keep)
 
 
 class Funding(NamedTuple):
@@ -717,7 +755,7 @@ class Funding(NamedTuple):
     total: int              # the gaps summed
     reserve: float          # reserve(w)
     spare: float            # treasury above the reserve (negative below it)
-    idle: dict[str, int]    # {dept: idle funds} (dept_money), in turn order
+    idle: dict[str, int]    # {dept: idle funds} (DeptMoney), in turn order
     depts: dict[str, DeptMoney]     # every department in the game
 
     @property
@@ -731,22 +769,24 @@ class Funding(NamedTuple):
 
     def idle_note(self) -> str:
         """The idle money and what to do with it, "" without any."""
-        return (f"{money(sum(self.idle.values()))} idle in {', '.join(self.idle)}: take it back before loans or new "
-                "top-ups") if self.idle else ""
+        return (f"{money(sum(self.idle.values()))} idle in {', '.join(self.idle)}: take it back (negative "
+                "allocate_budget) before loans or new top-ups") if self.idle else ""
 
 
 def funding_gaps(env, fleet: FleetState) -> Funding:
     """Departments in the game whose funds are below their plan budget target by more than max(GAP_MIN, GAP_SHARE x
-    target), and whether the treasury above the reserve covers them: the update_plan result and the mayor's
-    briefing show this, with the idle money (dept_money). An idle department is no gap: smoke v12 seed 0 read
-    "planning: funds $7,834 < target $9,000" and topped it up to $10,721."""
+    target) and that would use a top-up (DeptMoney.wants_more), and whether the treasury above the reserve covers
+    them: the update_plan result and the mayor's briefing show this, with the idle money. An idle department is no
+    gap: smoke v12 seed 0 read "planning: funds $7,834 < target $9,000" and topped it up to $10,721."""
     w, budgets = env.world, fleet.plan["budgets"]
-    depts = {d: dept_money(env, d) for d in DEPARTMENTS if d in env.roles}
+    depts = {d: DeptMoney(env, d) for d in DEPARTMENTS if d in env.roles}
     idle = {d: m.idle for d, m in depts.items() if m.idle}
     gaps = {}
     for d, m in depts.items():
-        if d not in idle and d in budgets and budgets[d] - m.funds >= max(GAP_MIN, GAP_SHARE * budgets[d]):
-            gaps[d] = {"funds": round(m.funds), "target": round(budgets[d]), "gap": round(budgets[d] - m.funds)}
+        target = budgets.get(d)
+        if (target is not None and d not in idle and target - m.funds >= max(GAP_MIN, GAP_SHARE * target)
+                and m.wants_more):
+            gaps[d] = {"funds": round(m.funds), "target": round(target), "gap": round(target - m.funds)}
     keep = reserve(w)
     return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep, idle, depts)
 
@@ -973,7 +1013,7 @@ class FirstBuild(NamedTuple):
 
 def first_build(env, dept: str) -> FirstBuild | None:
     """`dept`'s cheapest ready site from one observation, None when none is ready: the mayor's needs line names it and
-    dept_money keeps its price. A per-tile purpose counts its best site whole ("$90 for 3 avenue tiles",
+    DeptMoney keeps its price. A per-tile purpose counts its best site whole ("$90 for 3 avenue tiles",
     best_stretch), also when picking the cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line.
     Every building at that price is named, with the ready sites of the first purpose pricing it."""
     w = env.world
