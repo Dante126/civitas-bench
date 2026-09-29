@@ -55,25 +55,32 @@ end_turn report.
 [agents.mayor]
 kind = "fleet"
 playbook = """
-- First turn: write the plan with update_plan (3-4 goals, a budget for every department for the next quarter, \
-a one-line priority each; the budgets are the targets your briefing compares funds with), then fund it with \
+- First turn: write the plan with update_plan (3-4 goals, a budget for every department for the next quarter, a \
+one-line priority each; the budgets are the targets your briefing compares funds with), then fund it with \
 allocate_budget in the same turn. A good start from $30,000: planning $3,000 (roads $10 a tile, zones $5-8: a \
 quarter's work; after that keep its budget near what it spends, about $1,000-1,500 a quarter) and utilities \
-$7,000. From month 3: $2,500 each to police, fire and health (a first building costs $2,000-2,500; less buys \
-nothing), and to education once its needs line shows school sites; transport $0 until ~1,500 residents. The rest \
-stays in the treasury: upkeep grows with every building.
-- Every turn: read the reports and the Departments block. First take back the idle money it names (negative \
-allocate_budget), before any new top-up or loan; then top up the departments below target from the money above \
-the reserve, most urgent first (utilities when supply is tight, then first buildings before second ones, from month 3). \
-Allocations add up, so allocate once per department per turn.
-- Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 months while running a deficit). \
-When the briefing or update_plan says "hold", allocate nothing new (taking idle money back is fine).
+$7,000 for its first plants. From month 3, fund every first building a needs line names ("its first ..."; \
+police, fire, health, education: $2,000-2,500 each; less buys nothing), whatever its target; transport $0 until \
+~1,500 residents. After month 0 give utilities what its needs line asks, not its target. The rest stays in the \
+treasury: every building adds upkeep for good (its needs line says how much).
+- Every turn: read the reports and the Departments block (most urgent first). First take back the idle money the \
+'to spend' line counts (at most the idle a line shows), before any top-up or loan; then fund the 'to fund' line \
+in its order and stop where the money to spend runs out. A department with no needs line has nothing ready to \
+buy, whatever its target. Allocate once per department per turn, one call at a time when money is short: each \
+result shows the treasury and what is still to fund.
+- Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 after a deficit month). In a hold \
+fund only first buildings, supply and planning's road, from the treasury above $3,000 and idle money; the 'to \
+spend' line says when operations close the gap.
 - Use find_sites only to verify a department's "no site" claim (e.g. utilities.sewage), at most 2 calls per \
 turn, before moving its money elsewhere; if sites exist, tell it where.
 - Taxes start at 9%. Raise R by 1 point when the city runs a deficit while happiness is above 55% and approval \
 above 45%; lower it by 1 when happiness is below 45% or the surplus is large. Stay within 6-12%.
-- Loans only when the treasury falls below $3,000 and something urgent is waiting; repay once the treasury is \
-above $25,000.
+- Loans only for a first building or supply need the money to spend can't cover, and only if operations stay \
+positive after its upkeep and the interest (Finances shows both); never for another building, and never after \
+this turn's own top-ups emptied the treasury (take one back instead). With debt and no first building or supply \
+need waiting, repay from the money above the reserve (each $1,000 repaid saves $5 a month).
+- A refused call says why and what to do instead: do that. confirm: true counts only on a repeat of the exact \
+refused call, and only for a reason the refusal didn't weigh.
 - The factory offer: accept if unemployment is above 8% or the treasury is below $10,000, otherwise decline.
 - A flood forecast: give fire ~$3,000 for levees at once. Policies (recycling, neighborhood_watch) only while \
 the city runs a surplus with more than $15,000 in the treasury.

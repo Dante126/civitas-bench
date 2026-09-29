@@ -793,3 +793,38 @@ def test_city_overview_splits_the_treasury_change():
     assert list(ov["costs_last_month"].items()) == sorted(
         ((k, round(v)) for k, v in spent.items() if round(v)), key=lambda kv: -kv[1])
     assert ov["costs_last_month"]["town_hall"] == 20 and "police" not in ov["costs_last_month"]    # $0 left out
+
+
+# --- Unit E: the mayor's playbook (configs/fleet_smoke.toml, fleet_trinity.toml, fleet_region_smoke.toml)
+MAYOR_CONFIGS = ("configs/fleet_smoke.toml", "configs/fleet_trinity.toml", "configs/fleet_region_smoke.toml")
+
+
+def test_the_mayor_playbook_follows_the_money_lines():
+    """The mayor's playbook reads the briefing's money lines (to spend / to fund, needs lines with upkeep), funds
+    first buildings by need rather than target, borrows only for first buildings or supply, repays, and treats a
+    refusal as advice; its numbers match the code (the reserve, the loan interest)."""
+    from civitas.config import load_config
+    books = [load_config(p)["agents"]["mayor"]["playbook"] for p in MAYOR_CONFIGS]
+    assert books[0] == books[1] == books[2]                             # one fleet
+    book = " ".join(books[0].split())
+    for s in ("utilities $7,000 for its first plants",
+              "fund every first building a needs line names",
+              "whatever its target",
+              "After month 0 give utilities what its needs line asks, not its target",
+              "every building adds upkeep for good (its needs line says how much)",
+              "the Departments block (most urgent first)",
+              "the idle money the 'to spend' line counts",
+              "then fund the 'to fund' line in its order and stop where the money to spend runs out",
+              "A department with no needs line has nothing ready to buy, whatever its target",
+              "each result shows the treasury and what is still to fund",
+              f"keep at least {money(RESERVE_MIN)} or 3 months of expenses in the treasury (6 after a deficit month)",
+              "In a hold fund only first buildings, supply and planning's road",
+              "Loans only for a first building or supply need the money to spend can't cover",
+              "never after this turn's own top-ups emptied the treasury (take one back instead)",
+              f"each $1,000 repaid saves {money(1000 * C.LOAN_INTEREST)} a month",
+              "A refused call says why and what to do instead: do that. confirm: true counts only on a repeat of "
+              "the exact refused call"):
+        assert s in book, s
+    for s in ("allocate nothing new", "repay once the treasury is above $25,000", "top up the departments below "
+              "target", "first buildings before second ones"):
+        assert s not in book, s

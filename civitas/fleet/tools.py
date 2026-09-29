@@ -2877,8 +2877,9 @@ class ToolBox:
 
     def _money_note(self, name: str, args: dict, res: dict) -> str:
         """Where the money stands after one of the mayor's MONEY_ACTIONS (`res`: apply_action's result as a dict,
-        `args` without type and confirm), for the model's message only: `executed`, the history log and the trace
-        keep the core text. Recomputes funding_gaps (about 5 ms).
+        `args` without type and confirm), for the model's message only: `executed` and the history log keep the core
+        text (the turn's tool trace shows the message the model read, cut at agent.TRACE_CHARS). Recomputes
+        funding_gaps (about 5 ms).
         - a top-up: " | police: " + topped_up, then "; " + treasury_state + "; still to fund: " + still_to_fund;
         - a take-back: " | " + taken_back, then the treasury and what is still to fund;
         - take_loan: " | interest now $15/month (+$15); $47k more can be borrowed; treasury ...; still to fund ...";
