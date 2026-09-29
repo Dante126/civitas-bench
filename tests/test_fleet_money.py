@@ -455,6 +455,15 @@ def _mayor(env, treasury: float = 30000.0, **funds) -> T.ToolBox:
     return T.ToolBox(env, "mayor")
 
 
+def _topup(box, dept: str, amount: float, **kw) -> dict:
+    """allocate_budget as the model does, a reserve refusal repeated with confirm: true (an earned override): the loan
+    and note tests top up departments with nothing ready, which the reserve guard refuses once under the reserve."""
+    res = box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
+    if res.get("refused") == "reserve":
+        res = box.call("allocate_budget", {"department": dept, "amount": amount, **kw, "confirm": True})
+    return res
+
+
 def _props(box, tool: str) -> dict:
     return next(s["function"]["parameters"]["properties"] for s in box.schemas() if s["function"]["name"] == tool)
 
@@ -542,7 +551,7 @@ def test_a_self_inflicted_loan_is_refused_until_confirmed():
     # started at $3,000 or more, and this turn's own top-ups took it under
     w.debt = 0
     box = _mayor(env, treasury=5698)
-    move = lambda dept, amount: box.call("allocate_budget", {"department": dept, "amount": amount})
+    move = lambda dept, amount: _topup(box, dept, amount)     # nothing ready on the fresh map: earned overrides
     assert move("police", 4698)["ok"] and move("fire", 1000)["ok"] and w.treasury == 0
     assert box.call("take_loan", {"amount": 3000}) == {"ok": False, "refused": "loan", "error": (
         "the treasury started this turn at $5,698; this turn's top-ups ($5,698 net) took it under $3,000: take back "
@@ -590,7 +599,7 @@ def test_money_results_carry_the_money_note(monkeypatch):
     docs = action_docs()
     assert desc["take_loan"] == docs["take_loan"][1] + " Interest is due monthly." and desc["set_tax"] == docs[
         "set_tax"][1]
-    assert box.call("allocate_budget", {"department": "police", "amount": 500})["message"] == (
+    assert _topup(box, "police", 500)["message"] == (         # police: nothing ready, under the reserve
         "transferred $500 to police (now $500) | allocate_budget")
     res = box.call("allocate_budget", {"department": "police", "amount": 5000})        # a core failure
     assert res["ok"] is False and res["message"] == "treasury only has $1,500 | allocate_budget"
@@ -607,7 +616,7 @@ def test_money_results_carry_the_money_note(monkeypatch):
     assert [r["message"] for r in box.executed][:4] == core
     assert [e["message"] for e in FleetState.of(env).log if e["kind"] == "action"][:4] == core
     monkeypatch.setattr(T.ToolBox, "_money_note", lambda self, *a: 1 / 0)          # advice never fails an action
-    res = box.call("allocate_budget", {"department": "fire", "amount": 100})
+    res = _topup(box, "fire", 100)
     assert res["ok"] and res["message"] == "transferred $100 to fire (now $100)" and w.dept_funds["fire"] == 100
 
 
@@ -669,7 +678,7 @@ def test_money_results_show_the_treasury_and_what_is_left(monkeypatch):
     assert _money(box, "allocate_budget", department="education", amount=1500) == (
         " | education: still $1,000 short of its first elementary school: less buys nothing; treasury $1,288, "
         f"$1,712 under the $3,000 reserve; {school}")
-    assert _money(box, "allocate_budget", department="health", amount=200) == (
+    assert _money(box, "allocate_budget", confirm=True, department="health", amount=200) == (
         f" | health: had nothing ready to buy; treasury $1,088, $1,912 under the $3,000 reserve; {school}")
     assert _money(box, "allocate_budget", department="fire", amount=88) == (
         " | fire: blocked for lack of land: this buys nothing until planning frees a lot; treasury $1,000, $2,000 "
@@ -1021,7 +1030,7 @@ def test_a_loan_after_the_turn_s_own_moves_names_what_to_undo(monkeypatch):
     box = _mayor(env, treasury=5698)
     move = lambda dept, amount, **kw: box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
     assert move("education", 2500)["ok"] and move("police", 2500)["refused"] == "reserve"   # another, under $3,000
-    assert move("police", 2500, confirm=True)["ok"] and move("fire", 698)["ok"]
+    assert move("police", 2500, confirm=True)["ok"] and _topup(box, "fire", 698)["ok"]   # fire: nothing ready
     assert box.call("take_loan", {"amount": 3000}) == {"ok": False, "refused": "loan", "error": (
         "the treasury started this turn at $5,698; this turn's top-ups ($5,698 net) took it under $3,000: take back "
         "(free) a top-up that isn't a first building or supply (police $2,500, fire $698) instead of a $3,000 loan "
@@ -1167,7 +1176,9 @@ def test_the_needs_line_names_a_building_for_every_short_supply():
         "another coal plant, its first water pump and sewage outlet")
     assert (b.dearest, b.keep_for) == (7400, "its first coal plant, water tower and sewage outlet")   # + the outlet
     line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- utilities:"))
-    assert line == "- utilities: funds $0; needs $6,200 for its first coal plant and water tower ($110/month)"
+    assert line == ("- utilities: funds $0; needs $6,200 for its first coal plant and water tower ($110/month); sewage "
+                    "outlet waits for a road to the river")               # review: the outlet's wait named too
+    assert b.waits == ("sewage outlet waits for a road to the river",)
     f = funding_gaps(env, FleetState.of(env))
     assert f.to_fund[0] == FundItem("utilities", "first/supply", 6200, 110, "its first coal plant and water tower")
     m = f.depts["utilities"]
@@ -1226,34 +1237,37 @@ def test_utilities_briefing_says_what_is_short_and_what_its_funds_build():
     w.dept_funds["utilities"] = 4400
     text = briefing(env, "utilities", mark=False)
     budget = _block(text, "## Your budget")
-    power = "power (1.50 of 6, 1.50 imported)"          # the supply as Key metrics give it; imports aren't the city's
-    assert budget[1] == (f"- short now: {power}, sewage (0 of 5): your $4,400 pays for a coal plant at (0,23) "
+    power = "power 25% covered (supply 1.50, demand 6, 1.50 imported)"    # as the mayor's needs line says it, and
+    sewage = "sewage 0% covered (supply 0, demand 5)"   # the supply as Key metrics give it; imports aren't the city's
+    assert budget[1] == (f"- supply needed now: {power}, {sewage}: your $4,400 pays for a coal plant at (0,23) "
                          "($4,000); a sewage outlet at (29,23) ($1,200) needs $800 more")
     ready = {ln.split(":")[0][2:]: ln for ln in _block(text, "## Ready sites")[:-1]}
     assert ready["pump"] == "- pump: 1 site, best (29,23), pollution 0 (riverbank: kept for sewage); $1,500"
     assert ready["sewage"] == "- sewage: 1 site, best (29,23) (riverbank: kept for sewage); $1,200"
     w.dept_funds["utilities"] = 5200                    # every one paid for
     assert _block(briefing(env, "utilities", mark=False), "## Your budget")[1] == (
-        f"- short now: {power}, sewage (0 of 5): your $5,200 pays for a coal plant at (0,23) ($4,000) and a sewage "
+        f"- supply needed now: {power}, {sewage}: your $5,200 pays for a coal plant at (0,23) ($4,000) and a sewage "
         "outlet at (29,23) ($1,200)")
     w.dept_funds["utilities"] = 400                     # none: the can't-pay line follows
     budget = _block(briefing(env, "utilities", mark=False), "## Your budget")
-    assert budget[1] == (f"- short now: {power}, sewage (0 of 5): your $400 pays for none of them; a coal plant at "
+    assert budget[1] == (f"- supply needed now: {power}, {sewage}: your $400 pays for none of them; a coal plant at "
                          "(0,23) ($4,000) and a sewage outlet at (29,23) ($1,200) need $4,800 more")
-    assert budget[2].startswith("- You can't pay for any ready site")
+    assert budget[2].startswith("- You can't pay for any ready site (the supply above needs $4,800 more). Don't call "
+                                "build tools this turn: ask the mayor for $4,800 with a reason")
     env = _env()                                        # month 0, no road to the river: the outlet has no site yet
     w = env.world
     w.dept_funds["utilities"] = 7000
     assert _block(briefing(env, "utilities", mark=False), "## Your budget")[1] == (
-        f"- short now: {power}, water (1.20 of 5, 1.20 imported), sewage (0 of 5; no site yet): your $7,000 pays for a "
-        "coal plant at (0,23) ($4,000) and a water tower at (1,23) ($2,200)")    # the two ranked (0,23) first
+        f"- supply needed now: {power}, water 24% covered (supply 1.20, demand 5, 1.20 imported), sewage 0% covered "
+        "(supply 0, demand 5; no site yet): your $7,000 pays for a coal plant at (0,23) ($4,000) and a water tower at "
+        "(1,23) ($2,200)")                              # the two ranked (0,23) first
     w.dept_funds["utilities"] = 50000
     _to_the_river(env)                                  # every supply built: nothing short, no line
     for a in ({"type": "build_power_plant", "kind": "coal", "x": 0, "y": 23},
               {"type": "build_water", "kind": "pump", "x": 25, "y": 23},
               {"type": "build_sewage", "kind": "outlet", "x": 30, "y": 25}):
         assert apply_action(w, "utilities", a).ok, a
-    assert "- short now" not in briefing(env, "utilities", mark=False)
+    assert "- supply needed now" not in briefing(env, "utilities", mark=False)
 
 
 def test_the_mayor_playbook_says_what_the_month_0_needs_line_leaves_out():
@@ -1316,15 +1330,16 @@ def test_another_building_under_the_reserve_is_refused_until_confirmed(monkeypat
     box = _mayor(env, treasury=6803)
     move = lambda dept, amount, **kw: box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
     assert move("police", 2500)["ok"] and w.treasury == 4303          # another, and the reserve stays: it runs
-    why = ("that leaves the treasury at $1,803, $1,413 under the $3,216 reserve" + DEFICIT + ", for another fire "
-           "station; first/supply and growth come first: education $2,500 (first/supply), planning $315 (growth) "
+    why = ("this top-up for another fire station leaves the treasury at $1,803, $1,413 under the $3,216 reserve"
+           + DEFICIT + "; first/supply and growth come first: education $2,500 (first/supply), planning $315 (growth) "
            "still wait." + FUND_ANYWAY)
     assert move("fire", 2500) == {"ok": False, "refused": "reserve", "error": why}
     assert w.treasury == 4303 and len(box.executed) == 1 and box._failed == {}   # nothing ran or is remembered
     # first/supply and growth may go under the reserve
     assert move("education", 2500)["ok"] and move("planning", 315)["ok"] and round(w.treasury) == 1488
-    why = ("that leaves the treasury at $488, $2,728 under the $3,216 reserve" + DEFICIT + ", for another clinic; "
-           "first/supply and growth come first and none is waiting." + FUND_ANYWAY)
+    why = ("this top-up for another clinic leaves the treasury at $488, $2,728 under the $3,216 reserve" + DEFICIT
+           + "; the reserve keeps the city solvent and pays for first buildings, supply and planning's road when they "
+           "come (none waits now)." + FUND_ANYWAY)
     first = move("health", 1000, confirm=True)       # confirm on a call not refused before: refused, with the note
     assert first == {"ok": False, "refused": "reserve", "error": why[:-1] + EARNED + "."}, first
     res = move("health", 1000, confirm=True)         # the identical repeat: earned
@@ -1332,13 +1347,12 @@ def test_another_building_under_the_reserve_is_refused_until_confirmed(monkeypat
     assert res["message"].startswith("transferred $1,000 to health (now $1,000) | health: still $1,000 short of "
                                      "another clinic")
     assert move("health", 400)["refused"] == "reserve"          # still another, still under: another amount asks again
-    # not refused: more than the treasury holds (the action says so), a blocked first building, nothing ready
+    # not refused: more than the treasury holds (the action says so), a blocked first building
     res = move("fire", 2500)
     assert res["ok"] is False and "refused" not in res and res["message"].startswith("treasury only has $488"), res
     _builds(monkeypatch, {"fire": NO_LOT, "health": CLINIC_2})
     assert DeptMoney(env, "fire").kind == "blocked" and move("fire", 300)["ok"]
-    assert DeptMoney(env, "transport").kind == "nothing" and move("transport", 100)["ok"]
-    assert [r["ok"] for r in box.executed] == [True, True, True, True, False, True, True]
+    assert [r["ok"] for r in box.executed] == [True, True, True, True, False, True]
 
 
 def test_the_reserve_refusal_names_idle_money_and_spares_dust(monkeypatch):
@@ -1353,9 +1367,10 @@ def test_the_reserve_refusal_names_idle_money_and_spares_dust(monkeypatch):
     assert DeptMoney(env, "planning").idle == 4000
     assert box.call("allocate_budget", {"department": "police", "amount": 2500})["ok"] and w.treasury == 3000
     res = box.call("allocate_budget", {"department": "fire", "amount": 2500})
-    assert res["error"] == ("that leaves the treasury at $500, $2,500 under the $3,000 reserve, for another fire "
-                            "station; first/supply and growth come first and none is waiting; take back idle money "
-                            "first (planning $4,000)." + FUND_ANYWAY), res
+    assert res["error"] == ("this top-up for another fire station leaves the treasury at $500, $2,500 under the "
+                            "$3,000 reserve; the reserve keeps the city solvent and pays for first buildings, supply "
+                            "and planning's road when they come (none waits now); take back idle money first "
+                            "(planning $4,000)." + FUND_ANYWAY), res
     res = _mayor(env, treasury=5999.6).call("allocate_budget", {"department": "fire", "amount": 3000})
     assert res["ok"] and "override" not in res, res             # $0.40 under: rounds to the reserve
 
@@ -1500,7 +1515,175 @@ def test_the_short_now_line_says_nothing_is_paid_for_one_building():
     w = _env().world
     coal = T.site_price(w, "utilities", "coal_or_gas")
     b = T.SupplyBuild("power", 229, 229, 60, "coal_or_gas", coal, 250, {"x": 0, "y": 23}, 6, imported=9.7)
-    assert _short_line([b], 1748) == ["- short now: power (229 of 229, 9.70 imported): your $1,748 pays for nothing "
-                                      "yet; a coal plant at (0,23) ($4,000) needs $2,252 more"]
-    assert _short_line([b], 4000) == ["- short now: power (229 of 229, 9.70 imported): your $4,000 pays for a coal "
-                                      "plant at (0,23) ($4,000)"]
+    assert _short_line([b], 1748) == ["- supply needed now: power 100% used (supply 229, demand 229, 9.70 imported): "
+                                      "your $1,748 pays for nothing yet; a coal plant at (0,23) ($4,000) needs $2,252 "
+                                      "more"]
+    assert _short_line([b], 4000) == ["- supply needed now: power 100% used (supply 229, demand 229, 9.70 imported): "
+                                      "your $4,000 pays for a coal plant at (0,23) ($4,000)"]
+
+
+# --- v20 fixes: review (tools.py: pick_supply's one-tile first buildings, the reserve guard's kinds, the loan guard's
+# excess, bills and flood; briefing.py: the supply-needed line's wording, the can't-pay line, the mayor's blocked supply)
+def _big_city(env, monkeypatch, **metrics) -> None:
+    """Past 10,000 residents (the water works, advanced treatment and nuclear plant unlocked), water at capacity with
+    imports filling the gap (review: scripted seed 0 month 90 with pumps removed, 1,235 of 1,235, 85.10 imported),
+    power and sewage with room, or as `metrics` say."""
+    w = env.world
+    w.milestones_reached += [m["name"] for m in C.MILESTONES if m["pop"] <= 10000]
+    real = w.metrics()
+    big = {**real, "population": 11788, "water_supply": 1235.1, "water_demand": 1235.1, "power_supply": 2000.0,
+           "power_demand": 1000.0, "sewage_supply": 2000.0, "sewage_demand": 1000.0,
+           "service_imports": {**real["service_imports"], "water": 85.1, "power": 0.0}, **metrics}
+    monkeypatch.setattr(w, "metrics", lambda: big)
+
+
+def test_a_big_city_short_of_water_names_a_pump_not_a_water_works(monkeypatch):
+    """Review, scripted seed 0 month 90 (11,788 residents, water 1,235 of 1,235): water wanted 703 more, which only the
+    $12,000 water works (2,000) covered, so utilities' lines and the mayor's named it over six ready $1,500 pumps
+    ("needs $12k for another water works", first on the to-fund line; main named a pump). A one-tile first building
+    is named while one is ready (the one with the most output when none covers the need); a 2x2 one only when none
+    is, and then its whole footprint is taken."""
+    env = _env()
+    w = env.world
+    _big_city(env, monkeypatch)
+    assert T.site_price(w, "utilities", "riverbank_2x2").name == "water_works"
+    bank = lambda *xy: SiteList([{"x": x, "y": y, "pollution": 0.0} for x, y in xy], None, None)
+    lists = {"pump": bank((25, 23), (29, 23)), "near_homes": SiteList([{"x": 1, "y": 23}], None, None),
+             "riverbank_2x2": SiteList([{"x": 25, "y": 22}], None, None), "sewage": bank((26, 23), (30, 25))}
+    water = next(b for b in T.short_supplies(w, lists) if b.supply == "water")
+    assert (round(water.need), water.purpose, water.price.cost, water.output) == (703, "pump", 1500, 250)
+    coal, works = T.Price(4000, "coal plant", name="coal"), T.Price(12000, "water works", first=False, size=(2, 2))
+    nuclear = T.Price(40000, "nuclear plant", size=(2, 2))
+    opts = [("coal_or_gas", coal, 250.0, {}), ("riverbank_2x2", nuclear, 2000.0, {})]
+    assert T.pick_supply(700, opts)[0] == "coal_or_gas" and T.pick_supply(700, opts[1:])[0] == "riverbank_2x2"
+    assert T.pick_supply(700, [("riverbank_2x2", works, 2000.0, {})])[1] is works
+    # only the 2x2 lot ready for water: the works is named, and the outlet goes on past its footprint
+    lists = {"riverbank_2x2": lists["riverbank_2x2"], "sewage": lists["sewage"]}
+    _big_city(env, monkeypatch, sewage_supply=1000.0)
+    builds = T.short_supplies(w, lists)
+    assert [(b.supply, b.purpose, (b.site["x"], b.site["y"])) for b in builds] == [
+        ("water", "riverbank_2x2", (25, 22)), ("sewage", "sewage", (30, 25))]
+    assert T.footprint_tiles({"x": 25, "y": 22}, (2, 2)) == {(25, 22), (26, 22), (25, 23), (26, 23)}
+
+
+def test_the_supply_needed_line_says_used_or_covered_as_the_mayor_reads_it():
+    """Review, fleet_scripted seed 0 month 12: "- short now: power (111 of 103)" called a supply with room short, under
+    Key metrics' "power: supply 111 / demand 103, coverage 100%", while the mayor read "another wind turbine (power 93%
+    used)". Each supply now reads as the mayor's line says it (SupplyBuild.status), with the numbers."""
+    from civitas.fleet.briefing import _short_line
+    w = _env().world
+    wind = T.site_price(w, "utilities", "wind")
+    b = T.SupplyBuild("power", 111, 103, 44.5, "wind", wind, 58.8, {"x": 20, "y": 25}, 6)
+    assert b.status == "power 93% used"
+    assert _short_line([b], 1559) == ["- supply needed now: power 93% used (supply 111, demand 103): your $1,559 pays "
+                                      "for nothing yet; a wind turbine at (20,25) ($2,500) needs $941 more"]
+    none = T.SupplyBuild("sewage", 0, 0, 50)
+    assert _short_line([none], 0) == ["- supply needed now: no sewage demand yet (supply 0, demand 0; no site yet)"]
+
+
+def test_utilities_can_t_pay_line_names_what_its_supply_needs():
+    """Review, fleet_scripted seed 0 month 24: the supply line named a $4,000 coal plant needing $2,252 more, then the
+    can't-pay line read "cheapest: near_homes $2,200" and "ask the mayor for the amount", with water at 141 of 250 (a
+    tower would buy nothing needed). It names the supply line's amount now (test_utilities_briefing_says_what_is_short_
+    and_what_its_funds_build), and with every supply roomy there is no line: utilities needs no money."""
+    env = _env()
+    w = env.world
+    w.dept_funds["utilities"] = 50000
+    _to_the_river(env)
+    for a in ({"type": "build_power_plant", "kind": "coal", "x": 0, "y": 23},
+              {"type": "build_water", "kind": "pump", "x": 25, "y": 23},
+              {"type": "build_sewage", "kind": "outlet", "x": 30, "y": 25}):
+        assert apply_action(w, "utilities", a).ok, a
+    w.dept_funds["utilities"] = 100
+    text = briefing(env, "utilities", mark=False)
+    assert "- supply needed now" not in text and "You can't pay" not in text, _block(text, "## Your budget")
+    assert "- you have $100" in text                                    # the Ready sites lines still price them
+
+
+def test_a_top_up_that_buys_nothing_now_is_refused_under_the_reserve(monkeypatch):
+    """Review probe, treasury $3,500: $3,000 to transport with nothing ready ran and left $500 of a $3,000 reserve,
+    then $400 for another police station was refused. Money a department has no use for now (nothing ready, or idle
+    already) meets the reserve guard like another building; with nothing waiting the refusal says what the reserve is
+    for."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": STATION})
+    box = _mayor(env, treasury=3500, planning=5000)
+    assert DeptMoney(env, "transport").kind == "nothing" and DeptMoney(env, "planning").kind == "idle"
+    assert box.call("allocate_budget", {"department": "transport", "amount": 3000})["error"] == (
+        "this top-up buys nothing now (transport: nothing ready to buy) and leaves the treasury at $500, $2,500 under "
+        "the $3,000 reserve; the reserve keeps the city solvent and pays for first buildings, supply and planning's "
+        "road when they come (none waits now); take back idle money first (planning $4,000)." + FUND_ANYWAY)
+    assert box.call("allocate_budget", {"department": "planning", "amount": 1000})["error"] == (
+        "this top-up buys nothing now (planning holds $4,000 idle) and leaves the treasury at $2,500, $500 under the "
+        "$3,000 reserve; the reserve keeps the city solvent and pays for first buildings, supply and planning's road "
+        "when they come (none waits now)." + FUND_ANYWAY)                  # its own idle money isn't named twice
+    res = box.call("allocate_budget", {"department": "transport", "amount": 3000, "confirm": True})
+    assert res["ok"] and res["override"] == "reserve" and w.treasury == 500
+    assert _mayor(env, treasury=9000).call("allocate_budget", {"department": "transport", "amount": 3000})["ok"]
+
+
+def test_a_loan_is_refused_only_beyond_what_first_buildings_growth_and_the_reserve_need(monkeypatch):
+    """Review replay of smoke v20 seed 0, month 9 (treasury $550): with utilities' $900 and planning's $500 waiting, a
+    $5,000 loan ran, though $3,850 funded those and brought the treasury back to the reserve. A loan while first/supply
+    or growth waits is refused once when it is LOAN_SLACK or more over that; rounding up to the next $1,000 runs."""
+    assert T.LOAN_SLACK == 1000
+    env = _env()
+    w = env.world
+    tower = FB(900, (N("water tower", 3, 1, "water 95% used", upkeep=30),), 900, ())
+    _builds(monkeypatch, {"utilities": tower, "police": STATION}, road=FB(500, (ROAD,), 500, ()))
+    box = _mayor(env, treasury=550)
+    assert box.call("take_loan", {"amount": 5000})["error"] == (
+        "only $3,850 of this $5,000 loan is needed ($1,400 for first/supply and growth, $2,450 to keep the treasury at "
+        "the $3,000 reserve): the other $1,150 would pay for another building at $6/month interest until repaid (debt "
+        "would be $5,000 of $50k): borrow $3,850 or less." + BORROW)
+    res = box.call("take_loan", {"amount": 4000})
+    assert res["ok"] and "override" not in res and w.debt == 4000, res
+    # nothing but first/supply waits: the rest would sit in the treasury; stacked after the first part as one text
+    _builds(monkeypatch, {"utilities": tower})
+    w.debt = 0
+    assert _mayor(env, treasury=3100).call("take_loan", {"amount": 5000})["error"] == (
+        "the treasury holds $3,100, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
+        "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover. Also, only $900 "
+        "of this $5,000 loan is needed ($900 for first/supply and growth): the other $4,100 would sit in the "
+        "treasury." + BORROW)
+
+
+def test_a_loan_for_levees_before_a_flood_is_not_for_another_building(monkeypatch):
+    """Review probe, treasury $1,000 and a flood forecast: take_loan 3000 for fire's levees (the playbook's flood rule;
+    allocate_budget fails over the treasury) was refused as "would pay for another building". Fire's item counts as
+    first/supply while flood_ahead, as the reserve guard already had it."""
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2})
+    forecast = []
+    monkeypatch.setattr(w, "forecast", lambda ahead=3: list(forecast))
+    assert _mayor(env, treasury=1000).call("take_loan", {"amount": 3000})["refused"] == "loan"
+    forecast.append("River flood expected in 2 month(s) along rows 8-22: riverside buildings without a levee will be "
+                    "damaged")
+    assert T.flood_ahead(w)
+    res = _mayor(env, treasury=1000).call("take_loan", {"amount": 3000})
+    assert res["ok"] and "override" not in res and w.debt == 3000, res
+
+
+def test_a_loan_that_pays_the_bills_before_the_next_turn_runs(monkeypatch):
+    """Review probe: operations at -$800/month, treasury $300, only another police station waiting: the loan was
+    refused as "would pay for another building", though the treasury goes below $0 before the mayor's next turn.
+    Operations over act_every months (bills_ahead) count as a need: the loan runs up to them and the reserve."""
+    env = _env(act_every=3)
+    w = env.world
+    env.end_month()
+    w.history[-1].update(income=100, expenses=900)
+    assert cash_flow(w).ops_per_month == -800 and T.bills_ahead(w, 3) == 2400 and reserve(w) == 5400
+    _builds(monkeypatch, {"police": STATION})
+    assert _mayor(env, treasury=3000).call("take_loan", {"amount": 2000})["refused"] == "loan"   # $3,000 covers them
+    res = _mayor(env, treasury=300).call("take_loan", {"amount": 7500})
+    assert res["ok"] and "override" not in res and w.debt == 7500, res
+    w.debt = 0
+    assert _mayor(env, treasury=300).call("take_loan", {"amount": 9000})["error"] == (
+        "only $7,500 of this $9,000 loan is needed ($7,500 to keep the treasury at the $5,400 reserve through "
+        "operations of -$2,400 to your next turn): the other $1,500 would pay for another building at $8/month "
+        "interest until repaid (debt would be $9,000 of $50k): borrow $7,500 or less." + BORROW)
+    w.history[-1].update(income=900, expenses=100)                     # a surplus: no bills
+    assert T.bills_ahead(w, 3) == 0

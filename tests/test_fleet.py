@@ -4047,7 +4047,7 @@ def test_mayor_briefing_marks_departments_below_their_target():
     assert lines["planning"] == "- planning: funds $9,500, target $9,000"
     # a building per short supply (v20 fixes; the pump and outlet wait for a road to the river)
     assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000; needs $6,200 for its first coal plant "
-                                  "and water tower ($110/month)")
+                                  "and water tower ($110/month); sewage outlet waits for a road to the river")
     assert lines["fire"] == "- fire: funds $0 < target $2,500; nothing ready to buy"
     assert lines["police"] == "- police: funds $0; nothing ready to buy"
     to_fund = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- to fund:"))
@@ -4093,7 +4093,8 @@ def test_mayor_departments_show_spending_and_idle_money():
     assert lines["planning"] == "- planning: funds $7,834, target $9,000, spent $1,166; idle $5,502 (keeps $2,332)"
     assert lines["transport"] == "- transport: funds $2,000, spent $0; idle $1,000 (keeps $1,000)"
     assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000, spent $0; needs $6,200 for its first "
-                                  "coal plant and water tower ($110/month)")
+                                  "coal plant and water tower ($110/month); sewage outlet waits for a road to the "
+                                  "river")
     assert lines["police"] == "- police: funds $0, spent $300; nothing ready to buy"
     assert ("- no reports yet\n- to spend: $27k above the $3,000 reserve + $6,502 idle to take back = $33.5k; "
             "operations ") in text                     # the idle money counts in the money to spend
@@ -4213,7 +4214,8 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     # top-ups; the worst mix below (needs lines on all seven departments, debt at the cap, a 6x deficit, seven
     # buildings lines in the costs, a partial cover in a hold, in a game long enough for "close that in N months")
     # takes 7,624, under the plan's 7,650, with MAYOR_REPORT_CHARS at 170; with utilities short of all three supplies
-    # (v20 fixes: a building per short supply on one line), 7,661
+    # (v20 fixes: a building per short supply on one line), 7,666 at its longest labels; with two and the third's
+    # building waiting for a lot (review), 7,683
     bound = lambda role: 7700 if role == "mayor" else 7450
     env = _env()
     w = env.world
@@ -4339,15 +4341,23 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         money_at_the_limits(3500.0)
         mayor = check("seven needs + money, hold")
         assert mayor.count("; needs $") == 7 and mayor.count("its first ") == 3, mayor
-        # utilities short of all three supplies (v20 fixes: a building per short supply, bought together), the heads
-        # as long as they get: no power or sewage building yet, a pump at capacity
-        seven["utilities"] = FB(6700, (N("coal plant", 6, 0, "power 25% covered", first=True, upkeep=80),
-                                       N("water pump", 6, 1, "water 100% used", upkeep=25),
-                                       N("sewage outlet", 6, 0, "sewage 0% covered", first=True, upkeep=15)),
-                                6700, (), all_of=True)
+        # utilities short of all three supplies (v20 fixes: a building per short supply, bought together), the labels
+        # as long as they get (review): alternating heads, and past 10,000 residents an advanced treatment where no
+        # outlet site is ready
+        seven["utilities"] = FB(19500, (N("wind turbine", 6, 1, "power 93% used", upkeep=20),
+                                        N("water pump", 6, 0, "water 25% covered", first=True, upkeep=25),
+                                        N("advanced treatment", 6, 1, "sewage 99% used", upkeep=110)),
+                                19500, (), all_of=True)
         mayor = check("seven needs, three supplies + money, hold")
-        assert ("; needs $6,700 for its first coal plant, another water pump and its first sewage outlet ($120/month)"
-                "\n") in mayor
+        assert ("; needs $19.5k for another wind turbine, its first water pump and another advanced treatment "
+                "($155/month)\n") in mayor
+        # two named and the third supply's building with no site (review: the mayor's line says what it waits for)
+        seven["utilities"] = FB(4000, (N("wind turbine", 6, 1, "power 93% used", upkeep=20),
+                                       N("water pump", 6, 0, "water 25% covered", first=True, upkeep=25)),
+                                5200, (), all_of=True, waits=("sewage outlet waits for a free riverbank lot",))
+        mayor = check("seven needs, two supplies and a wait + money, hold")
+        assert ("; needs $4,000 for another wind turbine and its first water pump ($45/month); sewage outlet waits for "
+                "a free riverbank lot\n") in mayor
         w.dept_funds.update(planning=9876, transport=9876)
     w.debt = 0.0
     _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
@@ -4365,9 +4375,10 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     check("blocked + money")
     assert "\n- blocked for lack of land: utilities (" in briefing(env, "planning", mark=False)
     # the plan's budget was 7,650 (7,624 at "seven needs + money, hold"); utilities' line naming a building per short
-    # supply (v20 fixes) takes the worst mix to 7,661, under the bound
-    assert max(sizes.values()) < 7675, sizes
-    assert max(sizes, key=sizes.get) == "seven needs, three supplies + money, hold", sizes
+    # supply (v20 fixes) took the worst mix to 7,661, its longest labels to 7,666, and a supply's building waiting for
+    # a lot (review) to 7,683, under the bound
+    assert max(sizes.values()) < 7690, sizes
+    assert max(sizes, key=sizes.get) == "seven needs, two supplies and a wait + money, hold", sizes
 
 
 
