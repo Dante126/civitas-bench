@@ -21,9 +21,9 @@ from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months
 from .memory import DEPARTMENTS, FleetState
 from .region import region_lines
 from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
-    Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
-    overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
-    spare_funded
+    Funding, cheapest, claim_spots, dept_lists, funded_sites, funding_gaps, land_blocked, land_fix, map_facts, \
+    map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, \
+    site_price, spare_funded, unclaimed_firsts, unclaimed_spots
 from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
@@ -200,25 +200,37 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
     land = []
     if role == "planning":
         depts = dept_lists(env)                                    # one observation per priced department
-        spots = funded_spots(w, depts)
+        funded = funded_sites(w, depts)
+        claims = claim_spots(funded)
+        spots = list(claims.values())
         roads = lists["road_extension"].sites if "road_extension" in lists else []
-        lists, land = spare_funded(lists, spots), _leave_line(spots) + _land_line(env, depts, roads)
+        lists = spare_funded(lists, spots)
+        land = _leave_line(spots, unclaimed_spots(funded, claims)) + _land_line(env, depts, roads)
     return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _leave_line(spots: list) -> list[str]:
-    """Planning's line naming what funded departments are about to build and where (funded_spots, each its own site):
-    "- leave free (funded): fire station (12,23), clinic (20,27): zone around them"; past BLOCKED_LINE_CHARS whole
-    items drop from the end, counted ("(+2 more)"). Smoke v14 seed 0, months 3-6: the mayor funded fire, health and
-    education for their ready sites near homes, planning (acting next) zoned those lots, and they read "nothing needs it
-    right now" at coverage 0; fire held $2,500 to month 12. v15 seed 0, month 9: cut mid-word at 240 ("zone arou")."""
+def _leave_line(spots: list, unclaimed: list = ()) -> list[str]:
+    """Planning's line naming what funded departments are about to build and where (claim_spots, each its own site):
+    "- leave free (funded): fire station (12,23), clinic (20,27): zone around them", then each funded building with no
+    lot of its own (`unclaimed`: unclaimed_spots, at its best listed site): "; education (elementary school): no lot
+    of its own - leave or free one near (38,25)". Past BLOCKED_LINE_CHARS whole items drop from the end, counted
+    ("(+2 more)"): the claimed sites first, then the notes. Smoke v14 seed 0, months 3-6: the mayor funded fire,
+    health and education for their ready sites near homes, planning (acting next) zoned those lots, and they read
+    "nothing needs it right now" at coverage 0; fire held $2,500 to month 12. v15 seed 0, month 9: cut mid-word at 240
+    ("zone arou"). v18 seed 1, month 6: education's only site was police's, the line named police's alone, and
+    education never built."""
     found = [f"{sp.building} ({sp.xy[0]},{sp.xy[1]})" for sp in spots]
-    if not found:
+    notes = [f"{sp.dept} ({sp.building}): no lot of its own - leave or free one near ({sp.xy[0]},{sp.xy[1]})"
+             for sp in unclaimed]
+    if not found:                                  # an unclaimed building always sits under a claim
         return []
     head, tail = "- leave free (funded): ", ": zone around them"
-    line = lambda n: head + ", ".join(found[:n]) + (f" (+{len(found) - n} more)" if n < len(found) else "") + tail
-    return [next((line(n) for n in range(len(found), 1, -1) if len(line(n)) <= BLOCKED_LINE_CHARS), line(1))]
+    more = lambda items, n, sep: sep.join(items[:n]) + (f" (+{len(items) - n} more)" if n < len(items) else "")
+    line = lambda n, k: head + more(found, n, ", ") + tail + (f"; {more(notes, k, '; ')}" if k else "")
+    fits = (line(n, k) for k in (range(len(notes), 0, -1) if notes else [0]) for n in range(len(found), 0, -1)
+            if len(line(n, k)) <= BLOCKED_LINE_CHARS)
+    return [next(fits, line(1, min(1, len(notes))))]
 
 
 def _land_line(env, depts: dict, roads: list[dict] = ()) -> list[str]:
@@ -287,24 +299,27 @@ def _firsts_line(f: Funding) -> list[str]:
     return [full if len(full) <= FIRSTS_LINE_CHARS else head + ", ".join(first) + tail]
 
 
-def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
+def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict, unclaimed: tuple[str, ...] = ()) -> str:
     """One department on the mayor's Departments block: funds, the plan target ("<" when below it and it would use a
     top-up: funding_gaps), what it spent (the block's header says over how many months), then one of its idle money
-    or what is blocked (summary lines say what to do), or what it needs. Smoke v9-v12: nothing showed what a
-    department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 < target $9,000" and was
-    topped up."""
+    or what is blocked (summary lines say what to do; `unclaimed`: unclaimed_firsts), or what it needs. Smoke v9-v12:
+    nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
+    target $9,000" and was topped up."""
     return (f"- {d}: funds {money(math.floor(m.funds))}"
             + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
             + (f", spent {money(m.spent)}" if m.months else "")
-            + (f"; idle {money(m.idle)}" if m.idle else _needs(m) or _blocked(m)))
+            + (f"; idle {money(m.idle)}" if m.idle else _needs(m) or _blocked(m, unclaimed)))
 
 
-def _blocked(m: DeptMoney) -> str:
+def _blocked(m: DeptMoney, unclaimed: tuple[str, ...] = ()) -> str:
     """The mayor's line suffix when a department has no ready site but a first building blocked for lack of land or
-    roads: "; blocked: a police station" (BLOCKED_NOTE, once below, says to ask planning; planning's Ready sites say
-    why and what each needs). Smoke v13 seed 0, month 6: police, fire, health and education held their first
-    building's price with every roadside lot zoned, and the mayor took it back instead of pushing planning."""
-    return f"; blocked: {' or '.join(m.blocked)}" if m.blocked else ""
+    roads, or when every funded first building of it has no lot of its own (`unclaimed`: unclaimed_firsts, each of
+    its sites claimed by an earlier department): "; blocked: a police station" (BLOCKED_NOTE, once below, says to
+    ask planning; planning's Ready sites say why and what each needs). Smoke v13 seed 0, month 6: police, fire,
+    health and education held their first building's price with every roadside lot zoned, and the mayor took it back
+    instead of pushing planning. v18 seed 1, month 6: education's only site was police's too."""
+    names = m.blocked or unclaimed
+    return f"; blocked: {' or '.join(names)}" if names else ""
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -381,8 +396,9 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     spent = min(len(w.history), SPEND_MONTHS)
     notes = [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped
     L += ["", "## Departments" + (f" ({'; '.join(notes)})" if notes else "")]
+    unclaimed = unclaimed_firsts(f.depts)
     for d, m in f.depts.items():
-        L.append(_dept_line(d, m, f, budgets)
+        L.append(_dept_line(d, m, f, budgets, unclaimed.get(d, ()))
                  + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
         if d in latest:
             L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
@@ -390,7 +406,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append("- no reports yet")
     if f.idle:
         L.append(f"- {f.idle_note()}")
-    if any(m.blocked for m in f.depts.values() if not m.idle):          # a line above says "; blocked: ..."
+    if any(m.blocked or d in unclaimed for d, m in f.depts.items() if not m.idle):   # a line says "; blocked: ..."
         L.append(BLOCKED_NOTE)
     L += _firsts_line(f)
     if f.gaps:
