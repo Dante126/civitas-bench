@@ -95,10 +95,6 @@ CONFIRM = {**{a: f"true only to repeat a {a} refused for cutting roads off the {
 # 3 take-back refusals were overridden at once and 3 of 7 duplicate refusals; confirm was a free pass
 EARNED_CONFIRM = {"allocate_budget", "take_loan"}
 EARNED_NOTE = " (confirm: true counts only when repeating this exact call after it was refused)"
-# the mayor's money actions: their results end with ToolBox._money_note (model only), not _explain's fix
-MONEY_ACTIONS = {"allocate_budget", "take_loan", "repay_loan"}
-# action -> text appended to its tool description (Unit D fills it; stub until then)
-MONEY_DOCS: dict[str, str] = {}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -807,7 +803,10 @@ def _plant(p: dict) -> dict:
 
 
 def overview(env) -> dict:
-    """Headline metrics, finances and scores, with the change over the last 3 months (`trend`, None early on)."""
+    """Headline metrics, finances and scores, with the change over the last 3 months (`trend`, None early on). The
+    treasury's change over that window is split (`operations_3_months`, cash_flow: treasury_change = operations -
+    top_ups + loans + other; None early on), and last month's costs by kind are listed dearest first
+    (`costs_last_month`, $0 ones left out)."""
     w = env.world
     m = w.metrics()
     last = w.history[-1] if w.history else m
@@ -830,6 +829,12 @@ def overview(env) -> dict:
         "since_month": past["month"], "population": m["population"] - past["population"],
         "treasury": round(w.treasury - past["treasury"]),
         "happiness_pct": round(100 * (m["happiness"] - past["happiness"]), 1)}
+    cf = cash_flow(w)                    # the same window: the mayor's own transfers and loans apart from operations
+    out["operations_3_months"] = None if cf.since is None else {
+        "since_month": cf.since, "months": cf.months, "treasury_change": round(cf.change), "operations": round(cf.ops),
+        "top_ups": round(cf.top_ups), "loans": round(cf.loans), "other": round(cf.other)}
+    costs = sorted(last.get("expense_breakdown", {}).items(), key=lambda kv: -kv[1])
+    out["costs_last_month"] = {k: round(v) for k, v in costs if round(v)}
     return out
 
 
@@ -1230,6 +1235,55 @@ def still_to_fund(f: Funding, n: int = FUNDED_SHOWN) -> str:
     if not items:
         return "none"
     return ", ".join(items[:n]) + (f", +{len(items) - n} more" if len(items) > n else "")
+
+
+# the mayor's actions whose results say where the money stands (ToolBox._money_note, appended by _act on success and
+# on a core failure, not _explain's fix), in the model's message only
+MONEY_ACTIONS = ("allocate_budget", "take_loan", "repay_loan")
+# appended to their tool descriptions (ToolBox.__init__): what a loan costs in dollars, where the core doc gives a
+# rate (read at import, as action_docs reads its rate when asked; the notes read C.LOAN_INTEREST when they run)
+_INTEREST_PER_1000 = money(1000 * C.LOAN_INTEREST)
+MONEY_DOCS = {
+    "take_loan": f" Interest is {_INTEREST_PER_1000} a month per $1,000 until repaid; the finance score reads net "
+                 "worth (treasury + department funds - debt).",
+    "repay_loan": f" Each $1,000 repaid saves {_INTEREST_PER_1000} a month in interest."}
+
+
+def treasury_state(w, f: Funding) -> str:
+    """The treasury against the reserve, for a money result: "treasury $2,788, $212 under the $3,000 reserve"
+    ("$2,000 above the", "at the"), with what sets the reserve after it (reserve_why)."""
+    gap = round(f.spare)
+    where = f"{money(gap)} above" if gap > 0 else f"{money(-gap)} under" if gap < 0 else "at"
+    return f"treasury {money(w.treasury)}, {where} the {money(f.reserve)} reserve{reserve_why(w)}"
+
+
+def topped_up(m: DeptMoney) -> str:
+    """What a department's money buys after a top-up, for its result: "can pay for another police station
+    (+$55/month)" (its cheapest ready site, first_build / road_build), "still $1,000 short of its first police
+    station: less buys nothing" (its needs line), "blocked for lack of land: this buys nothing until planning frees a
+    lot" (DeptMoney.blocked, or its funded first buildings unclaimed), or "had nothing ready to buy"."""
+    if m.needs is not None:
+        return f"still {money(m.top_up)} short of {m.what}: less buys nothing"
+    if m.unclaimed or m.blocked:
+        return "blocked for lack of land: this buys nothing until planning frees a lot"
+    b = m.build
+    if b is None or b.cost is None or not b.named:
+        return "had nothing ready to buy"
+    up = max(n.upkeep for n in b.named)
+    return f"can pay for {' or '.join(n.label for n in b.named)}" + (f" (+{money(up)}/month)" if round(up) else "")
+
+
+def taken_back(m: DeptMoney) -> str:
+    """What a department holds after a take-back against what it keeps (DeptMoney.keep), for its result: "planning now
+    $1,240, what it keeps (nothing idle)", "... $508 over what it keeps" (": still idle" when it is), or "... $1,316
+    below what it keeps (2 x its $658 spending): it can't build next quarter" (keep_why)."""
+    over = round(m.funds - m.keep)
+    head = f"{m.dept} now {money(m.funds)}, "
+    if over > 0:
+        return head + f"{money(over)} over what it keeps" + (": still idle" if m.idle else "")
+    if over < 0:
+        return head + f"{money(-over)} below what it keeps ({m.keep_why}): it can't build next quarter"
+    return head + "what it keeps (nothing idle)"
 
 
 class SiteList(NamedTuple):
@@ -2384,11 +2438,6 @@ class ToolBox:
             out["override"] = override
         return out
 
-    def _money_note(self, name: str, args: dict, res: dict) -> str:
-        """Stub until Unit D (docs/plans/2026-09-29-mayor-money.md, D1) fills it: the note after the mayor's money
-        action result (MONEY_ACTIONS; `res`: the core result), "" for none."""
-        return ""
-
     def _taken(self, name: str, args: dict, before: np.ndarray) -> frozenset:
         """The tiles a successful action took (Took.tiles): a build_road's whole line, else the tiles it filled
         (`before`: the structures before it ran)."""
@@ -2826,6 +2875,61 @@ class ToolBox:
             return f"next free {purpose} site: {_where(site)}"
         return f"no free {purpose} site listed ({lst.short})" if lst.short and not lst.short.startswith("locked") else ""
 
+    def _money_note(self, name: str, args: dict, res: dict) -> str:
+        """Where the money stands after one of the mayor's MONEY_ACTIONS (`res`: apply_action's result as a dict,
+        `args` without type and confirm), for the model's message only: `executed`, the history log and the trace
+        keep the core text. Recomputes funding_gaps (about 5 ms).
+        - a top-up: " | police: " + topped_up, then "; " + treasury_state + "; still to fund: " + still_to_fund;
+        - a take-back: " | " + taken_back, then the treasury and what is still to fund;
+        - take_loan: " | interest now $15/month (+$15); $47k more can be borrowed; treasury ...; still to fund ...";
+          at the debt limit " | no more credit: repay_loan from money above the reserve cuts the $250/month interest",
+          " | only $2,000 more can be borrowed (interest $240/month)" when less than it asked is left;
+        - repay_loan: " | interest now $225/month (saves $25/month); treasury ..." (" | no debt left: no more
+          interest; treasury ..." once repaid);
+        - "treasury only has" (a top-up or repay_loan the treasury can't pay): " | treasury $500, $2,500 under the
+          $3,000 reserve; idle to take back: planning $1,508; still to fund: ...";
+        "" for any other failure or action, and on any error: a note never fails an action that ran. Smoke v13-v19:
+        234 of 338 allocation messages had under 40 characters of content, so the step-0 plan was lost and block
+        order became funding order; the treasury ran dry mid-turn in 10 of 56 turns, 8 of 25 failures drained by an
+        earlier call of the same batch."""
+        if name not in MONEY_ACTIONS:
+            return ""
+        try:
+            w, ok, msg = self.world, bool(res.get("ok")), str(res.get("message", ""))
+            rate = C.LOAN_INTEREST
+            if name == "take_loan" and not ok and msg.startswith("debt limit"):
+                room, interest = C.MAX_DEBT - w.debt, f"{money(w.debt * rate)}/month"
+                if round(room) <= 0:
+                    return f" | no more credit: repay_loan from money above the reserve cuts the {interest} interest"
+                return f" | only {money(room)} more can be borrowed (interest {interest})"
+            if not ok and "treasury only has" not in msg:
+                return ""
+            f = funding_gaps(self.env, self.fleet)
+            where, still = treasury_state(w, f), f"still to fund: {still_to_fund(f)}"
+            if not ok:
+                idle = ", ".join(f"{d} {money(v)}" for d, v in f.idle.items()) or "none"
+                return f" | {where}; idle to take back: {idle}; {still}"
+            if name == "take_loan":
+                room = C.MAX_DEBT - w.debt
+                credit = f"{money(room)} more can be borrowed" if round(room) > 0 else "no more can be borrowed"
+                added = signed(float(args["amount"]) * rate, money)
+                return f" | interest now {money(w.debt * rate)}/month ({added}); {credit}; {where}; {still}"
+            if name == "repay_loan":
+                if w.debt <= 1e-9:                    # it repaid what was left, maybe less than it asked
+                    return f" | no debt left: no more interest; {where}"
+                saved = money(float(args["amount"]) * rate)
+                return f" | interest now {money(w.debt * rate)}/month (saves {saved}/month); {where}"
+            dept, amount = _allocation(args)
+            m = f.depts.get(dept)
+            if m is None:                             # a department not in the game: nobody spends it
+                what = f"{dept} now {money(w.dept_funds[dept])} (not in this game)" if amount < 0 else \
+                    f"{dept}: not in this game, so nothing spends it"
+            else:
+                what = taken_back(m) if amount < 0 else f"{dept}: {topped_up(m)}"
+            return f" | {what}; {where}; {still}"
+        except Exception:
+            return ""
+
     # ------------------------------------------------------------- look-ups
     def _lookup_tools(self) -> list[Tool]:
         if self.role == "mayor":                        # read-only: every department's lists, "<department>.<purpose>"
@@ -3045,29 +3149,32 @@ class ToolBox:
             raise ToolError(str(e))
 
     def update_plan(self, **fields) -> dict:
-        """Save the plan; the result lists the idle money to take back first and the departments now below their
-        budget target (budgets are targets, the money moves with allocate_budget), and says when the gaps exceed the
-        treasury above the reserve."""
+        """Save the plan. The result gives, needs-based whatever the targets (funding_gaps): the money to spend
+        (`to_spend`: the treasury above the reserve plus the idle money, 0 in a hold), the top-ups the needs lines
+        ask for, most urgent first (`to_fund`: department, kind, amount, upkeep_per_month), and the first/supply
+        departments at a $0 target (`first_buildings`); then the idle money to take back (`idle`) and the
+        departments below their budget target (`below_target`, with the treasury). `next` is the briefing's to spend
+        and to fund lines (spend_lines), plus "first buildings with a $0 target: education" when there are any.
+        Smoke v16-v19: the to-do line came from targets alone; education was at $0 in 15 of 15 plans and first
+        buildings at a $0 target were funded 16 times in 36."""
         w = self.world
         try:
             out = {"ok": True, "message": self.fleet.update_plan(w.month, **fields)}
         except ValueError as e:
             raise ToolError(str(e))
         f = funding_gaps(self.env, self.fleet)
-        nxt = [f.idle_note()] if f.idle else []
         if f.idle:
             out["idle"] = f.idle
         if f.gaps:
-            under = f.spare <= 0             # the treasury at or under the reserve, idle money aside
-            nxt.append(f"the treasury ({money(w.treasury)}) is at or under the {money(f.reserve)} reserve: hold; "
-                       "lower targets or wait for income"
-                       if under else f"call allocate_budget to fund these (treasury {money(w.treasury)})")
-            if f.short and not under:
-                nxt[-1] += (f"; the gaps total {money(f.total)}, more than the treasury above a {money(f.reserve)} "
-                            f"reserve ({money(max(0.0, f.spare))}): fund the most urgent first or lower targets")
             out.update(below_target=f.gaps, treasury=round(w.treasury))
-        if nxt:
-            out["next"] = "; ".join(nxt)
+        out["to_spend"] = max(0, round(f.spendable))
+        out["to_fund"] = [{"department": i.dept, "kind": i.kind, "amount": i.amount,
+                           "upkeep_per_month": round(i.upkeep)} for i in f.to_fund]
+        nxt = [ln.removeprefix("- ") for ln in spend_lines(w, f)]
+        if f.firsts_at_zero:
+            out["first_buildings"] = list(f.firsts_at_zero)
+            nxt.append(f"first buildings with a $0 target: {', '.join(f.firsts_at_zero)}")
+        out["next"] = "; ".join(nxt)
         return out
 
     def end_turn(self, report: str) -> dict:

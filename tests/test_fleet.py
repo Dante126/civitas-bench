@@ -1237,29 +1237,30 @@ def test_update_plan_lists_the_departments_below_their_target():
     w.dept_funds.update(planning=9500, utilities=2000)
     mayor = ToolBox(env, "mayor")
     res = mayor.call("update_plan", {"goals": ["grow"]})
-    assert res["ok"] and "below_target" not in res and "next" not in res          # no targets yet
+    assert res["ok"] and "below_target" not in res                                  # no targets yet
     res = mayor.call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500, "police": 0}})
     assert res["ok"] and res["message"].startswith("plan v2 saved")
     assert res["below_target"] == {"utilities": {"funds": 2000, "target": 7000, "gap": 5000},
                                    "fire": {"funds": 0, "target": 2500, "gap": 2500}}      # planning is funded
     assert res["treasury"] == 30000
-    assert res["next"] == "call allocate_budget to fund these (treasury $30k)"
+    assert res["next"].startswith("to spend: $27k above the $3,000 reserve; ")    # needs-based: test_fleet_money
     assert mayor.call("allocate_budget", {"department": "utilities", "amount": 5000})["ok"]
     res = mayor.call("update_plan", {"priorities": {"fire": "stations by homes"}})
     assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
     assert res["treasury"] == 25000
 
 
-def test_update_plan_says_when_the_gaps_exceed_the_treasury():
+def test_update_plan_says_what_there_is_to_spend():
     env = _env()
     w = env.world
-    w.treasury = 12000                                   # gaps $9,000 = treasury - the $3,000 reserve: enough
+    w.treasury = 12000                                   # the treasury above the $3,000 reserve, whatever the gaps
     res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
-    assert res["next"] == "call allocate_budget to fund these (treasury $12k)"
+    assert res["to_spend"] == 9000 and res["next"].startswith("to spend: $9,000 above the $3,000 reserve; ")
     w.treasury = 11000
     res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000, "utilities": 3000}})
-    assert res["next"] == ("call allocate_budget to fund these (treasury $11k); the gaps total $9,000, more than the "
-                           "treasury above a $3,000 reserve ($8,000): fund the most urgent first or lower targets")
+    assert res["to_spend"] == 8000 and res["next"].startswith("to spend: $8,000 above the $3,000 reserve; ")
+    assert res["below_target"] == {"planning": {"funds": 0, "target": 6000, "gap": 6000},
+                                   "utilities": {"funds": 0, "target": 3000, "gap": 3000}}
 
 
 def test_health_finds_cemetery_sites():
@@ -1299,15 +1300,14 @@ def test_update_plan_says_hold_under_the_reserve():
     for treasury in (3000, 1200, -500):                  # at, under and below zero: nothing above the $3,000 reserve
         w.treasury = treasury
         res = ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})
-        assert res["next"] == (f"the treasury ({money(treasury)}) is at or under the $3,000 reserve: hold; lower "
-                               "targets or wait for income")
+        assert res["to_spend"] == 0 and res["next"].startswith("to spend: none (hold): the treasury is ")
         text = briefing(env, "mayor", mark=False)
         line, = [ln for ln in text.splitlines() if ln.startswith("- to spend:")]
         assert line.startswith("- to spend: none (hold): the treasury is ") and line.endswith(
             "; nothing above $3,000"), line                 # nothing for first buildings either
     w.treasury = 3001                                    # $1 above: short, but something to allocate
     assert ToolBox(env, "mayor").call("update_plan", {"budgets": {"planning": 6000}})["next"].startswith(
-        "call allocate_budget")
+        "to spend: $1 above the $3,000 reserve")
 
 
 def test_mayor_tools_in_a_mixed_line_up():
@@ -1569,13 +1569,13 @@ def test_update_plan_says_to_take_idle_money_back():
     w.treasury = 30000
     w.dept_funds.update(planning=7834, transport=2000)
     mayor = ToolBox(env, "mayor")
-    note = "$7,834 idle in planning, transport: take it back (negative allocate_budget) before loans or new top-ups"
+    note = "to spend: $27k above the $3,000 reserve + $7,834 idle to take back = $34.8k; "
     res = mayor.call("update_plan", {"budgets": {"planning": 9000}})
     assert res["idle"] == {"planning": 6834, "transport": 1000} and "below_target" not in res
-    assert res["next"] == note
+    assert res["to_spend"] == 34834 and res["next"].startswith(note)
     res = mayor.call("update_plan", {"budgets": {"fire": 2500}})
     assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
-    assert res["next"] == note + "; call allocate_budget to fund these (treasury $30k)"
+    assert res["next"].startswith(note)
 
 
 def test_turn_control_tools():
