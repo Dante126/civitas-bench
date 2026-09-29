@@ -17,13 +17,13 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .region import region_lines
-from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
-    Funding, cheapest, claim_spots, dept_lists, funded_sites, funding_gaps, land_blocked, land_fix, map_facts, \
-    map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, \
-    site_price, spare_funded, unclaimed_firsts, unclaimed_spots
+from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SITE_PURPOSES, SPEND_MONTHS, CashFlow, \
+    DeptMoney, Funding, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, funding_gaps, land_blocked, \
+    land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, \
+    site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
 from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
@@ -56,18 +56,24 @@ UNLOCK_ROLES = {
 MAX_LINES = 6            # events / failed actions listed per briefing
 MAX_UNLOCKS = 4          # unlock names on the milestone line
 MAX_MESSAGES = 5         # new council messages quoted per briefing
-# the mayor's own plan text, quoted short in its briefing (get_plan has it in full)
-GOAL_CHARS, PRIORITY_CHARS, NOTES_CHARS = 60, 40, 150
+# the mayor's own plan text, quoted short in its briefing (get_plan has it in full, the priorities too: the
+# Departments lines dropped their "; priority: ..." suffix, about 385 characters at the limits)
+GOAL_CHARS, NOTES_CHARS = 60, 150
 BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this, department names only (then cut)
 # the mayor's Departments block, once below any line with a blocked suffix: " - ask planning" on each blocked line took
-# the worst case (2 idle, 5 blocked) to 7,445 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows;
-# said once here, 7,420
-BLOCKED_NOTE = "- blocked for lack of land: ask planning for lots"
-# the mayor's first-buildings line (_firsts_line): past this, department names only (their lines above say what and
-# for how much). Two departments' buildings and prices fit; four took 210 characters. At the limits with needs lines on
-# five departments, four of them first (2 idle), the mayor's briefing took 7,738 characters with this line whole, 7,616
-# with the cut; test_briefings_stay_bounded_at_the_limits builds that mix (7,621 of the mayor's 7,700)
-FIRSTS_LINE_CHARS = 160
+# the worst case (2 idle, 5 blocked) to 7,445 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allowed;
+# said once here. Smoke v13: the mayor took a blocked department's money back instead of pushing planning
+BLOCKED_NOTE = "- blocked for lack of land: money buys nothing there until planning frees lots (ask planning)"
+# department reports quoted on the mayor's Departments block (history kind=report has them whole): shorter than
+# REPORT_PREVIEW_CHARS, so the Finances split, the to spend / to fund lines and the debt line fit its 7,700 characters.
+# 180 until review: with every department on a needs line (3 first, planning's road, 3 another) in a hold, debt at the
+# cap and a 6x deficit, the worst mix took 7,694, over the plan's 7,650; at 170, 7,624
+MAYOR_REPORT_CHARS = 170
+# the Finances costs line names the dearest this many buildings lines, then "N more $X": with 3, the worst mix of
+# test_briefings_stay_bounded_at_the_limits (needs lines on six departments, debt at the cap, a 6x deficit, seven
+# buildings lines, a partial cover in a hold) took the mayor's briefing to 7,695 of its 7,700 characters; with 2, 7,677
+# (the plan's fallback; its "top 3" is left for when there is room)
+COSTS_SHOWN = 2
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -98,8 +104,8 @@ LOOKUPS = ("city_overview", "map_overview", "inspect", "find_sites", "my_facilit
            "get_messages", "history")
 LOOKUP_NOTES = {("mayor", "find_sites"): "find_sites (check which sites a department has; read-only)"}
 
-BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month, so keep a reserve when you move money "
-                   "to departments (allocate_budget) or cut taxes.",
+BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month and every building adds upkeep for "
+                   "good; keep the reserve when you move money to departments (allocate_budget) or cut taxes.",
           "dept": "Stay within your budget: you can only spend your department's funds, which the mayor allocates."}
 TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budget; departments only see their "
                  "slice. Read their reports and adjust the plan when the numbers move.",
@@ -283,32 +289,23 @@ def _needs(m: DeptMoney) -> str:
     return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(n.text() for n in b.named)
 
 
-def _firsts_line(f: Funding) -> list[str]:
-    """The line naming departments short of a first primary building on their needs line (Need.first), while
-    another department's is for another one: "- first buildings still unfunded: education (elementary school,
-    $2,500): fund these before second buildings". Smoke v16 seed 0, months 6-9: with the treasury short the mayor
-    funded second police and fire stations and a second clinic, and education's allocations were refused; education
-    (last in turn order and in the block) got no school in v16 seed 0 or either v17 seed (33.2-33.4)."""
-    needs = {d: b for d, m in f.depts.items() if not m.idle and (b := m.needs)}
-    first = {d: [n.what for n in b.named if n.first] for d, b in needs.items()}
-    first = {d: names for d, names in first.items() if names}
-    if not first or not any(n.have for d, b in needs.items() if d not in first for n in b.named):
-        return []
-    head, tail = "- first buildings still unfunded: ", ": fund these before second buildings"
-    full = head + ", ".join(f"{d} ({' or '.join(ns)}, {money(needs[d].cost)})" for d, ns in first.items()) + tail
-    return [full if len(full) <= FIRSTS_LINE_CHARS else head + ", ".join(first) + tail]
-
-
-def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict, unclaimed: tuple[str, ...] = ()) -> str:
+def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
     """One department on the mayor's Departments block: funds, the plan target ("<" when below it and it would use a
-    top-up: funding_gaps), what it spent (the block's header says over how many months), then one of its idle money
-    or what is blocked (summary lines say what to do; `unclaimed`: unclaimed_firsts), or what it needs. Smoke v9-v12:
-    nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
-    target $9,000" and was topped up."""
+    top-up: funding_gaps), what it spent (the block's header says over how many months), then one suffix by its kind
+    (DeptMoney.kind): its idle money and what it keeps ("; idle $1,508 (keeps $1,000)"), what its needs line buys
+    (_needs), what is blocked (_blocked, with the unclaimed_firsts funding_gaps set; BLOCKED_NOTE below says what to
+    do), else what its money does (DeptMoney.state: "; funds cover its builds", "; funds cover its next build",
+    "; supply has room", "; only a library ready ($1,500)", "; nothing ready to buy"; planning none). Smoke
+    v9-v12: nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
+    target $9,000" and was topped up. v19 seed 1, month 6: take-backs left planning under what it keeps, unseen."""
+    kind = m.kind
+    suffix = (f"; idle {money(m.idle)} (keeps {money(m.keep)})" if kind == "idle" else
+              _needs(m) if kind in NEED_KINDS else
+              _blocked(m, m.unclaimed) if kind == "blocked" else
+              f"; {m.state}" if m.state else "")
     return (f"- {d}: funds {money(math.floor(m.funds))}"
             + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
-            + (f", spent {money(m.spent)}" if m.months else "")
-            + (f"; idle {money(m.idle)}" if m.idle else _needs(m) or _blocked(m, unclaimed)))
+            + (f", spent {money(m.spent)}" if m.months else "") + suffix)
 
 
 def _blocked(m: DeptMoney, unclaimed: tuple[str, ...] = ()) -> str:
@@ -360,6 +357,47 @@ def _header(env, role: str, mode: str) -> list[str]:
             f"up to {env.cfg.max_actions_per_turn} successful actions this turn", ""]
 
 
+def _finances(w, cf: CashFlow) -> list[str]:
+    """The mayor's Finances lines (the WARNING line follows): the treasury and its change since overview's trend month
+    split into operations, the mayor's top-ups, loans and the rest (cash_flow; parts that round to $0 left out),
+    last month's income and expenses by kind (buildings, the dearest COSTS_SHOWN by name, then city services, imports
+    when they round to $1 or more, and interest), and with debt what it costs and what is left to borrow:
+    - "- treasury $7,922 (-$12.3k since month 3: operations +$977, top-ups -$13.3k), debt $0"
+    - "- last month: income $597, expenses $469: buildings $312 (utilities $82, roads $75, 3 more $155), city services
+      $157, interest $0" (city services: the rest of the expenses, the town hall and policies included, so the parts
+      add up; "imports $173" before the interest when there are any: review, a region's $173 of service imports read
+      as city services)
+    - "- debt $18.8k: $94/month interest, $31.2k more can be borrowed" (the first line then leaves the debt out; what a
+      repayment saves is in repay_loan's description and the playbook: review, the worst mix ran 27 characters over)
+    Smoke v13-v19: the treasury change mixed in the mayor's own transfers, so 30 of 81 turns showed a "loss" while
+    operations ran a surplus; interest never showed in dollars, and there were 0 repay_loan calls in 96 turns."""
+    debt = round(w.debt) > 0
+    head = f"- treasury {money(w.treasury)}"
+    if cf.since is not None:
+        parts = [f"{k} {signed(v, money)}" for k, v in (("operations", cf.ops), ("top-ups", -cf.top_ups),
+                                                         ("loans", cf.loans), ("other", cf.other)) if round(v)]
+        head += (f" ({signed(round(cf.change), money)} since month {cf.since}"
+                 + (": " + ", ".join(parts) if parts else "") + ")")
+    L = [head + ("" if debt else f", debt {money(w.debt)}")]
+    if cf.since is None:
+        L.append("- last month: no month played yet")
+    else:
+        costs = list(cf.buildings.items())
+        n = len(costs) if len(costs) <= COSTS_SHOWN + 1 else COSTS_SHOWN      # one more: named ("1 more" as long)
+        rest = [v for _, v in costs[n:]]
+        detail = ", ".join(f"{k} {money(v)}" for k, v in costs[:n]) + (f", {len(rest)} more {money(sum(rest))}"
+                                                                       if rest else "")
+        L.append(f"- last month: income {money(cf.income)}, expenses {money(cf.expenses)}: buildings "
+                 f"{money(sum(cf.buildings.values()))}" + (f" ({detail})" if detail else "")
+                 + f", city services {money(cf.services)}"
+                 + (f", imports {money(cf.imports)}" if round(cf.imports) else "") + f", interest {money(cf.interest)}")
+    if debt:
+        room = C.MAX_DEBT - w.debt
+        L.append(f"- debt {money(w.debt)}: {money(w.debt * C.LOAN_INTEREST)}/month interest, "
+                 + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit"))
+    return L
+
+
 def _mayor(env, fleet: FleetState) -> list[str]:
     w = env.world
     o = overview(env)
@@ -376,9 +414,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
              for k in ("power", "water", "sewage")),
          "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
-         "", "## Finances",
-         f"- treasury {money(o['treasury'])}{ch('treasury', money)}, debt {money(o['debt'])}; last month income "
-         f"{money(o['last_month']['income'])}, expenses {money(o['last_month']['expenses'])}"]
+         "", "## Finances", *_finances(w, cash_flow(w))]
     if w.months_negative or w.low_approval_months:
         L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
                  f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
@@ -389,36 +425,30 @@ def _mayor(env, fleet: FleetState) -> list[str]:
                  f"pollution (accept_offer / decline_offer before month {off['expires']})")
     p = plan_slice(fleet, "mayor")
     plan = bool(fleet.plan_versions)
-    budgets, priorities = (p["budgets"], p["priorities"]) if plan else ({}, {})
+    budgets = p["budgets"] if plan else {}
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     f = funding_gaps(env, fleet)
-    clipped = any(len(" ".join(e["text"].split())) > REPORT_PREVIEW_CHARS for e in latest.values())
+    clipped = any(len(" ".join(e["text"].split())) > MAYOR_REPORT_CHARS for e in latest.values())
     spent = min(len(w.history), SPEND_MONTHS)
-    notes = [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped
-    L += ["", "## Departments" + (f" ({'; '.join(notes)})" if notes else "")]
-    unclaimed = unclaimed_firsts(f.depts)
-    for d, m in f.depts.items():
-        L.append(_dept_line(d, m, f, budgets, unclaimed.get(d, ()))
-                 + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
+    notes = (["most urgent first"] + [f"spent = last {months(spent)}"] * bool(spent)
+             + ["cut reports: history kind=report"] * clipped)
+    # most urgent first (Funding.order): smoke v16-v19 funded in block order in 32 of 54 turns, and education, last
+    # in turn order, was topped up last in 11
+    L += ["", f"## Departments ({'; '.join(notes)})"]
+    for d in f.order:
+        L.append(_dept_line(d, f.depts[d], f, budgets))
         if d in latest:
-            L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], REPORT_PREVIEW_CHARS)}")
+            L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], MAYOR_REPORT_CHARS)}")
     if not latest:
         L.append("- no reports yet")
-    if f.idle:
-        L.append(f"- {f.idle_note()}")
-    if any(m.blocked or d in unclaimed for d, m in f.depts.items() if not m.idle):   # a line says "; blocked: ..."
+    if any(m.kind == "blocked" for m in f.depts.values()):              # a line says "; blocked: ..."
         L.append(BLOCKED_NOTE)
-    L += _firsts_line(f)
-    if f.gaps:
-        L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
-                 + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
-                    f", {money(f.spare)} above the {money(f.reserve)} reserve): allocate_budget" if f.short else
-                    "): allocate_budget"))
+    L += spend_lines(w, f)                     # the money to spend and the top-ups the needs lines ask, in order
     L += [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")
     else:
-        L += [f"## City plan (v{p['version']}, month {p['month']}; full text: get_plan)",
+        L += [f"## City plan (v{p['version']}, month {p['month']}; priorities and full text: get_plan)",
               f"- goals: {_goals(p['goals'], GOAL_CHARS)}"]
         if p["notes"]:
             L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")

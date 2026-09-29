@@ -218,6 +218,22 @@ def test_a_take_back_the_policy_means_is_confirmed(monkeypatch):
     assert w.dept_funds["fire"] == 0 and [r["ok"] for r in d.executed] == [True]
 
 
+def test_a_loan_refusal_the_policy_means_is_confirmed(monkeypatch):
+    """The scripted mayor borrows only at turn start with the treasury under $3,000, so the loan guard never meets it;
+    a loan it means anyway is repeated with confirm: true, which the refusal earned."""
+    a = _agent("mayor")
+    w = a.env.world
+    w.treasury = 20000
+    loan = {"type": "take_loan", "amount": 10000}
+    monkeypatch.setattr(a.policy, "act", lambda obs: Decision(actions=[dict(loan)], thinking="borrow"))
+    d = a.act({})
+    tr = [(c["tool"], c["result"].get("refused"), c["result"].get("override")) for c in d.meta["tool_trace"]]
+    assert tr == [("get_messages", None, None), ("update_plan", None, None), ("take_loan", "loan", None),
+                  ("take_loan", None, "loan"), ("end_turn", None, None)]
+    assert json.loads(d.meta["tool_trace"][3]["args"])["confirm"] is True
+    assert w.debt == 10000 and [r["ok"] for r in d.executed] == [True]
+
+
 def test_the_step_limit_keeps_a_step_for_end_turn():
     a = _agent("planning", max_steps=3)
     a.env.world.dept_funds["planning"] = 9000                # a road and zones to run

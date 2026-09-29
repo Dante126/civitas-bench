@@ -113,7 +113,7 @@ def _slim(res: dict) -> dict:
     for k in ("error", "message"):
         if res.get(k):
             out[k] = str(res[k])[:TRACE_CHARS]
-    out.update({k: res[k] for k in ("cost", "budget_left", "repeat", "refused") if k in res})
+    out.update({k: res[k] for k in ("cost", "budget_left", "repeat", "refused", "override") if k in res})
     return out
 
 

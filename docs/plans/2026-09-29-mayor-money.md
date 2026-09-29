@@ -112,7 +112,7 @@ The `to fund` line:
 **B1. Finances block** (root causes 2 and 4)
 - "- treasury $7,922 (-$12.3k since month 3: operations +$977, top-ups -$13.3k), debt $0". Zero parts are left out, and "loans +$X" and "other +$5,000" appear only when nonzero.
 - "- last month: income $597, expenses $561: buildings $312 (utilities $82, roads $75, police $55, 2 more $100), city services $157, interest $0"
-- When debt > 0: "- debt $18.8k: $94/month interest, $31.2k more can be borrowed; each $1,000 repaid saves $5/month". The first line then drops ", debt $X".
+- When debt > 0: "- debt $18.8k: $94/month interest, $31.2k more can be borrowed". The first line then drops ", debt $X". (As built: the "; each $1,000 repaid saves $5/month" hint is left to repay_loan's description and the playbook; see section 7.)
 - The WARNING line is unchanged.
 
 **B2. Departments block** (root causes 1, 3 and 5)
@@ -145,7 +145,7 @@ The `to fund` line:
 
 **C2. Duplicate guard on take-backs** (graft; root cause 5). An identical negative allocation is also a duplicate: "you already took $1,140 back from planning this turn (it now has $1,240); take-backs add up". In `_allocation_refusal` the take-back guard runs first, then the duplicate guard.
 
-**C3. Take-back refusal text.** "that takes planning below the $1,316 it keeps (2 x its $658 spending), so it can't build next quarter[; you already took back $1,140 from it this turn]; {free}: {todo}. To take it anyway, repeat this exact call with confirm: true."
+**C3. Take-back refusal text.** "that takes planning below the $1,316 it keeps (2 x its $658 spending)[, so it can't pay for a road into open land and zoning it ($640)][; you already took back $1,140 from it this turn]; {free}: {todo}. To take it anyway, repeat this exact call with confirm: true." (As built: the "can't pay" clause only when the money left is short of its next build; see section 7.)
 
 **C4. Soft loan guard** (graft; root cause 4)
 - `guarded("mayor", "take_loan")` returns True, so the schema gains a `confirm` parameter.
@@ -170,15 +170,15 @@ The `to fund` line:
 
 | Case | Note |
 |---|---|
-| top-up OK | " \| police: can pay for another police station (+$55/month)" or "still $1,000 short of its first police station: less buys nothing" or "had nothing ready to buy" or "blocked for lack of land: this buys nothing until planning frees a lot"; then "; treasury $2,788, $212 under the $3,000 reserve; still to fund: …" |
-| take-back OK | " \| planning now $1,240, what it keeps (nothing idle)" or "$508 over what it keeps" or "$1,316 below what it keeps (2 x its $658 spending): it can't build next quarter"; then treasury and still-to-fund |
+| top-up OK | " \| police: can pay for another police station (upkeep +$55/month)" or "still $1,000 short of its first police station: less buys nothing" (per-tile: "less buys fewer tiles"; planning: nothing added) or "had nothing ready to buy" or "blocked for lack of land: this buys nothing until planning frees a lot"; then "; treasury $2,788, $212 under the $3,000 reserve; still to fund: …" |
+| take-back OK | " \| planning now $1,240, what it keeps (nothing idle)" or "$508 over what it keeps" or "$1,316 below what it keeps (2 x its $658 spending)[: it can't pay for a road into open land and zoning it ($640)]"; then treasury and still-to-fund |
 | take_loan OK | " \| interest now $15/month (+$15); $47k more can be borrowed; treasury …; still to fund …" |
 | take_loan at the cap | " \| no more credit: repay_loan from money above the reserve cuts the $250/month interest" (graft) |
 | repay_loan OK | " \| interest now $225/month (saves $25/month); treasury …" |
 | "treasury only has" | " \| treasury $500, $2,500 under the $3,000 reserve; idle to take back: planning $1,508; still to fund: …" (graft: ledger on core failures) |
 
 **D2. `MONEY_DOCS`.**
-- take_loan: " Interest is $5 a month per $1,000 until repaid; the finance score reads net worth (treasury + department funds - debt)."
+- take_loan: " Interest is $5 a month per $1,000 until repaid." (As built: no score clause, and built when the toolbox is, as `money_docs()`; see section 7.)
 - repay_loan: " Each $1,000 repaid saves $5 a month in interest."
 
 **D3. `update_plan` result.** It keeps `idle` and `below_target` and adds:
@@ -186,7 +186,7 @@ The `to fund` line:
 - `to_fund`, as a list of `{department, kind, amount, upkeep_per_month}`;
 - `first_buildings`, from `firsts_at_zero` (graft).
 
-`next` becomes `"; ".join(spend_lines)`, plus "first buildings with a $0 target: education" when there are any.
+`next` becomes `"; ".join(spend_lines)`, plus "first/supply at a $0 target: education" when there are any.
 
 **D4. `overview()`.** Add `operations_3_months` (the `cash_flow` split) and `costs_last_month` (`expense_breakdown`, rounded).
 
@@ -194,9 +194,10 @@ The `to fund` line:
 
 **E1. Mayor playbook.** Replace the first-turn, every-turn, reserve and loans bullets, and add a refusal bullet:
 - **First turn:** "… planning $3,000 (…) and utilities $7,000 for its first plants. From month 3, fund every first building a needs line names ("its first …"; police, fire, health, education: $2,000-2,500 each; less buys nothing), whatever its target; transport $0 until ~1,500 residents. After month 0 give utilities what its needs line asks, not its target. The rest stays in the treasury: every building adds upkeep for good (its needs line says how much)."
-- **Every turn:** "Every turn: read the reports and the Departments block (most urgent first). First take back the idle money the 'to spend' line counts (at most the idle a line shows), before any top-up or loan; then fund the 'to fund' line in its order and stop where the money to spend runs out. A department with no needs line has nothing ready to buy, whatever its target. Allocate once per department per turn, one call at a time when money is short: each result shows the treasury and what is still to fund."
-- **Reserve:** "Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 after a deficit month). In a hold fund only first buildings, supply and planning's road, from the treasury above $3,000 and idle money; the 'to spend' line says when operations close the gap."
-- **Loans:** "Loans only for a first building or supply need the money to spend can't cover, and only if operations stay positive after its upkeep and the interest (Finances shows both); never for another building, and never after this turn's own top-ups emptied the treasury (take one back instead). With debt and no first building or supply need waiting, repay from the money above the reserve (each $1,000 repaid saves $5 a month)."
+- **Every turn:** "Every turn: read the reports and the Departments block (most urgent first). First take back the idle money the 'to spend' line counts (at most the idle a line shows), before any top-up or loan; then fund what the 'to fund' line says the money covers, in its order. A department with no needs line needs no money now, whatever its target. Allocate once per department per turn, one call at a time when money is short: each result shows the treasury and what is still to fund."
+- **Reserve:** "Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 after a deficit month). First buildings, supply and planning's road may use the treasury and idle money above $3,000; anything else only the money above the reserve (the 'to spend' line says how much, and in a hold when operations close the gap)."
+- **Loans:** "Loans only for a first building or supply need the money to spend can't cover, and only if operations stay positive after its upkeep and the interest (its needs line and Finances show them); never for another building, and never after this turn's own top-ups emptied the treasury (take one back instead). With debt and no first building or supply need waiting, repay from the money above the reserve (each $1,000 repaid saves $5 a month)."
+- (As built: the three bullets above are the review's wording; see section 7.)
 - **Refusals:** "A refused call says why and what to do instead: do that. confirm: true counts only on a repeat of the exact refused call, and only for a reason the refusal didn't weigh."
 
 **E2. README "Agent fleets".** Describe:
@@ -314,3 +315,26 @@ Baseline is v16–v19: 8 runs, 24 mayor turns at m3–9, computed from calls.jso
   - blind parallel batches, beyond the playbook's "one call at a time" advice.
 
 The three counts behind the new baseline and the loan-guard replay (read-only; everything else comes from the three analyses you passed in) are in `/private/tmp/claude-501/-Users-dantesimon-Desktop-civitas-bench/6b0fba63-53df-4475-81ba-43187cae37f1/scratchpad/mayor_money/plan/`: `baseline.py`, `firsts_left2.py` and `loan_guard.py`.
+
+## 7. As built
+
+Where the code departs from sections 2 and 4, so the v20 review compares against what shipped. Scripted parity, the baseline, region and fleet_scripted numbers are unchanged by all of it (only fleet texts and the mayor's guards changed).
+
+**Units A-E, beyond the literal spec** (none changes play):
+- `reserve()` multiplies the rounded expenses, not only the deficit test (the reserve can differ from the spec by up to $3).
+- `update_plan`'s `to_spend` is clamped to 0 in a hold.
+- An override uses up its refusal: one override per refused call.
+- `take_loan` has one more note for a partial debt-limit failure: "only $X more can be borrowed (interest $Y/month)".
+- The cover clause has one more form: "covers none of them; all $X would go under ...".
+- The duplicate take-back text adds " - repeat with confirm: true only to take it back again".
+- `COSTS_SHOWN` is 2 (the plan's fallback): with 3 the worst mix was 7,695 of 7,700.
+
+**Review fixes** (confirmed findings, then the cheap minor ones):
+- **The next build.** `first_build` names the cheapest ready first building the city lacks (`Price.first`, `buildings_of` 0, not supplementary or per-tile; a jail only once inmates pass 80% of the cells, as the police playbook and the scripted police build one), else the cheapest ready site. A $30 avenue stretch had hidden transport's first bus line (seed 0, months 42-69, 0 bus lines, "funds cover its next build"), and another elementary school had hidden education's first high school and university. With nothing named, `DeptMoney.state` says why: "supply has room" (utilities sites filtered by `_wanted`), "only a library ready ($1,500)" (supplementary only), else "nothing ready to buy". The playbook line reads "A department with no needs line needs no money now".
+- **What a take-back leaves.** "so it can't build next quarter" was false whenever the money left still paid for the next build (e.g. month 12: $950 left for a $640 road). The refusal and the take-back note now say "so it can't pay for <next build> (<cost>)" only when short of it (`DeptMoney.cant_pay`). `keep_why` names the building ("for its first university", "for another fire station") instead of "its dearest first building".
+- **What first/supply may use.** `Funding.dip = max(0, treasury + idle - $3,000)`, in a hold or not. First/supply and growth are covered against it and another against what is left above the reserve (`fund_cover`). The to-spend line names it whenever it exceeds the money to spend and first/supply or growth is listed. Before, $1 more idle money (or treasury past the reserve) left the hold and cut a first school's allowance from $3,605 to $1, and idle money counted with the treasury under $3,000. The label is "(treasury + idle above $3,000)". The Reserve bullet says first buildings, supply and the road may use the treasury above $3,000, anything else only the money above the reserve.
+- **The loan guard's advice.** Refusal (b) names this turn's top-ups that aren't for a first building or supply (`DeptMoney.buys`), with their amounts. It also counts a same-turn repayment ("a $4,000 loan at $20/month borrows back what you just repaid"). It doesn't fire when every top-up was first/supply, since the playbook allows that loan.
+- **Wording.** The to-fund kinds read "first/supply: ... | growth: ... | another: ...", and upkeep reads "upkeep +$X/month" there and in top-up notes. The hold's none-covered clause reads "covers no first/supply or growth; their $X would go under $3,000". Per-tile needs and planning's road no longer say "less buys nothing". `update_plan`'s `next` says "first/supply at a $0 target". Month 0 shows no operations. "close that in N months" is left out past the game's end. Imports show apart from city services on the costs line. A bus line's upkeep counts its 2 stops. The playbook says "fund what the 'to fund' line says the money covers, in its order" and "(its needs line and Finances show them)".
+- **Loan descriptions.** `money_docs()` is built with the toolbox, so a `LOAN_INTEREST` override reaches it. It no longer says what the finance score reads, which no other LLM agent is told.
+- **Size.** The debt line dropped its repay hint, and `MAYOR_REPORT_CHARS` is 170 (was 180). The worst mix, every department on a needs line in a hold with debt at the cap and a 6x deficit, is 7,624, under the 7,650 budget.
+- **Skipped:** "(3 x after a surplus month: $X)" after a 6x reserve. It would add about 35 characters to the worst case for a note the playbook already carries ("6 after a deficit month").
