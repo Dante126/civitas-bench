@@ -72,7 +72,8 @@ def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
     look-up that failed, an action tool refused before the action ran. A repeated failed action or bad call and a
     guard refusal (a bulldoze or demolish that would cut roads off, a duplicate allocation, a take-back below what a
-    department keeps), refused without running, are counted in `refused`, not here."""
+    department keeps, a self-inflicted loan), refused without running, are counted in `refused`, not here; a call
+    that overrode one (an earned confirm: true) ran, and is counted in `overrides` too."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
@@ -97,6 +98,7 @@ def turn_row(rec: dict) -> dict:
                         for r in rec.get("results") or []],
             "tool_errors": [e for e in errors if e is not None],
             "repeats": marked("repeat"), "refused": marked("refused"),   # repeated look-ups / refused actions
+            "overrides": marked("override"),       # guard refusals overridden by an earned confirm: true
             "seen": _safe(_seen, rec, None), "asked": _safe(_asked, rec, {})}
 
 
@@ -220,6 +222,7 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
     return {"turns": len(rows), "tool_calls": sum(r["steps"] for r in rows), "actions": len(results),
             "failed": len(fails), "tool_errors": len(tool_errs),
             "repeats": sum(r["repeats"] for r in rows), "refused": sum(r["refused"] for r in rows),
+            "overrides": sum(r.get("overrides", 0) for r in rows),
             "spent": round(sum(r["cost"] for r in results if r["ok"]), 2),
             "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
             "completion_tokens": sum(r["completion_tokens"] for r in rows),
@@ -630,12 +633,12 @@ def _body(rep: dict, h: str = "##") -> list[str]:
     if plan["notes"]:
         L += ["", f"Notes: {_cell(plan['notes'])}"]
     L += ["", f"{h} Roles", "",
-          "| role | turns | tool calls | actions | failed | tool errors | repeats (look-ups / refused) | spent "
-          "| tokens (prompt / completion) | limit turns | length stops | API / briefing errors |",
+          "| role | turns | tool calls | actions | failed | tool errors | repeats (look-ups / refused / overrides) "
+          "| spent | tokens (prompt / completion) | limit turns | length stops | API / briefing errors |",
           "|---|" + "---:|" * 11]
     for r, st in rep["roles"].items():
         L.append(f"| {r} | {st['turns']} | {st['tool_calls']} | {st['actions']} | {st['failed']} | {st['tool_errors']} "
-                 f"| {st['repeats']} / {st['refused']} | {money(st['spent'])} "
+                 f"| {st['repeats']} / {st['refused']} / {st.get('overrides', 0)} | {money(st['spent'])} "
                  f"| {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
                  f"| {st['limit_turns']} | {st['length_stops']} | {st['api_errors']} |")
     fails = [(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]

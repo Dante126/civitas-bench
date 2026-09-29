@@ -86,9 +86,19 @@ CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
 # guarded action -> its confirm parameter's description
 CONFIRM = {**{a: f"true only to repeat a {a} refused for cutting roads off the {c}, once you are sure"
               for a, c in CUT_FROM.items()},
-           "allocate_budget": "true only to repeat an allocation refused because the same one already ran this turn "
-                              "and you mean to add it again (allocations add up), or a take-back refused for taking "
-                              "a department below what it keeps, once you are sure"}
+           "allocate_budget": "true only to repeat an allocate_budget refused this turn with the same department and "
+                              "amount, once you are sure; on any other call it doesn't count",
+           "take_loan": "true only to repeat a take_loan refused this turn with the same amount, once you are sure; on "
+                        "any other call it doesn't count"}
+# the mayor's guarded money actions: their guard always runs, and confirm: true overrides a refusal only on a repeat of
+# the exact call (action, department, amount) refused this turn, one override per refusal (ToolBox._refused). v19: all
+# 3 take-back refusals were overridden at once and 3 of 7 duplicate refusals; confirm was a free pass
+EARNED_CONFIRM = {"allocate_budget", "take_loan"}
+EARNED_NOTE = " (confirm: true counts only when repeating this exact call after it was refused)"
+# the mayor's money actions: their results end with ToolBox._money_note (model only), not _explain's fix
+MONEY_ACTIONS = {"allocate_budget", "take_loan", "repay_loan"}
+# action -> text appended to its tool description (Unit D fills it; stub until then)
+MONEY_DOCS: dict[str, str] = {}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -439,12 +449,14 @@ def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
 
 
 def guarded(role: str, action: str) -> bool:
-    """Whether `role`'s `action` can be refused before it runs (confirm: true lets it run): a bulldoze, and a
-    demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would cut
-    roads off; the mayor's allocate_budget identical to one that succeeded this turn, or taking a department below
-    what it keeps (DeptMoney.keep)."""
+    """Whether `role`'s `action` can be refused before it runs (its schema then has a confirm parameter): a bulldoze,
+    and a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would
+    cut roads off (confirm: true lets it run); the mayor's allocate_budget identical to one that succeeded this turn,
+    or taking a department below what it keeps (DeptMoney.keep), and its take_loan while the treasury holds
+    RESERVE_MIN or its own top-ups this turn took it under (EARNED_CONFIRM: confirm: true counts only on a repeat of
+    the refused call)."""
     return (action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
-            or (action == "allocate_budget" and role == "mayor"))
+            or (role == "mayor" and action in EARNED_CONFIRM))
 
 
 def _allocation(p: dict) -> tuple[str, float] | None:
@@ -453,6 +465,18 @@ def _allocation(p: dict) -> tuple[str, float] | None:
         return str(p.get("department", "")).lower(), float(p["amount"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _money_key(name: str, p: dict) -> tuple:
+    """(action, department, amount) of an EARNED_CONFIRM call as its handler reads them: what an earned confirm must
+    repeat (ToolBox._refused). The department is None for a loan; both are None when they can't be read (the guards
+    then refuse nothing: the action reports it)."""
+    if name == "allocate_budget":
+        return (name, *(_allocation(p) or (None, None)))
+    try:
+        return name, None, float(p["amount"])
+    except (KeyError, TypeError, ValueError):
+        return name, None, None
 
 
 def _touching(mask: np.ndarray, diagonal: bool = True) -> np.ndarray:
@@ -2125,6 +2149,9 @@ class ToolBox:
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
         self._funded: dict | None = None                  # _funded_sites() since the last successful action
+        self._refused: set[tuple] = set()                 # EARNED_CONFIRM calls refused this turn (_money_key), each
+                                                          # until confirm: true overrides it once
+        self.start_treasury = self.world.treasury         # at the turn's start: the loan guard (_loan_refusal)
         self.tools: dict[str, Tool] = {}
         lookups = self._lookup_tools()
         self.lookups = {t.name for t in lookups}
@@ -2133,7 +2160,8 @@ class ToolBox:
         docs = action_docs()
         for a in ROLES[role]["actions"]:
             if a != "noop":
-                self.tools[a] = _action_tool(a, docs[a], partial(self._act, a), confirm=guarded(role, a))
+                doc = (docs[a][0], docs[a][1] + MONEY_DOCS.get(a, ""))
+                self.tools[a] = _action_tool(a, doc, partial(self._act, a), confirm=guarded(role, a))
         from .region import region_tools                  # region mode: region_overview, send_message, deals
         for t in region_tools(self):
             self.tools[t.name] = t
@@ -2150,10 +2178,12 @@ class ToolBox:
         without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
         until something changes: a successful action (or plan update) for look-ups, a successful action for failed
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
-        roads off the highway, transport's demolish of their only station / harbour / airport link ("refused":
-        "disconnect"), or the mayor's allocate_budget identical to one that succeeded this turn ("refused":
-        "duplicate") or taking a department below what it keeps ("refused": "take_back") is refused before it runs
-        (not executed, logged or remembered as a failure) unless it passes confirm: true. Once INSPECTS_FREE inspects
+        roads off the highway or transport's demolish of their only station / harbour / airport link ("refused":
+        "disconnect") is refused before it runs (not executed, logged or remembered as a failure) unless it passes
+        confirm: true; so is the mayor's allocate_budget identical to one that succeeded this turn ("refused":
+        "duplicate") or taking a department below what it keeps ("refused": "take_back"), and its self-inflicted
+        take_loan ("refused": "loan"), but there confirm: true counts only on a repeat of a call refused this turn
+        (EARNED_CONFIRM; the result then says "override"). Once INSPECTS_FREE inspects
         have run this turn (repeats don't count), each further inspect result notes that map_overview shows the whole
         map (only the count when its radius note says so), until map_overview runs; after its first run, once
         INSPECTS_AFTER_MAP more have run, each further one notes that its map already shows the layout. The notes
@@ -2294,6 +2324,12 @@ class ToolBox:
 
     # ------------------------------------------------------------- actions
     def _act(self, name: str, /, **args) -> dict:
+        """Run one action. Its guard first (guarded()): for the mayor's EARNED_CONFIRM actions it always runs, and a
+        refusal is overridden only when confirm: true repeats a call (_money_key) refused this turn, which the
+        override uses up; the result then carries "override": the refusal's kind. A refusal whose call sent confirm
+        says it didn't count (EARNED_NOTE). The mayor's money actions (MONEY_ACTIONS) end with _money_note on
+        success and on a core failure, the others with warnings or _explain's fix (the model only: executed and the
+        history log keep the core message)."""
         w = self.world
         cap = self.env.cfg.max_actions_per_turn
         if sum(r["ok"] for r in self.executed) >= cap:
@@ -2301,11 +2337,24 @@ class ToolBox:
         t = args.pop("type", None)
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
-        if not args.pop("confirm", False) and guarded(self.role, name):
+        confirm, override = bool(args.pop("confirm", False)), None
+        if self.role == "mayor" and name in EARNED_CONFIRM:
             kind, refusal = (self._allocation_refusal(args) if name == "allocate_budget"
-                             else ("disconnect", self._disconnect_refusal(name, args)))
+                             else ("loan", self._loan_refusal(args)))
             if refusal:
-                return {"ok": False, "refused": kind, "error": refusal}
+                key = _money_key(name, args)
+                if not (confirm and key in self._refused):
+                    self._refused.add(key)
+                    if confirm:                           # "... with confirm: true (confirm: true counts only ...)."
+                        refusal = (refusal[:-1] + EARNED_NOTE + "." if refusal.endswith(".")
+                                   else refusal + EARNED_NOTE)
+                    return {"ok": False, "refused": kind, "error": refusal}
+                self._refused.discard(key)
+                override = kind
+        elif not confirm and guarded(self.role, name):
+            refusal = self._disconnect_refusal(name, args)
+            if refusal:
+                return {"ok": False, "refused": "disconnect", "error": refusal}
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
         ways = self._ways_out() if name == "zone" else None
         before = w.struct.copy()
@@ -2317,15 +2366,28 @@ class ToolBox:
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
         dept = ROLES[self.role]["budget"]
-        if res["ok"]:                                     # advice goes to the model only; the log keeps the core text
+        if self.role == "mayor" and name in MONEY_ACTIONS:     # advice goes to the model only; the log keeps the
+            try:                                               # core text; it never fails an action that ran
+                note = self._money_note(name, args, res)
+            except Exception:
+                note = ""
+        elif res["ok"]:
             note = self._bank_warning(bank) if bank is not None else ""
             note += self._funded_warning(funded, bank=bool(note)) if funded is not None else ""
             prior = note or (res["message"] if "WARNING" in res["message"] else "")   # the game's no-access warning
             note += self._branch_warning(ways, before, prior) if ways is not None else ""
         else:
             note = self._explain(name, args, res["message"])
-        return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
-                "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
+        out = {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
+               "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
+        if override:
+            out["override"] = override
+        return out
+
+    def _money_note(self, name: str, args: dict, res: dict) -> str:
+        """Stub until Unit D (docs/plans/2026-09-29-mayor-money.md, D1) fills it: the note after the mayor's money
+        action result (MONEY_ACTIONS; `res`: the core result), "" for none."""
+        return ""
 
     def _taken(self, name: str, args: dict, before: np.ndarray) -> frozenset:
         """The tiles a successful action took (Took.tiles): a build_road's whole line, else the tiles it filled
@@ -2364,38 +2426,47 @@ class ToolBox:
         return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
                 f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
 
+    def _allocations(self) -> list[tuple[str, float]]:
+        """This turn's successful allocate_budget calls as (department, amount), oldest first (take-backs negative)."""
+        return [a for r in self.executed if r["ok"] and r["action"].get("type") == "allocate_budget"
+                and (a := _allocation(r["action"])) is not None]
+
     def _duplicate_refusal(self, args: dict) -> str | None:
         """Why an allocate_budget (guarded()) must not run: one with the same department and amount, as the handler
         reads them, succeeded this turn. Allocations add up and a success clears the repeat cache (v10 seed 0:
         utilities +$5,500 and health +$2,000 twice; v12 seed 0 month 3: a batch of three sent three times; the
-        treasury drained and loans followed). None for another amount or department, a negative or zero amount
-        (taking money back again is fine), a retry of one that failed, and bad arguments (the action reports
-        those)."""
+        treasury drained and loans followed); so do take-backs (v19 seed 1, month 6: the mayor repeated its take-back
+        pairs). None for another amount or department, a zero amount, a retry of one that failed, and bad arguments
+        (the action reports those)."""
         key = _allocation(args)
-        if key is None or key[1] <= 0 or not any(r["ok"] and r["action"].get("type") == "allocate_budget"
-                                                 and _allocation(r["action"]) == key for r in self.executed):
+        if key is None or not key[1] or key not in self._allocations():
             return None
         dept, amount = key
-        return (f"you already moved {money(amount)} to {dept} this turn (it now has "
-                f"{money(self.world.dept_funds[dept])}); allocations add up - repeat with confirm: true only to add it "
-                "again")
+        now = money(self.world.dept_funds[dept])
+        if amount < 0:
+            return (f"you already took {money(-amount)} back from {dept} this turn (it now has {now}); take-backs add "
+                    "up - repeat with confirm: true only to take it back again")
+        return (f"you already moved {money(amount)} to {dept} this turn (it now has {now}); allocations add up - "
+                "repeat with confirm: true only to add it again")
 
     def _allocation_refusal(self, args: dict) -> tuple[str, str | None]:
         """The guard an allocate_budget (guarded()) meets, as (refused kind, why or None): a take-back (a negative
-        amount) the keep guard (_take_back_refusal), anything else the duplicate guard."""
+        amount) the keep guard (_take_back_refusal) first, then the duplicate guard, which is the only one anything
+        else meets."""
         key = _allocation(args)
-        if key is not None and key[1] < 0:
-            return "take_back", self._take_back_refusal(*key)
+        if key is not None and key[1] < 0 and (why := self._take_back_refusal(*key)):
+            return "take_back", why
         return "duplicate", self._duplicate_refusal(args)
 
     def _take_back_refusal(self, dept: str, amount: float) -> str | None:
         """Why a take-back (allocate_budget with a negative `amount`; guarded()) must not run: it leaves `dept` below
-        what it keeps (DeptMoney.keep) of what it held before this turn's top-ups (DeptMoney.held leaves them out),
-        so this turn's top-ups and the money above its keep may go back. Smoke v18 seed 0, month 6: the mayor read
-        "planning: funds $2,508, target $3,000, spent $492; idle $1,508", took back all $2,508, and planning had $0
-        at months 9 and 12; seed 1, month 6: it took $1,182 of planning's $1,479 (nothing idle), then its last $297,
-        to fund health. None for a department not in the game (it keeps nothing), a take-back that leaves it what it
-        keeps, and one the action refuses (an unknown department, more than it holds)."""
+        what it keeps (DeptMoney.keep, and what set it: keep_why) of what it held before this turn's top-ups
+        (DeptMoney.held leaves them out), so this turn's top-ups and the money above its keep may go back; it names
+        what this turn already took back from it. Smoke v18 seed 0, month 6: the mayor read "planning: funds $2,508,
+        target $3,000, spent $492; idle $1,508", took back all $2,508, and planning had $0 at months 9 and 12; seed 1,
+        month 6: it took $1,182 of planning's $1,479 (nothing idle), then its last $297, to fund health. None for a
+        department not in the game (it keeps nothing), a take-back that leaves it what it keeps, and one the action
+        refuses (an unknown department, more than it holds)."""
         w = self.world
         if dept not in DEPARTMENTS or dept not in self.env.roles or short_of(w.dept_funds[dept], -amount):
             return None
@@ -2408,7 +2479,36 @@ class ToolBox:
         if top > 0:
             free += f"{', plus' if m.idle else ', only'} the {money(top)} you moved to it this turn"
         todo = f"take back {money(m.idle + top)}" if m.idle or top > 0 else "leave its funds"
-        return f"that takes {dept} below the {money(m.keep)} it keeps; {free}: {todo}, or repeat with confirm: true"
+        took = -sum(a for d, a in self._allocations() if d == dept and a < 0)
+        took = f"; you already took back {money(took)} from it this turn" if took > 0 else ""
+        return (f"that takes {dept} below the {money(m.keep)} it keeps ({m.keep_why}), so it can't build next "
+                f"quarter{took}; {free}: {todo}. To take it anyway, repeat this exact call with confirm: true.")
+
+    def _loan_refusal(self, args: dict) -> str | None:
+        """Why the mayor's take_loan (guarded()) must not run: (a) the treasury holds RESERVE_MIN or more, or (b) the
+        turn started with that much and this turn's own top-ups (net of take-backs) took it under. Its interest and
+        the debt it leaves are named. Smoke v13-v19: 10 of 15 loans ($34.8k of $60.0k) came in turns that started at
+        $3,000 or more, 14 of 15 after the mayor's own top-ups had emptied the treasury, and none was repaid; the
+        120-month run sat at the debt cap from month 45. The scripted mayor borrows only at a turn's start with the
+        treasury under RESERVE_MIN, so it never meets this. None for a loan the action refuses (not positive, over
+        the debt cap: its result says so) and bad arguments."""
+        w = self.world
+        amount = _money_key("take_loan", args)[2]
+        if amount is None or amount <= 0 or w.debt + amount > C.MAX_DEBT:
+            return None
+        interest = money(amount * C.LOAN_INTEREST)
+        anyway = " To borrow anyway, repeat this exact call with confirm: true."
+        if w.treasury >= RESERVE_MIN:
+            return (f"the treasury holds {money(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
+                    f"{money(amount)} loan costs {interest}/month until repaid (debt would be "
+                    f"{money(w.debt + amount)} of {money(C.MAX_DEBT)}); borrow only for a first building or supply "
+                    "need the treasury can't cover." + anyway)
+        net = sum(a for _, a in self._allocations())
+        if self.start_treasury >= RESERVE_MIN and net > 0:
+            return (f"the treasury started this turn at {money(self.start_treasury)} and this turn's top-ups "
+                    f"({money(net)} net) took it under {money(RESERVE_MIN)}: take back a top-up that isn't a first "
+                    f"building or supply (free) instead of a {money(amount)} loan at {interest}/month." + anyway)
+        return None
 
     def _bank_warning(self, before: np.ndarray) -> str:
         """A warning for a zone action that took the last free riverbank lots beside roads (`before`: free_bank()

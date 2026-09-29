@@ -1856,27 +1856,29 @@ def test_a_repeated_allocation_in_one_turn_is_refused_until_confirmed():
     props = lambda tool: next(s["function"]["parameters"]["properties"] for s in box.schemas()
                               if s["function"]["name"] == tool)
     assert props("allocate_budget")["confirm"]["type"] == "boolean"
-    assert "allocation" in props("allocate_budget")["confirm"]["description"]
-    assert "confirm" not in props("set_tax") and "confirm" not in props("take_loan")
-    res = box.call("allocate_budget", {**batch[0], "confirm": "true"})
-    assert res["ok"] and res["message"] == "transferred $400 to utilities (now $800)", res
+    assert "refused this turn with the same department and amount" in props("allocate_budget")["confirm"][
+        "description"]
+    assert "confirm" not in props("set_tax") and props("take_loan")["confirm"]["type"] == "boolean"   # the loan guard
+    res = box.call("allocate_budget", {**batch[0], "confirm": "true"})     # a repeat of a refused call: earned
+    assert res["ok"] and res["message"].startswith("transferred $400 to utilities (now $800)"), res
+    assert res["override"] == "duplicate"
     assert box.executed[-1]["action"] == {**batch[0], "type": "allocate_budget"}   # confirm is not an action param
     assert box.call("allocate_budget", batch[0])["error"].startswith(               # counts as moved: still refused
         "you already moved $400 to utilities this turn (it now has $800);")
 
 
 def test_other_allocations_pass_the_duplicate_guard():
-    """Another amount or department, taking money back (a negative amount) again, and a retry of an allocation
-    that failed all run."""
+    """Another amount or department, another take-back (an identical one is a duplicate:
+    test_identical_take_backs_are_duplicates), and a retry of an allocation that failed all run."""
     env = _env()
     w = env.world
     box = ToolBox(env, "mayor")
     ok = lambda dept, amount: box.call("allocate_budget", {"department": dept, "amount": amount})
     assert ok("utilities", 400)["ok"]
-    for dept, amount in (("utilities", 500), ("fire", 400), ("utilities", -100), ("utilities", -100)):
+    for dept, amount in (("utilities", 500), ("fire", 400), ("utilities", -100), ("utilities", -200)):
         res = ok(dept, amount)
         assert res["ok"] and "refused" not in res, (dept, amount, res)
-    assert w.dept_funds["utilities"] == 700 and w.dept_funds["fire"] == 400
+    assert w.dept_funds["utilities"] == 600 and w.dept_funds["fire"] == 400
     big = ok("health", 40000)
     assert big["ok"] is False and "treasury only has" in big["error"]
     assert box.call("set_tax", {"sector": "R", "rate": 9})["ok"]           # clears the failed-action cache
@@ -1900,26 +1902,28 @@ def test_a_take_back_below_what_a_department_keeps_is_refused_until_confirmed():
     assert (m.keep, m.idle) == (1000, 1508)
     box = ToolBox(env, "mayor")
     take = lambda amount, **kw: box.call("allocate_budget", {"department": "planning", "amount": amount, **kw})
+    tail = ", so it can't build next quarter; {}. To take it anyway, repeat this exact call with confirm: true."
     res = take(-2508)
     assert res == {"ok": False, "refused": "take_back", "error": (
-        "that takes planning below the $1,000 it keeps; its idle money is $1,508: take back $1,508, or repeat with "
-        "confirm: true")}, res
+        "that takes planning below the $1,000 it keeps (the $1,000 minimum)"
+        + tail.format("its idle money is $1,508: take back $1,508"))}, res
     assert take(-2508) == res                          # checked, and refused, again: not remembered as a failure
     assert w.dept_funds["planning"] == 2508 and box.executed == [] and box._failed == {}
     assert _tool_error({"tool": "allocate_budget", "result": res}) is None
     assert turn_row({"role": "mayor", "month": 3, "tool_trace": [{"tool": "allocate_budget", "result": res}]})[
         "refused"] == 1
-    assert "below what it keeps" in next(s["function"]["parameters"]["properties"]["confirm"]["description"]
-                                         for s in box.schemas() if s["function"]["name"] == "allocate_budget")
+    assert "refused this turn" in next(s["function"]["parameters"]["properties"]["confirm"]["description"]
+                                       for s in box.schemas() if s["function"]["name"] == "allocate_budget")
     res = take(-1508)                                  # its idle money: taken
     assert res["ok"] and w.dept_funds["planning"] == 1000, res
     res = take(-500)                                   # nothing idle left
     assert res == {"ok": False, "refused": "take_back", "error": (
-        "that takes planning below the $1,000 it keeps; it has no idle money: leave its funds, or repeat with "
-        "confirm: true")}, res
-    assert take(-5000)["error"] == "planning only holds $1,000"       # more than it holds: the action says so
-    res = take(-500, confirm=True)
-    assert res["ok"] and res["message"] == "reclaimed $500 from planning" and w.dept_funds["planning"] == 500, res
+        "that takes planning below the $1,000 it keeps (the $1,000 minimum)"
+        + tail.format("you already took back $1,508 from it this turn; it has no idle money: leave its funds"))}, res
+    assert take(-5000)["error"].startswith("planning only holds $1,000")    # more than it holds: the action says so
+    res = take(-500, confirm=True)                     # a repeat of the refused call: earned
+    assert res["ok"] and res["message"].startswith("reclaimed $500 from planning") and res["override"] == "take_back"
+    assert w.dept_funds["planning"] == 500, res
     assert box.executed[-1]["action"] == {"department": "planning", "amount": -500, "type": "allocate_budget"}
     w.dept_funds["planning"] = 1479                    # seed 1: $479 over the $1,000, nothing idle
     assert take(-1182)["refused"] == "take_back" and take(-479)["ok"] and w.dept_funds["planning"] == 1000
@@ -1938,17 +1942,20 @@ def test_take_backs_of_this_turn_s_top_ups_and_of_unkept_money_pass():
     assert move("planning", 700)["ok"] and move("planning", -300)["ok"] and move("planning", -400)["ok"]
     assert w.dept_funds["planning"] == 500
     assert move("planning", 800)["ok"]
+    tail = " To take it anyway, repeat this exact call with confirm: true."
     res = move("planning", -801)
-    assert res["error"] == ("that takes planning below the $1,000 it keeps; it has no idle money, only the $800 you "
-                            "moved to it this turn: take back $800, or repeat with confirm: true"), res
+    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum), so it can't build next "
+                            "quarter; you already took back $700 from it this turn; it has no idle money, only the $800 "
+                            "you moved to it this turn: take back $800." + tail), res
     assert move("police", -3000)["ok"] and w.dept_funds["police"] == 0       # nothing kept
     _months_spent(env, {})
     w.treasury, w.dept_funds["planning"] = 30000, 2500
     box = ToolBox(env, "mayor")
     assert move("planning", 1000)["ok"]                # $2,500 held: $1,500 idle, plus this turn's $1,000
     res = move("planning", -3000)
-    assert res["error"] == ("that takes planning below the $1,000 it keeps; its idle money is $1,500, plus the "
-                            "$1,000 you moved to it this turn: take back $2,500, or repeat with confirm: true"), res
+    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum), so it can't build next "
+                            "quarter; its idle money is $1,500, plus the $1,000 you moved to it this turn: take back "
+                            "$2,500." + tail), res
     assert move("planning", -2500)["ok"] and w.dept_funds["planning"] == 1000
 
 
@@ -5112,7 +5119,7 @@ def test_turn_row_is_slim():
                    "finish_reason": "end_turn", "length_stops": 2, "ended": True, "parse_error": None,
                    "results": [{"type": "build_service", "ok": False, "message": "tile (3,4) is occupied", "cost": 0}],
                    "tool_errors": ["bad args", "action limit reached", "no plan"], "repeats": 1, "refused": 1,
-                   "seen": None, "asked": {}}
+                   "overrides": 0, "seen": None, "asked": {}}
 
 
 def test_turn_row_and_rebuild_tolerate_minimal_records(tmp_path):
@@ -5219,7 +5226,7 @@ def test_fleet_report_counts_repeats_apart_from_failures():
     fire = rep["roles"]["fire"]
     assert fire["failed"] == 2 and fire["tool_errors"] == 0
     assert fire["repeats"] == 2 and fire["refused"] == 4
-    assert "repeats (look-ups / refused)" in md and "| 2 / 4 |" in md
+    assert "repeats (look-ups / refused / overrides)" in md and "| 2 / 4 / 0 |" in md
     assert _hints(rep, "repeated_failures") == []
 
 
