@@ -302,13 +302,17 @@ function actText(a) { const { type, ...rest } = a; return `<b>${esc(type)}</b> $
 function roleChips() {
   const roles = S.meta ? S.meta.roles : [];
   $("tabTools").innerHTML = roles.map(r => `<button class="chip ${S.roleFilter.size === 0 || S.roleFilter.has(r) ? "on" : ""}" data-role="${r}" style="--c:${roleColor(r)}"><span class="dot"></span>${r}</button>`).join("");
-  $("tabTools").querySelectorAll(".chip").forEach(b => b.onclick = () => {
+  // a click shows only that role (again: all roles); shift / cmd / ctrl-click adds or removes one
+  $("tabTools").querySelectorAll(".chip").forEach(b => b.onclick = (ev) => {
     const r = b.dataset.role;
-    if (S.roleFilter.size === 0) { S.roleFilter = new Set(roles.filter(x => x !== r)); }
-    else if (S.roleFilter.has(r)) S.roleFilter.delete(r); else S.roleFilter.add(r);
+    if (ev.shiftKey || ev.metaKey || ev.ctrlKey) {
+      if (S.roleFilter.size === 0) S.roleFilter = new Set([r]);
+      else if (S.roleFilter.has(r)) S.roleFilter.delete(r); else S.roleFilter.add(r);
+    } else S.roleFilter = S.roleFilter.size === 1 && S.roleFilter.has(r) ? new Set() : new Set([r]);
     if (S.roleFilter.size === roles.length) S.roleFilter.clear();
     renderTab();
   });
+  $("tabTools").querySelectorAll(".chip").forEach(b => b.title = "Show only this role (click again for all; shift-click to add or remove)");
 }
 const roleOn = (r) => S.roleFilter.size === 0 || S.roleFilter.has(r);
 
