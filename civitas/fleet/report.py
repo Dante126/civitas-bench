@@ -61,7 +61,9 @@ NEED_LABELS = {label for labels in NEED.values() for label in labels}
 NUMBER = r"\d[\d,]*(?:\.\d+)?k?"                   # num(): "55.80", "1,234", "12.5k"
 MONEY = rf"-?\${NUMBER}"                            # money(): "$2,500", "$12.5k", "-$40"
 BUDGET_LINE = re.compile(rf"- ({MONEY}) in department funds(?: \(plan target ({MONEY})\))?")
-PRICE_END = re.compile(rf"; ({MONEY})(?:/tile)?( - you have {MONEY})?$")      # a Ready sites line's price
+# a Ready sites line's price: "$2,500", "$30/tile", planning's road "$50 road + $75 zoning" (the two summed; older
+# briefings priced the road alone), then " - you have $X" when short of it
+PRICE_END = re.compile(rf"; ({MONEY})(?:/tile| road \+ ({MONEY}) zoning)?( - you have {MONEY})?$")
 SUPPLY_LINE = re.compile(rf"supply ({NUMBER}) / demand ({NUMBER}), coverage ([\d.]+)%")
 ASKED = re.compile(rf"\${NUMBER}")
 
@@ -69,8 +71,8 @@ ASKED = re.compile(rf"\${NUMBER}")
 def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
     look-up that failed, an action tool refused before the action ran. A repeated failed action or bad call and a
-    guard refusal (a bulldoze or demolish that would cut roads off, a duplicate allocation), refused without
-    running, are counted in `refused`, not here."""
+    guard refusal (a bulldoze or demolish that would cut roads off, a duplicate allocation, a take-back below what a
+    department keeps), refused without running, are counted in `refused`, not here."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None
@@ -148,7 +150,7 @@ def _seen(rec: dict) -> dict | None:
 
 def _site_state(rest: str) -> dict:
     """One Ready sites line after its "- purpose: " (briefing.ready_lines) as _seen reads it; a reason ending in a
-    price (planning's "none - no dead end; branch: ...; $150") is priced like a list."""
+    price (planning's "none - no dead end; branch: ...; $150 road + $375 zoning") is priced like a list."""
     if rest.startswith("locked"):
         return {"state": "locked"}
     m = PRICE_END.search(rest)
@@ -156,7 +158,8 @@ def _site_state(rest: str) -> dict:
         why = rest[len("none - "):]
         return {"state": "blocked", "why": why.split(": ask planning")[0]} if "ask planning" in why else {
             "state": "none"}
-    return {"state": "ready"} if m is None else {"state": "short" if m[2] else "ok", "price": _figure(m[1])}
+    return {"state": "ready"} if m is None else {"state": "short" if m[3] else "ok",
+                                                 "price": _figure(m[1]) + (_figure(m[2]) if m[2] else 0)}
 
 
 def _asked(rec: dict) -> dict[str, float]:
@@ -267,10 +270,11 @@ def _turn_kind(role: str, row: dict, funds: float | None, target: float | None) 
     (its funds covered a ready site of a first or upgrade building it needed: `what` its purpose and price), "starved"
     (short of the cheapest such site: that one), "land" (none ready, some blocked for lack of land or roads: purpose ->
     why) or "none" (nothing needed it: coverage at COVERED+, "nothing needs it", locked); SUPPLEMENTARY
-    purposes never count. Planning goes by its priced road_extension line (a road into open land: idle when its funds
-    cover it, starved when short); without one planning, and a turn without a briefing (funds and target from the
-    history log and the plan), go by the funds alone: idle with $1+ (it can still zone), under it starved against a
-    plan target, else none. Live 120-month run, seed 0, months 9-12: planning at $0 short of its $150 extension."""
+    purposes never count. Planning goes by its priced road_extension line (a road into open land and zoning it, the
+    two summed: idle when its funds cover them, starved when short); without one planning, and a turn without a
+    briefing (funds and target from the history log and the plan), go by the funds alone: idle with $1+ (it can still
+    zone), under it starved against a plan target, else none. Live 120-month run, seed 0, months 9-12: planning at $0
+    short of its $150 extension."""
     if any(r["ok"] for r in row["results"]):
         return "acted", {}
     seen = row.get("seen")
@@ -302,7 +306,7 @@ def _cost(name: str) -> float:
 
 def _building(role: str, purpose: str, price: float | None = None) -> str:
     """What a purpose's sites are for, by name: its SITE_BUILDS entry at `price`, else its cheapest (the purpose for
-    those without one: planning's; its road_extension a road into open land)."""
+    those without one: planning's; its road_extension a road into open land and zoning it, ROAD_NAME)."""
     names = SITE_BUILDS.get(role, {}).get(purpose, ())
     if not names:
         return ROAD_NAME if (role, purpose) == ("planning", "road_extension") else purpose.replace("_", " ")

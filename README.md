@@ -464,12 +464,16 @@ tasks and money, and to let people coach it.
     - A per-tile site counts its best stretch whole: `needs $90 for 3 avenue tiles (5
       sites)`.
     - Planning's is its best `road_extension` site (a dead end's extension or a branch
-      road), priced as `build_road` charges it plus any bulldozing: `needs $150 for a road
-      into open land (opens 71 tiles)`. A road is no building, so it is neither a first nor
+      road), priced as `build_road` charges it plus any bulldozing, plus zoning the land
+      it opens at low density (`zone`'s $5 a tile): `needs $505 for a road into open land
+      and zoning it (opens 71 tiles)`. A road is no building, so it is neither a first nor
       another, and it never shows on the first-buildings, leave-free or blocked lines. In
       the live 120-month run on seed 0, at month 9, the mayor read planning as `idle
       $1,243`. It took that back and $1,000 more. Planning's $150 extension then failed
-      twice on "the planning budget only has $0" while its line showed no need.
+      twice on "the planning budget only has $0" while its line showed no need. In smoke
+      v18 seed 0, at month 9, the line priced the road alone (`needs $50 for a road into
+      open land (opens 15 tiles)`); the mayor moved exactly $50, which left nothing to zone
+      the land the road opened.
   - **First buildings.** When a department's needs line is for its first building and
     another's is for another one, a line under the block says `- first buildings still
     unfunded: education (elementary school, $2,500): fund these before second buildings`.
@@ -478,9 +482,11 @@ tasks and money, and to let people coach it.
     clinic first, and education never got its school (33.2; v17: 33.3 and 33.4).
   - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
     first building, $1,000); for utilities only buildings the needs line could name
-    count. Funds that are $1,000 or more above that, excluding this month's top-ups, show
-    as `idle $3,400`, and a summary line says to take the money back (a negative
-    `allocate_budget`) before taking loans or giving new top-ups.
+    count, and for planning its road and zoning. Funds that are $1,000 or more above that,
+    excluding this month's top-ups, show as `idle $3,400`, and a summary line says to take
+    the money back (a negative `allocate_budget`) before taking loans or giving new
+    top-ups. A take-back that would leave a department below what it keeps is refused
+    (see Guards).
   - **Blocked buildings.** A first building with no lot for lack of land or roads counts
     toward the keep, because the department still needs that money. That covers:
     - no free roadside land;
@@ -518,10 +524,11 @@ tasks and money, and to let people coach it.
   free roadside lot near the homes that need it (around a named tile), no free 2x2
   roadside block, or no roadside lot away from homes for a landfill, cemetery or jail; a site on one of
   the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
-  memory. Every purpose outside planning is priced, and so is planning's `road_extension`
-  (`opens 71 land tiles; $150 - you have $0`), though never on its budget line. A library
-  (it only adds to schools), a
-  shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
+  memory. Every purpose outside planning is priced, and so is planning's `road_extension`,
+  with the road and the zoning shown apart
+  (`opens 71 land tiles; $150 road + $355 zoning - you have $0`, "you have" when its funds
+  are short of the two), though never on its budget line. A library (it only adds to
+  schools), a shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
   train station, harbour or metro station (bus lines come first) are priced on their
   lines, but the mayor's needs line never names one, and the budget line only when nothing
   else is ready (smoke v9's mayor funded fire $1,500 for "a shelter", and fire never
@@ -534,7 +541,7 @@ tasks and money, and to let people coach it.
   and tells it to zone at low density. When no dead end extends into open land, planning's
   `road_extension` line (and `find_sites road_extension`) offers branch roads instead:
   `- road_extension: none - no dead end; branch: dezone (23,25) (empty lot, free), then
-  build_road (23,25)-(23,39), opens 75 land tiles; $150`.
+  build_road (23,25)-(23,39), opens 75 land tiles; $150 road + $375 zoning`.
   - A branch leaves a road tile of the connected network and runs straight into open land
     (up to 15 tiles, bridges allowed). It starts from a free lot beside the road, or else
     through up to 2 empty zoned lots to dezone. Failing those, it bulldozes the cheapest
@@ -609,8 +616,16 @@ tasks and money, and to let people coach it.
   the same way; the refusal suggests asking planning for a road to the highway or building
   another link first. The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too
-  (`refused: "duplicate"`), naming what the department now holds; other amounts and taking
-  money back pass. A `zone` that takes the last free riverbank lot beside the connected
+  (`refused: "duplicate"`), naming what the department now holds; other amounts pass. So
+  is a take-back (a negative amount) that would leave a department below what it keeps
+  (see Idle money) of what it held before this turn's top-ups (`refused: "take_back"`):
+  `that takes planning below the $1,000 it keeps; its idle money is $1,508: take back
+  $1,508, or repeat with confirm: true` (or `it has no idle money`, or `only the $800 you
+  moved to it this turn`). Taking back idle money or this turn's top-ups passes, as does
+  any take-back from a department that isn't in the game. In smoke v18 seed 0, at month
+  6, the mayor read planning as `idle $1,508` and took back all $2,508; planning had $0
+  at months 9 and 12. On seed 1 it took $1,182 of planning's $1,479, nothing of it idle,
+  then its last $297. A `zone` that takes the last free riverbank lot beside the connected
   roads while the city still has no pump or water tower, or no sewage outlet / treatment
   plant, succeeds, with a warning naming what utilities still needs the bank for. So does
   a `zone` that leaves a department with funds for its cheapest ready first building no
@@ -804,8 +819,9 @@ monthly). Each turn:
   the departments that read the map, `get_messages` for the mayor's council requests;
 - it runs the scripted decision as tool calls, arguments sent as JSON text. The mayor first
   writes its working balances into the plan with `update_plan` (goals, a budget and a
-  priority per department). Each action is one call (a duplicate allocation the policy
-  means is repeated with `confirm: true`), then come `send_message`, `update_memory` (open
+  priority per department). Each action is one call (a duplicate allocation, or a
+  take-back below a department's keep, that the policy means is repeated with
+  `confirm: true`), then come `send_message`, `update_memory` (open
   requests, one lesson per kind of failed action) and `end_turn` with a report.
 
 `configs/fleet_scripted.toml` plays all eight roles with the game settings of
@@ -895,9 +911,10 @@ A hint fires on any of these:
     demand under 90% of supply), no congested road, "nothing needs it", locked, and
     supplementary buildings (library, shelter, cemetery, train station, harbour, metro).
 
-  Planning goes by its priced `road_extension` line: idle when its funds covered the road,
-  starved when short (`planning short of its $150 road into open land`). Without a road to
-  build it is idle with $1 or more, since it can still zone.
+  Planning goes by its priced `road_extension` line, the road and its zoning summed: idle
+  when its funds covered them, starved when short (`planning short of its $505 road into
+  open land and zoning it`; older briefings priced the road alone, and are read that way).
+  Without a road to build it is idle with $1 or more, since it can still zone.
   Without a briefing (older records), the funds come from the history log: under $1
   against a plan budget is starved, under $1 without one is nothing needed, and anything
   else is idle.

@@ -52,9 +52,14 @@ ROAD_LINES = 8               # the longest this many named, then "+N more"
 # empty land or river (bridges; observation's extensions run 3-15), opening at least BRANCH_OPENS land tiles; listed
 # branches that run the same way start more than BRANCH_APART tiles apart
 BRANCH_CLEAR, BRANCH_MIN, BRANCH_LEN, BRANCH_OPENS, BRANCH_APART = 2, 3, 15, 5, 4
+# the most land a road_extension site opens (opens_land: empty land without road access within 2 tiles of it): a dead
+# end and its BRANCH_LEN-tile extension, 2 tiles round, 20 x 5 (a branch's BRANCH_LEN tiles, 19 x 5)
+OPENS_MAX = (BRANCH_LEN + 5) * 5
 DIRECTIONS = ((0, -1), (0, 1), (-1, 0), (1, 0))
 BUILT_NAMES = {"R": "home", "C": "shop", "I": "factory", "O": "office", "M": "mixed-use block"}   # a developed lot
-ROAD_NAME = "road into open land"    # what planning's road_extension sites buy (road_price), for the mayor's needs line
+# what planning's road_extension price buys (road_price: the road and zoning the land it opens), for the mayor's needs
+# line and the report
+ROAD_NAME = "road into open land and zoning it"
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
@@ -75,7 +80,8 @@ CUT_FROM = {"bulldoze": "highway", "demolish": "region"}
 CONFIRM = {**{a: f"true only to repeat a {a} refused for cutting roads off the {c}, once you are sure"
               for a, c in CUT_FROM.items()},
            "allocate_budget": "true only to repeat an allocation refused because the same one already ran this turn "
-                              "and you mean to add it again (allocations add up)"}
+                              "and you mean to add it again (allocations add up), or a take-back refused for taking "
+                              "a department below what it keeps, once you are sure"}
 
 # purpose -> path into build_observation(..., site_hints=True)
 SITE_PURPOSES = {
@@ -421,7 +427,8 @@ def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
 def guarded(role: str, action: str) -> bool:
     """Whether `role`'s `action` can be refused before it runs (confirm: true lets it run): a bulldoze, and a
     demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would cut
-    roads off; the mayor's allocate_budget identical to one that succeeded this turn."""
+    roads off; the mayor's allocate_budget identical to one that succeeded this turn, or taking a department below
+    what it keeps (DeptMoney.keep)."""
     return (action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
             or (action == "allocate_budget" and role == "mayor"))
 
@@ -819,9 +826,9 @@ class DeptMoney:
     it this month doesn't count: the mayor acts first, so the rest sat through at least one of its turns (at month 0
     none has had one). Its observation (`build`) is built once, on first use, and only asked for when a site's price
     can matter: funds short of its dearest priced purpose, a per-tile purpose (a stretch has no such bound), or a
-    price above what its spending keeps. Planning's is its road into open land (road_build), bounded by road_max: live
-    120-month run, seed 0, month 9: it read "idle $1,243" with nothing priced, the mayor took that and $1,000 more,
-    and its $150 extension failed twice on "the planning budget only has $0"."""
+    price above what its spending keeps. Planning's is its road into open land and zoning the land it opens
+    (road_build), bounded by road_max: live 120-month run, seed 0, month 9: it read "idle $1,243" with nothing priced,
+    the mayor took that and $1,000 more, and its $150 extension failed twice on "the planning budget only has $0"."""
 
     def __init__(self, env, dept: str):
         w = env.world
@@ -840,7 +847,7 @@ class DeptMoney:
         priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
         self.priced = bool(priced)
         self.bound = None if any(pr.per_tile for pr in priced) else max((pr.cost for pr in priced), default=0)
-        if dept == "planning":                  # its road into open land (road_build), no dearer than road_max
+        if dept == "planning":                  # its road and zoning (road_build), no dearer than road_max
             self.bound = road_max(w)
 
     @cached_property
@@ -1304,8 +1311,11 @@ class Price(NamedTuple):
     first: bool = True      # a line's base tier or an off-tier spec: a first building (not a clinic's hospital)
     size: tuple[int, int] = (1, 1)      # its footprint (the tier's, as C.footprint gives it): a university 2x2
     name: str = ""          # the SITE_BUILDS name pricing it (a tier name or an OFF_TIER_SPECS key)
+    zoning: float = 0.0     # planning's road (road_price): zoning the land it opens, included in `cost`, shown apart
 
     def text(self) -> str:
+        if self.zoning:                         # "$50 road + $75 zoning"
+            return f"{money(self.cost - self.zoning)} road + {money(self.zoning)} zoning"
         return money(self.cost) + ("/tile" if self.per_tile else "")
 
 
@@ -1377,7 +1387,7 @@ class Need(NamedTuple):
 
     def text(self) -> str:
         sites = f"{self.sites} site{'s' * (self.sites != 1)}"
-        if self.have is None:                   # planning's road: "a road into open land (opens 71 tiles)"
+        if self.have is None:           # planning's road: "a road into open land and zoning it (opens 71 tiles)"
             return f"{self.what} ({self.status or sites})"
         return f"its first {self.what} ({sites})" if not self.have else f"another {self.what} ({self.status or sites})"
 
@@ -1643,32 +1653,47 @@ def road_cost(site: dict) -> float:
     return (site["tiles"] - bridges) * C.CATALOG["road"]["cost"] + bridges * C.CATALOG["bridge"]["cost"]
 
 
+def zoning_cost(site: dict) -> float:
+    """Zoning the land a road_extension site opens (its opens_land) at low density, as zone charges it: road_price adds
+    it to the road. Smoke v18 seed 0, month 9: the mayor read "needs $50 for a road into open land (opens 15 tiles)",
+    moved exactly $50, and planning had nothing left to zone the land the road opened. A little over what zoning all
+    of it charges: opens_land counts the road's own tiles beyond its dead end's reach."""
+    return site.get("opens_land", 0) * C.CATALOG["zone"]["cost"]
+
+
 def road_max(w) -> float:
-    """The dearest a road_extension site can be: BRANCH_LEN bridge tiles (an extension runs up to 15, as a branch)
-    and BRANCH_CLEAR tiles to bulldoze."""
-    return BRANCH_LEN * C.CATALOG["bridge"]["cost"] + BRANCH_CLEAR * C.CATALOG["bulldoze"]["cost"]
+    """The dearest a road_extension site can be, zoning included: BRANCH_LEN bridge tiles (an extension runs up to 15,
+    as a branch), BRANCH_CLEAR tiles to bulldoze and OPENS_MAX tiles to zone."""
+    return (BRANCH_LEN * C.CATALOG["bridge"]["cost"] + BRANCH_CLEAR * C.CATALOG["bulldoze"]["cost"]
+            + OPENS_MAX * C.CATALOG["zone"]["cost"])
 
 
 def road_price(lists: dict[str, SiteList]) -> Price | None:
-    """Planning's best road_extension site (a dead end's extension, else a branch road) priced (road_cost), for its
-    Ready sites line; None without one. Never in ready_prices or site_price: a road is no building, so it stays out
-    of the department budget line, the leave-free line (funded_firsts, claim_spots), the blocked line and cheapest()."""
+    """Planning's best road_extension site (a dead end's extension, else a branch road) priced: the road (road_cost)
+    and zoning the land it opens (zoning_cost), for its Ready sites line ("$50 road + $75 zoning") and the mayor's
+    needs line (road_build); None without one. Never in ready_prices or site_price: a road is no building, so it stays
+    out of the department budget line, the leave-free line (funded_firsts, claim_spots), the blocked line and
+    cheapest()."""
     lst = lists.get("road_extension")
-    return Price(road_cost(lst.sites[0]), ROAD_NAME, name="road") if lst and lst.sites else None
+    if not lst or not lst.sites:
+        return None
+    best = lst.sites[0]
+    return Price(road_cost(best) + zoning_cost(best), ROAD_NAME, name="road", zoning=zoning_cost(best))
 
 
 def road_build(env) -> FirstBuild | None:
     """Planning's needs line from one observation (DeptMoney.build): its best road_extension site, as "a road into open
-    land (opens 71 tiles)" (Need, neither a first nor another building), costing road_cost; None without one. The
-    live 120-month run, seed 0, months 9-12: planning at $0 read "road_extension: 1 site, best (24,20)-(24,5), opens
-    71 land tiles", failed on its $150 twice and asked for it, and the mayor's line for it showed no need."""
+    land and zoning it (opens 71 tiles)" (Need, neither a first nor another building), costing road_price; None
+    without one. The live 120-month run, seed 0, months 9-12: planning at $0 read "road_extension: 1 site, best
+    (24,20)-(24,5), opens 71 land tiles", failed on its $150 twice and asked for it, and the mayor's line for it showed
+    no need."""
     w = env.world
-    lst = site_lists(w, "planning", role_obs(env, "planning"))["road_extension"]
-    if not lst.sites:
+    lists = {"road_extension": site_lists(w, "planning", role_obs(env, "planning"))["road_extension"]}
+    if (pr := road_price(lists)) is None:
         return None
-    best, cost = lst.sites[0], road_cost(lst.sites[0])
-    need = Need(a_or_an(ROAD_NAME), len(lst.sites[:MAX_SITES]), None, f"opens {best['opens_land']} tiles")
-    return FirstBuild(cost, (need,), cost, ())
+    lst = lists["road_extension"]
+    need = Need(a_or_an(ROAD_NAME), len(lst.sites[:MAX_SITES]), None, f"opens {lst.sites[0]['opens_land']} tiles")
+    return FirstBuild(pr.cost, (need,), pr.cost, ())
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
@@ -1775,11 +1800,12 @@ class ToolBox:
         actions and bad calls; a failed action only refreshes `history`, which lists it. A bulldoze that would cut
         roads off the highway, transport's demolish of their only station / harbour / airport link ("refused":
         "disconnect"), or the mayor's allocate_budget identical to one that succeeded this turn ("refused":
-        "duplicate") is refused before it runs (not executed, logged or remembered as a failure) unless it passes
-        confirm: true. Once INSPECTS_FREE inspects have run this turn (repeats don't count), each further inspect
-        result notes that map_overview shows the whole map (only the count when its radius note says so), until
-        map_overview runs; after its first run, once INSPECTS_AFTER_MAP more have run, each further one notes that
-        its map already shows the layout. The notes aren't cached, so a repeat comes without them."""
+        "duplicate") or taking a department below what it keeps ("refused": "take_back") is refused before it runs
+        (not executed, logged or remembered as a failure) unless it passes confirm: true. Once INSPECTS_FREE inspects
+        have run this turn (repeats don't count), each further inspect result notes that map_overview shows the whole
+        map (only the count when its radius note says so), until map_overview runs; after its first run, once
+        INSPECTS_AFTER_MAP more have run, each further one notes that its map already shows the layout. The notes
+        aren't cached, so a repeat comes without them."""
         self.n_calls += 1
         try:
             tool, args = self._resolve(name, arguments)
@@ -1924,7 +1950,7 @@ class ToolBox:
         if t is not None and t != name:
             raise ToolError(f"the tool name is the action ({name}); don't pass type={t!r} - did you mean kind?")
         if not args.pop("confirm", False) and guarded(self.role, name):
-            kind, refusal = (("duplicate", self._duplicate_refusal(args)) if name == "allocate_budget"
+            kind, refusal = (self._allocation_refusal(args) if name == "allocate_budget"
                              else ("disconnect", self._disconnect_refusal(name, args)))
             if refusal:
                 return {"ok": False, "refused": kind, "error": refusal}
@@ -2001,6 +2027,36 @@ class ToolBox:
         return (f"you already moved {money(amount)} to {dept} this turn (it now has "
                 f"{money(self.world.dept_funds[dept])}); allocations add up - repeat with confirm: true only to add it "
                 "again")
+
+    def _allocation_refusal(self, args: dict) -> tuple[str, str | None]:
+        """The guard an allocate_budget (guarded()) meets, as (refused kind, why or None): a take-back (a negative
+        amount) the keep guard (_take_back_refusal), anything else the duplicate guard."""
+        key = _allocation(args)
+        if key is not None and key[1] < 0:
+            return "take_back", self._take_back_refusal(*key)
+        return "duplicate", self._duplicate_refusal(args)
+
+    def _take_back_refusal(self, dept: str, amount: float) -> str | None:
+        """Why a take-back (allocate_budget with a negative `amount`; guarded()) must not run: it leaves `dept` below
+        what it keeps (DeptMoney.keep) of what it held before this turn's top-ups (DeptMoney.held leaves them out),
+        so this turn's top-ups and the money above its keep may go back. Smoke v18 seed 0, month 6: the mayor read
+        "planning: funds $2,508, target $3,000, spent $492; idle $1,508", took back all $2,508, and planning had $0
+        at months 9 and 12; seed 1, month 6: it took $1,182 of planning's $1,479 (nothing idle), then its last $297,
+        to fund health. None for a department not in the game (it keeps nothing), a take-back that leaves it what it
+        keeps, and one the action refuses (an unknown department, more than it holds)."""
+        w = self.world
+        if dept not in DEPARTMENTS or dept not in self.env.roles or short_of(w.dept_funds[dept], -amount):
+            return None
+        m = DeptMoney(self.env, dept)
+        left = m.funds + amount
+        if not short_of(left, m.held) or not short_of(left, m.keep):     # only top-ups, or its keep stays
+            return None
+        top = m.funds - m.held
+        free = f"its idle money is {money(m.idle)}" if m.idle else "it has no idle money"
+        if top > 0:
+            free += f"{', plus' if m.idle else ', only'} the {money(top)} you moved to it this turn"
+        todo = f"take back {money(m.idle + top)}" if m.idle or top > 0 else "leave its funds"
+        return f"that takes {dept} below the {money(m.keep)} it keeps; {free}: {todo}, or repeat with confirm: true"
 
     def _bank_warning(self, before: np.ndarray) -> str:
         """A warning for a zone action that took the last free riverbank lots beside roads (`before`: free_bank()

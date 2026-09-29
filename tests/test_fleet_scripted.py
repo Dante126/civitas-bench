@@ -182,6 +182,20 @@ def test_a_duplicate_allocation_the_policy_means_is_confirmed(monkeypatch):
     assert a.env.world.dept_funds["fire"] == 2000 and [r["ok"] for r in d.executed] == [True, True]
 
 
+def test_a_take_back_the_policy_means_is_confirmed(monkeypatch):
+    a = _agent("mayor")
+    w = a.env.world
+    w.dept_funds["fire"] = 1500                        # not this turn's top-up: under the $1,000 it keeps if taken
+    alloc = {"type": "allocate_budget", "department": "fire", "amount": -1500}
+    monkeypatch.setattr(a.policy, "act", lambda obs: Decision(actions=[dict(alloc)], thinking="take it"))
+    d = a.act({})
+    tr = [(c["tool"], c["result"].get("refused")) for c in d.meta["tool_trace"]]
+    assert tr == [("get_messages", None), ("update_plan", None), ("allocate_budget", "take_back"),
+                  ("allocate_budget", None), ("end_turn", None)]
+    assert json.loads(d.meta["tool_trace"][3]["args"])["confirm"] is True
+    assert w.dept_funds["fire"] == 0 and [r["ok"] for r in d.executed] == [True]
+
+
 def test_the_step_limit_keeps_a_step_for_end_turn():
     a = _agent("planning", max_steps=3)
     a.env.world.dept_funds["planning"] = 9000                # a road and zones to run
