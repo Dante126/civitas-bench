@@ -24,7 +24,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     DeptMoney, Funding, SupplyBuild, bank_keep, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, \
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
-from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
+from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -218,21 +218,18 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_b
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
 
-def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
-    """Utilities' line under its funds while a supply is short (short_supplies): what is short, most urgent first (a
-    lot develops at all only with power, to level 2 with water, to 3 with sewage), and what its funds pay for, greedy
-    in that order with the building its needs line names for each (the mayor's line asks the same), then what the rest
-    needs: "- short now: power (1.80 of 7, 1.80 imported), sewage (0 of 7): your $4,400 pays for a coal plant at (0,23)
-    ($4,000); a sewage outlet at (33,23) ($1,200) needs $800 more". The imports it names are in the supply (as Key
-    metrics show it) but not the city's own: imports filling a gap read "514 of 514". A supply with no ready site says
-    so ("sewage (0 of 5; no site yet)"; its Ready sites line says why). It names, it doesn't choose: utilities decides.
-    Smoke v20 seed 1, month 3: $4,400 held and the $4,000 coal plant ready, but 20 steps went on inspecting sewage
-    sites and nothing was built; power stayed at 0-18% until month 10."""
-    if not builds:
-        return []
-    line = "- short now: " + ", ".join(f"{b.supply} ({num(b.have)} of {num(b.demand)}"
-                                       + (f", {num(b.imported)} imported" if round(b.imported, 1) else "")
-                                       + ("" if b.purpose else "; no site yet") + ")" for b in builds)
+def _supply_state(b: SupplyBuild) -> str:
+    """One supply on utilities' supply-needed line, in the words the mayor's needs line uses (SupplyBuild.status) and
+    with the numbers: "power 93% used (supply 111, demand 103)", "water 100% used (supply 1,235, demand 1,235, 85.10
+    imported)", "sewage 0% covered (supply 0, demand 5; no site yet)"."""
+    nums = (f"supply {num(b.have)}, demand {num(b.demand)}"
+            + (f", {num(b.imported)} imported" if round(b.imported, 1) else ""))
+    return f"{b.status} ({nums}{'' if b.purpose else '; no site yet'})"
+
+
+def _supply_money(builds: list[SupplyBuild], funds: float) -> tuple[list[str], list[tuple[str, float]], float]:
+    """(what `funds` pay for, what they don't with its price, what that still needs): greedy over the buildings
+    short_supplies names, in SUPPLIES order (each "a coal plant at (0,23) ($4,000)")."""
     left = math.floor(funds)
     paid, unpaid = [], []
     for b in (b for b in builds if b.purpose):
@@ -242,14 +239,31 @@ def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
         else:
             paid.append(at)
             left -= b.price.cost
+    return paid, unpaid, math.ceil(sum(c for _, c in unpaid) - left) if unpaid else 0
+
+
+def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
+    """Utilities' line under its funds while a supply is wanted (short_supplies: demand at 90% of it or more, or a
+    pump or outlet the city lacks), most urgent first (a lot develops at all only with power, to level 2 with water,
+    to 3 with sewage), each as the mayor's needs line says it (_supply_state), and what its funds pay for, greedy in
+    that order with the building its needs line names for each (the mayor's line asks the same), then what the rest
+    needs: "- supply needed now: power 25% covered (supply 1.80, demand 7, 1.80 imported), sewage 0% covered (supply
+    0, demand 7): your $4,400 pays for a coal plant at (0,23) ($4,000); a sewage outlet at (33,23) ($1,200) needs $800
+    more". A supply with no ready site says so ("; no site yet"; its Ready sites line says why). It names, it doesn't
+    choose: utilities decides. Smoke v20 seed 1, month 3: $4,400 held and the $4,000 coal plant ready, but 20 steps went
+    on inspecting sewage sites and nothing was built; power stayed at 0-18% until month 10. Review: as "- short now:
+    power (111 of 103)" it called a supply with room short, under Key metrics' "coverage 100%", while the mayor read
+    "power 93% used" (fleet_scripted seed 0: 6 of 20 lines showed more supply than demand)."""
+    if not builds:
+        return []
+    line = "- supply needed now: " + ", ".join(_supply_state(b) for b in builds)
+    paid, unpaid, more = _supply_money(builds, funds)
     if not paid and not unpaid:
         return [line]
     line += f": your {money(math.floor(funds))} pays for " + (_and(paid) if paid else
                                                               "none of them" if len(unpaid) > 1 else "nothing yet")
     if unpaid:
-        more = sum(c for _, c in unpaid) - left
-        line += (f"; {_and([at for at, _ in unpaid])} need{'s' * (len(unpaid) == 1)} {money(math.ceil(more))} "
-                 "more")
+        line += f"; {_and([at for at, _ in unpaid])} need{'s' * (len(unpaid) == 1)} {money(more)} more"
     return [line]
 
 
@@ -323,9 +337,12 @@ def _needs(m: DeptMoney) -> str:
     83%)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). Smoke v16: "a police
     station (5 ready sites)" read the same with one built, and second stations were funded before a first school.
     Utilities names a building per short supply, bought together (FirstBuild.text: "its first coal plant and water
-    tower ($110/month)"; one alone reads as before)."""
+    tower ($110/month)"; one alone reads as before), then each short supply's building with no ready site and what it
+    waits for (FirstBuild.waits: "; sewage outlet waits for a road to the river"). Review, month 0: the mayor read
+    only "needs $6,200 for its first coal plant and water tower" while utilities read "sewage (0 of 5; no site yet)",
+    and nothing told it sewage waited for planning's road to the river."""
     b = m.needs
-    return "" if b is None else f"; needs {money(b.cost)} for {b.text()}"
+    return "" if b is None else f"; needs {money(b.cost)} for {b.text()}" + "".join(f"; {x}" for x in b.waits)
 
 
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
@@ -523,10 +540,17 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     # smoke runs: builds tried with $0, stations funded $1,000 of $2,500. Only when funds are short of every ready
     # price (a supplementary one too, else it's false); it names the cheapest primary ones (all on a tie: health's
     # clinic or landfill), else a supplementary one
-    purposes, low = cheapest(prices) or cheapest(prices, supplementary=True) or ((), None)
-    if low and all(short_of(funds, pr.cost) for pr in prices.values()):
-        L.append(f"- You can't pay for any ready site (cheapest: {' or '.join(purposes)} {low.text()}). Don't call "
-                 "build tools this turn: ask the mayor for the amount with a reason (send_message) unless you already "
+    # utilities: only purposes whose supply is wanted, and the amount its supply line names. Review, fleet_scripted
+    # seed 0 month 24: "a coal plant at (0,23) ($4,000) needs $2,252 more", then "cheapest: near_homes $2,200" with
+    # water at 141 of 250
+    wanted = {p: pr for p, pr in prices.items() if role != "utilities" or _wanted(w, p)}
+    purposes, low = cheapest(wanted) or cheapest(wanted, supplementary=True) or ((), None)
+    more = _supply_money(supplies, funds)[2]
+    if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
+        L.append("- You can't pay for any ready site" + (" (the supply above needs " + money(more) + " more)" if more
+                                                         else f" (cheapest: {' or '.join(purposes)} {low.text()})")
+                 + ". Don't call build tools this turn: ask the mayor for "
+                 + (money(more) if more else "the amount") + " with a reason (send_message) unless you already "
                  "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)

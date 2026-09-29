@@ -493,8 +493,14 @@ tasks and money, and to let people coach it.
       out), else the one with the most output. The 60 and 50 are a young city's first
       quarter (smoke v9–v19: a median 62 power and 50 water from month 0 to 3), so a wind
       turbine's 40 (× its site's wind) falls short of a fresh map's 66 power and a coal
-      plant's 250 doesn't. With one free riverbank lot the outlet, which can go nowhere
-      else, gets it and water a tower. One supply alone reads as before, with the share
+      plant's 250 doesn't. Only one-tile first buildings count while one is ready: a 2×2
+      water works, advanced treatment or nuclear plant is named only when none is (past
+      10,000 residents water wants 700 or more, which only the $12,000 water works
+      covers, and a review state at month 90 named it over six ready $1,500 pumps). With
+      one free riverbank lot the outlet, which can go nowhere else, gets it and water a
+      tower. A short supply whose building has no site yet is named after the price:
+      `needs $6,200 for its first coal plant and water tower ($110/month); sewage outlet
+      waits for a road to the river`. One supply alone reads as before, with the share
       used: `another water tower (water 117% used, $30/month)`. In smoke v20 seed 1 the
       line named only the cheapest ($2,200 tower), the mayor gave exactly that, and power
       stayed at 0–18% until month 10.
@@ -622,10 +628,15 @@ tasks and money, and to let people coach it.
   line builds there: `- wind: 6 sites, best (34,23), wind 1.39 (not (33,23): riverbank
   kept for sewage)`, `- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for
   sewage)`, `- sewage: 1 site, best (33,23) (riverbank: kept for sewage)`. While a supply
-  is short its budget block adds what is short and what its funds pay for, most urgent
-  first, with the buildings its needs line names: `- short now: power (1.80 of 7, 1.80
-  imported), sewage (0 of 7): your $4,400 pays for a coal plant at (0,23) ($4,000); a
-  sewage outlet at (33,23) ($1,200) needs $800 more`. It only names: utilities decides. In
+  is short or at least 90% used its budget block adds each such supply in the words of
+  the mayor's needs line and what its funds pay for, most urgent first, with the
+  buildings its needs line names: `- supply needed now: power 25% covered (supply 1.80,
+  demand 7, 1.80 imported), sewage 0% covered (supply 0, demand 7): your $4,400 pays for
+  a coal plant at (0,23) ($4,000); a sewage outlet at (33,23) ($1,200) needs $800 more`
+  (as `short now: power (111 of 103)` it called a supply with room short, under Key
+  metrics' "coverage 100%"). When its funds pay for no ready site, the can't-pay line
+  under it names that amount (`the supply above needs $800 more ... ask the mayor for
+  $800`), and names no purpose whose supply has room. It only names: utilities decides. In
   smoke v20 seed 1, month 3, utilities held $4,400 with the coal plant ready, read "best
   (33,23) ... (riverbank: keep for pump/sewage)" for wind and "same site as wind" for the
   pump and the outlet, spent all 20 steps inspecting sewage sites and built nothing.
@@ -742,16 +753,19 @@ tasks and money, and to let people coach it.
   at months 9 and 12. On seed 1 it took $1,182 of planning's $1,479, nothing of it idle,
   then its last $297.
 
-  A top-up for another building (the department's kind is "another" on the to-fund line)
-  that would leave the treasury at least $1 under the reserve is refused too
-  (`refused: "reserve"`): `that leaves the treasury at $1,803, $1,413 under the $3,216
-  reserve (6 x $536 expenses: last month's deficit was $22), for another fire station;
-  first/supply and growth come first: education $2,500 (first/supply), planning $315
-  (growth) still wait. To fund it anyway, repeat this exact call with confirm: true.`
-  With nothing of those waiting it reads `first/supply and growth come first and none is
-  waiting`, and it names idle money to take back first when there is some. First
-  buildings, supply, planning's road, a department blocked for lack of land, one with
-  nothing ready, and a top-up that leaves the treasury at or above the reserve all pass,
+  A top-up for another building (the department's kind is "another" on the to-fund line),
+  or one that buys nothing now (kind "nothing" or "idle"), that would leave the treasury
+  at least $1 under the reserve is refused too (`refused: "reserve"`): `this top-up for
+  another fire station leaves the treasury at $1,803, $1,413 under the $3,216 reserve (6
+  x $536 expenses: last month's deficit was $22); first/supply and growth come first:
+  education $2,500 (first/supply), planning $315 (growth) still wait. To fund it anyway,
+  repeat this exact call with confirm: true.` With nothing of those waiting it says what
+  the reserve is for (`the reserve keeps the city solvent and pays for first buildings,
+  supply and planning's road when they come (none waits now)`), a top-up to a department
+  with nothing ready reads `this top-up buys nothing now (transport: nothing ready to
+  buy) and leaves ...`, and it names idle money elsewhere to take back first when there
+  is some. First buildings, supply, planning's road, a department blocked for lack of
+  land, and a top-up that leaves the treasury at or above the reserve all pass,
   as does fire's while the briefing's forecast names a flood (levees are first/supply, and
   the playbook's flood rule funds fire at once, although fire's needs line names its
   cheaper next station). A top-up larger than the treasury gets the action's own failure
@@ -775,7 +789,14 @@ tasks and money, and to let people coach it.
   waiting (only another: police $2,500, fire $2,500); this $3,000 loan would pay for
   another building at $15/month interest until repaid (debt would be $3,000 of $50k): fund
   another building only from the money above the reserve.` With nothing listed at all it
-  says the loan `would sit in the treasury`. It stays silent while the treasury is below
+  says the loan `would sit in the treasury`. While a first building, supply or planning
+  road waits (fire's top-up too while a flood is forecast: levee money), or operations
+  would take the treasury below $0 before the mayor's next turn (last months' pace ×
+  `act_every`), it refuses only a loan $1,000 or more over what those, the bills and the
+  reserve need: `only $3,850 of this $5,000 loan is needed ($1,400 for first/supply and
+  growth, $2,450 to keep the treasury at the $3,000 reserve): the other $1,150 would pay
+  for another building at $6/month interest until repaid (debt would be $5,000 of $50k):
+  borrow $3,850 or less.` It stays silent while the treasury is below
   $0, where a loan pays the bills. With one of the first two cases it comes
   after that case's text as one refusal (`Also, no first building, supply or planning road
   is waiting (...): the loan would pay for another building.`), which one override
