@@ -463,6 +463,13 @@ tasks and money, and to let people coach it.
       (4 sites)` once a clinic is built).
     - A per-tile site counts its best stretch whole: `needs $90 for 3 avenue tiles (5
       sites)`.
+    - Planning's is its best `road_extension` site (a dead end's extension or a branch
+      road), priced as `build_road` charges it plus any bulldozing: `needs $150 for a road
+      into open land (opens 71 tiles)`. A road is no building, so it is neither a first nor
+      another, and it never shows on the first-buildings, leave-free or blocked lines. In
+      the live 120-month run on seed 0, at month 9, the mayor read planning as `idle
+      $1,243`. It took that back and $1,000 more. Planning's $150 extension then failed
+      twice on "the planning budget only has $0" while its line showed no need.
   - **First buildings.** When a department's needs line is for its first building and
     another's is for another one, a line under the block says `- first buildings still
     unfunded: education (elementary school, $2,500): fund these before second buildings`.
@@ -511,7 +518,9 @@ tasks and money, and to let people coach it.
   free roadside lot near the homes that need it (around a named tile), no free 2x2
   roadside block, or no roadside lot away from homes for a landfill, cemetery or jail; a site on one of
   the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
-  memory. Every purpose outside planning is priced. A library (it only adds to schools), a
+  memory. Every purpose outside planning is priced, and so is planning's `road_extension`
+  (`opens 71 land tiles; $150 - you have $0`), though never on its budget line. A library
+  (it only adds to schools), a
   shelter (it only matters in disasters), a cemetery (the landfill comes first) and a
   train station, harbour or metro station (bus lines come first) are priced on their
   lines, but the mayor's needs line never names one, and the budget line only when nothing
@@ -525,7 +534,7 @@ tasks and money, and to let people coach it.
   and tells it to zone at low density. When no dead end extends into open land, planning's
   `road_extension` line (and `find_sites road_extension`) offers branch roads instead:
   `- road_extension: none - no dead end; branch: dezone (23,25) (empty lot, free), then
-  build_road (23,25)-(23,39), opens 75 land tiles`.
+  build_road (23,25)-(23,39), opens 75 land tiles; $150`.
   - A branch leaves a road tile of the connected network and runs straight into open land
     (up to 15 tiles, bridges allowed). It starts from a free lot beside the road, or else
     through up to 2 empty zoned lots to dezone. Failing those, it bulldozes the cheapest
@@ -886,7 +895,9 @@ A hint fires on any of these:
     demand under 90% of supply), no congested road, "nothing needs it", locked, and
     supplementary buildings (library, shelter, cemetery, train station, harbour, metro).
 
-  Planning always has a road into open land to build, so it is idle with $1 or more.
+  Planning goes by its priced `road_extension` line: idle when its funds covered the road,
+  starved when short (`planning short of its $150 road into open land`). Without a road to
+  build it is idle with $1 or more, since it can still zone.
   Without a briefing (older records), the funds come from the history log: under $1
   against a plan budget is starved, under $1 without one is nothing needed, and anything
   else is idle.

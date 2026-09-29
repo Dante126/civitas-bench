@@ -54,6 +54,7 @@ ROAD_LINES = 8               # the longest this many named, then "+N more"
 BRANCH_CLEAR, BRANCH_MIN, BRANCH_LEN, BRANCH_OPENS, BRANCH_APART = 2, 3, 15, 5, 4
 DIRECTIONS = ((0, -1), (0, 1), (-1, 0), (1, 0))
 BUILT_NAMES = {"R": "home", "C": "shop", "I": "factory", "O": "office", "M": "mixed-use block"}   # a developed lot
+ROAD_NAME = "road into open land"    # what planning's road_extension sites buy (road_price), for the mayor's needs line
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
@@ -161,7 +162,7 @@ SITE_FIELDS = [("wind", "wind {}"), ("homes_within_5", "{} homes within 5"), ("n
 SITE_FIELDS_HIDDEN = {"sewage": {"pollution"}}    # the outfall's own water quality doesn't matter
 SITE_FIELDS_NONZERO = {"near_homes"}              # "0 homes within 5" says nothing near homes (unlike coal_or_gas)
 # purpose -> what its sites are for (tier names, or OFF_TIER_SPECS keys): the cheapest unlocked one prices the site
-# (site_price). Planning's purposes aren't priced
+# (site_price). Planning's purposes aren't (its road_extension is priced apart, as no building: road_price)
 SITE_BUILDS = {
     "utilities": {"coal_or_gas": ("coal", "gas"), "wind": ("wind",), "pump": ("pump",), "sewage": ("outlet",),
                   "near_homes": ("tower", "solar", "wind"),
@@ -818,7 +819,9 @@ class DeptMoney:
     it this month doesn't count: the mayor acts first, so the rest sat through at least one of its turns (at month 0
     none has had one). Its observation (`build`) is built once, on first use, and only asked for when a site's price
     can matter: funds short of its dearest priced purpose, a per-tile purpose (a stretch has no such bound), or a
-    price above what its spending keeps."""
+    price above what its spending keeps. Planning's is its road into open land (road_build), bounded by road_max: live
+    120-month run, seed 0, month 9: it read "idle $1,243" with nothing priced, the mayor took that and $1,000 more,
+    and its $150 extension failed twice on "the planning budget only has $0"."""
 
     def __init__(self, env, dept: str):
         w = env.world
@@ -837,10 +840,12 @@ class DeptMoney:
         priced = [pr for p in SITE_PURPOSES[dept] if (pr := site_price(w, dept, p))]
         self.priced = bool(priced)
         self.bound = None if any(pr.per_tile for pr in priced) else max((pr.cost for pr in priced), default=0)
+        if dept == "planning":                  # its road into open land (road_build), no dearer than road_max
+            self.bound = road_max(w)
 
     @cached_property
     def build(self) -> FirstBuild | None:
-        return first_build(self.env, self.dept)
+        return road_build(self.env) if self.dept == "planning" else first_build(self.env, self.dept)
 
     @cached_property
     def keep(self) -> float:
@@ -1372,8 +1377,8 @@ class Need(NamedTuple):
 
     def text(self) -> str:
         sites = f"{self.sites} site{'s' * (self.sites != 1)}"
-        if self.have is None:
-            return f"{self.what} ({sites})"
+        if self.have is None:                   # planning's road: "a road into open land (opens 71 tiles)"
+            return f"{self.what} ({self.status or sites})"
         return f"its first {self.what} ({sites})" if not self.have else f"another {self.what} ({self.status or sites})"
 
 
@@ -1628,13 +1633,52 @@ def first_build(env, dept: str) -> FirstBuild | None:
     return FirstBuild(low.cost if low else None, tuple(named.values()), max(firsts), shut)
 
 
+def road_cost(site: dict) -> float:
+    """What a road_extension site costs, as the actions charge it: a dead end's extension (observation) is build_road
+    over its `tiles` from the dead end, `bridge_tiles` of them on the river; a branch road (Branch.site) carries its
+    `cost`, bulldozing included (dezoning is free)."""
+    if "cost" in site:
+        return site["cost"]
+    bridges = site.get("bridge_tiles", 0)
+    return (site["tiles"] - bridges) * C.CATALOG["road"]["cost"] + bridges * C.CATALOG["bridge"]["cost"]
+
+
+def road_max(w) -> float:
+    """The dearest a road_extension site can be: BRANCH_LEN bridge tiles (an extension runs up to 15, as a branch)
+    and BRANCH_CLEAR tiles to bulldoze."""
+    return BRANCH_LEN * C.CATALOG["bridge"]["cost"] + BRANCH_CLEAR * C.CATALOG["bulldoze"]["cost"]
+
+
+def road_price(lists: dict[str, SiteList]) -> Price | None:
+    """Planning's best road_extension site (a dead end's extension, else a branch road) priced (road_cost), for its
+    Ready sites line; None without one. Never in ready_prices or site_price: a road is no building, so it stays out
+    of the department budget line, the leave-free line (funded_firsts, claim_spots), the blocked line and cheapest()."""
+    lst = lists.get("road_extension")
+    return Price(road_cost(lst.sites[0]), ROAD_NAME, name="road") if lst and lst.sites else None
+
+
+def road_build(env) -> FirstBuild | None:
+    """Planning's needs line from one observation (DeptMoney.build): its best road_extension site, as "a road into open
+    land (opens 71 tiles)" (Need, neither a first nor another building), costing road_cost; None without one. The
+    live 120-month run, seed 0, months 9-12: planning at $0 read "road_extension: 1 site, best (24,20)-(24,5), opens
+    71 land tiles", failed on its $150 twice and asked for it, and the mayor's line for it showed no need."""
+    w = env.world
+    lst = site_lists(w, "planning", role_obs(env, "planning"))["road_extension"]
+    if not lst.sites:
+        return None
+    best, cost = lst.sites[0], road_cost(lst.sites[0])
+    need = Need(a_or_an(ROAD_NAME), len(lst.sites[:MAX_SITES]), None, f"opens {best['opens_land']} tiles")
+    return FirstBuild(cost, (need,), cost, ())
+
+
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
                 prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
     zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
     (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. A line with
-    sites ends with its price (`prices`: ready_prices), and with `funds` (rounded down) when they are short of it."""
+    sites ends with its price (`prices`: ready_prices, and planning's road_price), and with `funds` (rounded down)
+    when they are short of it; so does a reason with sites (planning's branch roads)."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
 
     def site(purpose: str, s: dict) -> str:
@@ -1651,7 +1695,9 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
         head = f"- {purpose}: "
         path = SITE_PURPOSES[role][purpose]
         if lst.short:
-            lines.append(head + (lst.short if lst.short.startswith("locked") else f"none - {lst.short}"))
+            locked = lst.short.startswith("locked")
+            lines.append(head + (lst.short if locked else f"none - {lst.short}")
+                         + (price(purpose) if lst.sites and not locked else ""))
             continue
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "

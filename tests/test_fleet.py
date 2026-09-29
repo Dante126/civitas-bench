@@ -1968,11 +1968,11 @@ def test_boxed_in_planning_is_offered_branch_roads():
     else the cheapest building to bulldoze, ranked by land opened."""
     from civitas.fleet.tools import BRANCH_APART, branch_sites
     head = "- road_extension: none - no dead end; branch: "
-    env = _boxed_in(free=[(12, 23)], lots=[(40, 25)])
-    assert _road_line(env) == head + "build_road (12,23)-(12,9), opens 75 land tiles"          # nothing to clear
+    env = _boxed_in(free=[(12, 23)], lots=[(40, 25)])                                # priced: planning holds $1,000
+    assert _road_line(env) == head + "build_road (12,23)-(12,9), opens 75 land tiles; $150"    # nothing to clear
     env = _boxed_in(lots=[(12, 23)])
     assert _road_line(env) == head + ("dezone (12,23) (empty lot, free), then build_road (12,23)-(12,9), opens 75 "
-                                      "land tiles")
+                                      "land tiles; $150")
     res = ToolBox(env, "planning").call("find_sites", {"purpose": "road_extension"})
     assert res["sites"][0] == {"x": 12, "y": 23, "x1": 12, "y1": 23, "x2": 12, "y2": 9, "tiles": 15,
                                "bridge_tiles": 0, "opens_land": 75, "branch_from": [12, 24], "cost": 150,
@@ -1987,13 +1987,13 @@ def test_boxed_in_planning_is_offered_branch_roads():
             assert a.way != b.way or abs(a.start[0] - b.start[0]) + abs(a.start[1] - b.start[1]) > BRANCH_APART
     env = _boxed_in()                                                                # only buildings beside the road
     assert _road_line(env) == head + ("bulldoze (17,23) (a level-1 home, $5), then build_road (17,23)-(17,9), "
-                                      "opens 75 land tiles")
+                                      "opens 75 land tiles; $155")                  # the bulldozing counted
     deep = (22, 23, 25, 26)                                                          # zoned 2 deep, as v17 did
     assert _road_line(_boxed_in(lots=[(12, 22), (12, 23)], rows=deep)) == head + (
-        "dezone (12,22)-(12,23) (empty lots, free), then build_road (12,23)-(12,9), opens 75 land tiles")
+        "dezone (12,22)-(12,23) (empty lots, free), then build_road (12,23)-(12,9), opens 75 land tiles; $150")
     assert _road_line(_boxed_in(lots=[(12, 23)], rows=deep)) == head + (               # the fewest levels first
         "bulldoze (12,22)-(12,23) (a level-1 home and an empty lot, $10), then build_road (12,23)-(12,9), opens 75 "
-        "land tiles")
+        "land tiles; $160")
     assert _road_line(_boxed_in(rows=(21, 22, 23, 25, 26, 27))) == (                 # 3 deep: none within reach
         "- road_extension: none - no straight extension from a dead end: build_road from any road into free land")
     env = _boxed_in(lots=[(12, 23)])
@@ -2077,6 +2077,65 @@ def test_a_landfill_blocked_away_from_homes_is_tagged_with_where_to_leave_its_lo
     assert land_fix(w, "police", "jail") == land_fix(w, "health", "landfill") == "away from homes"
     among, clear = {"x2": 12, "y2": 23}, {"x2": 12, "y2": 9}         # a far end among the homes is skipped
     assert edge_site(w, [among, clear]) is clear and edge_site(w, [among]) is None
+
+
+def _planning_line(env) -> str:
+    return next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- planning: "))
+
+
+def test_the_mayor_sees_what_planning_needs_for_its_road():
+    """Live 120-month run, seed 0, month 9: the mayor read planning "idle $1,243", took that and $1,000 more, and
+    planning's $150 extension (24,20)-(24,5) failed twice on "the planning budget only has $0"; with nothing priced,
+    its line on the mayor's Departments block never showed the need. A road is priced as the actions charge it."""
+    from civitas.fleet.tools import IDLE_MIN, DeptMoney, road_max
+    env = _env()                                       # seed 0: the highway road's dead end (19,24), the river ahead
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    w.dept_funds["planning"] = 0
+    assert _planning_line(env) == ("- planning: funds $0, spent $0; needs $300 for a road into open land (opens 60 "
+                                   "tiles)")
+    road = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- road_extension: ")]
+    assert road == ["- road_extension: 1 site, best (19,24)-(34,24), opens 60 land tiles; $300 - you have $0"]
+    assert 12 * C.CATALOG["road"]["cost"] + 3 * C.CATALOG["bridge"]["cost"] == 300       # 12 land tiles, 3 bridge
+    w.dept_funds["planning"] = 299.5
+    assert _planning_line(env).endswith("; needs $300 for a road into open land (opens 60 tiles)")
+    for funds in (300, 1000):                          # enough for it: no needs line
+        w.dept_funds["planning"] = funds
+        assert _planning_line(env) == f"- planning: funds ${funds:,}, spent $0", funds
+    assert DeptMoney(env, "planning").keep == IDLE_MIN > road_max(w)       # the $1,000 floor covers any road
+    env = _boxed_in(lots=[(12, 23)])                   # no dead end: its branch road, dezoning free
+    env.world.dept_funds["planning"] = 0
+    assert _planning_line(env) == "- planning: funds $0; needs $150 for a road into open land (opens 75 tiles)"
+    env = _boxed_in()                                  # only buildings beside the road: $5 to bulldoze one
+    env.world.dept_funds["planning"] = 0
+    assert _planning_line(env) == "- planning: funds $0; needs $155 for a road into open land (opens 75 tiles)"
+    env = _boxed_in(rows=(21, 22, 23, 25, 26, 27))     # no road to build: no needs line
+    env.world.dept_funds["planning"] = 0
+    assert _planning_line(env) == "- planning: funds $0"
+
+
+def test_planning_s_road_is_no_building_for_the_other_lines(grown_env):
+    """Planning's road is priced on its own line and the mayor's needs line only: never a funded building to leave
+    a lot for (funded_firsts, claim_spots), a blocked one (land_blocked), a first building still unfunded, or its
+    budget line's "can't pay"."""
+    from civitas.fleet.briefing import _firsts_line
+    from civitas.fleet.tools import dept_lists, funded_sites, funding_gaps, land_blocked
+    env = copy.deepcopy(grown_env)
+    w = env.world
+    w.dept_funds.update({d: 50000 for d in DEPTS})     # every department funded, planning too
+    depts = dept_lists(env)
+    assert "planning" not in depts and not any(d == "planning" for d, _ in funded_sites(w, depts))
+    assert "planning" not in land_blocked(env, depts)
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    leave, = [ln for ln in block if ln.startswith("- leave free (funded): ")]
+    assert "road" not in leave and "planning" not in leave, leave
+    road, = [ln for ln in block if ln.startswith("- road_extension: ")]
+    assert re.search(r"opens \d+ land tiles; \$[\d,]+$", road), road          # priced on its own line
+    w.dept_funds.update({d: 0 for d in DEPTS})         # every department short
+    need, = funding_gaps(env, FleetState.of(env)).depts["planning"].needs.named
+    assert (need.what, need.have, need.first) == ("a road into open land", None, False)
+    assert all("planning" not in ln for ln in _firsts_line(funding_gaps(env, FleetState.of(env))))
+    assert "can't pay" not in briefing(env, "planning", mark=False)
 
 
 # ------------------------------------------------------------ explained failures
@@ -2876,8 +2935,10 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
         "mayor for the amount with a reason (send_message) unless you already did, then end_turn.")
     assert "(cheapest: station $2,500)" in briefing(env, "fire", mark=False)       # never the $1,500 shelter
     assert "(cheapest: clinic or landfill $2,000)" in briefing(env, "health", mark=False)     # a tie names both
-    planning = briefing(env, "planning", mark=False)  # nothing priced
-    assert "can't pay" not in planning and "$" not in "".join(_ready_sites(planning))
+    planning = briefing(env, "planning", mark=False)  # only its road priced, and never on the budget line
+    priced = [ln for ln in _ready_sites(planning) if "$" in ln]
+    assert "can't pay" not in planning and len(priced) == 1 and priced[0].startswith("- road_extension: "), priced
+    assert re.search(r"; \$\d+ - you have \$0$", priced[0]), priced
     transport = briefing(env, "transport", mark=False)
     assert _ready_sites(transport)[0].endswith("; $1,500 - you have $0") and "(cheapest: bus_stops $1,500)" in transport
     w.dept_funds["police"] = 3000
@@ -3177,7 +3238,8 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
     assert got["utilities"].startswith("- utilities: funds $0; needs $2,200 for another water tower (")
     assert got["fire"] == "- fire: funds $5,000; idle $2,500"          # it keeps the station's $2,500
     assert got["transport"].startswith("- transport: funds $0; needs $1,500 for its first bus line (")
-    assert got["planning"] == "- planning: funds $0"
+    assert re.fullmatch(r"- planning: funds \$0; needs \$\d+ for a road into open land \(opens \d+ tiles\)",
+                        got["planning"]), got["planning"]              # no building: neither its first nor another
     ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 2500}, "priorities": {"police": "cover downtown"}})
     assert lines()["police"] == (f"- police: funds $1,000 < target $2,500; needs $2,500 for its first police station "
                                  f"({n} sites); priority: cover downtown")
@@ -3343,9 +3405,9 @@ def test_department_briefing_builds_one_observation(monkeypatch):
     fleet = FleetState.of(env)
     for funds in (0, 50000):
         env.world.dept_funds.update({d: funds for d in DEPTS})
-        calls.clear()                                  # the blocked marker needs every priced department's sites
-        briefing(env, "mayor", mark=False)
-        assert calls == [True] * n
+        calls.clear()                                  # the blocked marker needs every priced department's sites, and
+        briefing(env, "mayor", mark=False)             # planning's needs line its road while short of the dearest one
+        assert calls == [True] * (n + (funds < T.road_max(env.world))), funds
         calls.clear()                                  # month 0, no plan: nothing idle, no gap to check
         funding_gaps(env, fleet)
         assert calls == []
@@ -3932,6 +3994,17 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         assert mayor.count("; idle $3,210") == 2 and mayor.count("; needs $") == 5 and mayor.count("its first ") == 4
         assert ("\n- first buildings still unfunded: utilities, police, fire, education: fund these before second "
                 "buildings\n") in mayor
+        dear = T.road_max(w)                           # planning short of the dearest road instead of idle (7,653)
+        mp.setattr(T, "road_build", lambda env: FB(dear, (N("a road into open land", 6, None, "opens 999 tiles"),),
+                                                   dear, ()))
+        w.dept_funds["planning"] = dear - 1
+        for role in TURN_ORDER:
+            text = briefing(env, role, mark=False)
+            memory = text[text.index("## Your memory"):].split("\n\n")[0]
+            assert len(text) - len(memory) < bound(role), (role, len(text) - len(memory))
+        mayor = briefing(env, "mayor", mark=False)
+        assert mayor.count("; needs $") == 6 and "; needs $910 for a road into open land (opens 999 tiles); " in mayor
+        w.dept_funds["planning"] = 9876
     _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
     monkeypatch.setattr(T, "_uncovered_need", lambda w, role, purpose: ((0, 0), 1.0) if (role, purpose) in T.NEAR_NEED
                         else None)                     # as if the (empty) map had people to serve
@@ -5148,6 +5221,26 @@ def test_planning_is_idle_with_money_and_starved_without():
                          "$1,000-6,000 - check its playbook and whether it is blocked (funds, unlocks, failures)")
     h, = _turn_hints([_briefed("planning", m, 0, full) for m in (6, 9)], "starved")
     assert h["depts"][0]["role"] == "planning" and "planning at $0 against its $3,000 target" in h["text"]
+
+
+def test_planning_is_starved_short_of_its_road_and_idle_with_it():
+    """Live 120-month run, seed 0, months 9-12: planning at $0 read "road_extension: 1 site, best (24,20)-(24,5), opens
+    71 land tiles" and failed on its $150 twice. With the road priced, its turns read by that price (a branch road's
+    line too), not by the funds alone ($1+ was idle)."""
+    zone = "zone_R: none - no free roadside strip: extend the roads (find_sites road_extension)"
+    ext = "road_extension: 1 site, best (24,20)-(24,5), opens 71 land tiles; $150"
+    branch = ("road_extension: none - no dead end; branch: dezone (13,22)-(13,23) (empty lots, free), then build_road "
+              "(13,23)-(13,9), opens 75 land tiles; $150")
+    assert _briefed("planning", 9, 0, [zone, branch + " - you have $0"])["seen"]["sites"]["road_extension"] == {
+        "state": "short", "price": 150.0}
+    for road in (ext, branch):
+        rows = [_briefed("planning", m, 100, [zone, road + " - you have $100"], asks=["We need $150"]) for m in (6, 9)]
+        assert _turn_hints(rows, "idle") == [], road
+        h, = _turn_hints(rows, "starved")
+        assert h["text"].startswith("mayor: left planning short of its $150 road into open land for 2 turns / 6 months "
+                                    "(months 6-11; it held $100 and asked 2 times)"), h["text"]
+    h, = _turn_hints([_briefed("planning", m, 1000, [zone, ext]) for m in (6, 9)], "idle")
+    assert "enough for its $150 road into open land" in h["text"], h["text"]
 
 
 def test_fleet_report_negative_treasury_hint():
