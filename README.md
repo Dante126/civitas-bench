@@ -856,8 +856,9 @@ cadence, since the scripted policies do about a month's work per turn:
 - **Planning** lays about one road and up to three zone strips per type a turn. It built 18
   road segments and 157 zone strips instead of 46 and 311, and spent $12.5k instead of $31k.
 - **The mayor** reads the requests posted since its previous turn. At `act_every = 3` that
-  is 106 of the 108 that departments sent (the other 2 came in its last turn; monthly: 529
-  of 531). It used to read only those from the month before its turn, which at `act_every =
+  is about 106 of the 108 that departments sent per game (seeds 0-4: 532 of 538; the rest
+  came in its last turn; monthly: 529 of 531). The observation keeps 3 months of council
+  messages, so this holds up to `act_every = 3`. It used to read only those from the month before its turn, which at `act_every =
   3` was none of the 146 sent, and this row read 67.0 ± 2.8, population 7,319 (mayor 84.3,
   education 70.0). Now the upgrades departments ask for get funded ($5,000 for education,
   $8,300 for police and fire), so fewer asks are repeated.
