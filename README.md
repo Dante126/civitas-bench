@@ -1106,6 +1106,31 @@ education again got no school on either seed (33.3 and 33.4).
     prompt tokens.
   - Nothing yet tells it to give up one lot to open a branch road.
 
+**v18** (2026-09-28, main at f8e8c57, adding:
+- the mayor's needs line saying first or another, with coverage;
+- the first-buildings line;
+- branch roads out of dead ends and the last-branch-lot warning;
+- the landfill away-from-homes tag;
+- coaching hints split by who should act;
+- planning's road into open land priced for the mayor)
+
+reached 1,412 / 44.9 and 2,120 / 45.9.
+
+- **Failed actions:** 14.1% on seed 0, the lowest of any run, and 21.9% on seed 1. Loans were $3,000 and $4,000.
+- **Seed 0:** police, fire, health and education all built by month 6 (education 58.1, up
+  from 33.3 in v16 and v17). Each built on or next to the site the leave-free line named.
+- **Needs lines worked:**
+  - At month 6 on seed 1 the mayor read "first buildings still unfunded: education" and
+    funded the school.
+  - At month 9 on both seeds it read planning's "needs $50 / $150 for a road into open
+    land" and funded it.
+- **Still open:**
+  - On seed 0 the mayor took back all $2,508 of planning's money when $1,508 was idle, then sent exactly
+    the $50 road price, with nothing left for zoning.
+  - On seed 1, education's only site was the lot police had claimed, so planning was never
+    told it needed a second lot. At month 9 each zone warning named one example tile for
+    several buildings, and planning dezoned only that tile. Education never built (33.4).
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
