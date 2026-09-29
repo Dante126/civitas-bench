@@ -1536,13 +1536,17 @@ def funded_sites(w, depts: dict[str, dict[str, SiteList]]) -> dict[tuple[str, st
 
 def claim_spots(funded: dict[tuple[str, str], tuple[Price, list]], keep: dict | None = None) -> dict[tuple, Spot]:
     """Each funded building's site (funded_sites), in turn order: its first one whose footprint no earlier claim
-    covers; none when every one is claimed. With `keep` (an earlier claim), a building whose claimed site is still
-    listed keeps it first. Smoke v15 seed 1, month 6: "leave free (funded): water tower (22,23), police station (34,25),
-    fire station (34,25), clinic (34,25), elementary school (34,25)", one lot for four buildings."""
+    covers; none when every one is claimed. With `keep` (an earlier claim), the buildings whose claimed site is still
+    listed go first, each trying that site before the rest of its list, so only a building whose site went moves.
+    Smoke v15 seed 1, month 6: "leave free (funded): water tower (22,23), police station (34,25), fire station (34,25),
+    clinic (34,25), elementary school (34,25)", one lot for four buildings. Review: taking the first unclaimed site in
+    list order, a kept police station moved onto a lot listed ahead of its own and pushed fire off the one it kept."""
     taken, out = set(), {}
     order = [k for k in funded if keep and k in keep and keep[k].xy in funded[k][1]]
     for k in order + [k for k in funded if k not in order]:
         pr, sites = funded[k]
+        if k in order:
+            sites = [keep[k].xy] + [xy for xy in sites if xy != keep[k].xy]
         for xy in sites:
             spot = Spot(*k, pr.building, xy, pr.size)
             if not spot.tiles & taken:
@@ -1990,11 +1994,13 @@ class ToolBox:
 
     def _funded_warning(self, before: dict, bank: bool = False) -> str:
         """A warning for a zone action that took a claimed site (claim_spots of `before`, _funded_sites() before it)
-        and so left a funded building no unclaimed site (buildings keep their claims where they can), naming the
-        taken sites to dezone; pump and outlet left to the riverbank warning when it fired (`bank`). "" on any error.
-        Smoke v14 seed 0, months 3-6: planning zoned the lots near homes the mayor had just funded fire, health and
-        education to build on; v15 seed 1, month 6: four buildings named one lot, and with the rest zoned no warning
-        came (each still had a site)."""
+        and so left a funded building no unclaimed site: a fresh claim afterwards seats fewer buildings than before.
+        It names the buildings a claim keeping the earlier ones (keep) leaves out and the taken sites to dezone; pump
+        and outlet left to the riverbank warning when it fired (`bank`). "" on any error. Smoke v14 seed 0, months
+        3-6: planning zoned the lots near homes the mayor had just funded fire, health and education to build on; v15
+        seed 1, month 6: four buildings named one lot, and with the rest zoned no warning came (each still had a
+        site). Review: police on P or Q, fire on Q or R, a zone took P; the kept claims left fire on Q and warned for
+        police, which a fresh claim seats on Q (fire on R)."""
         try:
             w = self.world
             was = claim_spots(before)
@@ -2006,6 +2012,8 @@ class ToolBox:
                 if d not in lists:
                     lists[d] = site_lists(w, d, role_obs(self.env, d))
                 after[d, p] = (pr, [(s["x"], s["y"]) for s in lists[d][p].sites])
+            if len(claim_spots(after)) >= len(was):       # a fresh claim still seats everyone
+                return ""
             now = claim_spots(after, keep=was)
             hit = [(sp, (d, p)) for (d, p), sp in was.items() if (d, p) not in now and not (bank and p in BANK_TOP_UP)]
             if not hit:
