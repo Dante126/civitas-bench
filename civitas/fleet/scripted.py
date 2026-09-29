@@ -5,10 +5,10 @@ as the turn's first user message, as an LLM fleet agent gets it), reads what the
 (`map_overview` for the roles whose policy reads the map, `get_messages` for the mayor's council requests) on top of
 `role_obs()`, asks the role's `agents/scripted.py` policy for a decision and runs it through `ToolBox.call`: the mayor
 first writes its working balances into the plan (`update_plan`), then every action runs as its own tool call (a
-duplicate allocation the policy means is repeated with `confirm: true`), messages go out with `send_message`, new
-requests and failures go into memory (`update_memory`), and `end_turn` carries the report. Arguments are sent as JSON
-text, as a model sends them. The turn is logged like a ToolAgent turn (transcript, tool trace, no tokens), so the
-runner, history log and fleet report treat it as any fleet turn.
+duplicate allocation or a take-back below a department's keep the policy means is repeated with `confirm: true`),
+messages go out with `send_message`, new requests and failures go into memory (`update_memory`), and `end_turn`
+carries the report. Arguments are sent as JSON text, as a model sends them. The turn is logged like a ToolAgent turn
+(transcript, tool trace, no tokens), so the runner, history log and fleet report treat it as any fleet turn.
 """
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ class ScriptedFleetAgent(Agent):
             res = turn.call(name, args)
             if res is None:
                 break
-            if res.get("refused") == "duplicate":          # the policy means it: allocations add up
+            if res.get("refused") in ("duplicate", "take_back"):     # the policy means it: allocations add up
                 turn.call(name, {**args, "confirm": True})
 
     def _memory(self, turn: _Turn) -> None:
