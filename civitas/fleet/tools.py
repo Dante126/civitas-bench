@@ -20,7 +20,7 @@ import numpy as np
 
 from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _kind_name, _line,
                             _point, _rect, action_docs, apply_action)
-from ..core.observation import MAP_LEGEND, _far_from_homes, _uncrowded_first, build_observation
+from ..core.observation import MAP_LEGEND, _far_from_homes, _road_extensions, _uncrowded_first, build_observation
 from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
@@ -47,6 +47,13 @@ CONTENT_KINDS = 5            # kinds of tile named when a failed zone / dezone s
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
 ROAD_LINES = 8               # the longest this many named, then "+N more"
+# branch roads (branch_sites), offered where no dead end extends: off a road tile, straight through at most
+# BRANCH_CLEAR zoned tiles (planning zones strips 2 deep beside a road) and on for BRANCH_MIN-BRANCH_LEN tiles of
+# empty land or river (bridges; observation's extensions run 3-15), opening at least BRANCH_OPENS land tiles; listed
+# branches that run the same way start more than BRANCH_APART tiles apart
+BRANCH_CLEAR, BRANCH_MIN, BRANCH_LEN, BRANCH_OPENS, BRANCH_APART = 2, 3, 15, 5, 4
+DIRECTIONS = ((0, -1), (0, 1), (-1, 0), (1, 0))
+BUILT_NAMES = {"R": "home", "C": "shop", "I": "factory", "O": "office", "M": "mixed-use block"}   # a developed lot
 RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
                              # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
@@ -359,10 +366,12 @@ def _on_connected_road(w, s) -> bool:
 
 
 def _distance(s: dict, near: tuple[int, int]) -> int:
+    """From `near` to the nearest tile of a site, rectangle or line (a road extension or branch runs either way)."""
     nx, ny = near
-    cx = min(max(nx, s.get("x1", s["x"])), s.get("x2", s["x"])) if "x2" in s else s["x"]
-    cy = min(max(ny, s.get("y1", s["y"])), s.get("y2", s["y"])) if "y2" in s else s["y"]
-    return abs(cx - nx) + abs(cy - ny)
+    if "x2" not in s:
+        return abs(s["x"] - nx) + abs(s["y"] - ny)
+    (xa, xb), (ya, yb) = sorted((s["x1"], s["x2"])), sorted((s["y1"], s["y2"]))
+    return abs(min(max(nx, xa), xb) - nx) + abs(min(max(ny, ya), yb) - ny)
 
 
 def _connected_roads(w) -> np.ndarray:
@@ -941,6 +950,8 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             sites, (short, note) = [], SITE_NOTES[purpose]
         elif sites:
             short = note = None
+        elif purpose == "road_extension" and (branches := branch_sites(w)):    # no dead end: branch off a road
+            sites, short, note = [b.site(w) for b in branches], branch_text(w, branches[0]), branch_note(w)
         elif purpose in SITE_NOTES:
             short, note = SITE_NOTES[purpose]
         else:                    # models told to "inspect the map" scanned it blindly for whole turns
@@ -978,7 +989,7 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
     nothing needing it). Review probe, month 60 (6,564 residents): the university list read "nothing needs it right
     now" with no free 2x2 block, and education's $12,000 keep for it read idle."""
     roads = lambda: _roads_text(_roads(w))
-    if purpose == "road_extension":
+    if purpose == "road_extension":                  # and no branch either (site_lists offers those first)
         return ("no straight extension from a dead end: build_road from any road into free land",
                 "no straight extension from a dead end into open land; build_road from any road tile into free "
                 f"land (L-shaped roads work, bridges cross the river; {roads()})", False)
@@ -1071,6 +1082,142 @@ def _uncovered_need(w, role: str, purpose: str) -> tuple[tuple[int, int], float]
         return None
     y, x = np.unravel_index(int(np.argmax(box_sum(uncovered, radius))), uncovered.shape)
     return (int(x), int(y)), left / total
+
+
+def _tiles_text(tiles) -> str:
+    """"(20,23)", or a straight run's ends "(20,22)-(20,23)"."""
+    (xa, ya), (xb, yb) = min(tiles), max(tiles)
+    return f"({xa},{ya})" + (f"-({xb},{yb})" if (xa, ya) != (xb, yb) else "")
+
+
+class Branch(NamedTuple):
+    """A road to branch off the highway-connected network into open land (branch_sites): off road tile `road`, going
+    `way`, straight through `clear` (the zoned tiles beside the road to free first, nearest first; none from a free
+    lot) and `run` (empty land or river, ending on land)."""
+    road: tuple[int, int]
+    way: tuple[int, int]
+    clear: tuple[tuple[int, int], ...]
+    run: tuple[tuple[int, int], ...]
+    opens: int              # empty land tiles without road access within 2 tiles of it (observation's opens_land)
+    built: int              # developed tiles among `clear`
+    levels: int             # their levels summed
+
+    @property
+    def start(self) -> tuple[int, int]:
+        return (self.clear or self.run)[0]
+
+    @property
+    def end(self) -> tuple[int, int]:
+        return self.run[-1]
+
+    @property
+    def tiles(self) -> tuple[tuple[int, int], ...]:
+        return self.clear + self.run
+
+    def first(self, w) -> str:
+        """What to run before the road, "" from a free lot: "dezone (20,23) (empty lot, free)", or with a building
+        "bulldoze (20,23) (a level-1 home, $5)" (bulldoze takes the lots with it)."""
+        if not self.clear:
+            return ""
+        where, n = _tiles_text(self.clear), len(self.clear)
+        if not self.built:
+            return f"dezone {where} (empty lot{'s' * (n > 1)}, free)"
+        what = Counter(f"level-{int(w.level[y, x])} {BUILT_NAMES[C.LETTER_BY_ZONE[int(w.struct[y, x])]]}"
+                       if w.level[y, x] > 0 else "empty lot" for x, y in sorted(self.clear))   # as `where` reads
+        plural = lambda k: k[:-1] + "ies" if k.endswith("y") else k + "s"
+        items = [a_or_an(k) if c == 1 else f"{c} {plural(k)}" for k, c in what.items()]
+        return f"bulldoze {where} ({_and(items)}, {money(n * C.CATALOG['bulldoze']['cost'])})"
+
+    def steps(self, w) -> str:
+        """"dezone (20,23) (empty lot, free), then build_road (20,23)-(20,10)"."""
+        road = f"build_road ({self.start[0]},{self.start[1]})-({self.end[0]},{self.end[1]})"
+        first = self.first(w)
+        return f"{first}, then {road}" if first else road
+
+    def site(self, w) -> dict:
+        """The find_sites entry: the build_road's ends (x1, y1 the tile beside the road), its tiles and bridge tiles,
+        the land it opens, the road tile it branches off and what to run first; cost: all of it, as charged."""
+        (x1, y1), (x2, y2) = self.start, self.end
+        bridges = sum(bool(w.terrain[y, x] == C.WATER) for x, y in self.tiles)
+        cost = ((len(self.tiles) - bridges) * C.CATALOG["road"]["cost"] + bridges * C.CATALOG["bridge"]["cost"]
+                + (len(self.clear) * C.CATALOG["bulldoze"]["cost"] if self.built else 0))
+        out = {"x": x1, "y": y1, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "tiles": len(self.tiles),
+               "bridge_tiles": bridges, "opens_land": self.opens, "branch_from": list(self.road), "cost": cost}
+        return {**out, "first": self.first(w)} if self.clear else out
+
+
+def branch_sites(w, clear: int = BRANCH_CLEAR, k: int = MAX_SITES) -> list[Branch]:
+    """Branch roads into open land, for where no dead end extends (observation's road_suggestions empty): from each
+    highway-connected road tile (not the highway entry), each way its neighbour isn't road, through up to `clear` zoned
+    tiles and then at least BRANCH_MIN tiles of empty land or river (trimmed to end on land; starting on a lot, so not
+    down the river from a bridge), BRANCH_LEN tiles in all at most, opening at least BRANCH_OPENS land tiles (as
+    observation counts opens_land: empty land without road access within 2 tiles of it). Ranked: none to bulldoze (a
+    free lot or empty lots to dezone) by land opened, then fewer tiles to clear, then nearer the town hall; then those
+    through buildings, the fewest levels first. Up to `k`, those running the same way more than BRANCH_APART apart.
+    Smoke v17 seed 0, months 3-9: one road across the map (y=24 x 0-47), every tile beside it zoned or built, and
+    planning, told "no straight extension from a dead end", built into buildings and past the map edge for 3 turns."""
+    s, level = w.struct.tolist(), w.level.tolist()
+    wet = (w.terrain == C.WATER).tolist()
+    band = (w.struct == C.NONE) & (w.terrain == C.LAND) & ~w.access
+    area = np.pad(band.cumsum(0).cumsum(1), ((1, 0), (1, 0))).tolist()     # summed-area table of `band`
+    zones, W, H = set(C.ZONES), w.w, w.h
+    found = []
+    ys, xs = np.nonzero(_connected_roads(w) & (w.struct != C.HIGHWAY))
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        for dx, dy in DIRECTIONS:
+            cx, cy, cleared, run, land = x + dx, y + dy, [], [], 0
+            while len(cleared) < clear and 0 <= cx < W and 0 <= cy < H and s[cy][cx] in zones:
+                cleared.append((cx, cy))
+                cx, cy = cx + dx, cy + dy
+            while len(cleared) + len(run) < BRANCH_LEN and 0 <= cx < W and 0 <= cy < H and s[cy][cx] == C.NONE:
+                run.append((cx, cy))
+                land = land if wet[cy][cx] else len(run)
+                cx, cy = cx + dx, cy + dy
+            run = run[:land]
+            if len(run) < BRANCH_MIN or not cleared and wet[run[0][1]][run[0][0]]:    # a lot, not the river
+                continue
+            (xa, ya), (xb, yb) = (cleared or run)[0], run[-1]
+            x0, x1 = max(0, min(xa, xb) - 2), min(W - 1, max(xa, xb) + 2)
+            y0, y1 = max(0, min(ya, yb) - 2), min(H - 1, max(ya, yb) + 2)
+            opens = area[y1 + 1][x1 + 1] - area[y0][x1 + 1] - area[y1 + 1][x0] + area[y0][x0]
+            if opens < BRANCH_OPENS:
+                continue
+            built = [level[by][bx] for bx, by in cleared if level[by][bx] > 0]
+            found.append(Branch((x, y), (dx, dy), tuple(cleared), tuple(run), int(opens), len(built), sum(built)))
+    tx, ty = w.townhall
+    found.sort(key=lambda b: (b.built > 0, b.levels, -b.opens, len(b.clear),
+                              abs(b.start[0] - tx) + abs(b.start[1] - ty), b.start[1], b.start[0]))
+    out = []
+    for b in found:
+        if not any(o.way == b.way and abs(o.start[0] - b.start[0]) + abs(o.start[1] - b.start[1]) <= BRANCH_APART
+                   for o in out):
+            out.append(b)
+            if len(out) >= k:
+                break
+    return out
+
+
+def branch_text(w, b: Branch) -> str:
+    """The Ready sites line's reason for road_extension with branch roads."""
+    return f"no dead end; branch: {b.steps(w)}, opens {b.opens} land tiles"
+
+
+def branch_note(w) -> str:
+    """find_sites' note on road_extension with branch roads."""
+    return ("no straight extension from a dead end into open land, so these are branch roads, best first: each leaves "
+            "a road tile (branch_from) at x1,y1 and runs straight to x2,y2; run its 'first' action if it has one "
+            f"(dezone empty lots: free; bulldoze a building: {money(C.CATALOG['bulldoze']['cost'])} a tile), then "
+            f"build_road x1,y1 to x2,y2 ({_roads_text(_roads(w))})")
+
+
+def ways_out(w) -> list[tuple]:
+    """Where a new road can still reach open land without clearing a lot, best first: the tiles of each straight
+    extension from a dead end (observation's road_suggestions), else of each branch from a free lot (branch_sites with
+    nothing to clear); [] when planning has boxed itself in (a zone that leaves none warns)."""
+    sign = lambda v: (v > 0) - (v < 0)
+    ext = [tuple((r["x1"] + i * sign(r["x2"] - r["x1"]), r["y1"] + i * sign(r["y2"] - r["y1"]))
+                 for i in range(1, r["tiles"] + 1)) for r in _road_extensions(w)]
+    return ext or [b.run for b in branch_sites(w, clear=0)]
 
 
 def _brief(v) -> str:
@@ -1260,9 +1407,13 @@ def land_blocked(env, lists: dict[str, dict[str, SiteList]] | None = None) -> di
 def land_fix(w, dept: str, purpose: str) -> str:
     """What a purpose blocked for lack of land needs beyond a free roadside lot, "" for none: a road to the river
     while no connected road reaches it, else a free riverbank lot (RIVERBANK_PURPOSES); a free 2x2 lot (TWO_BY_TWO);
-    "near homes" for NEAR_NEED while free roadside land is left (then that is why it is blocked: _why_empty).
-    Planning's blocked line tags them: smoke v14 seed 1 read "utilities (pump, sewage): extend a road into open land or
-    dezone a roadside lot for them"."""
+    "near homes" for NEAR_NEED while free roadside land is left (then that is why it is blocked: _why_empty); "away
+    from homes" for AWAY_FROM_HOMES (a lot freed among the homes doesn't do). Planning's blocked line tags them: smoke
+    v14 seed 1 read "utilities (pump, sewage): extend a road into open land or dezone a roadside lot for them"; v15
+    seed 1, months 6-9: health's landfill had "no roadside lot away from homes", planning left none at the town edge
+    and garbage coverage stayed 0 all run."""
+    if purpose in AWAY_FROM_HOMES:
+        return "away from homes"
     if purpose in RIVERBANK_PURPOSES:
         if not _riverbank_by_roads(w)[1]:
             return "a road to the river"
@@ -1270,6 +1421,14 @@ def land_fix(w, dept: str, purpose: str) -> str:
     if (dept, purpose) in NEAR_NEED and _free_roadside(w):
         return "near homes"
     return "a free 2x2 lot" if purpose in TWO_BY_TWO else ""
+
+
+def edge_site(w, roads: list[dict]) -> dict | None:
+    """The first of planning's road_extension sites (a dead end's extension or a branch road) whose far end (x2, y2)
+    has under 3 homes within 4 tiles (observation._far_from_homes): where to leave a lot for a building that must
+    stay away from homes (AWAY_FROM_HOMES); None without one."""
+    near = _far_from_homes(w)
+    return next((s for s in roads if not near[s["y2"], s["x2"]]), None)
 
 
 def funded_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
@@ -1644,6 +1803,7 @@ class ToolBox:
             if refusal:
                 return {"ok": False, "refused": kind, "error": refusal}
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
+        ways = self._ways_out() if name == "zone" else None
         before = w.struct.copy()
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         if res["ok"]:
@@ -1656,6 +1816,8 @@ class ToolBox:
         if res["ok"]:                                     # advice goes to the model only; the log keeps the core text
             note = self._bank_warning(bank) if bank is not None else ""
             note += self._funded_warning(funded, bank=bool(note)) if funded is not None else ""
+            prior = note or (res["message"] if "WARNING" in res["message"] else "")   # the game's no-access warning
+            note += self._branch_warning(ways, before, prior) if ways is not None else ""
         else:
             note = self._explain(name, args, res["message"])
         return {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
@@ -1787,6 +1949,37 @@ class ToolBox:
         except Exception:
             return ""
 
+    def _ways_out(self) -> list[tuple]:
+        """ways_out() before a zone runs; [] (no warning) on any error: it is advice, and a zone must never fail for
+        it."""
+        try:
+            return ways_out(self.world)
+        except Exception:
+            return []
+
+    def _branch_warning(self, ways: list[tuple], before: np.ndarray, prior: str = "") -> str:
+        """A warning for a zone that left no way for a new road into open land (ways_out() empty) where there was one
+        before it (`ways`, best first; `before`: the structures), naming the tiles it zoned on the best such way to
+        dezone. After another warning on the same zone (`prior`: the riverbank or funded-site one, or the game's "no
+        road access yet") it adds a clause to it, not a second WARNING. "" on any error. Smoke v17 seed 0, months 0-3:
+        planning zoned both sides of its only road nearly end to end (R at y=22 and y=23, I at y=25) with no dead end
+        left to extend; a wind turbine, a water tower and a police station took the last 3 free lots beside it, and
+        planning spent months 6-9 on roads into buildings and past the map edge."""
+        try:
+            w = self.world
+            if not ways or ways_out(w):
+                return ""
+            took = lambda way: [(x, y) for x, y in way if before[y, x] == C.NONE and w.struct[y, x] in C.ZONES]
+            tiles = next((t for way in ways if (t := took(way))), [])
+            where = _tiles_text(tiles) if tiles else ""
+            if prior:
+                return "; it also zoned the last lot a new road could branch from" + (
+                    f" (dezone {where} to leave one)" if where and where not in prior else "")
+            return (" WARNING: that zoned the last lot a new road could branch from; leave one free"
+                    + (f", e.g. dezone {where}" if where else ""))
+        except Exception:
+            return ""
+
     def _explain(self, name: str, args: dict, message: str) -> str:
         """How to fix a failed build_road, zone or dezone, appended to the core message in the tool result (v8, seed 0
         month 0: planning zoned row 23, then ran four roads north through those lots, still empty, told only
@@ -1800,8 +1993,9 @@ class ToolBox:
         rectangle holds, a zone adds the free roadside land beside it, and a road on existing road names the road
         lines it runs along (else, off every line, the connected roads' extent). Smoke v12-v16: 14 of 25 such zones
         and 4 of 13 such roads went over the role's own zone or road of that turn, so those name its calls
-        (_own_zones, _own_roads). A build on a taken tile says what took it and the next free site (_taken_hint). ""
-        otherwise."""
+        (_own_zones, _own_roads). A road blocked by a building, or off the map, while no dead end extends also names
+        the best branch road (_branch_hint). A build on a taken tile says what took it and the next free site
+        (_taken_hint). "" otherwise."""
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
@@ -1832,7 +2026,8 @@ class ToolBox:
                     + (f" ({mine})" if mine else "")
                     + f"; branch off {'them' if many else 'it'} into free land (find_sites road_extension)")
         if " is occupied by " not in message:
-            return ""
+            outside = message.endswith(f" is outside the {w.w}x{w.h} map")
+            return f" - {hint}" if outside and (hint := self._branch_hint()) else ""
         line = _line(w, args)                             # build_road got this far, so the arguments parse
         kind = {}                                         # what build_road can't take, as it walks the line
         for x, y in line:
@@ -1847,6 +2042,8 @@ class ToolBox:
         ls, bs = "s" * (len(lots) > 1), "s" * (len(built) > 1)
         tiles = lambda pts: _some([f"({x},{y})" for x, y in pts], BLOCKERS_NAMED)
         tail = f"; route around the building{bs} (the Map block has the road extent)"
+        if built and (hint := self._branch_hint()):
+            tail += f"; {hint}"
         if not lots:
             return f" - in the way: building{bs} {tiles(built)}{tail}"
         n = next((i for i, (_, y) in enumerate(line) if y != line[0][1]), len(line))    # the horizontal leg comes first
@@ -1866,6 +2063,19 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _branch_hint(self) -> str:
+        """For a failed build_road while no dead end extends (observation's road_suggestions empty): the best branch
+        road (branch_sites) and how to build it; "" when a dead end extends, there is no branch, or on any error.
+        Smoke v17 seed 0, months 6-9: with the only road's sides all zoned or built, planning ran 6 roads into
+        buildings ("occupied by coal_plant / commercial / residential ... route around") and 2 past the map edge."""
+        try:
+            w = self.world
+            found = [] if _road_extensions(w) else branch_sites(w, k=1)
+            return (f"no dead end to extend: branch instead, e.g. {found[0].steps(w)} (find_sites road_extension)"
+                    if found else "")
+        except Exception:
+            return ""
 
     def _own_roads(self, args: dict) -> list[str]:
         """This turn's successful build_road calls along the failed line `args` names, each as the legs of it that

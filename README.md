@@ -501,8 +501,22 @@ tasks and money, and to let people coach it.
   their straight road lines, e.g. `y=24 x 0-47; x=19 y 19-29`, up to 8 with the longest
   first, any road tiles not connected to the highway, and the built-up area) and end with
   the next milestone. While high density is locked, planning's Ready sites block says so
-  and tells it to zone at low density. Two more lines there are about the other
-  departments' buildings:
+  and tells it to zone at low density. When no dead end extends into open land, planning's
+  `road_extension` line (and `find_sites road_extension`) offers branch roads instead:
+  `- road_extension: none - no dead end; branch: dezone (23,25) (empty lot, free), then
+  build_road (23,25)-(23,39), opens 75 land tiles`.
+  - A branch leaves a road tile of the connected network and runs straight into open land
+    (up to 15 tiles, bridges allowed). It starts from a free lot beside the road, or else
+    through up to 2 empty zoned lots to dezone. Failing those, it bulldozes the cheapest
+    buildings (`bulldoze (17,23) (a level-1 home, $5)`).
+  - Branches are ranked by land opened (as the dead-end extensions count it), then by
+    fewer tiles to clear, then by distance to the town hall. `find_sites` lists up to 6,
+    each with its cost, the road tile it leaves and what to run first.
+  - In smoke v17 seed 0 the only road crossed the map with every tile beside it zoned or
+    built. Planning read "no straight extension from a dead end" and spent three turns on
+    roads into buildings and past the map edge.
+
+  Two more lines there are about the other departments' buildings:
   - **`- leave free (funded): fire station (20,22), clinic (21,25): zone around them`**
     covers each department whose funds already pay for its cheapest ready first
     building (all of them on a tie; utilities' only while that supply is at least 90% used). It gives each building a site, in turn order,
@@ -514,7 +528,15 @@ tasks and money, and to let people coach it.
   - **`- blocked for lack of land: utilities (sewage outlet: a road to the river), police
     (police station: near homes): extend a road into open land, or free a lot, for
     them`** gives each department's cheapest blocked first building, in turn order, and
-    what frees it. Past 240 characters the tags are dropped, then the building names.
+    what frees it. Past 240 characters the tags are dropped (`away from homes` first),
+    then the building names.
+    - A landfill or jail is tagged `(landfill: away from homes)`, and a line under it says
+      where to leave its lot: `- away from homes (health's landfill): leave a lot free by
+      (12,9), the far end of road_extension (12,23)-(12,9), with no homes within 4 tiles`.
+      It names the first extension or branch whose far end has under 3 homes within 4
+      tiles; without one it says to extend a road into open land at the town edge. In
+      smoke v15 seed 1 the landfill read "no roadside lot away from homes" from month 6,
+      planning never left one, and garbage coverage stayed 0 all run.
 
   In smoke v14 seed 0, planning zoned the lots near homes after the mayor had funded fire,
   health and education, and fire held $2,500 for nine months without a site.
@@ -525,6 +547,9 @@ tasks and money, and to let people coach it.
   failed `build_road`, `zone` or `dezone` also says how to fix it: a road blocked by empty zoned
   lots names them and the `dezone` rectangles to run first (free; they stay on the road's
   line, at most 2 named), and one blocked by a building says to route around it.
+  - While no dead end extends, a road blocked by a building or run off the map also names
+    the best branch road (`no dead end to extend: branch instead, e.g. dezone (12,23)
+    (empty lot, free), then build_road (12,23)-(12,9) (find_sites road_extension)`).
   - "Already road" names the road line it runs along ("branch off it into free land") and
     points to `find_sites road_extension`. When the line runs along the role's own
     `build_road` of that turn, it names that call (`you built y=24 x 19-34 at call 2 this
@@ -560,7 +585,12 @@ tasks and money, and to let people coach it.
   plant, succeeds, with a warning naming what utilities still needs the bank for. So does
   a `zone` that leaves a department with funds for its cheapest ready first building no
   unclaimed site for it (`WARNING: that zoned the last site for fire's fire station near homes (fire holds
-  $2,500 for it): dezone one, e.g. (20,22)`).
+  $2,500 for it): dezone one, e.g. (20,22)`). A `zone` that leaves no dead end to extend and
+  no free lot beside the roads from which a straight road reaches open land warns as well
+  (`WARNING: that zoned the last lot a new road could branch from; leave one free, e.g.
+  dezone (12,23)`). After another warning on the same zone (the riverbank one, or the
+  game's "no road access yet"), it adds `; it also zoned the last lot a new road could
+  branch from` instead of a second warning.
 
 | tools | |
 |---|---|

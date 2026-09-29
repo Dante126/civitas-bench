@@ -24,6 +24,7 @@ from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURP
     Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
     overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
     spare_funded
+from .tools import AWAY_FROM_HOMES, _and, _where, edge_site
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -195,7 +196,8 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
     if role == "planning":
         depts = dept_lists(env)                                    # one observation per priced department
         spots = funded_spots(w, depts)
-        lists, land = spare_funded(lists, spots), _leave_line(spots) + _land_line(env, depts)
+        roads = lists["road_extension"].sites if "road_extension" in lists else []
+        lists, land = spare_funded(lists, spots), _leave_line(spots) + _land_line(env, depts, roads)
     return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
 
@@ -214,22 +216,44 @@ def _leave_line(spots: list) -> list[str]:
     return [next((line(n) for n in range(len(found), 1, -1) if len(line(n)) <= BLOCKED_LINE_CHARS), line(1))]
 
 
-def _land_line(env, depts: dict) -> list[str]:
+def _land_line(env, depts: dict, roads: list[dict] = ()) -> list[str]:
     """Planning's line naming each department's cheapest first buildings blocked for lack of land or roads
     (land_blocked), by the names the mayor sees, each tagged with what it needs beyond a roadside lot (land_fix:
-    "sewage outlet: a road to the river"); past BLOCKED_LINE_CHARS without the tags, then departments only. Smoke v13
-    seed 0, months 6-9: planning zoned every roadside tile despite its playbook's "leave room", and utilities, police,
-    fire, health and education all read "none - no free roadside land: ask planning for a lot"."""
+    "sewage outlet: a road to the river"); past BLOCKED_LINE_CHARS without the "away from homes" tags (the next line
+    says it), then without tags, then departments only. Smoke v13 seed 0, months 6-9: planning zoned every roadside
+    tile despite its playbook's "leave room", and utilities, police, fire, health and education all read "none - no
+    free roadside land: ask planning for a lot". With a building that must stay away from homes, _away_line follows."""
     found = land_blocked(env, depts)
     if not found:
         return []
     w = env.world
     head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
-    name = lambda d, p, tag: site_price(w, d, p).building + (f": {fix}" if tag and (fix := land_fix(w, d, p)) else "")
+
+    def name(d: str, p: str, tag: int) -> str:            # tag 2: every tag, 1: all but away from homes, 0: none
+        fix = land_fix(w, d, p) if tag > (p in AWAY_FROM_HOMES) else ""
+        return site_price(w, d, p).building + (f": {fix}" if fix else "")
     forms = [", ".join(f"{d} ({', '.join(dict.fromkeys(name(d, p, tag) for p in ps))})" for d, ps in found.items())
-             for tag in (True, False)] + [", ".join(found)]
+             for tag in (2, 1, 0)] + [", ".join(found)]
     body = next((f for f in forms if len(head + f + tail) <= BLOCKED_LINE_CHARS), forms[-1])
-    return [head + cut(body, BLOCKED_LINE_CHARS - len(head + tail)) + tail]
+    return [head + cut(body, BLOCKED_LINE_CHARS - len(head + tail)) + tail] + _away_line(w, found, roads)
+
+
+def _away_line(w, found: dict[str, list[str]], roads: list[dict]) -> list[str]:
+    """Planning's line under the blocked one when a blocked first building must stay away from homes
+    (AWAY_FROM_HOMES: a landfill or jail): leave a lot free by the far end of a road_extension site (`roads`: a dead
+    end's extension or a branch road) with under 3 homes within 4 tiles (edge_site), else by the end of a new road
+    into open land at the town edge. Smoke v15 seed 1, months 6-9: health's landfill read "no roadside lot away from
+    homes", planning never left a lot at the town edge, and garbage coverage stayed 0 all run."""
+    away = [f"{d}'{'s' * (not d.endswith('s'))} {site_price(w, d, p).building}" for d, ps in found.items()
+            for p in ps if p in AWAY_FROM_HOMES]
+    if not away:
+        return []
+    head, site = f"- away from homes ({_and(away)}): ", edge_site(w, roads)
+    if site is None:
+        return [head + "extend a road into open land at the town edge and leave a lot free by its far end, with no "
+                "homes within 4 tiles"]
+    return [head + f"leave a lot free by ({site['x2']},{site['y2']}), the far end of road_extension {_where(site)}, "
+            "with no homes within 4 tiles"]
 
 
 def _needs(m: DeptMoney) -> str:
