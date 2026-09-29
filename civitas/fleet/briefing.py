@@ -244,7 +244,8 @@ def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
             left -= b.price.cost
     if not paid and not unpaid:
         return [line]
-    line += f": your {money(math.floor(funds))} pays for " + (_and(paid) if paid else "none of them")
+    line += f": your {money(math.floor(funds))} pays for " + (_and(paid) if paid else
+                                                              "none of them" if len(unpaid) > 1 else "nothing yet")
     if unpaid:
         more = sum(c for _, c in unpaid) - left
         line += (f"; {_and([at for at, _ in unpaid])} need{'s' * (len(unpaid) == 1)} {money(math.ceil(more))} "

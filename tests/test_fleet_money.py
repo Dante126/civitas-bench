@@ -1490,3 +1490,17 @@ def test_the_scripted_mayor_confirms_the_new_refusals(monkeypatch):
     assert tr == [("take_loan", "loan", None), ("take_loan", None, "loan"), ("allocate_budget", "reserve", None),
                   ("allocate_budget", None, "reserve")]
     assert w.debt == 10000 and w.dept_funds["police"] == 11000 and [r["ok"] for r in d.executed] == [True, True]
+
+
+# --- v20 fixes: integration (briefing.py: _short_line's wording with one unpaid building)
+def test_the_short_now_line_says_nothing_is_paid_for_one_building():
+    """The merged scripted fleet at month 24 read "your $1,748 pays for none of them; a coal plant at (0,23) ($4,000)
+    needs $2,252 more": one building named, so "none of them" had nothing plural to point at."""
+    from civitas.fleet.briefing import _short_line
+    w = _env().world
+    coal = T.site_price(w, "utilities", "coal_or_gas")
+    b = T.SupplyBuild("power", 229, 229, 60, "coal_or_gas", coal, 250, {"x": 0, "y": 23}, 6, imported=9.7)
+    assert _short_line([b], 1748) == ["- short now: power (229 of 229, 9.70 imported): your $1,748 pays for nothing "
+                                      "yet; a coal plant at (0,23) ($4,000) needs $2,252 more"]
+    assert _short_line([b], 4000) == ["- short now: power (229 of 229, 9.70 imported): your $4,000 pays for a coal "
+                                      "plant at (0,23) ($4,000)"]
