@@ -149,6 +149,19 @@ BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purpos
 # it or demand reaches BANK_BUSY x that supply (_wanted)
 SUPPLY_OF = {"pump": ("water", "pump"), "sewage": ("sewage", "sewage outlet"), "near_homes": ("water", None),
              "coal_or_gas": ("power", None), "wind": ("power", None)}
+# utilities' supplies, most urgent first: a lot develops to level 1 only with power, to 2 with water, to 3 with sewage
+# (economy.max_levels). Its needs line names one building per short supply (short_supplies) in this order
+SUPPLIES = ("power", "water", "sewage")
+# what a short supply wants added (supply_need): max(SUPPLY_MARGIN x demand, demand + SUPPLY_GROWTH) less the city's
+# own output, and the building named is the cheapest ready one whose output covers that (pick_supply). Smoke v9-v19
+# (22 runs): power demand grew a median 62 from month 0 to month 3 (46-192), water 50 (34-144; sewage demand is
+# water's without the cooling), so a first plant must cover about that: a wind turbine's 40 (x its site's wind, 1.4
+# at best: 56) doesn't, a coal plant's 250, a pump's 250, a tower's 120 and an outlet's 250 do. Later, half again the
+# demand is inside the 10-60% margin the utilities playbook asks and a quarter's growth (x1.3-1.5 a quarter from
+# month 6 to 12 in those runs). Smoke v20 seed 1: the line named only the cheapest ($2,200 tower), the mayor gave that,
+# and power stayed at 0-18% until month 10
+SUPPLY_MARGIN = 1.5
+SUPPLY_GROWTH = {"power": 60, "water": 50, "sewage": 50}
 BANK_BUSY = 0.9
 JAIL_BUSY = 0.8              # a first jail is needed once inmates pass this share of the cells (_cells_busy)
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
@@ -970,6 +983,12 @@ class DeptMoney:
         self.bound = None if any(pr.per_tile for pr in priced) else max((pr.cost for pr in priced), default=0)
         if dept == "planning":                  # its road and zoning (road_build), no dearer than road_max
             self.bound = road_max(w)
+        if dept == "utilities":                 # a building per short supply (short_supplies): each supply's dearest
+            dear = {}                           # summed. Smoke v20 seed 1, month 6: $4,400 above the $4,000 coal
+            for pr in priced:                   # plant read "funds cover its builds", power 17% and sewage 0%
+                s = supply_of(pr.name)
+                dear[s] = max(dear.get(s, 0.0), pr.cost)
+            self.bound = sum(dear.values())
         # its funded first buildings with no lot of their own (unclaimed_firsts across departments): funding_gaps
         # sets it, so a DeptMoney made alone reads () and its kind is "blocked" only for lack of land
         self.unclaimed: tuple[str, ...] = ()
@@ -1060,16 +1079,18 @@ class DeptMoney:
 
     @property
     def upkeep(self) -> float:
-        """The monthly upkeep its needs line adds: the largest Need.upkeep of the buildings it names; 0 without."""
+        """The monthly upkeep its needs line adds (FirstBuild.upkeep): the largest Need.upkeep of the buildings it
+        names, their sum when bought together (utilities' supplies); 0 without."""
         b = self.needs
-        return max((n.upkeep for n in b.named), default=0.0) if b is not None else 0.0
+        return b.upkeep if b is not None else 0.0
 
     @property
     def what(self) -> str:
-        """What its needs line buys, without the details: "its first police station", "another clinic or another
-        landfill", "a road into open land and zoning it"; "" without a needs line."""
+        """What its needs line buys, without the details (FirstBuild.what): "its first police station", "another clinic
+        or another landfill", "a road into open land and zoning it", "its first coal plant and water tower"; "" without
+        a needs line."""
         b = self.needs
-        return " or ".join(n.label for n in b.named) if b is not None else ""
+        return b.what if b is not None else ""
 
     @property
     def state(self) -> str:
@@ -1117,7 +1138,7 @@ class DeptMoney:
             return ""
         if self.keep > self.floor and b.cost >= self.keep:         # keep_why names it ("for another fire station")
             return ""
-        return f"{' or '.join(n.label for n in b.named)} ({money(b.cost)})"
+        return f"{b.what} ({money(b.cost)})"
 
 
 class FundItem(NamedTuple):
@@ -1330,14 +1351,15 @@ def treasury_state(w, f: Funding) -> str:
 def topped_up(m: DeptMoney) -> str:
     """What a department's money buys after a top-up, for its result: "can pay for another police station (upkeep
     +$55/month)" (its next build, first_build / road_build), "still $1,000 short of its first police station: less
-    buys nothing" (its needs line; less buys fewer tiles of a per-tile need, and part of planning's road and zoning,
-    so neither says nothing: review, $600 of a $900 levee stretch buys 2 of its 3 tiles), "blocked for lack of land:
+    buys nothing" (its needs line; less buys fewer tiles of a per-tile need, fewer of utilities' supply buildings bought
+    together, and part of planning's road and zoning, so none of them says nothing: review, $600 of a $900 levee
+    stretch buys 2 of its 3 tiles), "blocked for lack of land:
     this buys nothing until planning frees a lot" (DeptMoney.blocked, or its funded first buildings unclaimed), or
     with nothing named "needs nothing now: supply has room" (FirstBuild.room), "had only a library ready ($1,500)"
     (FirstBuild.extra) or "had nothing ready to buy"."""
     if (b := m.needs) is not None:
         less = ("" if m.dept == "planning" else ": less buys fewer tiles" if any(n.have is None for n in b.named)
-                else ": less buys nothing")
+                else ": less buys fewer of them" if b.all_of and len(b.named) > 1 else ": less buys nothing")
         return f"still {money(m.top_up)} short of {m.what}{less}"
     if m.unclaimed or m.blocked:
         return "blocked for lack of land: this buys nothing until planning frees a lot"
@@ -1348,9 +1370,8 @@ def topped_up(m: DeptMoney) -> str:
         if b is not None and b.extra:
             return f"had only {a_or_an(b.extra[0])} ready ({money(b.extra[1])})"
         return "had nothing ready to buy"
-    up = max(n.upkeep for n in b.named)
-    return (f"can pay for {' or '.join(n.label for n in b.named)}"
-            + (f" (upkeep +{money(up)}/month)" if round(up) else ""))
+    up = b.upkeep
+    return f"can pay for {b.what}" + (f" (upkeep +{money(up)}/month)" if round(up) else "")
 
 
 def taken_back(m: DeptMoney) -> str:
@@ -1836,7 +1857,8 @@ class Need(NamedTuple):
     what: str                   # the building ("police station"); uncounted, whole ("a levee tile", "3 avenue tiles")
     sites: int                  # ready sites of the first purpose pricing it (up to MAX_SITES)
     have: int | None            # buildings_of; None when not counted
-    status: str = ""            # for another one: its coverage or supply (build_status), "" for none
+    status: str = ""            # for another one: its coverage or supply (build_status), "" for none; a utilities
+                                # supply building, first or another, its supply's cover (SupplyBuild.status)
     first: bool = False         # a primary first building (Price.first) the city lacks: the mayor's priority line
     upkeep: float = 0.0         # what it adds a month (Price.upkeep; per-tile ones for all their tiles); 0 for the road
 
@@ -1855,6 +1877,20 @@ class Need(NamedTuple):
         return f"{self.label} ({sites if self.have == 0 else self.status or sites}{up})"
 
 
+LABEL_HEADS = ("its first ", "another ")
+
+
+def labels_and(labels: list[str]) -> str:
+    """Need labels all bought together, a run of the same head said once: "its first coal plant, water pump and sewage
+    outlet", "another coal plant and its first sewage outlet"."""
+    out, prev = [], None
+    for lab in labels:
+        head = next((h for h in LABEL_HEADS if lab.startswith(h)), None)
+        out.append(lab[len(head):] if head and head == prev else lab)
+        prev = head
+    return _and(out)
+
+
 class FirstBuild(NamedTuple):
     cost: float | None          # the cheapest ready site (cheapest), a per-tile purpose's best stretch whole; None
                                 # when none is ready
@@ -1870,6 +1906,31 @@ class FirstBuild(NamedTuple):
                                 # supply has room (_wanted): "supply has room" (DeptMoney.state)
     extra: tuple[str, float] | None = None  # with nothing else ready or blocked: the cheapest ready SUPPLEMENTARY
                                             # building and its price ("only a library ready ($1,500)")
+    all_of: bool = False        # `named` are bought together, `cost` their sum: utilities' one building per short
+                                # supply (short_supplies); else each is one way to spend `cost` (a tie)
+
+    @property
+    def what(self) -> str:
+        """What it buys, without the details: "its first police station", "another clinic or another landfill" (a
+        tie), every building bought together "its first coal plant and water tower" (all_of)."""
+        labels = [n.label for n in self.named]
+        return labels_and(labels) if self.all_of else " or ".join(labels)
+
+    @property
+    def upkeep(self) -> float:
+        """What it adds a month: the buildings' upkeep summed when bought together (all_of), else the largest."""
+        ups = [n.upkeep for n in self.named]
+        return sum(ups) if self.all_of else max(ups, default=0.0)
+
+    def text(self) -> str:
+        """The mayor's needs line after "needs $X for ": each Need's text, " or " between them; several bought
+        together, the labels and the upkeep summed: "its first coal plant and water tower ($110/month)". Their
+        supplies' state is left to the City block's supply / demand line: with each one's (e.g. "power 25% covered")
+        the worst mix of test_briefings_stay_bounded_at_the_limits took the mayor's briefing to 7,699-7,707 of its
+        7,700."""
+        if not self.all_of or len(self.named) < 2:
+            return " or ".join(n.text() for n in self.named)
+        return self.what + (f" ({money(self.upkeep)}/month)" if round(self.upkeep) else "")
 
 
 def supply_of(name: str) -> str | None:
@@ -1936,6 +1997,114 @@ def _busy(w, supply: str) -> bool:
     """Demand is at least BANK_BUSY of the `supply` ("power", "water", "sewage")."""
     m = w.metrics()
     return m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
+
+
+def supply_need(w, supply: str) -> float:
+    """What a short `supply` wants added: max(SUPPLY_MARGIN x demand, demand + SUPPLY_GROWTH) less what the city makes
+    itself. Service imports are left out: they cover at most IMPORT_SHARE_MAX of demand, are bought by the unit and
+    stop once the city's own output covers it (a fresh map's power 1.5 of 6 is all imports)."""
+    m = w.metrics()
+    demand = m[f"{supply}_demand"]
+    own = m[f"{supply}_supply"] - m["service_imports"].get(supply, 0.0)
+    return max(SUPPLY_MARGIN * demand, demand + SUPPLY_GROWTH[supply]) - own
+
+
+def supply_output(name: str, supply: str, site: dict) -> float:
+    """What a building of the tier `name` adds to `supply` at `site`: its tier's output, a wind turbine's times the
+    site's wind strength (the windy list's "wind", as World.plant_output_factor applies it)."""
+    line, tier = C.TIER_BY_NAME[name]
+    out = float(C.TIER_LINES[line][tier - 1].get(supply) or 0)
+    return out * float(site.get("wind", 1.0)) if line == "wind" else out
+
+
+def pick_supply(need: float, options: list[tuple]) -> tuple | None:
+    """Of `options` (purpose, Price, output, site), the cheapest whose output covers `need`, else the one with the
+    most output (the cheaper on a tie); None without options."""
+    covering = [o for o in options if o[2] >= need]
+    if covering:
+        return min(covering, key=lambda o: o[1].cost)
+    return max(options, key=lambda o: (o[2], -o[1].cost), default=None)
+
+
+class SupplyBuild(NamedTuple):
+    """One short supply (short_supplies) and the building utilities' needs line and short-now line name for it."""
+    supply: str                 # "power", "water" or "sewage"
+    have: float                 # the supply as the metrics give it (imports in, as the City block and Key metrics)
+    demand: float
+    need: float                 # what it wants added (supply_need)
+    purpose: str | None = None  # the ready purpose picked (pick_supply); None when nothing is ready for it
+    price: Price | None = None
+    output: float = 0.0         # what that building adds (supply_output)
+    site: dict | None = None    # where: that purpose's first site no earlier pick took
+    sites: int = 0              # that purpose's ready sites (up to MAX_SITES)
+    blocked: Price | None = None    # with nothing ready: its cheapest first building blocked for lack of land or
+                                    # roads (blocked_firsts), which utilities keeps money for
+    imported: float = 0.0       # the part of `have` bought in (service imports): supply_need leaves it out
+
+    @property
+    def status(self) -> str:
+        """The supply against demand, imports in (as the City block shows them): short of demand "power 25% covered",
+        else the share used, as build_status says it ("power 98% used"; imports filling a gap read "100% used": at
+        capacity, where "100% covered" read as nothing to do)."""
+        if self.demand <= 0:
+            return f"no {self.supply} demand yet"
+        if self.have < self.demand:
+            return f"{self.supply} {pct(100 * self.have / self.demand)} covered"
+        return f"{self.supply} {pct(100 * self.demand / self.have)} used"
+
+
+def short_supplies(w, lists: dict[str, SiteList]) -> list[SupplyBuild]:
+    """Each supply with a utilities purpose it wants (_wanted: demand at BANK_BUSY of its supply, or a pump or outlet
+    the city lacks), in SUPPLIES order, with the building to name for it: of its ready purposes (ready_prices), each at
+    its first site no earlier pick took, pick_supply's for supply_need. Supplies whose ready purposes all need the
+    riverbank pick first (an outlet can go nowhere else: with one free bank lot it gets the lot and water a tower),
+    then in SUPPLIES order (a coal plant and a tower ranked on the same lot take two). A supply with nothing ready
+    carries its cheapest blocked first building (blocked_firsts). Utilities' needs line (first_build) and short-now
+    line (briefing) read it, and bank_keep the lots it picks. Smoke v20 seed 1: the needs line named only the cheapest
+    wanted building; at month 3 utilities, holding $4,400, built nothing."""
+    ready, blocked = ready_prices(w, "utilities", lists), blocked_firsts(w, "utilities", lists)
+    short, cands, stuck = [], {s: [] for s in SUPPLIES}, {s: [] for s in SUPPLIES}
+    for p in SITE_PURPOSES["utilities"]:
+        pr = site_price(w, "utilities", p)
+        if pr is None or (s := supply_of(pr.name)) is None or not _wanted(w, p):
+            continue
+        short += [s] * (s not in short)
+        if p in ready:
+            cands[s].append(p)
+        elif p in blocked:
+            stuck[s].append(blocked[p])
+    bank_only = lambda s: bool(cands[s]) and all(p in RIVERBANK_PURPOSES for p in cands[s])
+    need = {s: supply_need(w, s) for s in short}
+    picks, taken = {}, set()
+    for s in sorted(short, key=lambda s: (not bank_only(s), SUPPLIES.index(s))):
+        opts = []
+        for p in cands[s]:
+            site = next((x for x in lists[p].sites if (x["x"], x["y"]) not in taken), None)
+            if site is not None:
+                opts.append((p, ready[p], supply_output(ready[p].name, s, site), site))
+        picks[s] = pick_supply(need[s], opts)
+        if picks[s]:
+            taken.add((picks[s][3]["x"], picks[s][3]["y"]))
+    m = w.metrics()
+    out = []
+    for s in (s for s in SUPPLIES if s in short):
+        base = SupplyBuild(s, m[f"{s}_supply"], m[f"{s}_demand"], need[s], imported=m["service_imports"].get(s, 0.0))
+        if (pick := picks[s]) is not None:
+            p, pr, output, site = pick
+            out.append(base._replace(purpose=p, price=pr, output=output, site=site,
+                                     sites=len(lists[p].sites[:MAX_SITES])))
+        else:
+            out.append(base._replace(blocked=min(stuck[s], key=lambda pr: pr.cost, default=None)))
+    return out
+
+
+def bank_keep(w, builds: list[SupplyBuild]) -> dict[tuple[int, int], str]:
+    """The scarce free riverbank lots (scarce_bank) -> what utilities' Ready sites say each is kept for: the pump or
+    sewage purpose short_supplies picked it for, else "pump/sewage" (as other roles' lines say). Smoke v20 seed 1,
+    month 3: its one lot read "(riverbank: keep for pump/sewage)" on the wind line and "same site as wind" on the pump
+    and sewage lines, and utilities spent its turn inspecting sewage sites."""
+    picked = {(b.site["x"], b.site["y"]): b.purpose for b in builds if b.purpose in BANK_TOP_UP}
+    return {xy: picked.get(xy, "pump/sewage") for xy in sorted(scarce_bank(w))}
 
 
 def dept_lists(env) -> dict[str, dict[str, SiteList]]:
@@ -2150,9 +2319,10 @@ def first_build(env, dept: str) -> FirstBuild | None:
     to 4.7-4.9x demand. Every building at that price is named (Need: first or another, buildings_of), with the ready
     sites of the first purpose pricing it; at a tie with a first one, the others go (health's clinic built: its first
     landfill alone). Each Need carries what the building adds in upkeep a month (Price.upkeep; a per-tile one for its
-    whole stretch, bridges twice). Its funded_firsts ride along (FirstBuild.funded) for unclaimed_firsts. With nothing
-    else ready or blocked, a FirstBuild without a cost says why when something was ready: utilities sites whose supply
-    has room (`room`), a supplementary building (`extra`); else None."""
+    whole stretch, bridges twice). Its funded_firsts ride along (FirstBuild.funded) for unclaimed_firsts. Utilities
+    names one building per short supply instead, bought together (_supply_build). With nothing else ready or blocked,
+    a FirstBuild without a cost says why when something was ready: utilities sites whose supply has room (`room`), a
+    supplementary building (`extra`); else None."""
     w = env.world
     lists = site_lists(w, dept, role_obs(env, dept))
     blocked = blocked_firsts(w, dept, lists)
@@ -2164,6 +2334,12 @@ def first_build(env, dept: str) -> FirstBuild | None:
             bridges = (units - tiles[p]) / (BRIDGE_UPGRADE - 1)
             prices[p] = pr._replace(cost=pr.cost * units, upkeep=pr.upkeep * (tiles[p] + bridges))
     labels = {p: _label(w, pr, tiles.get(p, 1)) for p, pr in prices.items()}
+    # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
+    label = lambda what, have: what if have is None else f"its first {what}" if not have else f"another {what}"
+    firsts = [(pr.cost, label(*labels[p])) for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first] + [
+        (pr.cost, label(*_label(w, pr))) for pr in blocked.values()]
+    if dept == "utilities" and (supply := _supply_build(w, lists, firsts, label)) is not None:
+        return supply._replace(funded=_funded_of(w, dept, lists))
     lacking = {p: pr for p, pr in prices.items()                                         # cheapest skips SUPPLEMENTARY
                if pr.first and labels[p][1] == 0 and (p != "jail" or _cells_busy(w))}
     purposes, low = cheapest(lacking) or cheapest(prices) or ((), None)
@@ -2181,16 +2357,37 @@ def first_build(env, dept: str) -> FirstBuild | None:
                                     pr.upkeep))
     if any(nd.have == 0 for nd in named.values()):
         named = {k: nd for k, nd in named.items() if not nd.have}
-    # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
-    label = lambda what, have: what if have is None else f"its first {what}" if not have else f"another {what}"
-    firsts = [(pr.cost, label(*labels[p])) for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first] + [
-        (pr.cost, label(*_label(w, pr))) for pr in blocked.values()]
     if low:
         firsts.append((low.cost, next(iter(named.values())).label))
     dearest = max(firsts, key=lambda t: t[0])                   # the first of the dearest, as max() reads them
     shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
     return FirstBuild(low.cost if low else None, tuple(named.values()), dearest[0], shut, _funded_of(w, dept, lists),
                       keep_for=dearest[1])
+
+
+def _supply_build(w, lists: dict[str, SiteList], firsts: list[tuple[float, str]], label) -> FirstBuild | None:
+    """Utilities' first_build: one building per short supply (short_supplies) bought together (FirstBuild.all_of, the
+    cost their sum), each Need with its supply's cover as its status ("power 25% covered"), in SUPPLIES order; None
+    when no short supply has a ready one (first_build's own path then says blocked, room or nothing). It keeps those
+    buildings and each blocked supply's cheapest first building together (the pump and outlet before the road reaches
+    the river), or the dearest single first building (`firsts`) when that is more. Smoke v20 seed 1, month 0: "needs
+    $2,200 for its first water tower" with power at 25% and sewage at 0%; the mayor gave $2,200, and at month 6
+    utilities' $4,400, above the $4,000 coal plant, read "funds cover its builds" with power at 17%."""
+    builds = short_supplies(w, lists)
+    if not any(b.purpose for b in builds):
+        return None
+    named, held = [], []
+    for b in builds:
+        if b.purpose:
+            have = buildings_of(w, b.price.name)
+            named.append(Need(b.price.building, b.sites, have, b.status, have == 0 and b.price.first, b.price.upkeep))
+            held.append((b.price.cost, named[-1].label))
+        elif b.blocked is not None:
+            held.append((b.blocked.cost, label(*_label(w, b.blocked))))
+    together = (sum(c for c, _ in held), labels_and([lab for _, lab in held]))
+    dearest = max([together] + firsts, key=lambda t: t[0])      # all of them on a tie
+    return FirstBuild(sum(b.price.cost for b in builds if b.purpose), tuple(named), dearest[0], (),
+                      keep_for=dearest[1], all_of=True)
 
 
 def road_cost(site: dict) -> float:
@@ -2246,19 +2443,39 @@ def road_build(env) -> FirstBuild | None:
     return FirstBuild(pr.cost, (need,), pr.cost, ())
 
 
-def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),
+def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = frozenset(),
                 prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
     on an earlier line is named once: the line points back to it and shows the next distinct site instead (several
     zone types rank the same strip first); a purpose reading another's list says so. A site in `keep_bank`
-    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. A line with
-    sites ends with its price (`prices`: ready_prices, and planning's road_price), and with `funds` (rounded down)
-    when they are short of it; so does a reason with sites (planning's branch roads)."""
+    (scarce_bank) shown for a purpose that doesn't need the river is marked to keep for pump / sewage. Utilities'
+    `keep_bank` says what each lot is kept for (bank_keep: {(x, y): "sewage"}): every line showing it says so
+    ("(riverbank: kept for sewage)", never "same site as"), and a purpose it isn't kept for shows its next site with
+    "(not (33,23): riverbank kept for sewage)" (one that needs the river keeps a lot kept for "pump/sewage"). A line
+    with sites ends with its price (`prices`: ready_prices, and planning's road_price), and with `funds` (rounded
+    down) when they are short of it; so does a reason with sites (planning's branch roads). Smoke v20 seed 1, month 3:
+    "wind: best (33,23) (riverbank: keep for pump/sewage)", "pump: same site as wind", "sewage: same site as wind";
+    utilities spent the turn inspecting sewage sites."""
     lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
+    kept = keep_bank if isinstance(keep_bank, dict) else None
+
+    def kept_for(s: dict) -> str | None:
+        return kept.get((s["x"], s["y"])) if kept and "x2" not in s else None
+
+    def mine(purpose: str, s: dict) -> bool:
+        """`s` may be shown as `purpose`'s best: not a lot kept for another purpose."""
+        k = kept_for(s)
+        return k is None or k == purpose or (k == "pump/sewage" and purpose in RIVER_PURPOSES)
+
+    def tag(purpose: str, s: dict) -> str:
+        if kept is None:
+            bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
+            return " (riverbank: keep for pump/sewage)" if bank else ""
+        k = kept_for(s)
+        return "" if k is None or (k == "pump/sewage" and purpose in RIVER_PURPOSES) else f" (riverbank: kept for {k})"
 
     def site(purpose: str, s: dict) -> str:
-        bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
-        return (_where(s) + _extra(purpose, s) + (" (riverbank: keep for pump/sewage)" if bank else "")
+        return (_where(s) + _extra(purpose, s) + tag(purpose, s)
                 + (f" (leave {s['leave']})" if "leave" in s else ""))
 
     def price(purpose: str) -> str:
@@ -2281,6 +2498,16 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozense
             continue
         paths[path] = purpose
         best, first = sites[0], shown.get(_where(sites[0]))
+        if kept_for(best) is not None:                 # a kept bank lot: said on every line, never "same site as"
+            own = next((s for s in sites if mine(purpose, s)), None)
+            if mine(purpose, best) or own is None:
+                lines.append(head + f"best {site(purpose, best)}" + price(purpose))
+            else:
+                if kept_for(own) is None:
+                    shown.setdefault(_where(own), purpose)
+                lines.append(head + f"best {site(purpose, own)} (not {_where(best)}: riverbank kept for "
+                             f"{kept_for(best)})" + price(purpose))
+            continue
         if first is None:
             shown[_where(best)] = purpose
             lines.append(head + f"best {site(purpose, best)}" + price(purpose))
