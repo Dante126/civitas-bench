@@ -314,3 +314,14 @@ table.ptab td.qrole .dot { display: inline-block; width: 7px; height: 7px; borde
 .mlines { margin: 6px 0; font-size: 12px; } .mlines summary { cursor: pointer; color: var(--muted); }
 .mlines pre.log { white-space: pre-wrap; font-size: 11px; max-height: 220px; }
 table.mtab .good { color: var(--ok); } table.mtab tr.midle td { background: rgba(255,200,87,.06); }
+/* reasoning per model reply, above its calls */
+.rstep { margin: 8px 0 4px; padding: 5px 8px; border-left: 2px solid rgba(185,155,255,.6); background: rgba(185,155,255,.06); border-radius: 0 6px 6px 0; cursor: pointer; font-size: 11.5px; }
+.rstep .rs-h { font-weight: 600; color: #cdbdff; }
+.rstep .rs-t { color: #c9d1d9; white-space: pre-wrap; margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.rstep.open .rs-t { display: block; -webkit-line-clamp: unset; max-height: 420px; overflow: auto; }
+/* problems: run comparison */
+.pcmp { margin: 4px 0 10px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.02); }
+.pcmp-h { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+.pcmp-h select { max-width: 60%; font-size: 11px; }
+table.pcmp-t th { font-weight: 500; font-size: 10.5px; white-space: nowrap; } table.pcmp-t td.best { color: var(--ok); font-weight: 700; }
+.pcmp-x { cursor: pointer; color: var(--muted); margin-left: 3px; } .pcmp-x:hover { color: var(--bad); }

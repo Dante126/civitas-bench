@@ -129,6 +129,23 @@ def trace_call(n: int, call: dict) -> dict:
     return out
 
 
+STEP = re.compile(r"\[step (\d+)\]\s*")
+STEP_CHARS = 8000
+
+
+def reasoning_steps(text: str) -> list[dict]:
+    """A fleet turn's reasoning split at its "[step N]" markers (the agent loop writes one per model reply), each cut
+    at STEP_CHARS: the viewer shows each step above the tool calls it made. Text before any marker is step 0."""
+    parts, out = STEP.split(text), []
+    if parts and parts[0].strip():
+        out.append({"step": 0, "text": parts[0].strip()[:STEP_CHARS], "chars": len(parts[0].strip())})
+    for n, body in zip(parts[1::2], parts[2::2]):
+        body = body.strip()
+        if body:
+            out.append({"step": int(n), "text": body[:STEP_CHARS], "chars": len(body)})
+    return out
+
+
 def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
     """Counts for a fleet turn's header: calls, actions that ran (and failed), tool errors, refusals, repeats,
     money spent, model replies and how the turn ended."""
@@ -383,7 +400,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                                         f"(agent {t.get('agent')})"}, 404)
                         calls = [trace_call(i + 1, c) for i, c in enumerate(t.get("tool_trace") or [])]
                         return self._json({"run_id": d.name, "month": month, "role": role, "agent": t.get("agent"),
-                                           "summary": trace_summary(t, calls), "calls": calls})
+                                           "summary": trace_summary(t, calls), "calls": calls,
+                                           "steps": reasoning_steps(t.get("reasoning") or "")})
                     if parts[3] == "problems":      # every problem in the run and how the agents handled it
                         from .bench.problems import run_problems
                         traj = d / "trajectories.jsonl"

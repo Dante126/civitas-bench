@@ -73,3 +73,12 @@ def test_problems_endpoint(tmp_path):
         assert d["total"]["problems"] == 1 and d["problems"][0]["handled"] == "dropped"
     finally:
         srv.shutdown()
+
+
+def test_reasoning_splits_at_step_markers():
+    from civitas.server import reasoning_steps, STEP_CHARS
+    steps = reasoning_steps("[step 0] look at the plan\n[step 1] the loan was refused; use the treasury\n[step 3] " + "x" * (STEP_CHARS + 50))
+    assert [(s["step"], s["text"][:12]) for s in steps] == [(0, "look at the "), (1, "the loan was"), (3, "xxxxxxxxxxxx")]
+    assert steps[2]["chars"] == STEP_CHARS + 50 and len(steps[2]["text"]) == STEP_CHARS
+    assert reasoning_steps("no markers here")[0] == {"step": 0, "text": "no markers here", "chars": 15}
+    assert reasoning_steps("") == []

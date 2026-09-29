@@ -535,15 +535,22 @@ function callsHeader(s) {
 function callsPanel(month, tr) {
   const key = `${S.runId}:${month}:${tr.role}`;
   return `<details class="calls" data-key="${esc(key)}" data-month="${month}" data-role="${esc(tr.role)}" ${S.callsOpen.has(key) ? "open" : ""}>
-    <summary>Tool calls <span class="callsum">${callsHeader(tr.trace)}</span></summary><div class="calllist"></div></details>`;
+    <summary>Tool calls &amp; reasoning <span class="callsum">${callsHeader(tr.trace)}</span></summary><div class="calllist"></div></details>`;
 }
 function argsText(a) {
   if (a == null || typeof a !== "object") return String(a ?? "");
   return Object.entries(a).map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? JSON.stringify(v) : v}`).join(" ");
 }
+// the model's reasoning for one reply, shown above the calls that reply made (clamped; click to expand)
+function stepBlock(st) {
+  return `<div class="rstep" title="click to expand"><span class="rs-h">💭 reply ${st.step + 1} reasoning <span class="muted">(${st.chars.toLocaleString()} chars${st.chars > st.text.length ? `, first ${st.text.length.toLocaleString()} shown` : ""})</span></span><div class="rs-t">${esc(st.text)}</div></div>`;
+}
 function callRows(d) {
-  if (!d.calls.length) return `<div class="small muted">No tool calls: the turn ended before the model called a tool (${esc(d.summary.finish_reason)}).</div>`;
-  return d.calls.map((c, i) => {
+  const steps = new Map((d.steps || []).map(st => [st.step, st])), shown = new Set();
+  const before = (step) => { const st = steps.get(step ?? 0); if (!st || shown.has(st.step)) return ""; shown.add(st.step); return stepBlock(st); };
+  if (!d.calls.length) return [...steps.values()].map(stepBlock).join("") + `<div class="small muted">No tool calls: the turn ended before the model called a tool (${esc(d.summary.finish_reason)}).</div>`;
+  const rest = () => [...steps.values()].filter(st => !shown.has(st.step)).map(stepBlock).join("");   // e.g. the last reply's thoughts
+  return d.calls.map((c, i) => before(c.step) + (() => {
     const [glyph, word] = OUTCOME[c.outcome] || ["·", c.outcome], raw = typeof c.args === "string";
     const nested = !raw && c.args && Object.values(c.args).some(v => v && typeof v === "object");   // flat args read fine on the line
     const step = `model reply ${(c.step ?? 0) + 1}${c.finish_reason && c.finish_reason !== "tool_calls" ? ` (finish: ${c.finish_reason})` : ""}`;
@@ -556,7 +563,7 @@ function callRows(d) {
         <span class="cx small muted">${esc(extra)}${raw ? " · arguments were not a JSON object" : ""}</span>
         ${nested ? `<pre class="log cx">${esc(JSON.stringify(c.args, null, 1))}</pre>` : ""}</span>
       <span class="co">${c.outcome === "ok" ? "" : `<span class="tag ${c.outcome === "repeat" ? "" : "warn"}">${word}</span>`}${c.cost ? `<span class="cost">${fmt$(c.cost)}</span>` : ""}</span></div>`;
-  }).join("");
+  })()).join("") + rest();
 }
 function fillCalls(det, d) {
   const list = det.querySelector(".calllist");
@@ -564,6 +571,7 @@ function fillCalls(det, d) {
   det.querySelector(".callsum").innerHTML = callsHeader(d.summary);
   list.innerHTML = callRows(d);
   list.querySelectorAll(".call").forEach(el => el.onclick = (ev) => { if (!window.getSelection().toString()) el.classList.toggle("open"); ev.stopPropagation(); });
+  list.querySelectorAll(".rstep").forEach(el => el.onclick = (ev) => { if (!window.getSelection().toString()) el.classList.toggle("open"); ev.stopPropagation(); });
   const fc = S.focusCall;                     // opened from the Problems tab: show that call
   if (fc && fc.key === det.dataset.key) {
     const el = list.querySelectorAll(".call")[fc.n - 1];
@@ -706,7 +714,7 @@ function renderProblems() {
         <span class="pmsg">${esc(p.text)}</span></span>
       <span class="pbadges"><span class="tag">${esc(p.kind)}</span><span class="tag hb h-${esc(p.handled)}" title="${esc((HANDLED[p.handled] || ["", ""])[1])}">${esc(hw)}${p.at ? ` · call ${p.at}` : ""}</span>${p.recurred ? `<span class="tag bad" title="the same cause on this role's next turn">↻</span>` : ""}</span></div>`;
   }
-  body.innerHTML = head + table + hints + chips + (rows || `<div class="emptytab">No problems match.</div>`) + (list.length > 500 ? `<div class="small muted">+${list.length - 500} more: filter by role or outcome</div>` : "");
+  body.innerHTML = head + compareBlock(d) + table + hints + chips + (rows || `<div class="emptytab">No problems match.</div>`) + (list.length > 500 ? `<div class="small muted">+${list.length - 500} more: filter by role or outcome</div>` : "");
   body.querySelectorAll(".pchips .chip").forEach(b => b.onclick = () => {
     const k = b.dataset.h;
     if (k === "recurred") { S.probFilter.has(k) ? S.probFilter.delete(k) : S.probFilter.add(k); }
@@ -715,6 +723,57 @@ function renderProblems() {
     renderProblems();
   });
   body.querySelectorAll(".prow").forEach(el => el.onclick = () => openProblem(+el.dataset.m, el.dataset.role, el.dataset.n ? +el.dataset.n : null));
+  bindCompare();
+}
+
+// compare problem-solving rates across runs (per turn, so runs of different lengths compare); picks are remembered
+S.compare = store.get("compare", []); S.cmpData = {};
+async function loadCompare(id) {
+  if (S.cmpData[id]) return;
+  S.cmpData[id] = { loading: true };
+  try {
+    const [p, sm] = await Promise.all([api(`/api/runs/${encodeURIComponent(id)}/problems`), api(`/api/runs/${encodeURIComponent(id)}/summary`).catch(() => null)]);
+    S.cmpData[id] = { p, sm };
+  } catch (e) { S.cmpData[id] = { error: e.message }; }
+  if (S.tab === "problems") renderProblems();
+}
+function cmpRates(p, sm) {
+  const t = p.total || {}, turns = t.turns || 1;
+  return { turns: t.turns || 0, perTurn: (t.problems || 0) / turns, fixed: t.fixable ? t.fixed / t.fixable : null, esc: t.fixable ? t.escalated / t.fixable : null,
+    unsolved: t.fixable ? (t.dropped + t.repeated) / t.fixable : null, recurred: (t.recurred || 0) / turns, guards: t.guards ? t.heeded / t.guards : null,
+    ends: (t.bad_ends || 0) / turns, city: sm && sm.final_scores ? sm.final_scores.city : null, pop: sm && sm.final_metrics ? sm.final_metrics.population : null,
+    roles: Object.fromEntries(Object.entries(p.roles || {}).map(([r, v]) => [r, v.fixable ? v.fixed / v.fixable : null])) };
+}
+function compareBlock(d) {
+  const ids = [S.runId, ...S.compare.filter(x => x !== S.runId)].slice(0, 5);
+  const fleetRuns = (S.runs || []).filter(r => /fleet:/.test(r.signature || "") && !ids.includes(r.run_id));
+  const picker = `<div class="pcmp-h"><b>Compare runs</b> <select id="pcmpAdd"><option value="">+ add a fleet run…</option>${fleetRuns.map(r => `<option value="${esc(r.run_id)}">${esc(r.run_id)}</option>`).join("")}</select></div>`;
+  if (ids.length < 2) return `<div class="pcmp">${picker}<div class="small muted">Add runs to compare their problem-solving rates with this one.</div></div>`;
+  const cur = { p: d, sm: null };
+  const cols = ids.map(id => id === S.runId ? { id, ...cur, sm: S.cmpData[id]?.sm || null } : { id, ...(S.cmpData[id] || {}) });
+  for (const c of cols) if (c.id === S.runId ? !S.cmpData[c.id] : !S.cmpData[c.id]) loadCompare(c.id);   // the open run's summary too
+  const R = cols.map(c => c.p ? cmpRates(c.p, c.sm) : null);
+  const f = { pct: (v) => v == null ? "—" : `${Math.round(v * 100)}%`, num: (v) => v == null ? "—" : v.toFixed(2), int: (v) => v == null ? "—" : Math.round(v).toLocaleString(), sc: (v) => v == null ? "—" : v.toFixed(1) };
+  // higher is better unless flagged; the best value per row is highlighted
+  const rows = [["final city score", "city", f.sc, 1], ["population", "pop", f.int, 1], ["turns", "turns", f.int, 0], ["problems per turn", "perTurn", f.num, -1],
+    ["fixed in turn", "fixed", f.pct, 1], ["escalated", "esc", f.pct, 0], ["unsolved", "unsolved", f.pct, -1], ["recurred per turn", "recurred", f.num, -1],
+    ["guards heeded", "guards", f.pct, 1], ["bad turn ends per turn", "ends", f.num, -1]];
+  const cell = (r, k, fm, dir) => {
+    const vals = R.map(x => x ? x[k] : null).filter(v => v != null), best = dir > 0 ? Math.max(...vals) : dir < 0 ? Math.min(...vals) : null;
+    return R.map((x, i) => `<td class="${dir && x && x[k] != null && vals.length > 1 && x[k] === best ? "best" : ""}">${x ? fm(x[k]) : (cols[i].error ? "error" : "…")}</td>`).join("");
+  };
+  const head = `<tr><th></th>${cols.map(c => `<th title="${esc(c.id)}">${c.id === S.runId ? "<b>this run</b>" : `${esc(c.id.replace(/^fleet_/, "").slice(0, 16))} <span class="pcmp-x" data-x="${esc(c.id)}" title="remove">×</span>`}</th>`).join("")}</tr>`;
+  const main = rows.map(([label, k, fm, dir]) => `<tr><td>${label}</td>${cell(null, k, fm, dir)}</tr>`).join("");
+  const roles = [...new Set(R.flatMap(x => x ? Object.keys(x.roles) : []))];
+  const per = roles.map(r => `<tr style="--c:${roleColor(r)}"><td class="qrole"><span class="dot"></span>${esc(r)}</td>${(() => {
+    const vals = R.map(x => x ? x.roles[r] : null).filter(v => v != null), best = Math.max(...vals);
+    return R.map(x => `<td class="${x && x.roles[r] != null && vals.length > 1 && x.roles[r] === best ? "best" : ""}">${x ? f.pct(x.roles[r]) : "…"}</td>`).join(""); })()}</tr>`).join("");
+  return `<div class="pcmp">${picker}<table class="lb pcmp-t">${head}${main}</table>
+    <details class="phints"><summary>Fixed in turn, per role</summary><table class="lb pcmp-t">${head.replace(/<span class="pcmp-x"[^<]*<\/span>/g, "")}${per}</table></details></div>`;
+}
+function bindCompare() {
+  const sel = $("pcmpAdd"); if (sel) sel.onchange = () => { if (!sel.value) return; S.compare = [...S.compare.filter(x => x !== sel.value), sel.value].slice(-4); store.set("compare", S.compare); renderProblems(); };
+  document.querySelectorAll(".pcmp-x").forEach(x => x.onclick = (ev) => { ev.stopPropagation(); S.compare = S.compare.filter(id => id !== x.dataset.x); store.set("compare", S.compare); renderProblems(); });
 }
 // jump to the quarter, the role's card and (for a call) its tool calls with that call shown
 function openProblem(month, role, n) {
