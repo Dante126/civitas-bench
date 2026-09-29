@@ -658,8 +658,9 @@ def test_money_results_show_the_treasury_and_what_is_left(monkeypatch):
     w.treasury, w.dept_funds["planning"] = 5288, 2748     # planning: $1,508 idle
     box = ToolBox(env, "mayor")
     school = "still to fund: education $2,500 (first/supply)"
-    # top-ups: what the department can buy now, then the treasury against the reserve and what is still to fund
-    assert _money(box, "allocate_budget", department="police", amount=2500) == (
+    # top-ups: what the department can buy now, then the treasury against the reserve and what is still to fund (another
+    # police station under the reserve: refused once, then earned)
+    assert _money(box, "allocate_budget", confirm=True, department="police", amount=2500) == (
         " | police: can pay for another police station (upkeep +$55/month); treasury $2,788, $212 under the $3,000 "
         f"reserve; {school}")
     school = "still to fund: education $1,000 (first/supply)"
@@ -1013,10 +1014,12 @@ def test_a_loan_after_the_turn_s_own_moves_names_what_to_undo(monkeypatch):
     top-up."""
     env = _env()
     w = env.world
-    _builds(monkeypatch, {"police": STATION, "education": SCHOOL})
+    clinic = FB(2000, (N("clinic", 3, 0, first=True, upkeep=40),), 2000, ())     # a first building still waits
+    _builds(monkeypatch, {"police": STATION, "education": SCHOOL, "health": clinic})
     box = _mayor(env, treasury=5698)
-    move = lambda dept, amount: box.call("allocate_budget", {"department": dept, "amount": amount})
-    assert move("education", 2500)["ok"] and move("police", 2500)["ok"] and move("fire", 698)["ok"]
+    move = lambda dept, amount, **kw: box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
+    assert move("education", 2500)["ok"] and move("police", 2500)["refused"] == "reserve"   # another, under $3,000
+    assert move("police", 2500, confirm=True)["ok"] and move("fire", 698)["ok"]
     assert box.call("take_loan", {"amount": 3000}) == {"ok": False, "refused": "loan", "error": (
         "the treasury started this turn at $5,698; this turn's top-ups ($5,698 net) took it under $3,000: take back "
         "(free) a top-up that isn't a first building or supply (police $2,500, fire $698) instead of a $3,000 loan "
@@ -1093,3 +1096,200 @@ def test_money_polish(monkeypatch):
                                             - cf.expenses) < 1e-6
     fin = _mayor_block(env, "## Finances")[1]
     assert fin.endswith(f", city services {money(cf.services)}, imports $173, interest $0"), fin
+
+
+# --- v20 fixes: mayor guards (tools.py: ToolBox._reserve_refusal, _loan_refusal; fleet/scripted.py's confirm tuple)
+FIRE_2 = FB(2500, (N("fire station", 4, 1, "coverage 69%", upkeep=55),), 2500, ())
+CLINIC_2 = FB(2000, (N("clinic", 3, 1, "coverage 68%", upkeep=40),), 2000, ())
+FUND_ANYWAY = " To fund it anyway, repeat this exact call with confirm: true."
+DEFICIT = " (6 x $536 expenses: last month's deficit was $22)"
+
+
+def test_another_building_under_the_reserve_is_refused_until_confirmed(monkeypatch):
+    """Smoke v20 seed 0, month 6: the to-fund line read "$4,305 covers planning, police; the other $6,500 would go
+    under the reserve", and the mayor funded another fire station and another clinic anyway, leaving $303 of a $3,216
+    reserve. A top-up for another building that would leave the treasury under the reserve is refused once; the exact
+    repeat with confirm: true is an override."""
+    env = _env()
+    w = env.world
+    env.end_month()
+    w.history[-1].update(income=514, expenses=536)       # a $22 deficit: 6 x $536
+    assert reserve(w) == 3216 and reserve_why(w) == DEFICIT
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2, "health": CLINIC_2, "education": SCHOOL}, road=ROAD_315)
+    box = _mayor(env, treasury=6803)
+    move = lambda dept, amount, **kw: box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
+    assert move("police", 2500)["ok"] and w.treasury == 4303          # another, and the reserve stays: it runs
+    why = ("that leaves the treasury at $1,803, $1,413 under the $3,216 reserve" + DEFICIT + ", for another fire "
+           "station; first/supply and growth come first: education $2,500 (first/supply), planning $315 (growth) "
+           "still wait." + FUND_ANYWAY)
+    assert move("fire", 2500) == {"ok": False, "refused": "reserve", "error": why}
+    assert w.treasury == 4303 and len(box.executed) == 1 and box._failed == {}   # nothing ran or is remembered
+    # first/supply and growth may go under the reserve
+    assert move("education", 2500)["ok"] and move("planning", 315)["ok"] and round(w.treasury) == 1488
+    why = ("that leaves the treasury at $488, $2,728 under the $3,216 reserve" + DEFICIT + ", for another clinic; "
+           "first/supply and growth come first and none is waiting." + FUND_ANYWAY)
+    first = move("health", 1000, confirm=True)       # confirm on a call not refused before: refused, with the note
+    assert first == {"ok": False, "refused": "reserve", "error": why[:-1] + EARNED + "."}, first
+    res = move("health", 1000, confirm=True)         # the identical repeat: earned
+    assert res["ok"] and res["override"] == "reserve" and w.dept_funds["health"] == 1000, res
+    assert res["message"].startswith("transferred $1,000 to health (now $1,000) | health: still $1,000 short of "
+                                     "another clinic")
+    assert move("health", 400)["refused"] == "reserve"          # still another, still under: another amount asks again
+    # not refused: more than the treasury holds (the action says so), a blocked first building, nothing ready
+    res = move("fire", 2500)
+    assert res["ok"] is False and "refused" not in res and res["message"].startswith("treasury only has $488"), res
+    _builds(monkeypatch, {"fire": NO_LOT, "health": CLINIC_2})
+    assert DeptMoney(env, "fire").kind == "blocked" and move("fire", 300)["ok"]
+    assert DeptMoney(env, "transport").kind == "nothing" and move("transport", 100)["ok"]
+    assert [r["ok"] for r in box.executed] == [True, True, True, True, False, True, True]
+
+
+def test_the_reserve_refusal_names_idle_money_and_spares_dust(monkeypatch):
+    """The refusal names idle money to take back first (the playbook's first step); a top-up that leaves the treasury
+    at the reserve, or less than $1 under it, runs."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    assert reserve(w) == RESERVE_MIN
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2})
+    box = _mayor(env, treasury=5500, planning=5000)          # planning keeps $1,000 of $5,000: $4,000 idle
+    assert DeptMoney(env, "planning").idle == 4000
+    assert box.call("allocate_budget", {"department": "police", "amount": 2500})["ok"] and w.treasury == 3000
+    res = box.call("allocate_budget", {"department": "fire", "amount": 2500})
+    assert res["error"] == ("that leaves the treasury at $500, $2,500 under the $3,000 reserve, for another fire "
+                            "station; first/supply and growth come first and none is waiting; take back idle money "
+                            "first (planning $4,000)." + FUND_ANYWAY), res
+    res = _mayor(env, treasury=5999.6).call("allocate_budget", {"department": "fire", "amount": 3000})
+    assert res["ok"] and "override" not in res, res             # $0.40 under: rounds to the reserve
+
+
+def test_levee_money_before_a_flood_is_not_another_building(monkeypatch):
+    """Fleet_scripted acting monthly, seeds 3 and 4 (months 43, 65, 66): the playbook's flood rule ("give fire ~$3,000
+    for levees at once"), which the scripted mayor follows, met the reserve guard, since fire's needs line named its
+    cheaper next fire station (and at seed 4 month 43 no levee site was listed: the forecast rows had nothing to
+    protect by a road). Levees are first/supply: while the forecast the briefing shows names a flood, a fire top-up
+    runs; a heatwave doesn't count."""
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"fire": FIRE_2, "police": STATION})
+    forecast = []
+    monkeypatch.setattr(w, "forecast", lambda ahead=3: list(forecast))
+    fire = {"department": "fire", "amount": 3000}
+    assert _mayor(env, treasury=3500).call("allocate_budget", fire)["refused"] == "reserve"
+    forecast.append("Heatwave expected in 1 month(s): +20% power, +30% water demand, more fires")
+    assert _mayor(env, treasury=3500).call("allocate_budget", fire)["refused"] == "reserve"
+    forecast.append("River flood expected in 2 month(s) along rows 8-22: riverside buildings without a levee will be "
+                    "damaged")
+    box = _mayor(env, treasury=3500)
+    res = box.call("allocate_budget", fire)
+    assert res["ok"] and "override" not in res and w.treasury == 500, res
+    assert box.call("allocate_budget", {"department": "police", "amount": 400})["refused"] == "reserve"  # fire only
+
+
+def test_a_loan_while_only_extra_buildings_wait_is_refused_until_confirmed(monkeypatch):
+    """Smoke v20 seed 0, month 9: in a hold that started at $550, the mayor took loans of $5,000, $3,000 and $2,500
+    (confirm: true on each first call, which passed since no guard fired: the turn started under $3,000) to fund
+    another police, fire and health building. A loan is refused once when no first building, supply or planning road
+    waits (Funding.to_fund), whatever the treasury at the turn's start."""
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2})
+    box = _mayor(env, treasury=550)
+    only = ("no first building, supply or planning road is waiting (only another: police $2,500, fire $2,500); this "
+            "$3,000 loan would pay for another building at $15/month interest until repaid (debt would be $3,000 of "
+            "$50k): fund another building only from the money above the reserve." + BORROW)
+    first = box.call("take_loan", {"amount": 3000, "confirm": True})      # v20: confirm on the first call
+    assert first == {"ok": False, "refused": "loan", "error": only[:-1] + EARNED + "."}, first
+    res = box.call("take_loan", {"amount": 3000, "confirm": True})
+    assert res["ok"] and res["override"] == "loan" and w.debt == 3000 and w.treasury == 3550, res
+    # nothing to fund at all: the loan would sit in the treasury
+    _builds(monkeypatch, {})
+    box = _mayor(env, treasury=550)
+    assert box.call("take_loan", {"amount": 2000})["error"] == (
+        "no first building, supply or planning road is waiting (nothing is ready to fund); this $2,000 loan would sit "
+        "in the treasury at $10/month interest until repaid (debt would be $5,000 of $50k)." + BORROW)
+    # below $0 (the WARNING line's months in the red) a loan pays the bills: it runs
+    res = _mayor(env, treasury=-500).call("take_loan", {"amount": 2000})
+    assert res["ok"] and "override" not in res and w.debt == 5000, res
+    # a first building, supply or planning road waiting: the loan runs
+    outlet = FB(1200, (N("sewage outlet", 2, 1, "sewage 95% used", upkeep=15),), 1200, ())
+    for mix, road in (({"police": STATION, "education": SCHOOL}, None), ({"police": STATION}, ROAD_315),
+                      ({"utilities": outlet}, None)):
+        _builds(monkeypatch, mix, road=road)
+        w.debt = 0
+        res = _mayor(env, treasury=550).call("take_loan", {"amount": 1000})
+        assert res["ok"] and "override" not in res, (mix, res)
+
+
+def test_the_loan_refusals_stack(monkeypatch):
+    """Only extra buildings waiting stacks with the other loan refusals (the treasury at $3,000 or more, or this turn's
+    own moves took it under) into one refusal text, which one override passes."""
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2})
+    box = _mayor(env, treasury=3598)
+    assert box.call("take_loan", {"amount": 5000})["error"] == (
+        "the treasury holds $3,598, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
+        "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover. Also, no first "
+        "building, supply or planning road is waiting (only another: police $2,500, fire $2,500): the loan would pay "
+        "for another building." + BORROW)
+    box = _mayor(env, treasury=5698)
+    move = lambda dept, amount, **kw: box.call("allocate_budget", {"department": dept, "amount": amount, **kw})
+    assert move("police", 2500)["ok"] and move("fire", 2500)["refused"] == "reserve"
+    assert move("fire", 2500, confirm=True)["override"] == "reserve" and round(w.treasury) == 698
+    assert box.call("take_loan", {"amount": 3000})["error"] == (
+        "the treasury started this turn at $5,698; this turn's top-ups ($5,000 net) took it under $3,000: take back "
+        "(free) a top-up that isn't a first building or supply (police $2,500, fire $2,500) instead of a $3,000 loan "
+        "at $15/month. Also, no first building, supply or planning road is waiting (nothing is ready to fund): the "
+        "loan would sit in the treasury." + BORROW)
+    res = box.call("take_loan", {"amount": 3000, "confirm": True})
+    assert res["ok"] and res["override"] == "loan" and w.debt == 3000
+
+
+def test_the_new_guards_never_block_an_action_by_failing(monkeypatch):
+    """Like the money notes, the guards read funding_gaps; if that fails the call runs as if they said nothing."""
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION})
+
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(T, "funding_gaps", boom)
+    box = _mayor(env, treasury=2000)
+    assert box.call("allocate_budget", {"department": "police", "amount": 1500})["ok"]
+    assert box.call("take_loan", {"amount": 1000})["ok"] and w.debt == 1000
+
+
+def test_the_report_counts_the_new_refusals():
+    """fleet_report counts refusals and overrides whatever their kind: the reserve refusal and its override too."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.report import _tool_error, turn_row
+    refused = {"ok": False, "refused": "reserve", "error": "that leaves the treasury at $303, ..."}
+    over = {"ok": True, "message": "transferred $1,500 to health", "override": "reserve"}
+    trace = [{"tool": "allocate_budget", "result": _slim(r)} for r in (refused, over)]
+    trace.append({"tool": "take_loan", "result": {"ok": False, "refused": "loan", "error": "no first building ..."}})
+    row = turn_row({"role": "mayor", "month": 6, "tool_trace": trace})
+    assert (row["refused"], row["overrides"], row["tool_errors"]) == (2, 1, [])
+    assert _tool_error(trace[0]) is None and _slim(over)["override"] == "reserve"
+
+
+def test_the_scripted_mayor_confirms_the_new_refusals(monkeypatch):
+    """The scripted fleet's mayor repeats a refusal its policy means with confirm: true, the new kinds included."""
+    from civitas.core.decision import Decision
+    from civitas.fleet.scripted import ScriptedFleetAgent
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION, "fire": FIRE_2})
+    a = ScriptedFleetAgent("mayor", cfg=FleetAgentConfig(model="scripted"))
+    a.reset(0)
+    a.bind(env)
+    w.treasury = 2000
+    acts = [{"type": "take_loan", "amount": 10000},
+            {"type": "allocate_budget", "department": "police", "amount": 11000}]
+    monkeypatch.setattr(a.policy, "act", lambda obs: Decision(actions=[dict(x) for x in acts], thinking="spend"))
+    d = a.act({})
+    tr = [(c["tool"], c["result"].get("refused"), c["result"].get("override")) for c in d.meta["tool_trace"]
+          if c["tool"] in ("take_loan", "allocate_budget")]
+    assert tr == [("take_loan", "loan", None), ("take_loan", None, "loan"), ("allocate_budget", "reserve", None),
+                  ("allocate_budget", None, "reserve")]
+    assert w.debt == 10000 and w.dept_funds["police"] == 11000 and [r["ok"] for r in d.executed] == [True, True]
