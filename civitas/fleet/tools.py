@@ -1105,19 +1105,10 @@ class Funding(NamedTuple):
         return max(0.0, self.spare + self.reserve - RESERVE_MIN) + sum(self.idle.values())
 
     @property
-    def short(self) -> bool:
-        return self.total > self.spare
-
-    @property
     def hold(self) -> bool:
         """Nothing to spend (spendable <= 0): the treasury is at or under the reserve and the idle money doesn't lift
         it above; spend_lines says what first/supply and growth may still use (dip)."""
         return self.spendable <= 0
-
-    def idle_note(self) -> str:
-        """The idle money and what to do with it, "" without any."""
-        return (f"{money(sum(self.idle.values()))} idle in {', '.join(self.idle)}: take it back (negative "
-                "allocate_budget) before loans or new top-ups") if self.idle else ""
 
 
 def funding_gaps(env, fleet: FleetState) -> Funding:
