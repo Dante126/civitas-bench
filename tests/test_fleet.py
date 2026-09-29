@@ -3663,6 +3663,10 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     import civitas.fleet.tools as T
     from civitas.fleet.memory import LIMITS
     from civitas.fleet.tools import MAX_ENTRIES, REPORT_MAX_CHARS
+    # characters without the memory block (shown in full). The mayor's is higher: its needs lines ("its first ..." /
+    # "another ... (coverage 74%)") and the first-buildings line are what it was missing in smoke v16 and v17, when it
+    # funded second stations and education never got its school; the needs-heavy mix below takes 7,621
+    bound = lambda role: 7700 if role == "mayor" else 7450
     env = _env()
     w = env.world
     spend = {d: 1111 for d in DEPTS}                     # $3,333 over the 3 months on every Departments line
@@ -3698,7 +3702,7 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 7500 - 50, (role, len(text) - len(memory))    # memory is shown in full
+        assert len(text) - len(memory) < bound(role), (role, len(text) - len(memory))
         assert (road_lines in text) == (role != "mayor"), role                   # a full road lines line
         assert ("spent $3,333" in text) == (role == "mayor"), role
         assert len(text) < 13000, (role, len(text))
@@ -3710,6 +3714,26 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     assert "\n## Departments (spent = last 3 months; cut reports: history kind=report)\n" in mayor
     assert mayor.count("; idle $3,210") == 5
     assert "- $16.1k idle in planning, transport, police, fire, education: take it back" in mayor
+    # the needs-heavy mix: 2 idle, 5 needs lines, 4 of them for a first building (the first-buildings line shows, cut
+    # to department names), each as long as it gets: 6 sites, health's another clinic and landfill (the longest tie)
+    N, FB = T.Need, T.FirstBuild
+    mix = {"utilities": FB(1200, (N("sewage outlet", 6, 0, first=True),), 1200, ()),
+           "police": FB(2500, (N("police station", 6, 0, first=True),), 2500, ()),
+           "fire": FB(2500, (N("fire station", 6, 0, first=True),), 2500, ()),
+           "health": FB(2000, (N("clinic", 6, 1, "coverage 21%"), N("landfill", 6, 1, "coverage 83%")), 2000, ()),
+           "education": FB(2500, (N("elementary school", 6, 0, first=True),), 2500, ())}
+    w.dept_funds.update(utilities=1000, police=2000, fire=2000, health=1500, education=2000)
+    with monkeypatch.context() as mp:
+        real = T.first_build
+        mp.setattr(T, "first_build", lambda env, dept: mix.get(dept) or real(env, dept))
+        for role in TURN_ORDER:
+            text = briefing(env, role, mark=False)
+            memory = text[text.index("## Your memory"):].split("\n\n")[0]
+            assert len(text) - len(memory) < bound(role), (role, len(text) - len(memory))
+        mayor = briefing(env, "mayor", mark=False)
+        assert mayor.count("; idle $3,210") == 2 and mayor.count("; needs $") == 5 and mayor.count("its first ") == 4
+        assert ("\n- first buildings still unfunded: utilities, police, fire, education: fund these before second "
+                "buildings\n") in mayor
     _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
     monkeypatch.setattr(T, "_uncovered_need", lambda w, role, purpose: ((0, 0), 1.0) if (role, purpose) in T.NEAR_NEED
                         else None)                     # as if the (empty) map had people to serve
@@ -3718,7 +3742,7 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     for role in TURN_ORDER:
         text = briefing(env, role, mark=False)
         memory = text[text.index("## Your memory"):].split("\n\n")[0]
-        assert len(text) - len(memory) < 7500 - 50, (role, len(text) - len(memory))
+        assert len(text) - len(memory) < bound(role), (role, len(text) - len(memory))
     mayor = briefing(env, "mayor", mark=False)
     assert mayor.count("; idle $3,210") == 2 and mayor.count("; blocked: ") == 5, mayor
     assert "- police: funds $2,500 < target $12.3k, spent $3,333; blocked: a police station; priority: " in mayor

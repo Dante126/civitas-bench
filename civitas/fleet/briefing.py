@@ -64,8 +64,8 @@ BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this
 BLOCKED_NOTE = "- blocked for lack of land: ask planning for lots"
 # the mayor's first-buildings line (_firsts_line): past this, department names only (their lines above say what and
 # for how much). Two departments' buildings and prices fit; four took 210 characters. At the limits with needs lines on
-# five departments (2 idle; test_briefings_stay_bounded_at_the_limits has 5 blocked) the mayor's briefing took 7,496
-# characters before the first / another wording, 7,738 after with this line whole, 7,616 with the cut
+# five departments, four of them first (2 idle), the mayor's briefing took 7,738 characters with this line whole, 7,616
+# with the cut; test_briefings_stay_bounded_at_the_limits builds that mix (7,621 of the mayor's 7,700)
 FIRSTS_LINE_CHARS = 160
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
