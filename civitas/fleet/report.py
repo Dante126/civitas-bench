@@ -21,8 +21,8 @@ from pathlib import Path
 from ..sim import catalog as C
 from .fmt import REPORT_PREVIEW_CHARS, cut, money, pct
 from .memory import DEPARTMENTS, FleetState
-from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, SITE_BUILDS, SITE_PURPOSES, SUPPLEMENTARY, SUPPLY_OF, \
-    building_name
+from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, ROAD_NAME, SITE_BUILDS, SITE_PURPOSES, SUPPLEMENTARY, \
+    SUPPLY_OF, building_name
 
 LIMIT_REASONS = ("max_steps", "turn_tokens")
 ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
@@ -147,14 +147,15 @@ def _seen(rec: dict) -> dict | None:
 
 
 def _site_state(rest: str) -> dict:
-    """One Ready sites line after its "- purpose: " (briefing.ready_lines) as _seen reads it."""
+    """One Ready sites line after its "- purpose: " (briefing.ready_lines) as _seen reads it; a reason ending in a
+    price (planning's "none - no dead end; branch: ...; $150") is priced like a list."""
     if rest.startswith("locked"):
         return {"state": "locked"}
-    if rest.startswith("none - "):
+    m = PRICE_END.search(rest)
+    if rest.startswith("none - ") and m is None:
         why = rest[len("none - "):]
         return {"state": "blocked", "why": why.split(": ask planning")[0]} if "ask planning" in why else {
             "state": "none"}
-    m = PRICE_END.search(rest)
     return {"state": "ready"} if m is None else {"state": "short" if m[2] else "ok", "price": _figure(m[1])}
 
 
@@ -266,15 +267,19 @@ def _turn_kind(role: str, row: dict, funds: float | None, target: float | None) 
     (its funds covered a ready site of a first or upgrade building it needed: `what` its purpose and price), "starved"
     (short of the cheapest such site: that one), "land" (none ready, some blocked for lack of land or roads: purpose ->
     why) or "none" (nothing needed it: coverage at COVERED+, "nothing needs it", locked); SUPPLEMENTARY
-    purposes never count. Planning, and a turn without a briefing (funds and target from the history log and the
-    plan), go by the funds alone: idle with $1+ (planning always has a road into open land to build), under it
-    starved against a plan target, else none."""
+    purposes never count. Planning goes by its priced road_extension line (a road into open land: idle when its funds
+    cover it, starved when short); without one planning, and a turn without a briefing (funds and target from the
+    history log and the plan), go by the funds alone: idle with $1+ (it can still zone), under it starved against a
+    plan target, else none. Live 120-month run, seed 0, months 9-12: planning at $0 short of its $150 extension."""
     if any(r["ok"] for r in row["results"]):
         return "acted", {}
     seen = row.get("seen")
     if seen and seen["funds"] is not None:
         funds = seen["funds"]
     broke = funds is not None and funds < 1
+    road = seen["sites"].get("road_extension", {}) if seen and role == "planning" else {}
+    if "price" in road:
+        return "idle" if road["state"] == "ok" else "starved", {"purpose": "road_extension", "price": road["price"]}
     if seen is None or role == "planning":
         return ("starved" if target else "none", {}) if broke else ("idle", {})
     wanted = {p: s for p, s in seen["sites"].items() if p not in SUPPLEMENTARY and _needed(role, p, seen["metrics"])}
@@ -297,10 +302,10 @@ def _cost(name: str) -> float:
 
 def _building(role: str, purpose: str, price: float | None = None) -> str:
     """What a purpose's sites are for, by name: its SITE_BUILDS entry at `price`, else its cheapest (the purpose for
-    those without one: planning's)."""
+    those without one: planning's; its road_extension a road into open land)."""
     names = SITE_BUILDS.get(role, {}).get(purpose, ())
     if not names:
-        return purpose.replace("_", " ")
+        return ROAD_NAME if (role, purpose) == ("planning", "road_extension") else purpose.replace("_", " ")
     return building_name(next((n for n in names if _cost(n) == price), None) or min(names, key=_cost))
 
 

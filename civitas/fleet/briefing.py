@@ -24,7 +24,7 @@ from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURP
     Funding, cheapest, dept_lists, funded_spots, funding_gaps, land_blocked, land_fix, map_facts, map_lines, \
     overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, site_price, \
     spare_funded
-from .tools import AWAY_FROM_HOMES, _and, _where, edge_site
+from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -443,6 +443,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                  "did, then end_turn.")
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     L += [""] + _digest(env, fleet, role)
+    if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
+        prices = {**prices, "road_extension": road}
     return L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds) + [""] + _memory(fleet, role)
 
 
