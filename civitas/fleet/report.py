@@ -72,8 +72,9 @@ def _tool_error(call: dict) -> str | None:
     """A failed tool call that is not a failed action (those are in `results`): bad arguments, unknown tools, a
     look-up that failed, an action tool refused before the action ran. A repeated failed action or bad call and a
     guard refusal (a bulldoze or demolish that would cut roads off, a duplicate allocation, a take-back below what a
-    department keeps, a self-inflicted loan), refused without running, are counted in `refused`, not here; a call
-    that overrode one (an earned confirm: true) ran, and is counted in `overrides` too."""
+    department keeps, a top-up for another building under the reserve, a self-inflicted loan or one while only other
+    buildings wait), refused without running, are counted in `refused` whatever its kind, not here; a call that
+    overrode one (an earned confirm: true) ran, and is counted in `overrides` too."""
     res = call.get("result") or {}
     if res.get("ok") is not False or (call.get("tool") in ALL_ACTIONS and "message" in res) or "refused" in res:
         return None

@@ -464,9 +464,10 @@ def guarded(role: str, action: str) -> bool:
     """Whether `role`'s `action` can be refused before it runs (its schema then has a confirm parameter): a bulldoze,
     and a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would
     cut roads off (confirm: true lets it run); the mayor's allocate_budget identical to one that succeeded this turn,
-    or taking a department below what it keeps (DeptMoney.keep), and its take_loan while the treasury holds
-    RESERVE_MIN or its own top-ups this turn took it under (EARNED_CONFIRM: confirm: true counts only on a repeat of
-    the refused call)."""
+    taking a department below what it keeps (DeptMoney.keep), or topping up another building under the reserve, and
+    its take_loan while the treasury holds RESERVE_MIN, its own top-ups this turn took it under, or no first
+    building, supply or planning road waits (EARNED_CONFIRM: confirm: true counts only on a repeat of the refused
+    call)."""
     return (action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
             or (role == "mayor" and action in EARNED_CONFIRM))
 
@@ -2583,8 +2584,9 @@ class ToolBox:
         roads off the highway or transport's demolish of their only station / harbour / airport link ("refused":
         "disconnect") is refused before it runs (not executed, logged or remembered as a failure) unless it passes
         confirm: true; so is the mayor's allocate_budget identical to one that succeeded this turn ("refused":
-        "duplicate") or taking a department below what it keeps ("refused": "take_back"), and its self-inflicted
-        take_loan ("refused": "loan"), but there confirm: true counts only on a repeat of a call refused this turn
+        "duplicate"), taking a department below what it keeps ("refused": "take_back") or topping up another building
+        under the reserve ("refused": "reserve"), and its self-inflicted take_loan or one while only other buildings
+        wait ("refused": "loan"), but there confirm: true counts only on a repeat of a call refused this turn
         (EARNED_CONFIRM; the result then says "override"). Once INSPECTS_FREE inspects
         have run this turn (repeats don't count), each further inspect result notes that map_overview shows the whole
         map (only the count when its radius note says so), until map_overview runs; after its first run, once
@@ -2850,12 +2852,52 @@ class ToolBox:
 
     def _allocation_refusal(self, args: dict) -> tuple[str, str | None]:
         """The guard an allocate_budget (guarded()) meets, as (refused kind, why or None): a take-back (a negative
-        amount) the keep guard (_take_back_refusal) first, then the duplicate guard, which is the only one anything
-        else meets."""
+        amount) the keep guard (_take_back_refusal) first, then the duplicate guard, then a top-up (a positive
+        amount) the reserve guard (_reserve_refusal)."""
         key = _allocation(args)
         if key is not None and key[1] < 0 and (why := self._take_back_refusal(*key)):
             return "take_back", why
-        return "duplicate", self._duplicate_refusal(args)
+        if why := self._duplicate_refusal(args):
+            return "duplicate", why
+        if key is not None and key[1] > 0 and (why := self._reserve_refusal(*key)):
+            return "reserve", why
+        return "duplicate", None
+
+    def _reserve_refusal(self, dept: str, amount: float) -> str | None:
+        """Why a top-up (allocate_budget with a positive `amount`; guarded()) must not run: it buys another building
+        (DeptMoney.kind "another", as the to-fund line lists it) and leaves the treasury at least $1 under the reserve
+        (reserve()), which the playbook keeps for first buildings, supply and planning's road. It names the treasury
+        after it, the reserve and why, what the top-up buys, the first/supply and growth top-ups still unfunded
+        (Funding.to_fund) and the idle money to take back first. Smoke v20 seed 0, month 6: the to-fund line read
+        "$4,305 covers planning, police; the other $6,500 would go under the reserve" and the mayor funded another
+        fire station and another clinic anyway, leaving $303 of a $3,216 reserve; month 9: another police station
+        took a $4,150 treasury to $1,650 (plan section 6 deferred this guard until v20 showed it). None for any other
+        kind (first/supply, growth, blocked with a price, nothing, idle), fire while the forecast the briefing shows
+        (World.forecast) names a flood (levees are first/supply, and the playbook's flood rule funds fire at once,
+        as the scripted mayor does, though fire's needs line names a cheaper station and no levee site may be listed:
+        fleet_scripted acting monthly met the guard only there, seeds 3 and 4, months 43, 65 and 66), a top-up that
+        leaves the treasury at or above the reserve, a department not in the game, and one the action refuses (more
+        than the treasury holds: its money note names the idle money). The scripted mayor tops up only from the
+        treasury above its own reserve, bar that flood rule."""
+        w = self.world
+        if dept not in DEPARTMENTS or dept not in self.env.roles or amount > w.treasury:
+            return None
+        after, keep = w.treasury - amount, reserve(w)
+        if round(keep - after) <= 0:
+            return None
+        if dept == "fire" and any("flood" in s.lower() for s in w.forecast()):
+            return None
+        f = self._funding()
+        m = f.depts.get(dept) if f else None
+        if m is None or m.kind != KINDS[2]:
+            return None
+        firsts = [f"{i.dept} {money(i.amount)} ({i.kind})" for i in f.to_fund if i.kind in NEED_KINDS[:2]]
+        wait = f": {_some(firsts, FUNDED_SHOWN)} still wait" if firsts else " and none is waiting"
+        idle = ", ".join(f"{d} {money(v)}" for d, v in f.idle.items())
+        return (f"that leaves the treasury at {money(after)}, {money(keep - after)} under the {money(keep)} "
+                f"reserve{reserve_why(w)}, for {m.what}; first/supply and growth come first{wait}"
+                + (f"; take back idle money first ({idle})" if idle else "")
+                + ". To fund it anyway, repeat this exact call with confirm: true.")
 
     def _take_back_refusal(self, dept: str, amount: float) -> str | None:
         """Why a take-back (allocate_budget with a negative `amount`; guarded()) must not run: it leaves `dept` below
@@ -2888,28 +2930,53 @@ class ToolBox:
                 + f"{took}; {free}: {todo}. To take it anyway, repeat this exact call with confirm: true.")
 
     def _loan_refusal(self, args: dict) -> str | None:
-        """Why the mayor's take_loan (guarded()) must not run: (a) the treasury holds RESERVE_MIN or more, or (b) the
-        turn started with that much and this turn's own moves took it under: top-ups (net of take-backs) that aren't
-        for a first building or supply (DeptMoney.buys), named with their amounts to take back instead, or a
-        repayment (`repaid`), which the loan would only borrow back. Its interest and the debt it leaves are named.
-        Smoke v13-v19: 10 of 15 loans ($34.8k of $60.0k) came in turns that started at $3,000 or more, 14 of 15 after
-        the mayor's own top-ups had emptied the treasury, and none was repaid; the 120-month run sat at the debt cap
-        from month 45. Review: (b) advised taking back "a top-up that isn't a first building or supply" when every
-        top-up was one (a loan the playbook allows), and blamed a $100 top-up for what a $3,000 repayment drained.
-        The scripted mayor borrows only at a turn's start with the treasury under RESERVE_MIN, so it never meets
-        this. None for a loan the action refuses (not positive, over the debt cap: its result says so) and bad
-        arguments."""
+        """Why the mayor's take_loan (guarded()) must not run, as one text: the treasury holds RESERVE_MIN or more,
+        or this turn's own moves took it under (_own_loan_refusal); and, whatever the treasury at the turn's start,
+        no first building, supply or planning road waits (no first/supply or growth item in Funding.to_fund), so the
+        loan would pay for another building (the ones waiting named) or sit in the treasury. Its interest and the
+        debt it leaves are named. Smoke v20 seed 0, month 9: in a hold that started at $550 the mayor borrowed
+        $5,000, $3,000 and $2,500, each with confirm: true on the first call (no guard fired: the turn started under
+        $3,000), to fund another police, fire and health building (plan section 6 deferred this guard until v20
+        showed it). The second part stays silent with the treasury below $0, where a loan pays the bills (the
+        briefing's WARNING line counts the months in the red). The scripted mayor borrows only at a turn's start with
+        the treasury under RESERVE_MIN, whatever waits (never on seeds 0-4 at either cadence); its fleet repeats a
+        refusal with confirm: true. None for a loan the action refuses (not positive, over the debt cap: its result
+        says so) and bad arguments."""
         w = self.world
         amount = _money_key("take_loan", args)[2]
         if amount is None or amount <= 0 or w.debt + amount > C.MAX_DEBT:
             return None
         interest = money(amount * C.LOAN_INTEREST)
         anyway = " To borrow anyway, repeat this exact call with confirm: true."
+        own = self._own_loan_refusal(amount, interest)
+        f = self._funding() if w.treasury >= 0 else None
+        if f is None or any(i.kind in NEED_KINDS[:2] for i in f.to_fund):
+            return own + anyway if own else None
+        extras = [f"{i.dept} {money(i.amount)}" for i in f.to_fund]
+        waits = f"only another: {_some(extras, FUNDED_SHOWN)}" if extras else "nothing is ready to fund"
+        buys = "pay for another building" if extras else "sit in the treasury"
+        none = f"no first building, supply or planning road is waiting ({waits})"
+        if own:
+            return f"{own} Also, {none}: the loan would {buys}." + anyway
+        return (f"{none}; this {money(amount)} loan would {buys} at {interest}/month interest until repaid (debt would "
+                f"be {money(w.debt + amount)} of {money(C.MAX_DEBT)})"
+                + (": fund another building only from the money above the reserve" if extras else "") + "." + anyway)
+
+    def _own_loan_refusal(self, amount: float, interest: str) -> str | None:
+        """_loan_refusal's first part, a sentence without the confirm advice: (a) the treasury holds RESERVE_MIN or
+        more, or (b) the turn started with that much and this turn's own moves took it under: top-ups (net of
+        take-backs) that aren't for a first building or supply (DeptMoney.buys), named with their amounts to take
+        back instead, or a repayment (`repaid`), which the loan would only borrow back. Smoke v13-v19: 10 of 15 loans
+        ($34.8k of $60.0k) came in turns that started at $3,000 or more, 14 of 15 after the mayor's own top-ups had
+        emptied the treasury, and none was repaid; the 120-month run sat at the debt cap from month 45. Review: (b)
+        advised taking back "a top-up that isn't a first building or supply" when every top-up was one (a loan the
+        playbook allows), and blamed a $100 top-up for what a $3,000 repayment drained. None otherwise."""
+        w = self.world
         if w.treasury >= RESERVE_MIN:
             return (f"the treasury holds {money(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
                     f"{money(amount)} loan costs {interest}/month until repaid (debt would be "
                     f"{money(w.debt + amount)} of {money(C.MAX_DEBT)}); borrow only for a first building or supply "
-                    "need the treasury can't cover." + anyway)
+                    "need the treasury can't cover.")
         net = sum(a for _, a in self._allocations())
         if self.start_treasury < RESERVE_MIN or (net <= 0 and self.repaid <= 0):
             return None
@@ -2926,7 +2993,15 @@ class ToolBox:
         todo = (f"{loan} borrows back what you just repaid; {back} instead" if others and self.repaid else
                 f"{back} instead of {loan}" if others else f"{loan} borrows back what you just repaid")
         return (f"the treasury started this turn at {money(self.start_treasury)}; {causes} took it under "
-                f"{money(RESERVE_MIN)}: {todo}." + anyway)
+                f"{money(RESERVE_MIN)}: {todo}.")
+
+    def _funding(self) -> Funding | None:
+        """funding_gaps for the reserve and loan guards, None if it fails: a guard never blocks an action by failing
+        (like _money_note and _buys)."""
+        try:
+            return funding_gaps(self.env, self.fleet)
+        except Exception:
+            return None
 
     def _buys(self, dept: str) -> str:
         """What `dept`'s money is for (DeptMoney.buys), "" for a department not in the game (nobody spends it)."""
