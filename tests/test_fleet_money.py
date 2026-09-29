@@ -281,3 +281,184 @@ def test_cash_flow_identity(monkeypatch):
     cf = cash_flow(env.world)
     assert C.MILESTONES[0]["name"] in env.world.milestones_reached and abs(cf.other - 5000) < 0.5
     assert cash_flow(_env().world) == T.CashFlow(None, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0)
+
+
+# --- Unit C: money guards (tools.py: earned confirm, duplicate take-backs, the loan guard, the money-note hook;
+# agent._slim and report.py: overrides)
+EARNED = " (confirm: true counts only when repeating this exact call after it was refused)"
+BORROW = " To borrow anyway, repeat this exact call with confirm: true."
+
+
+def _mayor(env, treasury: float = 30000.0, **funds) -> T.ToolBox:
+    """The mayor's toolbox for a turn starting with this treasury and these department funds."""
+    env.world.treasury = treasury
+    env.world.dept_funds.update(funds)
+    return T.ToolBox(env, "mayor")
+
+
+def _props(box, tool: str) -> dict:
+    return next(s["function"]["parameters"]["properties"] for s in box.schemas() if s["function"]["name"] == tool)
+
+
+def test_confirm_counts_only_after_a_refusal():
+    """v19: all 3 take-back refusals were overridden at once, and 3 of 7 duplicate refusals; confirm: true was a free
+    pass. It now counts only on a repeat of the exact call refused this turn, one override per refusal."""
+    from civitas.fleet.agent import _slim
+    from civitas.fleet.report import _tool_error, turn_row
+    env = _env()
+    w = env.world
+    _months_spent(env, {"planning": 658}, {}, {})
+    box = _mayor(env, planning=2508)
+    m = DeptMoney(env, "planning")
+    assert (m.keep, m.keep_why, m.idle) == (1316, "2 x its $658 spending", 1192)
+    take = lambda amount, **kw: box.call("allocate_budget", {"department": "planning", "amount": amount, **kw})
+    res = take(-1000, confirm=True)                    # within what it keeps: confirm or not, it just runs
+    assert res["ok"] and "override" not in res and w.dept_funds["planning"] == 1508, res
+    why = ("that takes planning below the $1,316 it keeps (2 x its $658 spending), so it can't build next quarter; you "
+           "already took back $1,000 from it this turn; it has no idle money: leave its funds. To take it anyway, "
+           "repeat this exact call with confirm: true")
+    first = take(-1000, confirm=True)                  # confirm on a call not refused before: refused, with the note
+    assert first == {"ok": False, "refused": "take_back", "error": why + EARNED + "."}, first
+    assert take(-1000) == {"ok": False, "refused": "take_back", "error": why + "."}       # no confirm: no note
+    again = take(-1000, confirm=True)                  # the identical repeat: earned (the take-back guard ran first)
+    assert again["ok"] and again["override"] == "take_back" and w.dept_funds["planning"] == 508, again
+    assert again["message"].startswith("reclaimed $1,000 from planning")
+    assert box.executed[-1]["action"] == {"department": "planning", "amount": -1000, "type": "allocate_budget"}
+    assert _slim(again)["override"] == "take_back" and _tool_error({"tool": "allocate_budget", "result": again}) is None
+    row = turn_row({"role": "mayor", "month": 3, "tool_trace": [{"tool": "allocate_budget", "result": _slim(r)}
+                                                                for r in (first, again)]})
+    assert (row["refused"], row["overrides"]) == (1, 1)
+    # the same call as the handler reads it (department case, a number as text), and one refusal per override
+    assert box.call("allocate_budget", '{"department": "fire", "amount": 400}')["ok"]
+    dup = lambda **kw: box.call("allocate_budget", {"department": "Fire", "amount": "400", **kw})
+    assert dup()["refused"] == "duplicate"
+    assert dup(confirm="true")["override"] == "duplicate" and w.dept_funds["fire"] == 800
+    res = dup(confirm=True)                            # that refusal earned one override: refused again, with the note
+    assert res["refused"] == "duplicate" and res["error"].endswith("only to add it again" + EARNED), res
+    assert dup(confirm=True)["override"] == "duplicate" and w.dept_funds["fire"] == 1200
+    assert [r["ok"] for r in box.executed] == [True, True, True, True, True]
+    assert _props(box, "allocate_budget")["confirm"] == {"type": "boolean", "description": T.CONFIRM["allocate_budget"]}
+    assert T.CONFIRM["allocate_budget"] == (
+        "true only to repeat an allocate_budget refused this turn with the same department and amount, once you are "
+        "sure; on any other call it doesn't count")
+
+
+def test_identical_take_backs_are_duplicates():
+    """v19 seed 1, month 6: the mayor repeated its take-back pairs; the duplicate guard let negative amounts through.
+    The take-back guard runs first, then the duplicate guard."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    box = _mayor(env, planning=5000)
+    assert DeptMoney(env, "planning").idle == 4000
+    take = lambda amount, **kw: box.call("allocate_budget", {"department": "planning", "amount": amount, **kw})
+    assert take(-1140)["ok"]
+    res = take(-1140)
+    assert res == {"ok": False, "refused": "duplicate", "error": (
+        "you already took $1,140 back from planning this turn (it now has $3,860); take-backs add up - repeat with "
+        "confirm: true only to take it back again")}, res
+    assert box.executed[-1]["ok"] and len(box.executed) == 1 and w.dept_funds["planning"] == 3860
+    assert take(-1000)["ok"] and w.dept_funds["planning"] == 2860                      # another amount
+    res = take(-1140, confirm=True)                    # refused before this turn: earned
+    assert res["ok"] and res["override"] == "duplicate" and w.dept_funds["planning"] == 1720, res
+    assert take(-1720)["refused"] == "take_back"       # below what it keeps: that guard first
+
+
+def test_a_self_inflicted_loan_is_refused_until_confirmed():
+    """Smoke v13-v19: 10 of 15 loans ($34.8k of $60.0k) came in turns that started at $3,000 or more, and 14 of 15
+    after the mayor's own top-ups had emptied the treasury; none was repaid."""
+    env = _env()
+    w = env.world
+    box = _mayor(env, treasury=3598)
+    loan = lambda amount, **kw: box.call("take_loan", {"amount": amount, **kw})
+    over = ("the treasury holds $3,598, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
+            "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover." + BORROW)
+    assert loan(5000) == {"ok": False, "refused": "loan", "error": over}
+    assert w.debt == 0 and box.executed == [] and box._failed == {}
+    res = loan("5000", confirm=True)                   # the earned repeat
+    assert res["ok"] and res["override"] == "loan" and (w.debt, w.treasury) == (5000, 8598), res
+    assert res["message"].startswith("borrowed $5,000 at 0.5%/month (debt $5,000)")
+    # started at $3,000 or more, and this turn's own top-ups took it under
+    w.debt = 0
+    box = _mayor(env, treasury=5698)
+    move = lambda dept, amount: box.call("allocate_budget", {"department": dept, "amount": amount})
+    assert move("police", 4698)["ok"] and move("fire", 1000)["ok"] and w.treasury == 0
+    assert box.call("take_loan", {"amount": 3000}) == {"ok": False, "refused": "loan", "error": (
+        "the treasury started this turn at $5,698 and this turn's top-ups ($5,698 net) took it under $3,000: take back "
+        "a top-up that isn't a first building or supply (free) instead of a $3,000 loan at $15/month." + BORROW)}
+    assert move("fire", -1000)["ok"]                   # take-backs net off
+    res = box.call("take_loan", {"amount": 3000})
+    assert res["refused"] == "loan" and "this turn's top-ups ($4,698 net) took it under $3,000" in res["error"]
+    res = box.call("take_loan", {"amount": 3000, "confirm": True})
+    assert res["ok"] and res["override"] == "loan" and w.debt == 3000
+    # a turn that started under $3,000 borrows at once, top-ups or not
+    w.debt = 0
+    box = _mayor(env, treasury=2400)
+    assert move("police", 400)["ok"]
+    res = box.call("take_loan", {"amount": 10000})
+    assert res["ok"] and "refused" not in res and "override" not in res and w.treasury == 12000, res
+    res = box.call("take_loan", {"amount": 1000, "confirm": True})      # now over $3,000; confirm not earned yet
+    assert res["refused"] == "loan" and res["error"].endswith(" with confirm: true" + EARNED + "."), res
+    # what the action refuses (at the cap, nothing to borrow) is left to it
+    w.debt = 50000
+    res = box.call("take_loan", {"amount": 1000})
+    assert res["ok"] is False and "refused" not in res and res["error"].startswith("debt limit is $50,000"), res
+    assert box.call("take_loan", {"amount": 0})["error"].startswith("amount must be positive")
+    assert _props(box, "take_loan")["confirm"] == {"type": "boolean", "description": T.CONFIRM["take_loan"]}
+    assert T.CONFIRM["take_loan"] == ("true only to repeat a take_loan refused this turn with the same amount, once "
+                                      "you are sure; on any other call it doesn't count")
+    assert T.guarded("mayor", "take_loan") and not T.guarded("mayor", "repay_loan")
+    assert not T.guarded("utilities", "take_loan")
+
+
+def test_money_results_carry_the_money_note(monkeypatch):
+    """The mayor's allocate_budget, take_loan and repay_loan results end with ToolBox._money_note on success and on a
+    core failure, instead of _explain's fix; a guard refusal gets none, and executed and the log keep the core text.
+    MONEY_DOCS extends those tools' descriptions."""
+    from civitas.core.actions import action_docs
+    env = _env()
+    w = env.world
+    notes = []
+    monkeypatch.setattr(T.ToolBox, "_money_note",
+                        lambda self, name, args, res: notes.append((name, dict(args), res["ok"])) or f" | {name}")
+    monkeypatch.setattr(T.ToolBox, "_explain", lambda self, name, args, message: " | explained")
+    monkeypatch.setitem(T.MONEY_DOCS, "take_loan", " Interest is due monthly.")
+    box = _mayor(env, treasury=2000)
+    desc = {s["function"]["name"]: s["function"]["description"] for s in box.schemas()}
+    docs = action_docs()
+    assert desc["take_loan"] == docs["take_loan"][1] + " Interest is due monthly." and desc["set_tax"] == docs[
+        "set_tax"][1]
+    assert box.call("allocate_budget", {"department": "police", "amount": 500})["message"] == (
+        "transferred $500 to police (now $500) | allocate_budget")
+    res = box.call("allocate_budget", {"department": "police", "amount": 5000})        # a core failure
+    assert res["ok"] is False and res["message"] == "treasury only has $1,500 | allocate_budget"
+    assert box.call("take_loan", {"amount": 1000})["message"] == "borrowed $1,000 at 0.5%/month (debt $1,000) | take_loan"
+    assert box.call("repay_loan", {"amount": 400})["message"] == "repaid $400 (debt $600) | repay_loan"
+    res = box.call("allocate_budget", {"department": "police", "amount": 500})         # a guard refusal: no note
+    assert res["refused"] == "duplicate" and " | " not in res["error"]
+    assert notes == [("allocate_budget", {"department": "police", "amount": 500}, True),
+                     ("allocate_budget", {"department": "police", "amount": 5000}, False),
+                     ("take_loan", {"amount": 1000}, True), ("repay_loan", {"amount": 400}, True)]
+    assert box.call("set_tax", {"sector": "Q", "rate": 9})["message"].endswith(" | explained")   # other actions
+    core = ["transferred $500 to police (now $500)", "treasury only has $1,500", "borrowed $1,000 at 0.5%/month (debt "
+            "$1,000)", "repaid $400 (debt $600)"]
+    assert [r["message"] for r in box.executed][:4] == core
+    assert [e["message"] for e in FleetState.of(env).log if e["kind"] == "action"][:4] == core
+    monkeypatch.setattr(T.ToolBox, "_money_note", lambda self, *a: 1 / 0)          # advice never fails an action
+    res = box.call("allocate_budget", {"department": "fire", "amount": 100})
+    assert res["ok"] and res["message"] == "transferred $100 to fire (now $100)" and w.dept_funds["fire"] == 100
+
+
+def test_the_report_counts_overrides():
+    from civitas.fleet.report import fleet_report, turn_row
+    env = _env()
+    FleetState.of(env).update_plan(0, goals=["grow"])
+    trace = [{"tool": "allocate_budget", "result": {"ok": False, "refused": "take_back", "error": "below its keep"}},
+             {"tool": "allocate_budget", "result": {"ok": True, "message": "reclaimed $900", "override": "take_back"}},
+             {"tool": "take_loan", "result": {"ok": True, "message": "borrowed $3,000", "override": "loan"}}]
+    rows = [turn_row({"role": "mayor", "month": m, "tool_trace": trace}) for m in (0, 3)]
+    assert [(r["refused"], r["overrides"]) for r in rows] == [(1, 2), (1, 2)]
+    assert turn_row({"role": "fire", "month": 2})["overrides"] == 0
+    rep, md = fleet_report(env, {"run_id": "r", "seed": 0, "months_played": 6}, rows)
+    assert (rep["roles"]["mayor"]["refused"], rep["roles"]["mayor"]["overrides"]) == (2, 4)
+    assert "| repeats (look-ups / refused / overrides) |" in md and "| 0 / 2 / 4 |" in md
