@@ -285,3 +285,28 @@ table.qsum tr.qrow:hover td { background: rgba(255,255,255,.05); }
 table.qsum .bad { color: var(--bad); } table.qsum .warn { color: var(--warn); }
 .turn.flash { animation: qflash 1.2s ease-out; }
 @keyframes qflash { from { box-shadow: 0 0 0 2px var(--c); } to { box-shadow: 0 0 0 2px transparent; } }
+/* problems tab */
+.pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; margin-bottom: 8px; }
+.pcard { background: var(--glass-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; }
+.pcard b { font-size: 17px; font-variant-numeric: tabular-nums; } .pcard span { font-size: 10.5px; color: var(--muted); }
+.pcard.good b { color: var(--ok); } .pcard.bad b { color: var(--bad); }
+table.ptab { margin-bottom: 8px; } table.ptab .bad { color: var(--bad); } table.ptab .warn { color: var(--warn); }
+table.ptab td.qrole { text-transform: capitalize; font-weight: 600; color: var(--c); white-space: nowrap; }
+table.ptab td.qrole .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--c); margin-right: 5px; }
+.phints { margin: 4px 0 8px; font-size: 12px; } .phints summary { cursor: pointer; color: var(--muted); }
+.pchips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 8px; }
+.pchips .chip { font-size: 10.5px; }
+.pmonth { font-size: 11px; font-weight: 700; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .04em; }
+.pmonth.cur { color: var(--accent); }
+.prow { display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; margin-bottom: 4px; border-radius: 8px; background: var(--glass-2); border-left: 3px solid var(--c); cursor: pointer; font-size: 11.5px; }
+.prow:hover { background: rgba(255,255,255,.07); }
+.prole { color: var(--c); font-weight: 600; text-transform: capitalize; min-width: 64px; }
+.pbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .pline code { color: var(--muted); }
+.pmsg { color: #c9d1d9; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.pbadges { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; flex: none; }
+.tag.hb.h-fixed, .tag.hb.h-heeded { color: #b9f5d0; border-color: rgba(69,212,131,.45); }
+.tag.hb.h-escalated { color: #cfd8ff; border-color: rgba(120,150,255,.45); }
+.tag.hb.h-dropped, .tag.hb.h-repeated, .tag.hb.h-ended, .tag.bad { color: #ffc2bc; border-color: rgba(255,107,94,.5); }
+.tag.hb.h-overridden { color: #ffe0a0; border-color: rgba(255,200,87,.45); }
+.call.focus { outline: 2px solid var(--warn); outline-offset: 1px; }

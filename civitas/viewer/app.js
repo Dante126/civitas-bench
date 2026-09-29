@@ -155,6 +155,7 @@ async function fetchFrames(first) {
   const prevStatus = S.status; S.status = d.status;
   $("statusPill").className = "pill " + d.status; $("statusPill").textContent = d.status;
   $("slider").max = Math.max(0, S.frames.length - 1);
+  if (d.frames.length) loadProblems();          // the timeline's problem marks; refetched as a live run grows
   if (d.status !== "running") clearInterval(S.poll);
   if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); }
   if (!first && d.frames.length) {
@@ -405,6 +406,9 @@ function renderTab() {
       const r = turns[+el.dataset.t].results[+el.dataset.r], rc = actRect(r.action);
       scene.highlightRect(rc); scene.flyTo((rc.x1 + rc.x2) / 2, (rc.y1 + rc.y2) / 2, 12 + Math.max(Math.abs(rc.x2 - rc.x1), Math.abs(rc.y2 - rc.y1)) * 0.6);
     });
+  } else if (S.tab === "problems") {
+    roleChips();
+    renderProblems();
   } else if (S.tab === "council") {
     roleChips();
     const msgs = S.frames.slice(0, S.idx + 1).flatMap(fr => fr.council || []).filter(m => roleOn(m.sender)).reverse();
@@ -553,6 +557,12 @@ function fillCalls(det, d) {
   det.querySelector(".callsum").innerHTML = callsHeader(d.summary);
   list.innerHTML = callRows(d);
   list.querySelectorAll(".call").forEach(el => el.onclick = (ev) => { if (!window.getSelection().toString()) el.classList.toggle("open"); ev.stopPropagation(); });
+  const fc = S.focusCall;                     // opened from the Problems tab: show that call
+  if (fc && fc.key === det.dataset.key) {
+    const el = list.querySelectorAll(".call")[fc.n - 1];
+    if (el) { el.classList.add("focus", "open"); el.scrollIntoView({ behavior: "smooth", block: "center" }); }
+    S.focusCall = null;
+  }
 }
 S.callsLoading = {};
 async function showCalls(det) {
@@ -572,6 +582,92 @@ function bindCalls(det) {
     if (det.open) { S.callsOpen.add(det.dataset.key); showCalls(det); } else S.callsOpen.delete(det.dataset.key);
   });
   if (det.open) showCalls(det);
+}
+
+// ---------------------------------------------------------------- problems
+// every failed / refused call and bad turn end in the run (/problems), and what the agent did about it
+S.problems = null; S.probFilter = new Set();
+const UNSOLVED = new Set(["dropped", "repeated", "ended"]);
+const HANDLED = { fixed: ["fixed", "a later call of the same tool worked"], escalated: ["escalated", "gave up but messaged another role"],
+  dropped: ["dropped", "gave up on it this turn"], repeated: ["repeated", "sent the same failing call again"],
+  heeded: ["heeded", "a guard refused and the agent changed course"], overridden: ["overridden", "repeated the refused call with confirm"],
+  ended: ["turn ended badly", "step limit, no tool call, token budget or an unreadable reply"] };
+function probsAt(month) { const d = S.problems && S.problems.runId === S.runId ? S.problems.data : null; return d ? (d.byMonth[month] || []) : []; }
+async function loadProblems() {
+  const runId = S.runId, n = S.frames.length;
+  if (!runId || (S.problems && S.problems.runId === runId && S.problems.at === n)) return;
+  try {
+    const d = await api(`/api/runs/${encodeURIComponent(runId)}/problems`);
+    d.byMonth = {}; for (const p of d.problems) (d.byMonth[p.month] = d.byMonth[p.month] || []).push(p);
+    S.problems = { runId, at: n, data: d };
+  } catch (e) { S.problems = { runId, at: n, data: null, error: e.message }; }
+  if (S.runId === runId) { drawTrackMarks(); if (S.tab === "problems") renderProblems(); }
+}
+const pct0 = (a, b) => b ? `${Math.round(100 * a / b)}%` : "—";
+function renderProblems() {
+  const body = $("tabBody");
+  if (!S.problems || S.problems.runId !== S.runId || S.problems.at !== S.frames.length) {
+    if (!S.problems || S.problems.runId !== S.runId) body.innerHTML = `<div class="emptytab">Loading problems…</div>`;
+    loadProblems(); if (!S.problems || S.problems.runId !== S.runId) return;
+  }
+  const d = S.problems.data;
+  if (!d) { body.innerHTML = `<div class="emptytab">Could not load problems: ${esc(S.problems.error || "")}</div>`; return; }
+  const t = d.total || {};
+  if (!d.problems.length) { body.innerHTML = `<div class="emptytab">No failed or refused calls in this run.</div>`; return; }
+  const card = (v, label, title, cls = "") => `<div class="pcard ${cls}" title="${esc(title)}"><b>${v}</b><span>${label}</span></div>`;
+  const head = `<div class="pcards">
+      ${card(t.problems, "problems", "failed or refused calls and bad turn ends")}
+      ${card(pct0(t.fixed, t.fixable), "fixed in turn", `${t.fixed} of ${t.fixable} failed calls: a later call of the same tool worked`, "good")}
+      ${card(pct0(t.escalated, t.fixable), "escalated", `${t.escalated}: gave up but messaged another role (e.g. asked the mayor for money)`)}
+      ${card(pct0(t.dropped + t.repeated, t.fixable), "unsolved", `${t.dropped} dropped, ${t.repeated} repeated the same failing call`, "bad")}
+      ${card(t.recurred, "recurred", "the same role hit the same cause on its next turn", t.recurred ? "bad" : "")}
+      ${card(t.guards ? `${t.heeded}/${t.guards}` : "—", "guards heeded", `${t.overridden} overridden with confirm`)}
+      ${card(t.bad_ends, "bad turn ends", "step limit, no tool call, token budget, unreadable reply", t.bad_ends ? "bad" : "")}</div>`;
+  const roles = Object.entries(d.roles).filter(([r, v]) => roleOn(r) && v.problems);
+  const table = `<table class="lb ptab"><tr><th>role</th><th title="problems">⚠</th><th title="fixed in the same turn / fixable">fixed</th><th>escal.</th><th title="dropped + repeated">unsolved</th><th title="recurred next turn">↻</th><th title="guards heeded / refused">guards</th><th title="bad turn ends">ends</th></tr>` +
+    roles.map(([r, v]) => `<tr style="--c:${roleColor(r)}"><td class="qrole"><span class="dot"></span>${esc(r)}</td><td>${v.problems}</td><td>${pct0(v.fixed, v.fixable)}</td><td>${v.escalated || 0}</td>
+      <td>${v.dropped + v.repeated ? `<span class="bad">${v.dropped + v.repeated}</span>` : "0"}</td><td>${v.recurred ? `<span class="bad">${v.recurred}</span>` : "0"}</td>
+      <td>${v.guards ? `${v.heeded}/${v.guards}` : "—"}</td><td>${v.bad_ends ? `<span class="warn">${v.bad_ends}</span>` : "0"}</td></tr>`).join("") + `</table>`;
+  const hints = (d.hints || []).length ? `<details class="phints"><summary>Coaching hints from the fleet report (${d.hints.length})</summary>${d.hints.map(h => `<div class="msgline small">${esc(h.text || "")}</div>`).join("")}</details>` : "";
+  const chips = `<div class="pchips">${Object.entries(HANDLED).map(([k, [w, title]]) => `<button class="chip ${S.probFilter.size === 0 || S.probFilter.has(k) ? "on" : ""} h-${k}" data-h="${k}" title="${esc(title)}">${w}</button>`).join("")}
+    <button class="chip ${S.probFilter.has("recurred") ? "on" : ""} h-recurred" data-h="recurred" title="only problems whose cause came back on the role's next turn">↻ recurred only</button></div>`;
+  const onlyRecurred = S.probFilter.has("recurred"), hs = new Set([...S.probFilter].filter(k => k !== "recurred"));
+  const list = d.problems.filter(p => roleOn(p.role) && (hs.size === 0 || hs.has(p.handled)) && (!onlyRecurred || p.recurred));
+  const cur = S.frames[turnFrame(S.idx)]?.month - 1;
+  let last = null, rows = "";
+  for (const p of list.slice(0, 500)) {
+    if (p.month !== last) { rows += `<div class="pmonth ${p.month === cur ? "cur" : ""}">Month ${p.month}</div>`; last = p.month; }
+    const [hw] = HANDLED[p.handled] || [p.handled];
+    rows += `<div class="prow h-${esc(p.handled)}" data-m="${p.month}" data-role="${esc(p.role)}" data-n="${p.n ?? ""}" style="--c:${roleColor(p.role)}">
+      <span class="prole">${esc(p.role)}</span>
+      <span class="pbody"><span class="pline">${p.tool ? `<b>${esc(p.tool)}</b> <code>${esc(argsText(p.args))}</code>` : `<b>${esc(p.cause)}</b>`}</span>
+        <span class="pmsg">${esc(p.text)}</span></span>
+      <span class="pbadges"><span class="tag">${esc(p.kind)}</span><span class="tag hb h-${esc(p.handled)}" title="${esc((HANDLED[p.handled] || ["", ""])[1])}">${esc(hw)}${p.at ? ` · call ${p.at}` : ""}</span>${p.recurred ? `<span class="tag bad" title="the same cause on this role's next turn">↻</span>` : ""}</span></div>`;
+  }
+  body.innerHTML = head + table + hints + chips + (rows || `<div class="emptytab">No problems match.</div>`) + (list.length > 500 ? `<div class="small muted">+${list.length - 500} more: filter by role or outcome</div>` : "");
+  body.querySelectorAll(".pchips .chip").forEach(b => b.onclick = () => {
+    const k = b.dataset.h;
+    if (k === "recurred") { S.probFilter.has(k) ? S.probFilter.delete(k) : S.probFilter.add(k); }
+    else if (S.probFilter.size === 0 || [...S.probFilter].every(x => x === "recurred")) { S.probFilter.add(k); }
+    else if (S.probFilter.has(k)) S.probFilter.delete(k); else S.probFilter.add(k);
+    renderProblems();
+  });
+  body.querySelectorAll(".prow").forEach(el => el.onclick = () => openProblem(+el.dataset.m, el.dataset.role, el.dataset.n ? +el.dataset.n : null));
+}
+// jump to the quarter, the role's card and (for a call) its tool calls with that call shown
+function openProblem(month, role, n) {
+  const j = S.frames.findIndex(f => f.month === month + 1); if (j < 0) return;
+  go(j); S.tab = "agents"; renderTab();
+  const cardEl = document.getElementById(`turn-${role}`); if (!cardEl) return;
+  cardEl.scrollIntoView({ behavior: "smooth", block: "start" }); cardEl.classList.remove("flash"); void cardEl.offsetWidth; cardEl.classList.add("flash");
+  if (n == null) return;
+  const open = () => {
+    const det = cardEl.querySelector("details.calls"); if (!det) return false;
+    S.focusCall = { key: det.dataset.key, n };
+    if (det.open) showCalls(det); else det.open = true;             // the toggle handler loads and fills the calls
+    return true;
+  };
+  if (!open()) { let tries = 0; const t = setInterval(() => { if (open() || ++tries > 40) clearInterval(t); }, 100); }   // traces load after the card
 }
 
 async function renderRunsTab() {
@@ -742,6 +838,8 @@ function drawTrackMarks() {
     else if (bad) { g.fillStyle = "rgba(255,200,87,.8)"; g.fillRect(x - 1, 6, 2, 6); }
     if (msgs) { g.fillStyle = "rgba(185,155,255,.9)"; g.fillRect(x - 1, 0, 2, 4); }
     if (f.month && f.month % 12 === 0) { g.fillStyle = "rgba(255,255,255,.35)"; g.fillRect(x, 4, 1, 4); }
+    const pr = probsAt(f.month - 1);          // this frame shows the turns of month - 1
+    if (pr.length) { g.fillStyle = pr.some(p => UNSOLVED.has(p.handled)) ? "#ff6b5e" : "#ffc857"; g.fillRect(x - 2, h - 3, 4, 3); }
   });
 }
 function minimapJump(e) {

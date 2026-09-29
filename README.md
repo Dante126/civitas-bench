@@ -1496,6 +1496,16 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **Guards:** on seed 0 the reserve refusal led the mayor to take idle money back from planning and transport before funding a second police station. At month 9 it accepted two loan refusals and borrowed only $3,000, for utilities.
 - The review fixes merged after v21 (3958732: one-tile supply picks, the "supply needed now" wording, guards by need) have not had their own smoke run yet.
 
+**Problems tab** (viewer). `GET /api/runs/<id>/problems` (`bench/problems.py`) lists every failed or refused tool call and every turn that ended badly (step limit, no tool call, token budget, unreadable reply), each with what the agent did next:
+- **fixed:** a later call of the same tool worked in the same turn;
+- **escalated:** it gave up but messaged another role, e.g. asked the mayor for money;
+- **dropped:** it gave up;
+- **repeated:** it sent the same failing call again;
+- **heeded or overridden:** for a guard refusal, it changed course, or repeated the call with `confirm`;
+- **recurred:** the same role hit the same cause on its next turn.
+
+Hitting the per-turn action cap doesn't count. The tab shows these rates for the run and per role, the fleet report's coaching hints, and a filterable list; clicking an item opens that quarter's card with the call outlined. The timeline marks quarters with problems, red when one went unsolved. On the 120-month seed-0 run: 214 problems, 32% fixed in turn, 42% escalated, 26% unsolved, 58 recurred; planning had 83 of them.
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources

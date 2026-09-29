@@ -7,6 +7,7 @@ Endpoints
   GET  /api/runs/<id>/turns?month=M  every agent turn of month M: prompt / briefing, reasoning, reply (+ a
                                      fleet turn's tool-call summary under "trace")
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
+  GET  /api/runs/<id>/problems   every failed / refused call and bad turn end, how the agent handled it, per-role rates
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -142,6 +143,9 @@ def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
             "model_calls": len(rec.get("finish_reasons") or []), "finish_reason": rec.get("finish_reason"),
             "ended": rec.get("ended"), "length_stops": rec.get("length_stops") or 0,
             "recovered_calls": rec.get("recovered_calls") or 0}
+
+
+_PROBLEMS: dict[str, tuple] = {}   # trajectories path -> ((path, size), run_problems result): recomputed as a live run grows
 
 
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
@@ -380,6 +384,14 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                         calls = [trace_call(i + 1, c) for i, c in enumerate(t.get("tool_trace") or [])]
                         return self._json({"run_id": d.name, "month": month, "role": role, "agent": t.get("agent"),
                                            "summary": trace_summary(t, calls), "calls": calls})
+                    if parts[3] == "problems":      # every problem in the run and how the agents handled it
+                        from .bench.problems import run_problems
+                        traj = d / "trajectories.jsonl"
+                        key = (str(traj), traj.stat().st_size if traj.exists() else 0)
+                        if _PROBLEMS.get(str(traj), (None,))[0] != key:
+                            _PROBLEMS[str(traj)] = (key, run_problems(traj, d / "fleet_report.json") if traj.exists()
+                                                    else {"problems": [], "roles": {}, "total": {}, "hints": []})
+                        return self._json(_PROBLEMS[str(traj)][1])
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []
