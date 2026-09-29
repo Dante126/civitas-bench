@@ -25,7 +25,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, shift
-from .fmt import TOOL_MESSAGE_CHARS, a_or_an, money
+from .fmt import TOOL_MESSAGE_CHARS, a_or_an, money, pct
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -188,6 +188,15 @@ BRIDGE_UPGRADE = 3           # upgrade_road charges a bridge tile this many time
 # either: the playbook wants bus lines first (at 5,000+ residents, $3,000 read "can't pay (cheapest: harbour $10k)"
 # with bus stops ready)
 SUPPLEMENTARY = {"library", "shelter", "cemetery", "train_station", "harbour", "metro_station"}
+# (dept, purpose) -> the World._metrics coverage the mayor's needs line shows for another building of a kind the city
+# has (buildings_of); utilities show the share of their supply used, a kind without either its ready sites. Smoke
+# v16: "needs $2,500 for a police station (5 ready sites)" read the same with a station built, and the mayor funded
+# second stations while education never got its school
+COVERAGE_OF = {("police", "station"): "police_coverage", ("fire", "station"): "fire_coverage",
+               ("health", "clinic"): "health_coverage", ("health", "hospital"): "health_coverage",
+               ("health", "landfill"): "garbage_coverage", ("education", "school"): "school_coverage",
+               ("education", "high_school"): "high_coverage", ("transport", "bus_stops"): "transit_share"}
+COVERAGE_LABEL = {"transit_share": "transit"}       # else "coverage"
 
 # every role's actions, and the region's deal actions (a region mayor's tools: fleet/region.py)
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]} | set(DEAL_ACTIONS)
@@ -1142,6 +1151,7 @@ class Price(NamedTuple):
     per_tile: bool = False
     first: bool = True      # a line's base tier or an off-tier spec: a first building (not a clinic's hospital)
     size: tuple[int, int] = (1, 1)      # its footprint (the tier's, as C.footprint gives it): a university 2x2
+    name: str = ""          # the SITE_BUILDS name pricing it (a tier name or an OFF_TIER_SPECS key)
 
     def text(self) -> str:
         return money(self.cost) + ("/tile" if self.per_tile else "")
@@ -1162,7 +1172,7 @@ def site_price(w, role: str, purpose: str) -> Price | None:
         return None
     tier = C.TIER_BY_NAME.get(best[1])
     return Price(best[0], building_name(best[1]), per_tile=best[1] in PER_TILE, first=tier is None or tier[1] == 1,
-                 size=tuple(C.TIER_LINES[tier[0]][tier[1] - 1]["footprint"]) if tier else (1, 1))
+                 size=tuple(C.TIER_LINES[tier[0]][tier[1] - 1]["footprint"]) if tier else (1, 1), name=best[1])
 
 
 def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
@@ -1203,14 +1213,64 @@ def cheapest(prices: dict[str, Price], supplementary: bool = False) -> tuple[tup
     return None if low is None else (tuple(p for p, pr in kept.items() if pr.cost == low.cost), low)
 
 
+class Need(NamedTuple):
+    """One building the mayor's needs line names (first_build): "its first police station (5 sites)" while the city
+    has none (buildings_of), "another police station (coverage 74%)" once it has one, "3 avenue tiles (1 site)" for
+    what isn't counted."""
+    what: str                   # the building ("police station"); uncounted, whole ("a levee tile", "3 avenue tiles")
+    sites: int                  # ready sites of the first purpose pricing it (up to MAX_SITES)
+    have: int | None            # buildings_of; None when not counted
+    status: str = ""            # for another one: its coverage or supply (build_status), "" for none
+    first: bool = False         # a primary first building (Price.first) the city lacks: the mayor's priority line
+
+    def text(self) -> str:
+        sites = f"{self.sites} site{'s' * (self.sites != 1)}"
+        if self.have is None:
+            return f"{self.what} ({sites})"
+        return f"its first {self.what} ({sites})" if not self.have else f"another {self.what} ({self.status or sites})"
+
+
 class FirstBuild(NamedTuple):
     cost: float | None          # the cheapest ready site (cheapest), a per-tile purpose's best stretch whole; None
                                 # when none is ready
-    named: dict[str, int]       # what it buys ("a clinic", "3 avenue tiles") -> ready sites of the first purpose
-                                # pricing it
+    named: tuple[Need, ...]     # what it buys, one per building at that price
     dearest: float              # the dearest ready or blocked first building (Price.first, SUPPLEMENTARY skipped), at
                                 # least `cost`: what it keeps
     blocked: tuple[str, ...]    # when none is ready, the cheapest blocked first building(s) ("a police station")
+
+
+def supply_of(name: str) -> str | None:
+    """"power", "water" or "sewage" for a tier name on a utilities line (a line's name is its tier 1), else None."""
+    line = C.TIER_BY_NAME.get(name, (None,))[0]
+    return next((s for s, lines in (("power", POWER_LINES), ("water", WATER_LINES), ("sewage", SEWAGE_LINES))
+                 if line in lines), None)
+
+
+def buildings_of(w, name: str) -> int | None:
+    """How many buildings the city has of what the SITE_BUILDS `name` builds: its tier line's at that tier or above
+    (a hospital counts as a clinic, a clinic not as a hospital), for a utilities building every one making its supply
+    (a pump makes a water tower another one), bus lines by count; None for tiles and off-tier stations."""
+    if name == "bus_line":
+        return len(w.bus_lines)
+    if name not in C.TIER_BY_NAME:
+        return None
+    line, tier = C.TIER_BY_NAME[name]
+    supply = supply_of(name)
+    lines, tier = ([ln for ln in C.TIER_LINES if supply_of(ln) == supply], 1) if supply else ([line], tier)
+    structs = {t["struct"] for ln in lines for t in C.TIER_LINES[ln][tier - 1:]}
+    return sum(w.facility_tier(x, y) >= tier for st in structs for x, y in w.facilities(st))
+
+
+def build_status(w, dept: str, purpose: str, name: str) -> str:
+    """How the kind `name` builds is doing, for another one on the mayor's needs line: the share of its supply used
+    ("water 117% used": demand 197 of 169; "water supply 169, demand 197" took 16 more characters a line), else its
+    COVERAGE_OF coverage ("coverage 74%"); "" for neither."""
+    m = w.metrics()
+    if supply := supply_of(name):
+        have, need = m[f"{supply}_supply"], m[f"{supply}_demand"]
+        return f"{supply} {pct(100 * need / have)} used" if have > 0 else f"no {supply} supply"
+    key = COVERAGE_OF.get((dept, purpose))
+    return f"{COVERAGE_LABEL.get(key, 'coverage')} {pct(100 * m[key])}" if key else ""
 
 
 def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
@@ -1228,12 +1288,21 @@ def _wanted(w, purpose: str) -> bool:
     the roads taken, and planning read "blocked for lack of land: utilities (pump, sewage) ... dezone a roadside lot for
     them" (its playbook frees a bank lot when asked); their own lists still say the bank is taken. Smoke v15: all 8
     leave-free lines named a water tower with water never short (e.g. 125 of 250): the near_homes list ranks every
-    roadside lot by the homes around it."""
+    roadside lot by the homes around it. A riverbank 2x2 building by the supply of the one pricing it (water works:
+    water): first_build counts only wanted ones, and with the tower and turbine left out it would name that $12k."""
+    if purpose == "riverbank_2x2":
+        pr = site_price(w, "utilities", purpose)
+        return pr is None or _busy(w, supply_of(pr.name))
     if purpose not in SUPPLY_OF:
         return True
     supply, bank = SUPPLY_OF[purpose]
+    return bank in _bank_needed(w) or _busy(w, supply)
+
+
+def _busy(w, supply: str) -> bool:
+    """Demand is at least BANK_BUSY of the `supply` ("power", "water", "sewage")."""
     m = w.metrics()
-    return bank in _bank_needed(w) or m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
+    return m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
 
 
 def dept_lists(env) -> dict[str, dict[str, SiteList]]:
@@ -1364,13 +1433,15 @@ def first_build(env, dept: str) -> FirstBuild | None:
     police, fire, health and education held their first building's price with every roadside lot zoned, read idle
     above the $1,000 floor, and lost it. A tier 2+ purpose (hospital, riverbank_2x2's water works) is an upgrade, not
     a first building. A per-tile purpose counts its best site whole ("$90 for 3 avenue tiles", best_stretch), also
-    when picking the cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line. Every building at the
-    lowest price is named, with the ready sites of the first purpose pricing it. None when nothing is ready or
-    blocked."""
+    when picking the cheapest: one $30 tile undersold an upgrade and beat the $1,500 bus line. A utilities building
+    counts only while its supply is short (_wanted): smoke v14-v15 seed 1 read "needs $2,200 for a water tower" with
+    water spare, and towers were built to 4.7-4.9x demand. Every building at the lowest price is named (Need: first
+    or another, buildings_of), with the ready sites of the first purpose pricing it; at a tie with a first one, the
+    others go (health's clinic built: its first landfill alone). None when nothing is ready or blocked."""
     w = env.world
     lists = site_lists(w, dept, role_obs(env, dept))
     blocked = blocked_firsts(w, dept, lists)
-    prices, tiles = ready_prices(w, dept, lists), {}
+    prices, tiles = {p: pr for p, pr in ready_prices(w, dept, lists).items() if _wanted(w, p)}, {}
     for p, pr in prices.items():
         if pr.per_tile:
             tiles[p], units = best_stretch(w, p, lists[p].sites)
@@ -1380,13 +1451,18 @@ def first_build(env, dept: str) -> FirstBuild | None:
         return None
     named = {}
     for p in purposes:
-        n, b = tiles.get(p, 1), prices[p].building
-        named.setdefault(f"{n} {b}s" if n != 1 else a_or_an(b), len(lists[p].sites[:MAX_SITES]))
+        pr, n = prices[p], tiles.get(p, 1)
+        have = None if pr.per_tile else buildings_of(w, pr.name)
+        what = pr.building if have is not None else f"{n} {pr.building}s" if n != 1 else a_or_an(pr.building)
+        named.setdefault(what, Need(what, len(lists[p].sites[:MAX_SITES]), have,
+                                    build_status(w, dept, p, pr.name) if have else "", have == 0 and pr.first))
+    if any(nd.have == 0 for nd in named.values()):
+        named = {k: nd for k, nd in named.items() if not nd.have}
     # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
     firsts = [pr.cost for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first] + [
         pr.cost for pr in blocked.values()] + ([low.cost] if low else [])
     shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
-    return FirstBuild(low.cost if low else None, named, max(firsts), shut)
+    return FirstBuild(low.cost if low else None, tuple(named.values()), max(firsts), shut)
 
 
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set = frozenset(),

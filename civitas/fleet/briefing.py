@@ -62,6 +62,11 @@ BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this
 # the worst case (2 idle, 5 blocked) to 7,445 of the 7,450 characters test_briefings_stay_bounded_at_the_limits allows;
 # said once here, 7,420
 BLOCKED_NOTE = "- blocked for lack of land: ask planning for lots"
+# the mayor's first-buildings line (_firsts_line): past this, department names only (their lines above say what and
+# for how much). Two departments' buildings and prices fit; four took 210 characters. At the limits with needs lines on
+# five departments (2 idle; test_briefings_stay_bounded_at_the_limits has 5 blocked) the mayor's briefing took 7,496
+# characters before the first / another wording, 7,738 after with this line whole, 7,616 with the cut
+FIRSTS_LINE_CHARS = 160
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
               ("ask for it on the council board.", "ask for it on the council board (post with send_message, read "
@@ -234,12 +239,28 @@ def _land_line(env, depts: dict) -> list[str]:
 
 def _needs(m: DeptMoney) -> str:
     """The mayor's Departments line suffix when a department's funds are below its cheapest ready build
-    (first_build): "; needs $X for a <building> (N ready sites)", else "". Every building at that price is named ("a
-    clinic (5 ready sites) or a landfill (4 ready sites)"): the mayor writes what it reads into the plan (smoke v9:
-    "Build first shelter")."""
+    (first_build): "; needs $X for its first <building> (N sites)" or "for another <building> (coverage 74%)" (Need),
+    else "". Every building at that price is named ("another clinic (coverage 21%) or another landfill (coverage
+    83%)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). Smoke v16: "a police
+    station (5 ready sites)" read the same with one built, and second stations were funded before a first school."""
     b = m.needs
-    return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(
-        f"{what} ({n} ready site{'s' * (n != 1)})" for what, n in b.named.items())
+    return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(n.text() for n in b.named)
+
+
+def _firsts_line(f: Funding) -> list[str]:
+    """The line naming departments short of a first primary building on their needs line (Need.first), while
+    another department's is for another one: "- first buildings still unfunded: education (elementary school,
+    $2,500): fund these before second buildings". Smoke v16 seed 0, months 6-9: with the treasury short the mayor
+    funded second police and fire stations and a second clinic, and education's allocations were refused; education
+    (last in turn order and in the block) got no school in v16 seed 0 or either v17 seed (33.2-33.4)."""
+    needs = {d: b for d, m in f.depts.items() if not m.idle and (b := m.needs)}
+    first = {d: [n.what for n in b.named if n.first] for d, b in needs.items()}
+    first = {d: names for d, names in first.items() if names}
+    if not first or not any(n.have for d, b in needs.items() if d not in first for n in b.named):
+        return []
+    head, tail = "- first buildings still unfunded: ", ": fund these before second buildings"
+    full = head + ", ".join(f"{d} ({' or '.join(ns)}, {money(needs[d].cost)})" for d, ns in first.items()) + tail
+    return [full if len(full) <= FIRSTS_LINE_CHARS else head + ", ".join(first) + tail]
 
 
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
@@ -347,6 +368,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append(f"- {f.idle_note()}")
     if any(m.blocked for m in f.depts.values() if not m.idle):          # a line above says "; blocked: ..."
         L.append(BLOCKED_NOTE)
+    L += _firsts_line(f)
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
                  + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
