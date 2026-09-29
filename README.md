@@ -1203,6 +1203,25 @@ and v19 fixes; 320 turns, 15.8M prompt tokens, 1.9 hours):
 - **Actions:** 34.7% failed, and turns with no successful action took 46% of the prompt
   tokens.
 
+**120-month runs on main at fd5112f** (after the v18 and v19 fixes; `fleet_trinity.toml`, 320 turns each,
+16.3M and 18.9M prompt tokens, 2.1 and 2.2 hours, run in parallel):
+
+| | seed 0 | seed 1 | first run (seed 0, 760ea72) |
+|---|---|---|---|
+| city score at month 120 (average over the run) | **73.5** (56.9) | **69.7** (54.7) | 47.9 (45.9) |
+| population | **18,412** | **13,064** | 2,892 |
+| debt at the end (months at the $50k cap) | $47.5k (0) | $22.0k (0) | $50k (78) |
+| failed actions | 23.8% | 22.0% | 34.7% |
+| turns with no successful action, share of tokens | 20% | 19% | 46% |
+
+- **Growth:** both cities kept growing all game (seed 0: 3,960 residents at month 24, 8,140 at 72,
+  14,308 at 96), where the first run stalled at about 2,000–2,900 from month 18.
+- **Against the scripted fleet:** on the same 3-month cadence (`fleet_scripted.toml`, 67.9 and 66.6
+  on these seeds, 6,472 and 6,104 residents), the LLM fleet scored higher on both seeds, with two
+  to three times the population. Seed 0's 18,412 residents is more than the monthly scripted
+  baseline's 14,092 (city 76.7).
+- **Weak spots:** transport (56.3 and 64.1) and, on seed 1, fire (56.8).
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
