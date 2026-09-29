@@ -444,15 +444,36 @@ tasks and money, and to let people coach it.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
   The mayor's briefing covers the city, the finances, each department's funds, target
   (`funds $0 < target $2,500` when it still needs funding), what it needs when its funds
-  are short of its cheapest ready building (`needs $2,500 for a police station (5 ready
-  sites)`, or each building at that price on a tie: `needs $2,000 for a clinic (5 ready
-  sites) or a landfill (4 ready sites)`; a per-tile site counts its best stretch whole:
-  `needs $90 for 3 avenue tiles (5 ready sites)`), what it spent over the last 3 months,
+  are short of its cheapest ready building (below), what it spent over the last 3 months,
   its idle money, and its latest report.
+  - **Needs line.** It names the cheapest ready building, and says whether it is the
+    first:
+    - `needs $2,500 for its first police station (5 sites)` while the city has none;
+    - `needs $2,500 for another police station (coverage 74%)` once it has one. Clinics,
+      landfills, schools and high schools show their coverage too, and bus lines the
+      transit share.
+    - A hospital counts as a clinic. For utilities, any building that makes the same
+      supply counts, and the line shows how much of the supply is used: `another water
+      tower (water 117% used)`. A utilities building is named only while the city lacks
+      that supply or uses at least 90% of it. In smoke v14–v15 seed 1 the line named a
+      water tower with water spare, and towers were built until water was 4.7–4.9×
+      demand.
+    - On a tie each building at that price is named (`another clinic (coverage 21%) or
+      another landfill (coverage 83%)`). A first one is named alone (`its first landfill
+      (4 sites)` once a clinic is built).
+    - A per-tile site counts its best stretch whole: `needs $90 for 3 avenue tiles (5
+      sites)`.
+  - **First buildings.** When a department's needs line is for its first building and
+    another's is for another one, a line under the block says `- first buildings still
+    unfunded: education (elementary school, $2,500): fund these before second buildings`.
+    Past 160 characters it gives the department names only. In smoke v16 seed 0 the
+    treasury ran short; the mayor funded second police and fire stations and a second
+    clinic first, and education never got its school (33.2; v17: 33.3 and 33.4).
   - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
-    first building, $1,000). Funds that are $1,000 or more above that, excluding this
-    month's top-ups, show as `idle $3,400`, and a summary line says to take the money back
-    (a negative `allocate_budget`) before taking loans or giving new top-ups.
+    first building, $1,000); for utilities only buildings the needs line could name
+    count. Funds that are $1,000 or more above that, excluding this month's top-ups, show
+    as `idle $3,400`, and a summary line says to take the money back (a negative
+    `allocate_budget`) before taking loans or giving new top-ups.
   - **Blocked buildings.** A first building with no lot for lack of land or roads counts
     toward the keep, because the department still needs that money. That covers:
     - no free roadside land;
