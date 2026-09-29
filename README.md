@@ -152,7 +152,7 @@ Baseline reference (all scripted, seeds 0–4): **city 77.5 ± 1.5**, mayor 88.1
 population ≈ 14.5k, no bankruptcies, ~4–5 s per game (seeds 5–9: city 75.9 ± 0.8). `noop` and
 `random` line-ups score 0. Building tiers changed these numbers. Just before tiers were
 added, the same baseline scored city 78.1 ± 1.8 with population ≈ 14.7k.
-Acting every 3 months, as the fleet configs do, the same agents reach city 67.0 ± 2.8 and
+Acting every 3 months, as the fleet configs do, the same agents reach city 68.8 ± 2.0 and
 population ≈ 7.3k; `configs/fleet_scripted.toml` plays them through the fleet tools and
 scores exactly that (see [Agent fleets](#agent-fleets), "Scripted fleet").
 The scripted agents leave obvious room: they never use districts, mixed use, historic
@@ -848,19 +848,25 @@ for these policies.
 | seeds 0–4, 120 months | city | population | mayor | planning | utilities | transport | police | fire | health | education |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | monthly: `baseline.toml`, or `fleet_scripted.toml --set game.act_every=1` | 77.5 ± 1.5 | 14,466 | 88.1 | 68.4 | 89.4 | 75.9 | 74.9 | 85.7 | 86.6 | 83.2 |
-| every 3 months: `fleet_scripted.toml`, or `baseline.toml --set game.act_every=3` | 67.0 ± 2.8 | 7,319 | 84.3 | 65.1 | 88.7 | 92.3 | 74.5 | 83.8 | 85.5 | 70.0 |
+| every 3 months: `fleet_scripted.toml`, or `baseline.toml --set game.act_every=3` | 68.8 ± 2.0 | 7,341 | 86.3 | 64.5 | 91.4 | 89.7 | 77.2 | 83.8 | 86.5 | 86.0 |
 
-So compare a fleet with 67.0, not the monthly 77.5. The 10.5 points are the quarterly
+So compare a fleet with 68.8, not the monthly 77.5. The 8.7 points are the quarterly
 cadence, since the scripted policies do about a month's work per turn:
 
 - **Planning** lays about one road and up to three zone strips per type a turn. It built 18
-  road segments and 160 zone strips instead of 46 and 311, and spent $9.6k instead of $31k.
-- **The mayor** reads only the requests posted the month before its turn. At `act_every =
-  3` that is none of the 146 that departments sent (monthly: 529 of 531).
-- **Money:** the mayor moved $166k to departments instead of $435k. Police and education
-  asked for their first building from month 6–9 and built it in months 33–48 and 39–63
-  (monthly: 34–40 and 35–48, the baseline's own slow start).
-- **Transport** scores higher (92.3) because it spends little in a smaller city.
+  road segments and 157 zone strips instead of 46 and 311, and spent $12.5k instead of $31k.
+- **The mayor** reads the requests posted since its previous turn. At `act_every = 3` that
+  is 106 of the 108 that departments sent (the other 2 came in its last turn; monthly: 529
+  of 531). It used to read only those from the month before its turn, which at `act_every =
+  3` was none of the 146 sent, and this row read 67.0 ± 2.8, population 7,319 (mayor 84.3,
+  education 70.0). Now the upgrades departments ask for get funded ($5,000 for education,
+  $8,300 for police and fire), so fewer asks are repeated.
+- **Money:** the mayor moved $231k to departments instead of $435k. Police and education
+  asked for their first building from month 6–9 and built it in months 33–48 and 39–66
+  (monthly: 34–40 and 35–48, the baseline's own slow start). Their $2,500 asks are under
+  the $3,000 working balance the mayor already aims for, so reading them changes nothing
+  there: the treasury is what they wait for.
+- **Transport** scores higher (89.7) because it spends little in a smaller city.
 
 What the runs showed about the tools:
 
@@ -891,6 +897,15 @@ What the runs showed about the tools:
     the mayor for $7,700–8,300 for an upgrade.
 
   The policies had reasons the briefing doesn't show (bus ridership, the upgrade).
+
+  Since the mayor reads the requests sent since its previous turn, the same seeds give 29
+  hints: 9 idle, 5 for the mayor (education longest at 11–21 turns), 2 for planning (the
+  sewage outlet lot, 6 months each), 9 repeated-failure and 4 idle-money. The idle-money
+  hints are utilities (3 runs) or health holding up to $6,044–7,200 against a $3,000 budget
+  for 6–12 months: the mayor funds an ask one turn after it was sent, and the budget falls
+  back once the department stops asking. No idle hint has police or health asking for an
+  upgrade any more; new ones are education holding $2,880–4,245 for a ready school while
+  asking for $5,000, and planning holding $7,000 after 2 failed actions (1 run each).
 
 **Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
 next to its summary. They contain:
@@ -1177,8 +1192,8 @@ tile per building in the zone warning) reached 1,776 / 45.0 and 2,016 / 45.1.
 **First 120-month run** (`fleet_trinity.toml`, seed 0, main at 760ea72, i.e. before the v18
 and v19 fixes; 320 turns, 15.8M prompt tokens, 1.9 hours):
 - **Result:** city 47.9 at the end (45.9 on average), 2,892 residents, no bankruptcy.
-- **Against the scripted fleet** on the same 3-month cadence (67.0, about 7,300 residents),
-  that is 19 points and 60% of the population short.
+- **Against the scripted fleet** on the same 3-month cadence (68.8, about 7,300 residents),
+  that is 21 points and 61% of the population short.
 - **Money:** the mayor reached the $50,000 debt limit at month 48 and stayed there. 46
   allocations failed on the treasury or the debt limit.
 - **Planning** had $0 for 23 attempted builds ("costs $150 but the planning budget only has
