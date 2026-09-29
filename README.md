@@ -560,7 +560,9 @@ tasks and money, and to let people coach it.
   plant, succeeds, with a warning naming what utilities still needs the bank for. So does
   a `zone` that leaves a department with funds for its cheapest ready first building no
   unclaimed site for it (`WARNING: that zoned the last site for fire's fire station near homes (fire holds
-  $2,500 for it): dezone one, e.g. (20,22)`).
+  $2,500 for it): dezone one, e.g. (20,22)`): only when claiming the sites afresh in turn
+  order seats fewer of the funded buildings than before; the buildings named are those
+  left out when each keeps its earlier site where it can.
 
 | tools | |
 |---|---|

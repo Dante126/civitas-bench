@@ -3321,6 +3321,54 @@ def test_a_2x2_funded_site_is_spared_whole():
     assert [(s.building, s.xy) for s in spots.values()] == [("university", (20, 20)), ("fire station", (23, 20))]
 
 
+def test_kept_claims_try_their_own_site_first():
+    """Review: a kept building was only processed first, taking its first unclaimed site in list order, so police,
+    kept on (5,5), took (3,3) once that was listed ahead of it and moved fire off its kept (3,3). Kept buildings now try
+    their kept site first: only a building whose site went is re-seated, and the warning names that one."""
+    from civitas.fleet.tools import Price, claim_spots
+    P, Q, R = (3, 3), (5, 5), (7, 7)
+    pol, fire = Price(2500, "police station"), Price(2500, "fire station")
+    was = claim_spots({("police", "station"): (pol, [Q]), ("fire", "station"): (fire, [P])})
+    now = claim_spots({("police", "station"): (pol, [P, Q]), ("fire", "station"): (fire, [P, R])}, keep=was)
+    assert {k: s.xy for k, s in now.items()} == {("police", "station"): Q, ("fire", "station"): P}
+    gone = claim_spots({("police", "station"): (pol, [P, R]), ("fire", "station"): (fire, [P, R])}, keep=was)
+    assert {k: s.xy for k, s in gone.items()} == {("fire", "station"): P, ("police", "station"): R}
+
+
+def _warn_after(monkeypatch, env, before: dict, after: dict[str, list]) -> str:
+    """planning's _funded_warning for `before` ((dept, purpose) -> (Price, sites)) once the claimed sites of `before`
+    are zoned (the first claim's tiles) and each department's "station" list reads `after[dept]`."""
+    import civitas.fleet.tools as T
+    from civitas.fleet.tools import SiteList, claim_spots
+    w = env.world
+    for sp in claim_spots(before).values():
+        if sp.xy not in [xy for sites in after.values() for xy in sites]:
+            w.struct[sp.xy[1], sp.xy[0]] = C.RES
+    monkeypatch.setattr(T, "site_lists", lambda w, role, obs: {"station": SiteList(
+        [{"x": x, "y": y} for x, y in after[role]], None, None)})
+    return ToolBox(env, "planning")._funded_warning(before)
+
+
+def test_a_zone_warns_only_when_a_fresh_claim_leaves_a_building_out(monkeypatch):
+    """Review: police lists P and Q, fire Q and R, and a zone takes P. Sticky claims kept fire on Q, left police with
+    nothing and warned that police lost its last site; a fresh claim in turn order seats police on Q and fire on R,
+    which is how play goes. The warning now needs a fresh claim that seats fewer buildings; the sticky one only
+    names them."""
+    from civitas.fleet.tools import Price
+    P, Q, R = (3, 3), (5, 5), (7, 7)
+    pol, fire = Price(2500, "police station"), Price(2500, "fire station")
+    env = _env()
+    env.world.dept_funds.update(police=2500, fire=2500)
+    before = {("police", "station"): (pol, [P, Q]), ("fire", "station"): (fire, [Q, R])}
+    assert _warn_after(monkeypatch, env, before, {"police": [Q], "fire": [Q, R]}) == ""
+    env = _env()
+    env.world.dept_funds.update(police=2500, fire=2500)
+    before = {("police", "station"): (pol, [P]), ("fire", "station"): (fire, [Q, R])}
+    assert _warn_after(monkeypatch, env, before, {"police": [], "fire": [Q, R]}) == (
+        " WARNING: that zoned the last site for police's police station near homes (police holds $2,500 for it): "
+        "dezone one, e.g. (3,3)")
+
+
 def test_the_zone_warning_never_fails_a_zone(env12, monkeypatch):
     """The funded look-ups run before and after apply_action: an error in them means no warning, not a failed zone;
     their result is kept until an action succeeds."""
