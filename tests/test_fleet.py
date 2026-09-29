@@ -1902,7 +1902,10 @@ def test_a_take_back_below_what_a_department_keeps_is_refused_until_confirmed():
     assert (m.keep, m.idle) == (1000, 1508)
     box = ToolBox(env, "mayor")
     take = lambda amount, **kw: box.call("allocate_budget", {"department": "planning", "amount": amount, **kw})
-    tail = ", so it can't build next quarter; {}. To take it anyway, repeat this exact call with confirm: true."
+    import civitas.fleet.tools as T
+    assert T.road_build(env).cost == 600               # what it would keep less than: its road into open land
+    tail = (", so it can't pay for a road into open land and zoning it ($600); {}. To take it anyway, repeat this "
+            "exact call with confirm: true.")
     res = take(-2508)
     assert res == {"ok": False, "refused": "take_back", "error": (
         "that takes planning below the $1,000 it keeps (the $1,000 minimum)"
@@ -1944,18 +1947,18 @@ def test_take_backs_of_this_turn_s_top_ups_and_of_unkept_money_pass():
     assert move("planning", 800)["ok"]
     tail = " To take it anyway, repeat this exact call with confirm: true."
     res = move("planning", -801)
-    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum), so it can't build next "
-                            "quarter; you already took back $700 from it this turn; it has no idle money, only the $800 "
-                            "you moved to it this turn: take back $800." + tail), res
+    road = ", so it can't pay for a road into open land and zoning it ($600)"      # $499 left
+    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum)" + road + "; you "
+                            "already took back $700 from it this turn; it has no idle money, only the $800 you moved "
+                            "to it this turn: take back $800." + tail), res
     assert move("police", -3000)["ok"] and w.dept_funds["police"] == 0       # nothing kept
     _months_spent(env, {})
     w.treasury, w.dept_funds["planning"] = 30000, 2500
     box = ToolBox(env, "mayor")
     assert move("planning", 1000)["ok"]                # $2,500 held: $1,500 idle, plus this turn's $1,000
     res = move("planning", -3000)
-    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum), so it can't build next "
-                            "quarter; its idle money is $1,500, plus the $1,000 you moved to it this turn: take back "
-                            "$2,500." + tail), res
+    assert res["error"] == ("that takes planning below the $1,000 it keeps (the $1,000 minimum)" + road + "; its idle "
+                            "money is $1,500, plus the $1,000 you moved to it this turn: take back $2,500." + tail), res
     assert move("planning", -2500)["ok"] and w.dept_funds["planning"] == 1000
 
 
@@ -3002,15 +3005,15 @@ def test_build_cost_prices_the_cheapest_unlocked_building(grown_env, open_env):
     assert build_cost(w, "transport", "harbour") == C.HARBOUR_SPEC["cost"]
     priced = {(r, p) for r in SITE_PURPOSES for p in SITE_PURPOSES[r] if build_cost(w, r, p) is not None}
     assert priced == set(BUILD_ACTIONS)                # not planning, nor levees and avenues (per tile)
-    assert site_price(w, "transport", "bus_stops") == Price(C.BUS_LINE_COST, "bus line", name="bus_line",
-                                                                 upkeep=C.BUS_LINE_UPKEEP)
+    line = C.BUS_LINE_UPKEEP + 2 * C.BUS_STOP_UPKEEP     # a line and the 2 stops it needs at least
+    assert site_price(w, "transport", "bus_stops") == Price(C.BUS_LINE_COST, "bus line", name="bus_line", upkeep=line)
     assert site_price(w, "transport", "congested_roads") == Price(C.ROAD_UPGRADE_COST[2], "avenue tile", True,
                                                                   name="avenue_tile",
                                                                   upkeep=C.ROAD_UPKEEP[2] - C.ROAD_UPKEEP[1])
     fresh = _env().world                               # avenues unlock at 1,000 residents; bus lines need no unlock
     assert site_price(fresh, "transport", "congested_roads") is None
     assert site_price(fresh, "transport", "bus_stops") == Price(C.BUS_LINE_COST, "bus line", name="bus_line",
-                                                                 upkeep=C.BUS_LINE_UPKEEP)
+                                                                 upkeep=line)
 
 
 def test_ready_sites_show_the_price_and_what_is_short():
@@ -3160,8 +3163,9 @@ def test_the_budget_line_falls_back_to_a_supplementary_price(grown_env, monkeypa
     assert _ready_sites(fire)[0] == "- station: none - nothing needs it right now"
     assert _block(fire, "## Your budget")[1].startswith("- You can't pay for any ready site (cheapest: shelter "
                                                         "$1,500).")
-    mayor = briefing(env, "mayor", mark=False).splitlines()
-    assert next(ln for ln in mayor if ln.startswith("- fire:")) == "- fire: funds $0, spent $0; nothing ready to buy"
+    mayor = briefing(env, "mayor", mark=False).splitlines()     # the needs line skips it; the state names it
+    assert next(ln for ln in mayor if ln.startswith("- fire:")) == "- fire: funds $0, spent $0; only a shelter ready " \
+                                                                    "($1,500)"
 
 
 def test_levees_are_priced_per_tile_in_a_flood(grown_env):
@@ -3195,9 +3199,10 @@ def test_levees_are_priced_per_tile_in_a_flood(grown_env):
     assert not res.ok and res.message.startswith(f"costs ${tile:,} but the fire budget only has ${tile - 1:,}")
 
 
-def test_congested_roads_are_priced_per_avenue_tile(open_env):
+def test_congested_roads_are_priced_per_avenue_tile(open_env, monkeypatch):
     """upgrade_road charges C.ROAD_UPGRADE_COST[2] per street tile on land for an avenue: the listed stretch costs its
     street tiles times the Ready line's per-tile price."""
+    import civitas.fleet.tools as T
     from civitas.fleet.tools import site_price
     env = copy.deepcopy(open_env)
     _no_spending(env)
@@ -3215,9 +3220,13 @@ def test_congested_roads_are_priced_per_avenue_tile(open_env):
     assert not res.ok and res.message.startswith(f"costs ${cost:,} but the transport budget only has ${cost - 1:,}")
     fleet_line = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines()
                               if ln.startswith("- transport:"))
+    # without a bus line its first one comes first, dearer or not (review: seed 0, months 42-69)
+    assert fleet_line().startswith(f"- transport: funds ${cost - 1:,}, spent $0; needs $1,500 for its first bus line (")
+    real = T.buildings_of
+    monkeypatch.setattr(T, "buildings_of", lambda w, name: 1 if name == "bus_line" else real(w, name))
     assert fleet_line() == (f"- transport: funds ${cost - 1:,}, spent $0; needs ${cost:,} for 4 avenue "
                             f"tiles (1 site, ${4 * (C.ROAD_UPKEEP[2] - C.ROAD_UPKEEP[1]):g}/month)")
-    w.dept_funds["transport"] = cost                   # the whole stretch: cheaper than the $1,500 bus line
+    w.dept_funds["transport"] = cost                   # the whole stretch: cheaper than another $1,500 bus line
     assert fleet_line() == f"- transport: funds ${cost:,}, spent $0; funds cover its next build"
     res = apply_action(w, "transport", action)
     assert res.ok and res.cost == cost and w.dept_funds["transport"] == 0, res.message
@@ -3313,7 +3322,7 @@ def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
     w.dept_funds["transport"] = 0
     n = len(ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})["sites"])
     assert "(cheapest: bus_stops $1,500)" in briefing(env, "transport", mark=False)
-    assert fleet_line() == f"- transport: funds $0, spent $0; needs $1,500 for its first bus line ({n} sites, $60/month)"
+    assert fleet_line() == f"- transport: funds $0, spent $0; needs $1,500 for its first bus line ({n} sites, $76/month)"
 
 
 def test_bank_top_up_ranks_as_the_observation_does():
@@ -3401,7 +3410,7 @@ def test_the_needs_line_says_first_or_another(grown_env):
                              f"({_cover(w, 'health_coverage')}, $40/month) or another landfill "
                              f"({_cover(w, 'garbage_coverage')}, $30/month)")
     assert got["education"].endswith(f"; needs $2,500 for its first elementary school ({n['school']} sites, $45/month)")
-    assert got["transport"].endswith(f"; needs $1,500 for its first bus line ({n['bus_stops']} sites, $60/month)")
+    assert got["transport"].endswith(f"; needs $1,500 for its first bus line ({n['bus_stops']} sites, $76/month)")
     assert m["water_demand"] == m["water_supply"] == 313            # the pump counts: another one
     assert got["utilities"].endswith("; needs $2,200 for another water tower (water 100% used, $30/month)")
     s = ToolBox(env, "police").call("find_sites", {"purpose": "station"})["sites"][0]
@@ -3441,6 +3450,7 @@ def test_first_buildings_come_before_second_ones(grown_env):
     quarter and never got its school (33.2). v17: education, last in turn order and in the block, again got none. The
     Departments block and the to-fund line put first buildings and supply first (Funding.order), then planning's road,
     then another building, turn order within a kind, and the cover clause fills them in that order."""
+    from civitas.fleet.fmt import money
     from civitas.fleet.tools import reserve
     env = copy.deepcopy(grown_env)
     _no_spending(env)
@@ -3454,31 +3464,36 @@ def test_first_buildings_come_before_second_ones(grown_env):
     order = lambda text: [ln.split(":")[0][2:] for ln in _block(text, "## Departments") if ": funds " in ln]
     assert "; needs $2,500 for another police station (" in text and "; needs $2,500 for another fire station (" in text
     assert order(text) == ["utilities", "education", "planning", "police", "fire", "health", "transport"]
-    assert re.fullmatch(r"- to fund: first/supply utilities \$2,200, education \$2,500 \(\$4,700, \+\$75/month\) \| "
-                        r"growth planning \$[\d,]+ \| another police \$2,500, fire \$2,500, health \$2,000 \(\$7,000, "
-                        r"\+\$150/month\): \$5,000 covers utilities, education; the other \$[\d.,k]+ would go under "
-                        r"the reserve", to_fund(text)), to_fund(text)      # the road doesn't fit after them: in order
+    # first/supply and growth may use the treasury above $3,000 ($5,000 above the reserve, which is above $3,000):
+    # the road fits after them, the other stations don't
+    dip = money(w.treasury - 3000)
+    assert f"; first/supply and growth may use {dip} (treasury above $3,000)" in text
+    assert re.fullmatch(r"- to fund: first/supply: utilities \$2,200, education \$2,500 \(\$4,700, upkeep \+\$75/month\)"
+                        r" \| growth: planning \$[\d,]+ \| another: police \$2,500, fire \$2,500, health \$2,000 "
+                        rf"\(\$7,000, upkeep \+\$150/month\): {re.escape(dip)} covers utilities, education, planning; "
+                        r"the other \$7,000 would go under the reserve", to_fund(text)), to_fund(text)
     ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 5000}})
     text = briefing(env, "mayor", mark=False)          # below its target: marked, still another station
     assert "- police: funds $0 < target $5,000" in text and order(text).index("education") < order(text).index("police")
     w.dept_funds["transport"] = 0                      # a first bus line too, in turn order
     assert to_fund(briefing(env, "mayor", mark=False)).startswith(
-        "- to fund: first/supply utilities $2,200, transport $1,500, education $2,500 ($6,200, +$135/month) | growth ")
+        "- to fund: first/supply: utilities $2,200, transport $1,500, education $2,500 ($6,200, upkeep +$151/month) | "
+        "growth: ")                                    # the bus line's upkeep: its line and 2 stops
     (x, y), = w.facilities(C.LANDFILL)                 # a third: health's first landfill, the clinic left out
     w.remove_building(x, y)
     w.refresh()
     text = briefing(env, "mayor", mark=False)
-    assert to_fund(text).startswith("- to fund: first/supply utilities $2,200, transport $1,500, health $2,000, "
-                                    "education $2,500 ($8,200, +$165/month) | growth planning ")
-    assert "| another police $2,500, fire $2,500 ($5,000, +$110/month): " in to_fund(text)
+    assert to_fund(text).startswith("- to fund: first/supply: utilities $2,200, transport $1,500, health $2,000, "
+                                    "education $2,500 ($8,200, upkeep +$181/month) | growth: planning ")
+    assert "| another: police $2,500, fire $2,500 ($5,000, upkeep +$110/month): " in to_fund(text)
     w.dept_funds.update(transport=1500, health=2000, education=2500)     # every first building funded
     text = briefing(env, "mayor", mark=False)
-    assert to_fund(text).startswith("- to fund: first/supply utilities $2,200 (+$30/month) | growth planning ")
+    assert to_fund(text).startswith("- to fund: first/supply: utilities $2,200 (upkeep +$30/month) | growth: planning ")
     assert order(text)[-3:] == ["transport", "health", "education"]      # funds cover their builds: last
     env = _env()                                       # nothing built yet: every needs line is for a first one
     text = briefing(env, "mayor", mark=False)
     assert "its first water tower" in text and to_fund(text).startswith(
-        "- to fund: first/supply utilities $2,200, health $2,000 ($4,200, +$60/month) | growth planning ")
+        "- to fund: first/supply: utilities $2,200, health $2,000 ($4,200, upkeep +$60/month) | growth: planning ")
 
 
 def test_utilities_needs_line_names_only_a_short_supply(env12):
@@ -3503,9 +3518,10 @@ def test_utilities_needs_line_names_only_a_short_supply(env12):
     assert apply_action(w, "utilities", {"type": "build_power_plant", "kind": "coal", "x": s["x"], "y": s["y"]}).ok
     m = w.metrics()
     assert m["power_demand"] < 0.9 * m["power_supply"]
-    w.dept_funds["utilities"] = 0                      # spare water, sewage and power: nothing to name
-    assert _dept_lines(env)["utilities"] == "- utilities: funds $0, spent $0; nothing ready to buy"
-    assert DeptMoney(env, "utilities").build is None
+    w.dept_funds["utilities"] = 0                      # spare water, sewage and power: nothing to name, and it says why
+    assert _dept_lines(env)["utilities"] == "- utilities: funds $0, spent $0; supply has room"
+    b = DeptMoney(env, "utilities").build
+    assert (b.cost, b.named, b.room) == (None, (), True)
 
 
 def test_mayor_names_the_cheapest_building():
@@ -4030,8 +4046,8 @@ def test_mayor_briefing_marks_departments_below_their_target():
     assert lines["fire"] == "- fire: funds $0 < target $2,500; nothing ready to buy"
     assert lines["police"] == "- police: funds $0; nothing ready to buy"
     to_fund = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- to fund:"))
-    assert to_fund() == ("- to fund: first/supply utilities $200, health $2,000 ($2,200, +$60/month): $27k covers "
-                         "utilities, health")        # what the needs lines lack, not the $5,000 and $2,500 gaps
+    assert to_fund() == ("- to fund: first/supply: utilities $200, health $2,000 ($2,200, upkeep +$60/month): $27k "
+                         "covers utilities, health")        # what the needs lines lack, not the $5,000 and $2,500 gaps
     w.treasury = 4000
     assert to_fund().endswith(": $1,000 covers utilities; the other $2,000 would go under the reserve")
     text = briefing(env, "mayor", mark=False)
@@ -4189,8 +4205,9 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     # characters without the memory block (shown in full). The mayor's is higher: its needs lines ("its first ..." /
     # "another ... (coverage 74%, $55/month)"), the Finances split and the to spend / to fund lines are what it was
     # missing in smoke v13-v19, when it funded second stations before education's school and borrowed after its own
-    # top-ups; the worst mix below (needs lines on six departments, debt at the cap, a 6x deficit, seven buildings
-    # lines in the costs, a partial cover in a hold) takes 7,677, the needs-heavy mix alone 7,379 (7,621 before)
+    # top-ups; the worst mix below (needs lines on all seven departments, debt at the cap, a 6x deficit, seven
+    # buildings lines in the costs, a partial cover in a hold, in a game long enough for "close that in N months")
+    # takes 7,624, under the plan's 7,650, with MAYOR_REPORT_CHARS at 170
     bound = lambda role: 7700 if role == "mayor" else 7450
     env = _env()
     w = env.world
@@ -4249,7 +4266,9 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
 
     def money_at_the_limits(treasury: float) -> None:
         """Debt at the cap, a 6x deficit last month with operations positive over the window (the hold's "close that
-        in N months"), seven buildings lines in last month's costs, and the treasury at `treasury`."""
+        in N months", in a game long enough to close it), seven buildings lines in last month's costs, and the
+        treasury at `treasury`."""
+        env.cfg.months = 9999
         prev, last = w.history[-2:]
         prev.update(income=99999.0, expenses=12345.0)
         costs = {d: 12345.0 for d in ("utilities", "roads", "transport", "police", "fire", "health", "education")}
@@ -4262,7 +4281,9 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     assert "- roads not connected to the highway: 121 tiles (x 10-46, y 10-47) - reconnect them" in mayor
     assert "\n## Departments (most urgent first; spent = last 3 months; cut reports: history kind=report)\n" in mayor
     assert mayor.count("; idle $3,210 (keeps $6,666)") == 5
-    assert "; first/supply and growth may use $16.1k (treasury above $3,000 + idle)\n" in mayor     # idle: the hold's
+    # the idle money doesn't lift the treasury above $3,000: nothing for first/supply either (review: the old dip
+    # counted it with the treasury at -$123k)
+    assert "- to spend: none (hold): " in mayor and "; nothing above $3,000\n" in mayor
     # the needs-heavy mix: 2 idle, 5 needs lines, 4 of them for a first building, each as long as it gets: 6 sites,
     # its upkeep, health's another clinic and landfill (the longest tie); the to-fund line lists all three kinds
     N, FB = T.Need, T.FirstBuild
@@ -4279,8 +4300,8 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         mayor = check("needs")
         assert mayor.count("; idle $3,210 (keeps $6,666)") == 2 and mayor.count("; needs $") == 5
         assert mayor.count("its first ") == 4
-        assert ("- to fund: first/supply utilities $200, police $500, fire $500, education $500 ($1,700, "
-                "+$170/month) | another health $500 (+$40/month)") in mayor
+        assert ("- to fund: first/supply: utilities $200, police $500, fire $500, education $500 ($1,700, "
+                "upkeep +$170/month) | another: health $500 (upkeep +$40/month)") in mayor
         dear = T.road_max(w)                           # planning short of the dearest road and zoning, not idle
         road = N(T.a_or_an(T.ROAD_NAME), 6, None, "opens 999 tiles")
         mp.setattr(T, "road_build", lambda env: FB(dear, (road,), dear, ()))
@@ -4294,14 +4315,25 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         w.dept_funds.update(utilities=0, police=0, fire=0, health=0, education=0)
         money_at_the_limits(3500.0)
         mayor = check("needs + money, hold")
-        assert "- debt $50k: $250/month interest, at the $50k limit; each $1,000 repaid saves $5/month" in mayor
+        assert "- debt $50k: $250/month interest, at the $50k limit\n" in mayor
         assert "(6 x $99k expenses: last month's deficit was $87k)" in mayor and "close that in " in mayor
         assert "buildings $86.4k (utilities $12.3k, roads $12.3k, 5 more $61.7k)" in mayor
         assert (": $3,710 covers utilities, police, planning; the other $5,000 would go under $3,000\n"   # greedy: the
                 in mayor)                                                   # $1 road fits after a skipped station
         money_at_the_limits(999999.0)
         check("needs + money, above the reserve")
-        w.dept_funds["planning"] = 9876
+        # every department on a needs line (review: 3 first, planning's road, 3 another with coverage), in the hold
+        seven = {"utilities": mix["utilities"], "education": mix["education"],
+                 "transport": FB(1500, (N("bus line", 6, 0, first=True, upkeep=76),), 1500, ()),
+                 "police": FB(2500, (N("police station", 6, 1, "coverage 74%", upkeep=55),), 2500, ()),
+                 "fire": FB(2500, (N("fire station", 6, 1, "coverage 74%", upkeep=55),), 2500, ()),
+                 "health": mix["health"]}
+        mp.setattr(T, "first_build", lambda env, dept: seven.get(dept) or real(env, dept))
+        w.dept_funds.update(transport=0)
+        money_at_the_limits(3500.0)
+        mayor = check("seven needs + money, hold")
+        assert mayor.count("; needs $") == 7 and mayor.count("its first ") == 3, mayor
+        w.dept_funds.update(planning=9876, transport=9876)
     w.debt = 0.0
     _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
     monkeypatch.setattr(T, "_uncovered_need", lambda w, role, purpose: ((0, 0), 1.0) if (role, purpose) in T.NEAR_NEED
@@ -4317,7 +4349,8 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     money_at_the_limits(3500.0)
     check("blocked + money")
     assert "\n- blocked for lack of land: utilities (" in briefing(env, "planning", mark=False)
-    assert max(sizes, key=sizes.get) == "needs + money, hold", sizes          # the worst: 7,677 of 7,700
+    assert max(sizes.values()) < 7650, sizes                                 # the plan's budget, under the bound
+    assert max(sizes, key=sizes.get) == "seven needs + money, hold", sizes
 
 
 

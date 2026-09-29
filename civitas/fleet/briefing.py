@@ -65,11 +65,14 @@ BLOCKED_LINE_CHARS = 240   # planning's blocked-for-lack-of-land line: past this
 # said once here. Smoke v13: the mayor took a blocked department's money back instead of pushing planning
 BLOCKED_NOTE = "- blocked for lack of land: money buys nothing there until planning frees lots (ask planning)"
 # department reports quoted on the mayor's Departments block (history kind=report has them whole): shorter than
-# REPORT_PREVIEW_CHARS, so the Finances split, the to spend / to fund lines and the debt line fit its 7,700 characters
-MAYOR_REPORT_CHARS = 180
+# REPORT_PREVIEW_CHARS, so the Finances split, the to spend / to fund lines and the debt line fit its 7,700 characters.
+# 180 until review: with every department on a needs line (3 first, planning's road, 3 another) in a hold, debt at the
+# cap and a 6x deficit, the worst mix took 7,694, over the plan's 7,650; at 170, 7,624
+MAYOR_REPORT_CHARS = 170
 # the Finances costs line names the dearest this many buildings lines, then "N more $X": with 3, the worst mix of
 # test_briefings_stay_bounded_at_the_limits (needs lines on six departments, debt at the cap, a 6x deficit, seven
 # buildings lines, a partial cover in a hold) took the mayor's briefing to 7,695 of its 7,700 characters; with 2, 7,677
+# (the plan's fallback; its "top 3" is left for when there is room)
 COSTS_SHOWN = 2
 # GAME_RULES was written for the map-reading LLMAgent; fleet agents read the map with tools
 RULE_EDITS = [("highway tile H on the west\n  edge", "highway on the west\n  edge"),
@@ -291,7 +294,8 @@ def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
     top-up: funding_gaps), what it spent (the block's header says over how many months), then one suffix by its kind
     (DeptMoney.kind): its idle money and what it keeps ("; idle $1,508 (keeps $1,000)"), what its needs line buys
     (_needs), what is blocked (_blocked, with the unclaimed_firsts funding_gaps set; BLOCKED_NOTE below says what to
-    do), else what its money does ("; funds cover its next build", "; nothing ready to buy"; planning none). Smoke
+    do), else what its money does (DeptMoney.state: "; funds cover its builds", "; funds cover its next build",
+    "; supply has room", "; only a library ready ($1,500)", "; nothing ready to buy"; planning none). Smoke
     v9-v12: nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
     target $9,000" and was topped up. v19 seed 1, month 6: take-backs left planning under what it keeps, unseen."""
     kind = m.kind
@@ -356,14 +360,15 @@ def _header(env, role: str, mode: str) -> list[str]:
 def _finances(w, cf: CashFlow) -> list[str]:
     """The mayor's Finances lines (the WARNING line follows): the treasury and its change since overview's trend month
     split into operations, the mayor's top-ups, loans and the rest (cash_flow; parts that round to $0 left out),
-    last month's income and expenses by kind (buildings, the dearest COSTS_SHOWN by name, then city services and
-    interest), and with debt what it costs and what is left to borrow:
+    last month's income and expenses by kind (buildings, the dearest COSTS_SHOWN by name, then city services, imports
+    when they round to $1 or more, and interest), and with debt what it costs and what is left to borrow:
     - "- treasury $7,922 (-$12.3k since month 3: operations +$977, top-ups -$13.3k), debt $0"
     - "- last month: income $597, expenses $469: buildings $312 (utilities $82, roads $75, 3 more $155), city services
-      $157, interest $0" (city services: the rest of the expenses, the town hall, policies and imports included, so
-      the parts add up)
-    - "- debt $18.8k: $94/month interest, $31.2k more can be borrowed; each $1,000 repaid saves $5/month" (the first
-      line then leaves the debt out)
+      $157, interest $0" (city services: the rest of the expenses, the town hall and policies included, so the parts
+      add up; "imports $173" before the interest when there are any: review, a region's $173 of service imports read
+      as city services)
+    - "- debt $18.8k: $94/month interest, $31.2k more can be borrowed" (the first line then leaves the debt out; what a
+      repayment saves is in repay_loan's description and the playbook: review, the worst mix ran 27 characters over)
     Smoke v13-v19: the treasury change mixed in the mayor's own transfers, so 30 of 81 turns showed a "loss" while
     operations ran a surplus; interest never showed in dollars, and there were 0 repay_loan calls in 96 turns."""
     debt = round(w.debt) > 0
@@ -384,12 +389,12 @@ def _finances(w, cf: CashFlow) -> list[str]:
                                                                        if rest else "")
         L.append(f"- last month: income {money(cf.income)}, expenses {money(cf.expenses)}: buildings "
                  f"{money(sum(cf.buildings.values()))}" + (f" ({detail})" if detail else "")
-                 + f", city services {money(cf.services)}, interest {money(cf.interest)}")
+                 + f", city services {money(cf.services)}"
+                 + (f", imports {money(cf.imports)}" if round(cf.imports) else "") + f", interest {money(cf.interest)}")
     if debt:
         room = C.MAX_DEBT - w.debt
         L.append(f"- debt {money(w.debt)}: {money(w.debt * C.LOAN_INTEREST)}/month interest, "
-                 + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit")
-                 + f"; each $1,000 repaid saves {money(1000 * C.LOAN_INTEREST)}/month")
+                 + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit"))
     return L
 
 

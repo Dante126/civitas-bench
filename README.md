@@ -446,30 +446,39 @@ tasks and money, and to let people coach it.
   urgent first. Each department's line gives its funds, its target (`funds $0 < target
   $2,500` when it still needs funding) and what it spent over the last 3 months. Then comes
   one note on its money: what its needs line buys (below), what is blocked, its idle money,
-  or `funds cover its next build` / `nothing ready to buy`. Last is its latest report, cut
-  at 180 characters. Two lines close the block: the money there is to spend and what to
-  fund with it.
+  or what its money does without a needs line: `funds cover its builds` (every priced
+  purpose), `funds cover its next build`, `supply has room` (utilities sites are ready but
+  no supply is short), `only a library ready ($1,500)` (only supplementary sites), or
+  `nothing ready to buy`. Last is its latest report, cut at 170 characters. Two lines close
+  the block: the money there is to spend and what to fund with it.
   - **Finances.** The treasury's change since the trend month is split into what the city
     earned and what the mayor moved: `- treasury $7,922 (-$12.3k since month 3: operations
     +$977, top-ups -$13.3k), debt $0`. Loans and `other` (a milestone reward, an offer's
     bonus) show only when nonzero. Last month's costs follow: `- last month: income $597,
-    expenses $561: buildings $312 (utilities $82, roads $75, 3 more $155), city services
-    $157, interest $0`. City services are the rest of the expenses (town hall, policies,
-    imports), so the parts add up. With debt, a third line gives the interest in dollars,
-    what can still be borrowed and what each $1,000 repaid saves. In smoke v13–v19 the
-    change mixed in the mayor's own transfers, so 30 of 81 turns showed a "loss" while
-    operations ran a surplus. Interest never showed in dollars either, and there were 0
-    `repay_loan` calls in 96 turns.
-  - **Needs line.** It names the cheapest ready building, and says whether it is the
-    first:
+    expenses $469: buildings $312 (utilities $82, roads $75, 3 more $155), city services
+    $157, interest $0`. City services are the rest of the expenses (town hall, policies),
+    and imports (services bought from outside, a region's trade deficit and deal payments)
+    show as `imports $173` before the interest when there are any, so the parts add up.
+    With debt, a third line gives the interest in dollars and what can still be borrowed
+    (`repay_loan`'s description and the playbook say what a repayment saves). In smoke
+    v13–v19 the change mixed in the mayor's own transfers, so 30 of 81 turns showed a
+    "loss" while operations ran a surplus. Interest never showed in dollars either, and
+    there were 0 `repay_loan` calls in 96 turns.
+  - **Needs line.** It names the department's next build, and says whether it is the
+    first. That is the cheapest ready first building the city lacks (not a supplementary
+    or per-tile site; a first jail only once inmates pass 80% of the cells), else the
+    cheapest ready building. In the review of this change, a $30 avenue stretch hid
+    transport's first $1,500 bus line on 9 mayor turns of seed 0 (months 42–69, no bus
+    line, `funds cover its next build`), and another elementary school hid education's
+    first high school and university:
     - `needs $2,500 for its first police station (5 sites, $55/month)` while the city has
       none;
     - `needs $2,500 for another police station (coverage 74%, $55/month)` once it has one.
       Clinics, landfills, schools and high schools show their coverage too, and bus lines
       the transit share.
     - The last figure is the building's monthly upkeep at the department's funding level
-      (the tier's or off-tier spec's, read when shown, so balance overrides reach it). Every
-      building adds it for good. In the 120-month run, service upkeep was a median 34% of
+      (the tier's or off-tier spec's, read when shown, so balance overrides reach it; a bus
+      line with the 2 stops it needs at least). Every building adds it for good. In the 120-month run, service upkeep was a median 34% of
       income, and at month 48 the city had 22 service buildings against the scripted
       fleet's 7.
     - A hospital counts as a clinic. For utilities, any building that makes the same
@@ -500,7 +509,7 @@ tasks and money, and to let people coach it.
        only while the supply is short), or a levee;
     2. growth: planning's road and zoning;
     3. another: a second building;
-    4. blocked, then nothing ready to buy, then idle money.
+    4. blocked, then nothing to fund, then idle money.
 
     The order is shown, not imposed. It replaces the old `- first buildings still unfunded`
     line and the plan's priorities, which `get_plan` still has. In smoke v16 seed 0 the
@@ -511,7 +520,9 @@ tasks and money, and to let people coach it.
     came tenth.
   - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
     first building, $1,000); for utilities only buildings the needs line could name
-    count, and for planning its road and zoning. Funds that are $1,000 or more above that,
+    count, and for planning its road and zoning. What set it is named: `2 x its $658
+    spending`, `for its first university`, `for another fire station`, or `the $1,000
+    minimum`. Funds that are $1,000 or more above that,
     excluding this month's top-ups, show as `idle $3,400 (keeps $2,000)`. The to-spend
     line counts them as money to take back (a negative `allocate_budget`) before any loan
     or new top-up. A take-back that would leave a department below what it keeps is
@@ -544,26 +555,36 @@ tasks and money, and to let people coach it.
     The `<` marker still reads the plan target. The to-fund line doesn't.
   - **To spend and to fund.** Two lines close the block, and `update_plan`'s `next` is the
     same two lines:
-    - `- to spend: $2,698 above the $3,000 reserve + $1,508 idle to take back = $4,206;
-      operations +$233/month`. The reserve is $3,000 or 3 months of expenses (6 after a
-      deficit month), with its reason when above the minimum: `the $3,711 reserve (3 x
-      $1,237 expenses)`. The deficit test works on rounded dollars; v16 seed 1 doubled the
-      reserve on a $0.70 deficit.
+    - `- to spend: $2,698 above the $3,711 reserve (3 x $1,237 expenses) + $1,508 idle to
+      take back = $4,206; operations +$233/month; first/supply and growth may use $4,917
+      (treasury + idle above $3,000)`. The reserve is $3,000 or 3 months of expenses (6
+      after a deficit month), with its reason when above the minimum. The deficit test works
+      on rounded dollars; v16 seed 1 doubled the reserve on a $0.70 deficit. There are no
+      operations before the first month.
+    - First buildings, supply and planning's road may take the treasury down to $3,000:
+      they may use the treasury and idle money above $3,000, in a hold or not, and the line
+      names that amount when it is more than the money to spend and the to-fund line lists
+      one. Anything else only gets the money above the reserve. In review, a hold's
+      allowance that stopped at the hold's edge cut what a first school could use from
+      $1,605 to $1 when the treasury rose $2 past the reserve.
     - In a hold (nothing to spend once idle money counts) the line says how far under the
-      reserve the treasury is and when operations close the gap. It also says what first
-      buildings, supply and planning's road may still use: the treasury above $3,000 plus
-      idle money. `- to spend: none (hold): the treasury is $1,723 under the $3,711 reserve
-      (3 x $1,237 expenses); operations +$381/month close that in 5 months; first/supply and
-      growth may use $900 (treasury above $3,000 + idle)`. In the 120-month run "hold"
-      showed in 35 of 40 turns with no way out, and $108.7k was still allocated in them.
-    - `- to fund: first/supply health $2,000, education $2,500 ($4,500, +$85/month) |
-      growth planning $315 | another police $2,500 (+$55/month): $4,206 covers health,
-      planning; the other $5,000 would go under the reserve`. Each amount is what the
-      department's needs line lacks, whatever its plan target. The kinds go in the block's
-      order, and a kind with several departments gets their sum and upkeep. The cover
-      clause is greedy: one that doesn't fit is skipped, and a cheaper one after it can
-      still fit. In a hold it covers first/supply and growth only, from what they may use.
-      With no needs line asking it reads `- to fund: nothing ready`.
+      reserve the treasury is and when operations close the gap (left out past the game's
+      end). `- to spend: none (hold): the treasury is $1,723 under the $3,711 reserve (3 x
+      $1,237 expenses); operations +$381/month close that in 5 months; first/supply and
+      growth may use $900 (treasury + idle above $3,000)`, or `nothing above $3,000`. In the
+      120-month run "hold" showed in 35 of 40 turns with no way out, and $108.7k was still
+      allocated in them.
+    - `- to fund: first/supply: health $2,000, education $2,500 ($4,500, upkeep
+      +$85/month) | growth: planning $315 | another: police $2,500 (upkeep +$55/month):
+      $4,917 covers health, education, planning; the other $2,500 would go under the
+      reserve`. Each amount is what the department's needs line lacks, whatever its plan
+      target. The kinds go in the block's order, and a kind with several departments gets
+      their sum and upkeep. The cover clause is greedy: one that doesn't fit is skipped, and
+      a cheaper one after it can still fit. First/supply and growth are covered from what
+      they may use, another from what is left above the reserve; the rest "would go under
+      $3,000" when only first/supply and growth are left. In a hold it covers first/supply
+      and growth only (`$400 covers no first/supply or growth; their $540 would go under
+      $3,000`). With no needs line asking it reads `- to fund: nothing ready`.
     - In smoke v13–v19, education's month-0 target was $0 in 15 of 15 plans. First
       buildings at a $0 target were funded 16 of 36 times, against 36 of 40 with a target,
       and utilities got $113k of its $135k top-ups beyond what its needs line asked.
@@ -684,10 +705,13 @@ tasks and money, and to let people coach it.
   repeated its take-back pairs. So is a take-back (a negative amount) that would leave a
   department below what it keeps (see Idle money) of what it held before this turn's
   top-ups (`refused: "take_back"`): `that takes planning below the $1,316 it keeps (2 x
-  its $658 spending), so it can't build next quarter; it has no idle money: leave its
-  funds. To take it anyway, repeat this exact call with confirm: true.` It names why the
-  department keeps that much, what this turn already took back from it, and what may go
-  back instead (`its idle money is $1,508`, `only the $800 you moved to it this turn`).
+  its $658 spending), so it can't pay for a road into open land and zoning it ($640); it
+  has no idle money: leave its funds. To take it anyway, repeat this exact call with
+  confirm: true.` It names why the department keeps that much, what the money left can't
+  pay for (only when it is short of the department's next build; in review, "so it can't
+  build next quarter" was false with planning's $640 road still covered by the $950
+  left), what this turn already took back from it, and what may go back instead (`its
+  idle money is $1,508`, `only the $800 you moved to it this turn`).
   Taking back idle money or this turn's top-ups passes, as does any take-back from a
   department that isn't in the game. In smoke v18 seed 0, at month
   6, the mayor read planning as `idle $1,508` and took back all $2,508; planning had $0
@@ -698,9 +722,13 @@ tasks and money, and to let people coach it.
   (`the treasury holds $3,598, over the $3,000 minimum: a $5,000 loan costs $25/month
   until repaid (debt would be $5,000 of $50k); borrow only for a first building or supply
   need the treasury can't cover`). It is also refused when the turn started at $3,000 or
-  more and this turn's own top-ups, net of take-backs, took the treasury under: `take back
-  a top-up that isn't a first building or supply (free) instead of a $3,000 loan at
-  $15/month`. A loan the action itself refuses (over the $50,000 cap, not positive) gets
+  more and this turn's own moves took the treasury under: top-ups that aren't for a first
+  building or supply, named with their amounts (`take back (free) a top-up that isn't a
+  first building or supply (police $2,500, fire $698) instead of a $3,000 loan at
+  $15/month`), or a repayment, which the loan would only borrow back (`repaying $4,000 took
+  it under $3,000: a $4,000 loan at $20/month borrows back what you just repaid`). When
+  every top-up was for a first building or supply, the loan is the playbook's own case
+  and runs. A loan the action itself refuses (over the $50,000 cap, not positive) gets
   the action's message. In smoke v13–v19, 10 of 15 loans ($34.8k of $60.0k) came in turns
   that started at $3,000 or more, and 14 of 15 after the mayor's own top-ups had emptied
   the treasury. The 120-month run sat at the debt cap from month 45 and paid $23.9k in
@@ -720,13 +748,17 @@ tasks and money, and to let people coach it.
   say where the money stands, for the model only (the history log and `executed` keep the
   game's message):
   - a top-up says what the department can buy now: `transferred $2,500 to police (now
-    $2,500) | police: can pay for another police station (+$55/month); treasury $2,788,
-    $212 under the $3,000 reserve; still to fund: education $2,500 (first/supply)`. Short
-    of it, the note reads `still $1,000 short of its first elementary school: less buys
-    nothing`. It can also read `had nothing ready to buy` or `blocked for lack of land`.
+    $2,500) | police: can pay for another police station (upkeep +$55/month); treasury
+    $2,788, $212 under the $3,000 reserve; still to fund: education $2,500
+    (first/supply)`. Short of it, the note reads `still $1,000 short of its first
+    elementary school: less buys nothing` (`less buys fewer tiles` for levee or avenue
+    tiles, and nothing added for planning's road, where less buys part of it). It can
+    also read `needs nothing now: supply has room`, `had only a library ready ($1,500)`,
+    `had nothing ready to buy` or `blocked for lack of land`.
   - a take-back says what the department holds against its keep: `planning now $1,240,
     what it keeps (nothing idle)`, `$508 over what it keeps`, or `$1,316 below what it
-    keeps (2 x its $658 spending): it can't build next quarter`.
+    keeps (2 x its $658 spending): it can't pay for a road into open land and zoning it
+    ($640)` (the last part only when what is left is short of its next build).
   - a loan gives the interest and the credit left: `interest now $15/month (+$15); $47k
     more can be borrowed`. At the cap it reads `no more credit: repay_loan from money above
     the reserve cuts the $250/month interest`. A repayment gives `interest now $225/month
@@ -735,7 +767,9 @@ tasks and money, and to let people coach it.
     what is still to fund.
 
   The `take_loan` and `repay_loan` descriptions give the interest in dollars ($5 a month
-  per $1,000). In smoke v13–v19, 234 of 338 allocation messages had under 40 characters
+  per $1,000, read when the toolbox is built, so a `LOAN_INTEREST` override reaches it;
+  nothing about the score, which no other LLM agent is told). In smoke v13–v19, 234 of
+  338 allocation messages had under 40 characters
   of content, so the model's step-0 plan was lost and block order became funding order.
   The treasury also ran dry mid-turn in 10 of 56 turns.
 
@@ -761,7 +795,7 @@ tasks and money, and to let people coach it.
 | tools | |
 |---|---|
 | look-ups (no side effects) | `city_overview` (headline numbers, a 3-month trend, `operations_3_months`, the treasury change split as in the Finances block, and `costs_last_month` by kind), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block; when the map and the facts together don't fit, as from about month 66 of a long game, the road lines go first, the longest kept while they fit, then the facts give way to a pointer to the Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
-| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing) with the treasury, gives `to_spend`, `to_fund` (department, kind, amount, upkeep per month, in the briefing's order) and `first_buildings` with a $0 target, and its `next` is the briefing's to-spend and to-fund lines; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 after a deficit on rounded dollars, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
+| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing) with the treasury, gives `to_spend`, `to_fund` (department, kind, amount, upkeep per month, in the briefing's order) and `first_buildings` (first/supply departments at a $0 target, utilities' supply included), and its `next` is the briefing's to-spend and to-fund lines; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 after a deficit on rounded dollars, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
 **Three memory layers.** Nothing else carries over between turns.
@@ -810,10 +844,12 @@ The "hold" advice and the to-spend line follow a reserve rule that lives in code
 change it there too. The example configs' mayor playbook reads the money lines: fund every
 first building a needs line names from month 3, whatever its target, and give utilities
 what its needs line asks after month 0. Each turn it takes back idle money first, then
-funds the to-fund line in order until the money to spend runs out. In a hold it funds only
-first buildings, supply and planning's road. It borrows only for a first building or
-supply need the money can't cover, repays from the money above the reserve, and does what
-a refusal says instead of confirming it.
+funds what the to-fund line says the money covers, in its order (the cover is greedy, so
+it doesn't stop at the first item that doesn't fit). First buildings, supply and
+planning's road may use the treasury above $3,000, anything else only the money above the
+reserve. It borrows only for a first building or supply need the money can't cover,
+repays from the money above the reserve, and does what a refusal says instead of
+confirming it.
 `civitas prompt -c configs/fleet_trinity.toml --role planning` prints a fleet agent's
 system prompt, its first briefing and its tool names.
 
@@ -965,7 +1001,8 @@ Departments block, the to-spend and to-fund lines, the money results, earned con
 the loan guard) changed only what the fleet reads. The scripted baseline (77.5 ± 1.5), the
 fleet reference below (68.8 ± 2.0, 7,341 residents) and the region games score exactly as
 before. On seeds 0–4 no guard refused a scripted call and nothing was overridden. On seed
-0 the scripted mayor's longest briefing is 4,397 characters (4,474 before).
+0 the scripted mayor's longest briefing is 4,577 characters (4,474 before; 4,397 before the
+review fixes named first buildings ahead of cheaper sites and what first/supply may use).
 
 | seeds 0–4, 120 months | city | population | mayor | planning | utilities | transport | police | fire | health | education |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
