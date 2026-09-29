@@ -281,3 +281,145 @@ def test_cash_flow_identity(monkeypatch):
     cf = cash_flow(env.world)
     assert C.MILESTONES[0]["name"] in env.world.milestones_reached and abs(cf.other - 5000) < 0.5
     assert cash_flow(_env().world) == T.CashFlow(None, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0)
+
+
+# --- Unit B: briefing (briefing.py: the mayor's Finances and Departments blocks, the system prompt)
+from civitas.fleet.briefing import BLOCKED_NOTE, COSTS_SHOWN, MAYOR_REPORT_CHARS, briefing, system_prompt  # noqa: E402
+from civitas.fleet.config import FleetAgentConfig  # noqa: E402
+from civitas.fleet.fmt import money, signed  # noqa: E402
+from civitas.fleet.tools import ToolBox  # noqa: E402
+
+
+def _block(text: str, header: str) -> list[str]:
+    """The lines of the briefing block whose header line starts with `header`, the header left out."""
+    at = text.index("\n" + header) + 1
+    return text[text.index("\n", at) + 1:].split("\n\n")[0].splitlines()
+
+
+def _mayor_block(env, header: str) -> list[str]:
+    return _block(briefing(env, "mayor", mark=False), header)
+
+
+def test_mayor_finances_lines(monkeypatch):
+    """Smoke v13-v19: the treasury change mixed in the mayor's own transfers (30 of 81 turns showed a "loss" while
+    operations ran a surplus), and interest never showed in dollars."""
+    env = _env()
+    w = env.world
+    fin = lambda: _mayor_block(env, "## Finances")
+    assert fin() == ["- treasury $30k, debt $0", "- last month: no month played yet"]      # month 0
+    mayor = lambda **a: apply_action(w, "mayor", a).ok
+    assert mayor(type="allocate_budget", department="police", amount=2500)
+    env.end_month()                                     # month 1: the window's start
+    env.end_month()
+    ops = lambda: sum(h["income"] - h["expenses"] for h in w.history[1:])
+    change = lambda: signed(round(w.treasury - w.history[0]["treasury"]), money)
+    assert fin()[0] == (f"- treasury {money(w.treasury)} ({change()} since month 1: operations "
+                        f"{signed(ops(), money)}), debt $0")          # no top-ups since month 1: left out
+    assert mayor(type="allocate_budget", department="fire", amount=2500)
+    env.end_month()                                     # month 3
+    assert fin()[0] == (f"- treasury {money(w.treasury)} ({change()} since month 1: operations {signed(ops(), money)}, "
+                        "top-ups -$2,500), debt $0")
+    last = w.history[-1]
+    b = {k: v for k, v in last["expense_breakdown"].items() if k in last["dept_upkeep"] and v > 0}
+    rest = last["expenses"] - sum(b.values()) - last["expense_breakdown"]["loan_interest"]
+    dear = sorted(b.items(), key=lambda kv: -kv[1])
+    assert len(dear) <= 3 and fin()[1] == (
+        f"- last month: income {money(last['income'])}, expenses {money(last['expenses'])}: buildings "
+        f"{money(sum(b.values()))} (" + ", ".join(f"{k} {money(v)}" for k, v in dear)
+        + f"), city services {money(rest)}, interest $0")
+    assert len(fin()) == 2                              # no debt: no debt line
+    # the costs line names the dearest COSTS_SHOWN (2), then how many more and what they cost together; city services
+    # are the rest (the town hall included), so the parts add up to the expenses
+    assert COSTS_SHOWN == 2
+    last.update(income=597, expenses=469, expense_breakdown={
+        "utilities": 82, "roads": 75, "police": 55, "fire": 55, "health": 45, "town_hall": 20, "city_services": 137,
+        "loan_interest": 0}, dept_upkeep={"utilities": 82, "roads": 75, "police": 55, "fire": 55, "health": 45,
+                                          "education": 0})
+    assert fin()[1] == ("- last month: income $597, expenses $469: buildings $312 (utilities $82, roads $75, 3 more "
+                        "$155), city services $157, interest $0")
+    last["expense_breakdown"].update(fire=0, health=0, city_services=237)       # one more: named ("1 more" is as long)
+    assert fin()[1] == ("- last month: income $597, expenses $469: buildings $212 (utilities $82, roads $75, police "
+                        "$55), city services $257, interest $0")
+    # a loan: the split shows it, the first line drops the debt, and a debt line says what it costs
+    assert mayor(type="take_loan", amount=18800)
+    lines = fin()
+    assert "loans +$18.8k" in lines[0] and lines[0].endswith(")") and ", debt" not in lines[0], lines[0]
+    assert lines[2] == ("- debt $18.8k: $94/month interest, $31.2k more can be borrowed; each $1,000 repaid saves "
+                        "$5/month")                        # 0.5% of the debt a month
+    assert 18800 * C.LOAN_INTEREST == 94
+    env.end_month()
+    assert fin()[1].endswith(", interest $94")          # last month's, from the ledger
+    w.debt = C.MAX_DEBT
+    assert fin()[2] == "- debt $50k: $250/month interest, at the $50k limit; each $1,000 repaid saves $5/month"
+    # a milestone reward is the rest of the change: "other"
+    env = _env()
+    env.end_month()
+    env.end_month()
+    monkeypatch.setitem(C.MILESTONES[0], "pop", 0)
+    env.end_month()
+    line = _mayor_block(env, "## Finances")[0]
+    assert ", other +$5,000)" in line and "top-ups" not in line and "loans" not in line, line
+
+
+def test_mayor_departments_most_urgent_first(monkeypatch):
+    """Smoke v16-v19: block order became funding order (32 of 54 turns followed it), and education, last in turn
+    order, was topped up last in 11 turns. The block follows Funding.order, each line with one suffix."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {"health": 1000})                # health keeps $2,000 of $9,000: idle
+    w.dept_funds["health"] = 9000
+    fleet = FleetState.of(env)
+    ToolBox(env, "mayor").call("update_plan", {"budgets": {"police": 5000},
+                                               "priorities": {d: "PRIO " * 8 for d in ("police", "fire")}})
+    ToolBox(env, "fire").call("end_turn", {"report": "FIRE-REPORT " + "z" * 600})
+    _builds(monkeypatch, {
+        "utilities": FB(1200, (N("sewage outlet", 2, 1, "sewage 95% used", upkeep=15),), 1200, ()),
+        "education": FB(2500, (N("elementary school", 3, 0, first=True, upkeep=45),), 2500, ()),
+        "police": FB(2500, (N("police station", 4, 1, "coverage 40%", upkeep=55),), 2500, ()),
+        "fire": FB(None, (), 2500, ("a fire station",))},
+        road=FB(315, (ROAD,), 315, ()))
+    text = briefing(env, "mayor", mark=False)
+    header = next(ln for ln in text.splitlines() if ln.startswith("## Departments"))
+    assert header == "## Departments (most urgent first; spent = last 1 month; cut reports: history kind=report)"
+    block = _block(text, "## Departments")
+    lines = [ln for ln in block if ": funds " in ln]
+    assert [ln.split(":")[0][2:] for ln in lines] == list(funding_gaps(env, fleet).order) == [
+        "utilities", "education", "planning", "police", "fire", "transport", "health"]
+    assert lines == [
+        "- utilities: funds $0, spent $0; needs $1,200 for another sewage outlet (sewage 95% used, $15/month)",
+        "- education: funds $0, spent $0; needs $2,500 for its first elementary school (3 sites, $45/month)",
+        "- planning: funds $0, spent $0; needs $315 for a road into open land and zoning it (opens 20 tiles)",
+        "- police: funds $0 < target $5,000, spent $0; needs $2,500 for another police station (coverage 40%, "
+        "$55/month)",
+        "- fire: funds $0, spent $0; blocked: a fire station",
+        "- transport: funds $0, spent $0; nothing ready to buy",
+        "- health: funds $9,000, spent $1,000; idle $7,000 (keeps $2,000)"]
+    report, = [ln for ln in block if "FIRE-REPORT" in ln]
+    assert block.index(report) == block.index(lines[4]) + 1                  # under its department's line
+    assert report == f"  report (m1): FIRE-REPORT {'z' * (MAYOR_REPORT_CHARS - 15)}..."
+    assert "priority" not in text and "PRIO" not in text                   # get_plan has them
+    assert block.count(BLOCKED_NOTE) == 1 and BLOCKED_NOTE == (
+        "- blocked for lack of land: money buys nothing there until planning frees lots (ask planning)")
+    assert block[-2:] == spend_lines(w, funding_gaps(env, fleet))           # after the notes, in their place
+    assert block.index(BLOCKED_NOTE) == len(block) - 3
+    assert not any(s in text for s in ("below target", "first buildings still unfunded", "idle in"))
+    assert "\n## City plan (v1, month 1; priorities and full text: get_plan)\n" in text
+    # a department with nothing to name reads what its money does; planning then reads nothing more
+    _builds(monkeypatch, {"police": FB(2500, (N("police station", 4, 1, "coverage 40%", upkeep=55),), 2500, ()),
+                          "fire": FB(2500, (N("fire station", 3, 0, first=True, upkeep=55),), 2500, ())})
+    w.dept_funds.update(police=2500, fire=2500, health=0)
+    lines = {ln.split(":")[0][2:]: ln for ln in _mayor_block(env, "## Departments") if ": funds " in ln}
+    assert lines["planning"] == "- planning: funds $0, spent $0"
+    assert lines["police"] == "- police: funds $2,500 < target $5,000, spent $0; funds cover its builds"
+    assert lines["fire"] == "- fire: funds $2,500, spent $0; funds cover its next build"    # levees: no dearest price
+    assert lines["health"] == "- health: funds $0, spent $1,000; nothing ready to buy"
+    assert BLOCKED_NOTE not in _mayor_block(env, "## Departments")
+    env = _env()                                        # month 0: nothing spent yet
+    assert "\n## Departments (most urgent first)\n" in briefing(env, "mayor", mark=False)
+
+
+def test_mayor_system_prompt_says_upkeep_is_for_good():
+    text = system_prompt("mayor", FleetAgentConfig(), 36)
+    assert ("Stay solvent: upkeep is paid from the treasury every month and every building adds upkeep for good; keep "
+            "the reserve when you move money to departments (allocate_budget) or cut taxes.") in text
+    assert "Stay within your budget" in system_prompt("police", FleetAgentConfig(), 36)
