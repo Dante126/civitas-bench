@@ -3742,6 +3742,125 @@ def test_riverbank_and_funded_warnings_come_once():
     assert res["message"].count("WARNING") == 1 and "riverbank lot" in res["message"], res
 
 
+def test_a_funded_building_whose_every_site_is_claimed_is_named_and_blocked(env12):
+    """Smoke v18 seed 1, month 6: the mayor funded education's first school, but its only site (38,25) was the police
+    station's too, claimed first in turn order. Planning read only "leave free (funded): police station (38,25)";
+    education was on neither that line nor the blocked one (its list wasn't empty), read "no free roadside land" in
+    month 6 and never built (33.4). Planning's line now says it has no lot of its own, and the mayor's line counts it as
+    blocked, its money kept (not idle)."""
+    from civitas.fleet.briefing import BLOCKED_NOTE
+    from civitas.fleet.tools import DeptMoney
+    env = copy.deepcopy(env12)
+    w = env.world
+    _hem_homes(env, keep=[(20, 22)])                   # one lot near homes: every station's and the school's only one
+    w.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, police=2500, education=2500)
+    assert _sites(env, "police", "station") == _sites(env, "education", "school") == [(20, 22)]
+    note = lambda d, b: f"; {d} ({b}): no lot of its own - leave or free one near (20,22)"
+    assert _leave(env) == ["- leave free (funded): police station (20,22): zone around them"
+                           + note("education", "elementary school")]
+    lines = _dept_lines(env)
+    assert lines["education"] == "- education: funds $2,500, spent $0; blocked: an elementary school"
+    assert lines["police"] == "- police: funds $2,500, spent $0"
+    assert briefing(env, "mayor", mark=False).count(BLOCKED_NOTE) == 1
+    m = DeptMoney(env, "education")
+    assert m.held == 2500 and m.keep == 2500 and m.idle == 0      # held through a turn, kept for the school
+    w.dept_funds["health"] = 2000                      # a tie: the clinic's only lot is police's, the landfill has its own
+    assert _leave(env) == ["- leave free (funded): police station (20,22), landfill (18,40): zone around them"
+                           + note("health", "clinic") + note("education", "elementary school")]
+    lines = _dept_lines(env)
+    assert lines["health"] == "- health: funds $2,000, spent $0"                     # its landfill can go up
+    w.dept_funds["police"] = 0                         # the school claims the lot itself
+    assert _leave(env) == ["- leave free (funded): clinic (20,22), landfill (18,40): zone around them"
+                           + note("education", "elementary school")]
+    env = copy.deepcopy(env12)                         # a lot of its own: nothing to add
+    env.world.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, police=2500, education=2500)
+    assert _leave(env) == ["- leave free (funded): " + ", ".join(_claimed(
+        env, ("police", "station", "police station"), ("education", "school", "elementary school")))
+        + ": zone around them"]
+    assert "blocked" not in _dept_lines(env)["education"]
+
+
+def test_the_leave_free_line_keeps_its_unclaimed_notes_at_its_cap():
+    """The notes for funded buildings with no lot of their own come after the claimed sites; past BLOCKED_LINE_CHARS
+    the claimed sites drop first, whole and counted, then the notes."""
+    from civitas.fleet.briefing import BLOCKED_LINE_CHARS, _leave_line
+    from civitas.fleet.tools import Spot
+    spots = [Spot("education", "school", "elementary school", (10 + i, 40), (1, 1)) for i in range(12)]
+    notes = [Spot("health", "clinic", "clinic", (10, 40)), Spot("fire", "station", "fire station", (11, 40))]
+    line, = _leave_line(spots, notes)
+    assert len(line) <= BLOCKED_LINE_CHARS and line.endswith(
+        " more): zone around them; health (clinic): no lot of its own - leave or free one near (10,40); fire (fire "
+        "station): no lot of its own - leave or free one near (11,40)"), line
+    assert line.startswith("- leave free (funded): elementary school (10,40) (+11 more)"), line
+    line, = _leave_line(spots, notes * 2)
+    assert len(line) <= BLOCKED_LINE_CHARS and line.endswith("near (11,40) (+2 more)") and "(+11 more)" in line, line
+    assert _leave_line(spots[:1], notes[:1]) == [
+        "- leave free (funded): elementary school (10,40): zone around them; health (clinic): no lot of its own - "
+        "leave or free one near (10,40)"]
+
+
+def test_a_zone_that_leaves_several_funded_buildings_no_site_names_a_tile_for_each(env12):
+    """Smoke v18 seed 1, month 9: each of planning's two high-density strips warned "that zoned the last site for
+    fire's fire station near homes ($2,500 held) and health's landfill ($2,000 held): dezone one, e.g. (46,29)" (then
+    police's, the clinic's and the school's), and planning dezoned exactly that tile, which seats one building. Each
+    building now gets a tile of its own from its list among those the zone took; a landfill one that is away from
+    homes once dezoned, else a lot at the town edge."""
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=[(20, 22), (22, 20)])         # two lots near homes: police claims one, fire the other
+    env.world.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, police=2500, fire=2500)
+    assert _sites(env, "police", "station") == _sites(env, "fire", "station") == [(20, 22), (22, 20)]
+    res = ToolBox(env, "planning").call("zone", {"zone": "R", "x1": 20, "y1": 20, "x2": 22, "y2": 22})
+    assert res["message"] == (
+        "zoned 5 tiles R (low density) WARNING: that zoned the last site for police's police station near homes "
+        "($2,500 held) and fire's fire station near homes ($2,500 held): dezone (20,22) for the police station and "
+        "(22,20) for the fire station"), res
+    head = ("WARNING: that zoned the last site for fire's fire station near homes ($2,500 held) and health's landfill "
+            "($2,000 held): dezone (20,22) for the fire station")
+    edge = ("the landfill needs a lot at the town edge: leave one by (40,19), the far end of road_extension "
+            "(25,19)-(40,19)")
+    for zone, fix in (("R", "; " + edge), ("C", " and (18,40) for the landfill")):   # homes around it, or shops
+        env = copy.deepcopy(env12)
+        _hem_homes(env, keep=[(20, 22)])               # fire claims (20,22), the landfill (18,40) by the new road
+        env.world.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, fire=2500, health=2000)
+        assert _sites(env, "health", "landfill")[0] == (18, 40)
+        res = ToolBox(env, "planning").call("zone", {"zone": zone, "x1": 18, "y1": 22, "x2": 20, "y2": 47})
+        assert res["message"].endswith(head + fix), (zone, res)
+
+
+def test_a_zone_names_each_building_a_distinct_tile_from_its_own_list(monkeypatch):
+    """Police and fire both list P and Q, police claims P and fire Q, and a zone takes both: each gets its own claimed
+    tile, not the first of its list (P twice)."""
+    from civitas.fleet.tools import Price
+    P, Q = (3, 3), (5, 5)
+    pol, fire = Price(2500, "police station"), Price(2500, "fire station")
+    env = _env()
+    env.world.dept_funds.update(police=2500, fire=2500)
+    before = {("police", "station"): (pol, [P, Q]), ("fire", "station"): (fire, [P, Q])}
+    assert _warn_after(monkeypatch, env, before, {"police": [], "fire": []}) == (
+        " WARNING: that zoned the last site for police's police station near homes ($2,500 held) and fire's fire "
+        "station near homes ($2,500 held): dezone (3,3) for the police station and (5,5) for the fire station")
+
+
+def test_a_landfill_losing_its_last_site_alone_is_told_where_it_can_go(env12):
+    """One building: a station keeps "dezone one, e.g. (x,y)" (test_zoning_the_last_site_of_a_funded_building_warns);
+    a landfill's tile must be away from homes once dezoned, else it needs a lot at the town edge: smoke v18's (46,35)
+    sat in a strip of new homes."""
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=[(20, 22)])
+    env.world.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, health=2000)   # clinic (20,22), landfill
+    res = ToolBox(env, "planning").call("zone", {"zone": "R", "x1": 18, "y1": 40, "x2": 18, "y2": 46})    # (18,40)
+    assert res["message"] == (
+        "zoned 7 tiles R (low density) WARNING: that zoned the last site for health's landfill (health holds $2,000 "
+        "for it): it needs a lot at the town edge: leave one by (40,19), the far end of road_extension "
+        "(25,19)-(40,19)"), res
+    env = copy.deepcopy(env12)
+    _hem_homes(env, keep=[(20, 22)])
+    env.world.dept_funds.update({d: 0 for d in DEPTS if d != "planning"}, health=2000)
+    res = ToolBox(env, "planning").call("zone", {"zone": "C", "x1": 18, "y1": 40, "x2": 20, "y2": 47})
+    assert res["message"].endswith(" WARNING: that zoned the last site for health's landfill (health holds $2,000 "
+                                   "for it): dezone one, e.g. (18,40)"), res
+
+
 def test_mayor_briefing_lists_department_reports():
     env = _env()
     assert "no reports yet" in briefing(env, "mayor").lower()

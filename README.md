@@ -496,7 +496,11 @@ tasks and money, and to let people coach it.
     When a department has no ready site, its line says `; blocked: a police station`, and
     one line under the block says `- blocked for lack of land: ask planning for lots`.
     In smoke v13 seed 0, planning had zoned every roadside lot, and the mayor took the
-    station, clinic and school money back from four departments as idle.
+    station, clinic and school money back from four departments as idle. A department
+    whose funded first buildings all have no lot of their own (every site of theirs is
+    claimed first by an earlier department, see planning's leave-free line) reads
+    `; blocked: an elementary school` too; its ready site already keeps the money. In smoke
+    v18 seed 1, education's only site was also police's, and education never built.
   - **Below target.** A department counts as below its plan target only if it isn't idle
     and would use a top-up: it spent more than half of the most it held over those 3
     months, or it never held its keep. In smoke v9–v12, planning spent about $1,000 a
@@ -550,8 +554,10 @@ tasks and money, and to let people coach it.
   - **`- leave free (funded): fire station (20,22), clinic (21,25): zone around them`**
     covers each department whose funds already pay for its cheapest ready first
     building (all of them on a tie; utilities' only while that supply is at least 90% used). It gives each building a site, in turn order,
-    that no earlier building has claimed. Past 240 characters whole items are dropped
-    (`(+2 more)`).
+    that no earlier building has claimed. A building with every site claimed first gets a
+    note after the list: `; education (elementary school): no lot of its own - leave or
+    free one near (38,25)`, at its best site. Past 240 characters whole items are dropped
+    (`(+2 more)`), the claimed sites before the notes.
     - Zone strips that cover a claimed site are listed after the others. When one still
       comes first, it's marked `(leave (20,22) for the fire station)`.
     - A failed zone's "zone beside it" suggestions skip these sites.
@@ -617,7 +623,12 @@ tasks and money, and to let people coach it.
   unclaimed site for it (`WARNING: that zoned the last site for fire's fire station near homes (fire holds
   $2,500 for it): dezone one, e.g. (20,22)`): only when claiming the sites afresh in turn
   order seats fewer of the funded buildings than before; the buildings named are those
-  left out when each keeps its earlier site where it can. A `zone` that leaves no dead end to extend and
+  left out when each keeps its earlier site where it can. With several, each gets its own
+  tile from its sites the zone took (`dezone (46,29) for the fire station and (46,35) for the
+  clinic`); in smoke v18 seed 1 planning dezoned the one tile named for two buildings. A
+  landfill or jail gets a tile that is away from homes once dezoned, else the warning says
+  it needs a lot at the town edge (`leave one by (40,19), the far end of road_extension
+  (25,19)-(40,19)`). A `zone` that leaves no dead end to extend and
   no free lot beside the roads from which a straight road reaches open land warns as well
   (`WARNING: that zoned the last lot a new road could branch from; leave one free, e.g.
   dezone (12,23)`). After another warning on the same zone (the riverbank one, or the
