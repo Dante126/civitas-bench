@@ -310,3 +310,7 @@ table.ptab td.qrole .dot { display: inline-block; width: 7px; height: 7px; borde
 .tag.hb.h-dropped, .tag.hb.h-repeated, .tag.hb.h-ended, .tag.bad { color: #ffc2bc; border-color: rgba(255,107,94,.5); }
 .tag.hb.h-overridden { color: #ffe0a0; border-color: rgba(255,200,87,.45); }
 .call.focus { outline: 2px solid var(--warn); outline-offset: 1px; }
+/* money tab */
+.mlines { margin: 6px 0; font-size: 12px; } .mlines summary { cursor: pointer; color: var(--muted); }
+.mlines pre.log { white-space: pre-wrap; font-size: 11px; max-height: 220px; }
+table.mtab .good { color: var(--ok); } table.mtab tr.midle td { background: rgba(255,200,87,.06); }

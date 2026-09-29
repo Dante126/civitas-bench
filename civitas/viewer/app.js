@@ -413,6 +413,9 @@ function renderTab() {
   } else if (S.tab === "problems") {
     roleChips();
     renderProblems();
+  } else if (S.tab === "money") {
+    roleChips();
+    renderMoneyTab();
   } else if (S.tab === "council") {
     roleChips();
     const msgs = S.frames.slice(0, S.idx + 1).flatMap(fr => fr.council || []).filter(m => roleOn(m.sender)).reverse();
@@ -586,6 +589,61 @@ function bindCalls(det) {
     if (det.open) { S.callsOpen.add(det.dataset.key); showCalls(det); } else S.callsOpen.delete(det.dataset.key);
   });
   if (det.open) showCalls(det);
+}
+
+// ---------------------------------------------------------------- money
+// the quarter's money: what the mayor saw (its briefing's money lines), what it moved, and each department's money
+// from its turn to the next one; frames carry treasury, debt and dept_funds / dept_spent / dept_upkeep per month
+const MONEY_LINE = /^- (treasury|last month|debt|to spend|to fund|first buildings|blocked for lack of land|\$[\d,.k]+ idle)/;
+const MONEY_ACTS = new Set(["allocate_budget", "take_loan", "repay_loan", "set_tax", "set_funding", "set_district_tax", "set_service_imports"]);
+function renderMoneyTab() {
+  const body = $("tabBody"), j = turnFrame(S.idx);
+  if (j < 0) { body.innerHTML = `<div class="emptytab">No mayor turn yet.</div>`; return; }
+  const tf = S.frames[j], month = tf.month - 1, seen = S.frames[Math.max(0, j - 1)].metrics;
+  const nj = nextTurnFrame(j), end = nj < 0 ? S.frames.length : nj, quarter = S.frames.slice(j, end), last = quarter[quarter.length - 1].metrics;
+  const prevJ = turnFrame(j - 1), nextJ = nextTurnFrame(S.idx);
+  const mayor = tf.turns.find(t => t.role === "mayor");
+  const card = (v, label, cls = "") => `<div class="pcard ${cls}"><b>${v}</b><span>${label}</span></div>`;
+  const head = `<div class="qhead"><button class="btn qnav" id="mPrev" ${prevJ < 0 ? "disabled" : ""} title="previous quarter">◀</button>
+      <div><b>Money in the quarter from month ${month}</b> <span class="muted">· months ${month}-${quarter[quarter.length - 1].month - 1}</span></div>
+      <button class="btn qnav" id="mNext" ${nextJ < 0 ? "disabled" : ""} title="next quarter">▶</button></div>
+    <div class="small muted" style="margin-bottom:4px">At the mayor's turn (month ${month}):</div>
+    <div class="pcards">${card(fmt$(seen.treasury), "treasury", seen.treasury < 0 ? "bad" : "")}${card(fmt$(seen.debt || 0), "debt", seen.debt ? "bad" : "")}
+      ${card(fmt$(seen.net_worth ?? seen.treasury), "net worth")}${card(fmt$(seen.income || 0), "income / month", "good")}${card(fmt$(seen.expenses || 0), "expenses / month")}</div>`;
+  // the mayor's own money lines, from its briefing (loaded with the turn traces)
+  const tr = (S.traces[`${S.runId}:${month}`] || []).find(x => x.role.split(".").pop() === "mayor");
+  const lines = tr ? (tr.observation || "").split("\n").filter(l => MONEY_LINE.test(l)) : null;
+  const seenBlock = `<details class="mlines" open><summary>What the mayor read</summary>${lines == null ? `<div class="small muted">loading…</div>` :
+    lines.length ? `<pre class="log">${esc(lines.join("\n"))}</pre>` : `<div class="small muted">(no money lines in this briefing: an older run)</div>`}</details>`;
+  if (!tr) loadTraces(month).then(() => { if (S.tab === "money") renderMoneyTab(); });
+  const moves = mayor ? mayor.results.filter(r => MONEY_ACTS.has(r.action.type)) : [];
+  const movesBlock = `<div class="small muted" style="margin:8px 0 4px">What the mayor did:</div>` + (moves.length ? moves.map(r =>
+    `<div class="act ${r.ok ? "ok" : "bad"}"><span class="st">${r.ok ? "✓" : "✗"}</span><span><code>${actText(r.action)}</code><span class="msg">${esc(r.message)}</span></span></div>`).join("")
+    : `<div class="small muted">no money moves</div>`);
+  // per department over the quarter: given / taken from the mayor's calls, spent from the monthly ledgers
+  const given = {}, taken = {};
+  for (const r of moves) if (r.ok && r.action.type === "allocate_budget") {
+    const d = r.action.department, a = +r.action.amount; if (a > 0) given[d] = (given[d] || 0) + a; else taken[d] = (taken[d] || 0) - a;
+  }
+  const depts = Object.keys(last.dept_funds || {}).filter(roleOn);
+  const rows = depts.map(d => {
+    const held = (seen.dept_funds || {})[d] || 0, now = (last.dept_funds || {})[d] || 0;
+    const spent = quarter.reduce((s, f) => s + ((f.metrics.dept_spent || {})[d] || 0), 0), up = (last.dept_upkeep || {})[d] || 0;
+    const idle = now >= 1000 && spent === 0;
+    return `<tr style="--c:${roleColor(d)}" class="${idle ? "midle" : ""}"><td class="qrole"><span class="dot"></span>${esc(d)}</td><td>${fmt$(held)}</td>
+      <td>${given[d] ? `<span class="good">+${fmt$(given[d])}</span>` : "—"}</td><td>${taken[d] ? `<span class="warn">−${fmt$(taken[d])}</span>` : "—"}</td>
+      <td>${spent ? fmt$(spent) : "—"}</td><td>${fmt$(now)}${idle ? ` <span class="tag warn" title="held $1,000+ and spent nothing all quarter">idle</span>` : ""}</td><td>${up ? fmt$(up) : "—"}</td></tr>`;
+  }).join("");
+  const table = `<div class="small muted" style="margin:10px 0 4px">Each department, month ${month} to ${quarter[quarter.length - 1].month - 1}:</div>
+    <table class="lb ptab mtab"><tr><th>role</th><th title="funds at the mayor's turn">held</th><th title="topped up this turn">given</th><th title="taken back this turn">taken</th><th title="spent over the quarter">spent</th><th title="funds at the end of the quarter">holds</th><th title="upkeep per month">upkeep</th></tr>${rows}</table>`;
+  const chart = `<div class="chart"><div class="ct"><span>Money over the run</span><b>${fmt$(S.frames[S.idx].metrics.treasury)}</b></div><svg id="mChart"></svg>
+    <div class="legendline"><span style="--c:#ffc857"><i></i>treasury</span><span style="--c:#ff6b5e"><i></i>debt</span><span style="--c:#4aa3ff"><i></i>department funds</span><span style="--c:#e9ecef"><i></i>net worth</span></div></div>`;
+  body.innerHTML = head + seenBlock + movesBlock + table + chart;
+  if (prevJ >= 0) $("mPrev").onclick = () => go(prevJ);
+  if (nextJ >= 0) $("mNext").onclick = () => go(nextJ);
+  const fr = S.frames, sum = (o) => Object.values(o || {}).reduce((a, b) => a + b, 0), kf = (v) => Math.abs(v) >= 1000 ? (v / 1000).toFixed(0) + "k" : Math.round(v);
+  lineChart($("mChart"), [{ values: fr.map(f => f.metrics.treasury), color: "#ffc857" }, { values: fr.map(f => f.metrics.debt || 0), color: "#ff6b5e" },
+    { values: fr.map(f => sum(f.metrics.dept_funds)), color: "#4aa3ff" }, { values: fr.map(f => f.metrics.net_worth ?? null), color: "#e9ecef", width: 1.2 }], { yFmt: kf });
 }
 
 // ---------------------------------------------------------------- problems
@@ -1006,7 +1064,7 @@ document.addEventListener("keydown", (e) => {
   const fn = map[k] || map[k.toLowerCase()];
   if (fn) { e.preventDefault(); fn(); }
 });
-window.addEventListener("resize", () => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); });
+window.addEventListener("resize", () => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); if (S.tab === "money") renderMoneyTab(); });
 
 // ================================================================ boot
 (async function boot() {
