@@ -4448,12 +4448,14 @@ def test_turn_row_is_slim():
     assert row == {"role": "police", "month": 3, "prompt_tokens": 100, "completion_tokens": 20, "steps": 3,
                    "finish_reason": "end_turn", "length_stops": 2, "ended": True, "parse_error": None,
                    "results": [{"type": "build_service", "ok": False, "message": "tile (3,4) is occupied", "cost": 0}],
-                   "tool_errors": ["bad args", "action limit reached", "no plan"], "repeats": 1, "refused": 1}
+                   "tool_errors": ["bad args", "action limit reached", "no plan"], "repeats": 1, "refused": 1,
+                   "seen": None, "asked": {}}
 
 
 def test_turn_row_and_rebuild_tolerate_minimal_records(tmp_path):
     row = turn_row({"role": "fire", "month": 2})
     assert row["steps"] == 0 and row["prompt_tokens"] == 0 and row["results"] == [] and row["tool_errors"] == []
+    assert row["seen"] is None and row["asked"] == {}
     p = tmp_path / "trajectories.jsonl"
     p.write_text(json.dumps({"role": "fire", "month": 2, "agent": "fleet:x"}) + "\n\n"
                  + json.dumps({"role": "mayor", "month": 2, "agent": "scripted"}) + "\n")
@@ -4490,10 +4492,42 @@ def test_fleet_report_repeated_failure_hint():
     rep, md = fleet_report(env, _summary(env), rows)
     h, = _hints(rep, "repeated_failures")
     assert h["role"] == "police" and h["count"] == 4 and "occupied by road" in h["text"] and h["text"] in md
+    assert h["cause"] == "taken land" and h["text"] == (
+        "police: 4 failures like \"tile (3,6) is occupied by road; pick an empty tile\" (build_service) - add a "
+        "lesson to its playbook: inspect a tile or use find_sites before building or zoning on it")
     pol = rep["roles"]["police"]
     assert pol["failed"] == 5 and pol["top_failures"][0]["count"] == 4
     assert pol["top_failures"] == [{"message": fails[0][2], "count": 4}, {"message": "costs $9,000 but the police "
                                    "budget only has $500; ask the mayor", "count": 1}]
+
+
+def test_repeated_failures_group_by_role_and_cause():
+    """Scripted fleet, seed 0: planning's failures gave 4 hints, 15 for a plaza spot off the road and 7 + 5 + 3 in
+    three wordings for zones, parks and a plaza on taken land. One hint per role and cause, with the wordings."""
+    env = _report_env()
+    fails = ([("zone", False, "no empty land tiles in that area", 0)] * 7
+             + [("build_park", False, "no empty land tiles there", 0)] * 5
+             + [("build_landmark", False, f"({x},26) is not an empty land tile", 0) for x in (21, 22, 23)]
+             + [("build_landmark", False, f"({x},27) does not touch a road; buildings must be next to a road", 0)
+                for x in range(11, 26)]
+             + [("build_road", False, f"tile ({x},23) is occupied by {s}; bulldoze it or route around", 0)
+                for x, s in ((35, "coal_plant"), (30, "residential"))])      # smoke v17: one action, two wordings
+    rows = _clean_rows() + [turn_row(_rec("planning", m, fails[m::3])) for m in range(3)]
+    rows += [turn_row(_rec("mayor", m, [("allocate_budget", False, f"treasury only has ${m}", 0)])) for m in range(2)]
+    rep, _ = fleet_report(env, _summary(env), rows)
+    hs = _hints(rep, "repeated_failures")
+    assert [(h["role"], h["cause"], h["count"]) for h in hs] == [("planning", "taken land", 17),
+                                                                  ("planning", "no road access", 15)]
+    assert hs[0]["text"] == (
+        "planning: 17 failures on taken land (7x zone \"no empty land tiles in that area\", 5x build_park \"no empty "
+        "land tiles there\", 3x build_landmark \"(21,26) is not an empty land tile\", 2x build_road \"tile (35,23) is "
+        "occupied by coal_plant; bulldoze it or route around\") - add a lesson to its playbook: inspect a tile or use "
+        "find_sites before building or zoning on it")
+    assert hs[1]["text"] == (
+        "planning: 15 failures like \"(11,27) does not touch a road; buildings must be next to a road\" "
+        "(build_landmark) - add a lesson to its playbook: build only beside a connected road (find_sites lists such "
+        "sites)")
+    assert len(rep["roles"]["planning"]["top_failures"]) == 4           # still one entry per wording (3 or more)
 
 
 def test_fleet_report_tool_errors_count_towards_repeated_failures():
@@ -4597,9 +4631,10 @@ def test_idle_hint_ignores_the_mayor():
     assert _hints(rep, "idle") == []
 
 
-def _transport_idle(funds, plans=(), turns=(0, 3, 6, 9), months=12):
-    """Idle hints for a transport department that never acts; `funds` maps history month -> its funds (default 0),
-    `plans` are (month, budgets) plan versions."""
+def _transport_idle(funds, plans=(), turns=(0, 3, 6, 9), months=12, kind="idle"):
+    """Hints of `kind` for a transport department that never acts and whose turns carry no briefing (so the history
+    log gives its funds); `funds` maps history month -> its funds (default 0), `plans` are (month, budgets) plan
+    versions."""
     env = _env()
     fs = FleetState.of(env)
     fs.update_plan(0, goals=["grow"])
@@ -4611,20 +4646,26 @@ def _transport_idle(funds, plans=(), turns=(0, 3, 6, 9), months=12):
                          for m in range(1, months + 1)]
     rows = [turn_row(_rec("transport", m, trace=[{"tool": "inspect", "result": {"ok": True}}])) for m in turns]
     rep, _ = fleet_report(env, _summary(env), rows)
-    return _hints(rep, "idle")
+    return _hints(rep, kind)
 
 
 def test_idle_hint_skips_a_department_without_money_or_a_target():
     assert _transport_idle({}) == []                                      # $0 and no plan budget all run
+    assert _transport_idle({}, kind="starved") == []
     assert _transport_idle({}, plans=[(0, {"transport": 0})]) == []       # a zero budget counts as none
     assert _transport_idle({m: 0.6 for m in range(13)}) == []             # under $1
     h, = _transport_idle({m: 500.0 for m in range(13)})                   # money but no target: idle
     assert (h["turns"], h["months"]) == (4, 12) and "mayor" not in h["text"]
-    h, = _transport_idle({}, plans=[(0, {"transport": 1000})])            # a target but no money: the mayor's fault
-    assert (h["turns"], h["months"]) == (4, 12)
-    assert "its funds stayed at $0 against a $1,000 target: check the mayor's allocations" in h["text"]
-    h, = _transport_idle({4: 500.0}, plans=[(0, {"transport": 1000})])    # money at one turn of the run: no note
-    assert (h["turns"], h["months"]) == (4, 12) and "mayor" not in h["text"]
+    plan = [(0, {"transport": 1000})]
+    assert _transport_idle({}, plans=plan) == []                          # a target but no money: the mayor's
+    h, = _transport_idle({}, plans=plan, kind="starved")
+    assert h["role"] == "mayor" and h["depts"] == [{"role": "transport", "turns": 4, "months": 12, "first": 0,
+                                                     "last": 11, "building": None, "price": None, "asked": 0}]
+    assert h["text"] == ("mayor: left transport at $0 against its $1,000 target for 4 turns / 12 months (months "
+                         "0-11) - fund the first buildings departments ask for, or tell them why not")
+    assert _transport_idle({4: 500.0}, plans=plan) == []                  # money at the month-3 turn splits the run
+    h, = _transport_idle({4: 500.0}, plans=plan, kind="starved")
+    assert (h["depts"][0]["turns"], h["depts"][0]["first"], h["depts"][0]["last"]) == (2, 6, 11)
 
 
 def test_unfunded_turns_split_idle_runs_and_read_the_month_after_the_turn():
@@ -4633,10 +4674,180 @@ def test_unfunded_turns_split_idle_runs_and_read_the_month_after_the_turn():
     assert (h["turns"], h["first"], h["last"]) == (2, 6, 11)
     assert _transport_idle({m: 5000.0 for m in range(8, 13)}) == []       # funded after the month-6 turn: one idle turn
     # the plan saved in month 6 (before the departments' turns) is in force for the month-6 turn
-    h, = _transport_idle({}, plans=[(6, {"transport": 2000})])
-    assert (h["turns"], h["first"], h["last"]) == (2, 6, 11) and "$2,000 target" in h["text"]
+    h, = _transport_idle({}, plans=[(6, {"transport": 2000})], kind="starved")
+    d, = h["depts"]
+    assert (d["turns"], d["first"], d["last"]) == (2, 6, 11) and "$2,000 target" in h["text"]
     assert _transport_idle({4: 500.0, 10: 500.0}) == []                   # idle turns at 3 and 9, blocked between
     assert _transport_idle({}, turns=range(12)) == []
+
+
+def _briefed(role, month, funds, ready, metrics=(), target=3000.0, results=(), asks=()):
+    """A fleet turn row whose briefing showed `funds` (and the plan `target`), these Key metrics and Ready sites lines
+    (without their "- "), and which sent the mayor `asks`."""
+    from civitas.fleet.fmt import money
+    text = "\n".join([f"# {role}: month {month}", "", "## Your budget",
+                      f"- {money(funds)} in department funds"
+                      + (f" (plan target {money(target)})" if target is not None else "") + "; spent last month $0",
+                      "", "## Key metrics", *(f"- {m}" for m in metrics), "", "## Since your last turn (month 0)",
+                      "- failed actions: none", "", "## Ready sites", *(f"- {r}" for r in ready),
+                      "find_sites <purpose> lists up to 6 with details", "", "## Your memory", "- empty"])
+    rec = _rec(role, month, results)
+    rec["prompt"] = [{"role": "system", "content": "(system prompt: meta.json fleet_prompts.x)"},
+                     {"role": "user", "content": text}]
+    rec["messages"] = [{"to": "mayor", "text": a} for a in asks]
+    return turn_row(rec)
+
+
+STATION = "station: 5 sites, best (20,20), need 270; $2,500"
+JAIL = "jail: locked (unlocks at 1,000 residents)"
+
+
+def _turn_hints(rows, kind):
+    env = _report_env()
+    return _hints(fleet_report(env, _summary(env), rows)[0], kind)
+
+
+def test_turn_row_reads_the_briefing():
+    """The idle rule's view of a turn: the briefing's funds, Ready sites (price, "- you have", blocked for land or
+    nothing to build) and the Key metrics that say whether a building is needed, plus what it asked the mayor for."""
+    from civitas.fleet.tools import role_obs, site_lists
+    row = _briefed("utilities", 3, 12500, ["coal_or_gas: 6 sites, best (0,23), 0 homes within 5; $4,000",
+                                           "wind: 6 sites, best (18,25), wind 1.38; $12.5k - you have $12.5k",
+                                           "pump: none - riverbank beside roads all taken: ask planning to free a lot "
+                                           "near (25,24)", "sewage: none - no river on this map",
+                                           "near_homes: 2 sites, same list as wind", "riverbank_2x2: locked (unlocks "
+                                           "at 10,000 residents)", "leave free (funded): x (1,1): zone around them"],
+                   ["power: supply 1.2k / demand 58, coverage 100%", "water: n/a", "river pollution: 3.6%"],
+                   target=None, asks=["Utilities needs $2,500 to add power", "and $1.5k"])
+    assert row["seen"] == {"funds": 12500.0, "target": None, "metrics": {"power": [1200.0, 58.0, 100.0]},
+                           "sites": {"coal_or_gas": {"state": "ok", "price": 4000.0},
+                                     "wind": {"state": "short", "price": 12500.0},
+                                     "pump": {"state": "blocked", "why": "riverbank beside roads all taken"},
+                                     "sewage": {"state": "none"}, "near_homes": {"state": "ready"},
+                                     "riverbank_2x2": {"state": "locked"}}}
+    assert row["asked"] == {"mayor": 2500.0}
+    assert turn_row({**_rec("mayor", 0), "prompt": [{"role": "user", "content": "## City\n- x"}]})["seen"] is None
+    odd = turn_row({**_rec("police", 0), "messages": [{"to": "mayor", "text": "costs $, or $1,500, or $x"}],
+                    "prompt": [{"role": "user", "content": ["not text"]}]})
+    assert odd["seen"] is None and odd["asked"] == {"mayor": 1500.0}
+    assert turn_row({**_rec("police", 0), "messages": "not a list of messages"})["asked"] == {}   # never raises
+    env = _env()                                       # a real briefing, then every roadside lot taken
+    env.world.dept_funds["police"] = 1500
+    row = turn_row({**_rec("police", 0), "prompt": [{"role": "user", "content": briefing(env, "police", mark=False)}]})
+    assert row["seen"]["funds"] == 1500 and row["seen"]["metrics"] == {"police coverage": 0.0}
+    for fill in (False, True):                         # the parsed states follow SiteList.blocked, not the words
+        if fill:
+            _fill_roadside(env.world)
+        for d in DEPTS[1:]:
+            lists = site_lists(env.world, d, role_obs(env, d))
+            seen = turn_row({**_rec(d, 0), "prompt": [{"role": "user", "content": briefing(env, d, mark=False)}]})
+            for p, lst in lists.items():
+                assert (seen["seen"]["sites"][p]["state"] == "blocked") == lst.blocked, (d, p, lst)
+
+
+def test_idle_needs_money_for_a_ready_site_it_needs():
+    """Scripted fleet, seeds 0-4: the idle rule fired for 6-7 departments a run, lumping departments waiting for money
+    they asked for, departments with nothing left to do (fire at 83-98% coverage) and the real case: money and a ready
+    site but no build. Only that case is an idle hint now, with what the briefing showed."""
+    rows = [_briefed("police", m, 3000, [STATION, JAIL], ["police coverage: 30%"],
+                     asks=["Police needs $8,300 to upgrade a police station"] * (m > 3)) for m in (0, 3, 6, 9)]
+    h, = _turn_hints(rows, "idle")
+    assert h["role"] == "police" and (h["turns"], h["months"], h["first"], h["last"]) == (4, 12, 0, 11)
+    assert h["text"] == ("police: 4 turns / 12 months without a build while it could pay for a ready site (months "
+                         "0-11): it held $3,000, enough for its $2,500 police station; police coverage 30%; asked the "
+                         "mayor for up to $8,300 in 2 of them - check its playbook and why it didn't build")
+    for ready, cov in (([STATION], "80%"),                               # covered: nothing needed
+                       (["station: none - nothing needs it right now"], "30%"),
+                       ([JAIL, "station: 5 sites, best (20,20); $2,500 - you have $2,000"], "30%")):
+        rows = [_briefed("police", m, 2000, ready, [f"police coverage: {cov}"]) for m in (0, 3, 6, 9)]
+        assert _turn_hints(rows, "idle") == [], ready
+    rows = [_briefed("fire", m, 2000, ["station: 5 sites, best (1,1); $2,500 - you have $2,000",
+                                       "shelter: 3 sites, best (2,2); $1,500"], ["fire coverage: 30%"])
+            for m in (0, 3, 6)]                                          # a shelter only: short of the station
+    assert _turn_hints(rows, "idle") == [] and len(_turn_hints(rows, "starved")) == 1
+    rows = [_briefed("police", m, 3000, [STATION], ["police coverage: 30%"],
+                     results=[("build_police_station", False, "tile (20,20) is occupied by road", 0)])
+            for m in (0, 3, 6)]
+    assert _turn_hints(rows, "idle")[0]["text"].endswith("; 3 failed actions - check its playbook and why it didn't "
+                                                         "build")
+
+
+def test_utilities_and_transport_are_idle_only_while_something_needs_building():
+    """Utilities' lists price a turbine with power at a fifth of supply (scripted seed 0, months 3-6: $3,000 held,
+    read idle); transport's ranks congested stretches with no road congested. A supply line counts from 90% used (the
+    leave-free line's BANK_BUSY) or under 80% coverage, roads once any is congested."""
+    wind = "wind: 6 sites, best (18,25), wind 1.38; $2,500"
+    idle = lambda role, ready, metrics: _turn_hints([_briefed(role, m, 3000, ready, metrics) for m in (0, 3, 6)],
+                                                    "idle")
+    assert idle("utilities", [wind], ["power: supply 250 / demand 58, coverage 100%"]) == []
+    assert len(idle("utilities", [wind], ["power: supply 111 / demand 103, coverage 100%"])) == 1
+    assert len(idle("utilities", [wind], ["power: supply 250 / demand 58, coverage 70%"])) == 1
+    assert "power demand 93% of supply" in idle("utilities", [wind], ["power: supply 111 / demand 103, coverage "
+                                                                     "100%"])[0]["text"]
+    road = "congested_roads: 6 sites, best (3,24)-(9,24), 7 tiles; $30/tile"
+    assert idle("transport", [road], ["congested road: 0%"]) == []
+    assert "its $30 avenue tile; congested road 1.2%" in idle("transport", [road], ["congested road: 1.2%"])[0]["text"]
+    assert len(idle("transport", ["bus_stops: 4 sites, best (9,24); $1,500"], ["congested road: 0%"])) == 1
+
+
+def test_departments_short_of_their_first_building_make_one_mayor_hint():
+    """Scripted fleet, seed 0: police held $1,494-2,436 against a $2,500 station in months 6-33 and asked every turn,
+    and read idle. A department short of its cheapest ready site is the mayor's to fund: one hint for all of them."""
+    short = lambda p, funds: f"{p}: 5 sites, best (20,20); $2,500 - you have ${funds:,}"
+    rows = [_briefed("police", m, 1494 + m, [short("station", 1494 + m), JAIL], ["police coverage: 0%"],
+                     asks=["Police needs $2,500 for a new building"] * bool(m)) for m in range(0, 12, 3)]
+    rows += [_briefed("education", m, 0, [short("school", 0)], ["school coverage: 0%"]) for m in (3, 6, 9)]
+    rows += [_briefed("fire", 9, 0, [short("station", 0)], ["fire coverage: 0%"])]       # one turn: below the rule
+    rows += [_briefed("health", m, 0, [short("clinic", 0)], ["health coverage: 90%"]) for m in (3, 6, 9)]  # covered
+    assert _turn_hints(rows, "idle") == []
+    h, = _turn_hints(rows, "starved")
+    assert h["role"] == "mayor" and [(d["role"], d["turns"], d["asked"]) for d in h["depts"]] == [
+        ("police", 4, 3), ("education", 3, 0)]
+    assert h["text"] == ("mayor: left police short of its $2,500 police station for 4 turns / 12 months (months 0-11; "
+                         "it held $1,494-1,503 and asked 3 times); education short of its $2,500 elementary school for "
+                         "3 turns / 9 months (months 3-11; it held $0 and never asked) - fund the first buildings "
+                         "departments ask for, or tell them why not")
+    rows = [_briefed(d, m, 0, [short(p, 0)], [f"{c} coverage: 0%"]) for m in (3, 6)
+            for d, p, c in (("police", "station", "police"), ("fire", "station", "fire"),
+                            ("health", "clinic", "health"), ("education", "school", "school"))]
+    rows += [_briefed("education", 0, 0, [short("school", 0)], ["school coverage: 0%"])]
+    h, = _turn_hints(rows, "starved")                  # the longest runs in full: education's 12 months first
+    assert [d["role"] for d in h["depts"]] == ["education", "police", "fire", "health"]
+    assert h["text"].startswith("mayor: left education short of its $2,500 elementary school for 3 turns / 12 months")
+    assert h["text"].count(" short of its ") == 3 and "; and 1 more (health) - fund" in h["text"]
+
+
+def test_departments_blocked_for_land_make_one_planning_hint():
+    """Smoke v17 seed 0: planning zoned every roadside lot by month 6, and police, fire, health and education each read
+    idle holding their first building's money. No lot is planning's to fix: one hint for all of them. Utilities'
+    blocked pump doesn't count with water at a fifth of supply."""
+    blocked = "station: none - no free roadside land: ask planning for a lot"
+    jail = "jail: none - no roadside lot away from homes (3+ within 4 tiles): ask planning for one at the town edge"
+    rows = [_briefed("police", m, 2500, [blocked, jail if m > 3 else JAIL], ["police coverage: 23%"])
+            for m in (3, 6, 9)]                        # the cheapest blocked building is named, as planning's line does
+    rows += [_briefed("utilities", m, 4800, [
+        "pump: none - riverbank beside roads all taken: ask planning to free a lot near (25,24)",
+        "sewage: none - riverbank beside roads all taken: ask planning to free a lot near (25,24)"],
+        ["water: supply 250 / demand 50, coverage 100%", "sewage: supply 0 / demand 17, coverage 0%"]) for m in (3, 6, 9)]
+    assert _turn_hints(rows, "idle") == [] and _turn_hints(rows, "starved") == []
+    h, = _turn_hints(rows, "no_land")
+    assert h["role"] == "planning" and [d["role"] for d in h["depts"]] == ["utilities", "police"]
+    assert h["text"] == ("planning: left utilities without a lot for its sewage outlet for 3 turns / 9 months (months "
+                         "3-11: riverbank beside roads all taken; it held $4,800); police without a lot for its police "
+                         "station for 3 turns / 9 months (months 3-11: no free roadside land; it held $2,500) - leave "
+                         "or free a roadside lot for each, or extend a road into open land")
+
+
+def test_planning_is_idle_with_money_and_starved_without():
+    """Planning's lists empty out when the roadside is zoned (smoke v17 seed 0, months 6-9: $1,000-6,000 held, no
+    action), but a road into open land is always there to build: with money and no successful action it is idle."""
+    full = ["zone_R: none - no free roadside strip: extend the roads (find_sites road_extension)",
+            "road_extension: none - no straight extension from a dead end: build_road from any road into free land"]
+    h, = _turn_hints([_briefed("planning", m, 1000 + 5000 * (m > 6), full) for m in (6, 9)], "idle")
+    assert h["text"] == ("planning: 2 turns / 6 months without a successful action (months 6-11): it held "
+                         "$1,000-6,000 - check its playbook and whether it is blocked (funds, unlocks, failures)")
+    h, = _turn_hints([_briefed("planning", m, 0, full) for m in (6, 9)], "starved")
+    assert h["depts"][0]["role"] == "planning" and "planning at $0 against its $3,000 target" in h["text"]
 
 
 def test_fleet_report_negative_treasury_hint():

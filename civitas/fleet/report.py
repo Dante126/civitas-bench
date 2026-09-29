@@ -3,20 +3,26 @@
 `run_episode` keeps one slim `turn_row(rec)` per fleet turn (the same rows can be rebuilt from
 `trajectories.jsonl` with `rows_from_trajectories`) and writes `fleet_report.json` / `fleet_report.md`; a region run
 gets one report with the region scoreboard and a section per city with fleet turns (`region_report`).
-Hint rules: >= 3 failures alike (failed actions and tool errors); funds above max(2x the plan budget, $1,000) for
-3+ consecutive months; 2+ consecutive turns without a successful action spanning 6+ months (a turn with no plan
-budget and under $1 in funds at the turn is blocked, not idle, and splits the run); a negative city treasury; > 20%
-of turns ended on the step or token limit.
+Hint rules: >= 3 failures of one role with one cause (failed actions and tool errors; CAUSES groups wordings); funds
+above max(2x the plan budget, $1,000) for 3+ consecutive months; 2+ consecutive department turns alike without a
+successful action spanning 6+ months (`_turn_kind`, from what the turn's briefing showed): funds that covered a ready
+site something needed (idle: the department's hint), funds short of its cheapest such site (starved: one hint for
+the mayor), none ready but some blocked for lack of land or roads (no_land: one hint for planning), nothing needed
+(none); a negative city treasury; > 20% of turns ended on the step or token limit.
 """
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from pathlib import Path
 
-from .fmt import REPORT_PREVIEW_CHARS, cut, money
+from ..sim import catalog as C
+from .fmt import REPORT_PREVIEW_CHARS, cut, money, pct
 from .memory import DEPARTMENTS, FleetState
-from .tools import ALL_ACTIONS
+from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, SITE_BUILDS, SITE_PURPOSES, SUPPLEMENTARY, SUPPLY_OF, \
+    building_name
 
 LIMIT_REASONS = ("max_steps", "turn_tokens")
 ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
@@ -25,6 +31,39 @@ FUNDS_MULTIPLE, FUNDS_MONTHS, UNUSED_FLOOR = 2.0, 3, 1000.0
 IDLE_TURNS, IDLE_MONTHS = 2, 6
 LIMIT_SHARE = 0.2
 MSG_CHARS = 160
+MAX_NAMED = 3               # departments detailed in the mayor's and planning's hints; the rest by name
+# failure wordings -> one cause each (first match), with the lesson to write down. Scripted fleet, seeds 0-4: planning's
+# failures gave 3-4 hints a run, e.g. seed 0: 15 x a plaza spot off the road, and 7 + 5 + 3 x zones, parks and a plaza
+# on taken land in three wordings. Other wordings are a cause of their own (_key)
+CAUSES = (("taken land", re.compile(r"is not an empty|no empty land|is occupied by"),
+           "inspect a tile or use find_sites before building or zoning on it"),
+          ("no road access", re.compile(r"does not touch a road|is not on a road"),
+           "build only beside a connected road (find_sites lists such sites)"),
+          ("money", re.compile(r"treasury only has|only holds \$|budget only has"),
+           "check the money it holds (the treasury, for the mayor) before spending"))
+LESSON = "add a lesson to its playbook (e.g. check find_sites / inspect before acting)"
+# The idle rule: at or above COVERED (%) coverage a department has nothing it must build; a supply is short from
+# BANK_BUSY used (what the leave-free line counts for utilities) or under COVERED coverage. 80: the playbooks build
+# clinics under 80%, stations under 85%, schools under 90%. Scripted fleet, seed 0: fire held $2,567-3,000 for a ready
+# station at 85-98% coverage, and read idle
+COVERED = 80.0
+# (role, purpose) -> the Key metrics lines that say whether its building is needed ((role, "*"): the role's other
+# purposes); a purpose without one is needed whenever it lists sites (bus stops only list from 1,500 residents, levees
+# with a flood forecast). Utilities' by the supply each adds to (SUPPLY_OF); a congested stretch while any road is
+# congested (transport's list ranked stretches with 0% congested: scripted seed 0, months 42-66)
+NEED = {**{("utilities", p): (supply,) for p, (supply, _) in SUPPLY_OF.items()},
+        ("utilities", "riverbank_2x2"): ("power", "water", "sewage"),
+        ("transport", "congested_roads"): ("congested road",), ("police", "*"): ("police coverage",),
+        ("fire", "station"): ("fire coverage",), ("health", "clinic"): ("health coverage",),
+        ("health", "hospital"): ("health coverage",), ("health", "landfill"): ("garbage collection",),
+        ("education", "*"): ("school coverage",)}
+NEED_LABELS = {label for labels in NEED.values() for label in labels}
+NUMBER = r"\d[\d,]*(?:\.\d+)?k?"                   # num(): "55.80", "1,234", "12.5k"
+MONEY = rf"-?\${NUMBER}"                            # money(): "$2,500", "$12.5k", "-$40"
+BUDGET_LINE = re.compile(rf"- ({MONEY}) in department funds(?: \(plan target ({MONEY})\))?")
+PRICE_END = re.compile(rf"; ({MONEY})(?:/tile)?( - you have {MONEY})?$")      # a Ready sites line's price
+SUPPLY_LINE = re.compile(rf"supply ({NUMBER}) / demand ({NUMBER}), coverage ([\d.]+)%")
+ASKED = re.compile(rf"\${NUMBER}")
 
 
 def _tool_error(call: dict) -> str | None:
@@ -39,7 +78,8 @@ def _tool_error(call: dict) -> str | None:
 
 
 def turn_row(rec: dict) -> dict:
-    """The part of a trajectory record the report needs."""
+    """The part of a trajectory record the report needs; `seen` is what its briefing showed (_seen), `asked` who its
+    messages went to (_asked)."""
     usage = rec.get("usage") or {}
     trace = rec.get("tool_trace") or []
     errors = [_tool_error(c) for c in trace]
@@ -54,7 +94,78 @@ def turn_row(rec: dict) -> dict:
                          "message": str(r.get("message") or "")[:MSG_CHARS], "cost": r.get("cost") or 0}
                         for r in rec.get("results") or []],
             "tool_errors": [e for e in errors if e is not None],
-            "repeats": marked("repeat"), "refused": marked("refused")}   # repeated look-ups / refused actions
+            "repeats": marked("repeat"), "refused": marked("refused"),   # repeated look-ups / refused actions
+            "seen": _safe(_seen, rec, None), "asked": _safe(_asked, rec, {})}
+
+
+def _safe(read, rec: dict, default):
+    """read(rec), or `default` on any error: the runner builds a row every fleet turn, and a briefing or message the
+    readers don't expect must not end the run."""
+    try:
+        return read(rec)
+    except Exception:
+        return default
+
+
+def _figure(s: str) -> float:
+    """A money() or num() figure as a number: "$2,500" -> 2500, "$12.5k" -> 12500, "-$40" -> -40."""
+    s = s.replace("$", "").replace(",", "")
+    return float(s[:-1]) * 1000 if s.endswith("k") else float(s)
+
+
+def _seen(rec: dict) -> dict | None:
+    """What a department's briefing (the turn's first user message) showed, for the idle rule: its funds and plan
+    target (Your budget), each find_sites purpose's Ready sites state and the Key metrics lines NEED reads. States:
+    "ok" (a price its funds cover), "short" (a price with "- you have $X"), "ready" (sites, no price), "blocked" (none
+    for lack of land or roads: every such _why_empty reason asks planning; `why` is the part before), "none" (none
+    otherwise: nothing needs it, no flood forecast) and "locked". None without a briefing, and for the mayor's (no
+    Your budget block)."""
+    text = next((m.get("content") for m in rec.get("prompt") or [] if m.get("role") == "user"), None)
+    if not isinstance(text, str) or "\n## Your budget\n" not in text:
+        return None
+    purposes = SITE_PURPOSES.get(str(rec["role"]).split(".")[-1], {})      # region runs: "north.police"
+    out, section = {"funds": None, "target": None, "sites": {}, "metrics": {}}, None
+    for ln in text.splitlines():
+        if ln.startswith("## "):
+            section = ln[3:]
+        elif not ln.startswith("- "):
+            continue
+        elif section == "Your budget" and (m := BUDGET_LINE.match(ln)):
+            out["funds"], out["target"] = _figure(m[1]), (_figure(m[2]) if m[2] else None)
+        elif section == "Key metrics":
+            label, _, value = ln[2:].partition(": ")
+            if label in NEED_LABELS:
+                if m := SUPPLY_LINE.fullmatch(value):
+                    out["metrics"][label] = [_figure(m[1]), _figure(m[2]), float(m[3])]
+                elif m := re.fullmatch(r"([\d.]+)%", value):
+                    out["metrics"][label] = float(m[1])
+        elif section == "Ready sites":
+            purpose, _, rest = ln[2:].partition(": ")
+            if purpose in purposes:
+                out["sites"][purpose] = _site_state(rest)
+    return out
+
+
+def _site_state(rest: str) -> dict:
+    """One Ready sites line after its "- purpose: " (briefing.ready_lines) as _seen reads it."""
+    if rest.startswith("locked"):
+        return {"state": "locked"}
+    if rest.startswith("none - "):
+        why = rest[len("none - "):]
+        return {"state": "blocked", "why": why.split(": ask planning")[0]} if "ask planning" in why else {
+            "state": "none"}
+    m = PRICE_END.search(rest)
+    return {"state": "ready"} if m is None else {"state": "short" if m[2] else "ok", "price": _figure(m[1])}
+
+
+def _asked(rec: dict) -> dict[str, float]:
+    """Who the turn's messages went to -> the largest dollar figure in them (0 for none): "Police needs $2,500 for a new
+    building (police cover 0.0%)"."""
+    out: dict[str, float] = {}
+    for m in rec.get("messages") or []:
+        to = str(m.get("to", ""))
+        out[to] = max([out.get(to, 0.0), *(_figure(f) for f in ASKED.findall(str(m.get("text", ""))))])
+    return out
 
 
 def rows_from_trajectories(path: str | Path) -> list[dict]:
@@ -116,16 +227,16 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
             "last_report": cut(fleet.reports[role], REPORT_PREVIEW_CHARS) if fleet.reports.get(role) else None}
 
 
-def _idle(turns: list[tuple[int, bool]], months: int) -> tuple[int, int, int] | None:
-    """Longest (turns, first month, end month) run of idle turns (`(month, False)`: no successful action and not
-    blocked) that fires the rule; a run lasts until the department's next turn (or the end of the run)."""
+def _longest(turns: list[tuple[int, str]], kind: str, months: int) -> tuple[int, int, int] | None:
+    """Longest (turns, first month, end month) run of consecutive `(month, kind)` turns that fires the rule; a run
+    lasts until the department's next turn (or the end of the run)."""
     best, i = None, 0
     while i < len(turns):
-        if turns[i][1]:
+        if turns[i][1] != kind:
             i += 1
             continue
         j = i
-        while j + 1 < len(turns) and not turns[j + 1][1]:
+        while j + 1 < len(turns) and turns[j + 1][1] == kind:
             j += 1
         end = turns[j + 1][0] if j + 1 < len(turns) else months
         n, a = j - i + 1, turns[i][0]
@@ -135,14 +246,236 @@ def _idle(turns: list[tuple[int, bool]], months: int) -> tuple[int, int, int] | 
     return best
 
 
-def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict], months: int) -> list[dict]:
+def _short(label: str, v) -> bool:
+    """A Key metrics value (_seen) saying its building is needed: a supply BANK_BUSY used or under COVERED coverage,
+    any congested road, a coverage under COVERED."""
+    if isinstance(v, list):
+        supply, demand, coverage = v
+        return demand >= BANK_BUSY * supply or coverage < COVERED
+    return v > 0 if label == "congested road" else v < COVERED
+
+
+def _needed(role: str, purpose: str, metrics: dict) -> bool:
+    labels = NEED.get((role, purpose), NEED.get((role, "*"), ()))
+    shown = [(k, metrics[k]) for k in labels if k in metrics]
+    return not shown or any(_short(k, v) for k, v in shown)
+
+
+def _turn_kind(role: str, row: dict, funds: float | None, target: float | None) -> tuple[str, dict]:
+    """(kind, what) of a department turn: "acted" (a successful action), else from its briefing (row["seen"]): "idle"
+    (its funds covered a ready site of a first or upgrade building it needed: `what` its purpose and price), "starved"
+    (short of the cheapest such site: that one), "land" (none ready, some blocked for lack of land or roads: purpose ->
+    why) or "none" (nothing needed it: coverage at COVERED+, "nothing needs it", locked); SUPPLEMENTARY
+    purposes never count. Planning, and a turn without a briefing (funds and target from the history log and the
+    plan), go by the funds alone: idle with $1+ (planning always has a road into open land to build), under it
+    starved against a plan target, else none."""
+    if any(r["ok"] for r in row["results"]):
+        return "acted", {}
+    seen = row.get("seen")
+    if seen and seen["funds"] is not None:
+        funds = seen["funds"]
+    broke = funds is not None and funds < 1
+    if seen is None or role == "planning":
+        return ("starved" if target else "none", {}) if broke else ("idle", {})
+    wanted = {p: s for p, s in seen["sites"].items() if p not in SUPPLEMENTARY and _needed(role, p, seen["metrics"])}
+    priced = lambda state: sorted((s.get("price", 0.0), p) for p, s in wanted.items() if s["state"] == state
+                                  or (s["state"] == "ready" and (state == "short") == broke))
+    for kind, state in (("idle", "ok"), ("starved", "short")):
+        if found := priced(state):
+            return kind, {"purpose": found[0][1], "price": wanted[found[0][1]].get("price")}
+    if blocked := {p: s["why"] for p, s in wanted.items() if s["state"] == "blocked"}:
+        return "land", {"blocked": blocked}
+    return "none", {}
+
+
+def _cost(name: str) -> float:
+    if name in OFF_TIER_SPECS:
+        return OFF_TIER_SPECS[name][0]()
+    line, tier = C.TIER_BY_NAME[name]
+    return C.TIER_LINES[line][tier - 1]["cost"]
+
+
+def _building(role: str, purpose: str, price: float | None = None) -> str:
+    """What a purpose's sites are for, by name: its SITE_BUILDS entry at `price`, else its cheapest (the purpose for
+    those without one: planning's)."""
+    names = SITE_BUILDS.get(role, {}).get(purpose, ())
+    if not names:
+        return purpose.replace("_", " ")
+    return building_name(next((n for n in names if _cost(n) == price), None) or min(names, key=_cost))
+
+
+def _held(values: list[float]) -> str:
+    lo, hi = math.floor(min(values)), math.floor(max(values))
+    return money(lo) if lo == hi else f"{money(lo)}-{money(hi)[1:]}"
+
+
+def _range(values: list[float], fmt=pct) -> str:
+    lo, hi = min(values), max(values)
+    return fmt(lo) if fmt(lo) == fmt(hi) else f"{fmt(lo).rstrip('%')}-{fmt(hi)}"
+
+
+def _metric_notes(role: str, purpose: str, run: list[dict]) -> list[str]:
+    """The Key metrics that made `purpose` needed over a run, as ranges: "police coverage 30%", "power demand 93% of
+    supply"."""
+    out = []
+    for k in NEED.get((role, purpose), NEED.get((role, "*"), ())):
+        vals = [t["seen"]["metrics"][k] for t in run if k in t["seen"]["metrics"]]
+        if vals and isinstance(vals[0], list):
+            used = [100 * d / s for s, d, _ in vals if s > 0]
+            out += [f"{k} demand {_range(used)} of supply"] if used else [f"no {k} supply"]
+        elif vals:
+            out.append(f"{k} {_range(vals)}")
+    return out
+
+
+def _dept_turns(dept: str, rows: list[dict], history: list[dict], target) -> list[dict]:
+    """A department's turns in month order, each with its kind (_turn_kind), its funds and target at the turn: the
+    briefing's, else the history log's (a turn in month t ends in history entry t + 1, after the mayor's turn, which
+    comes first, and its own; only actions move dept funds, so after a turn without a success the funds there are the
+    funds it had at its turn) and the plan in force."""
+    after = {m["month"] - 1: (m.get("dept_funds") or {}).get(dept) for m in history}
+    out = []
+    for row in sorted((r for r in rows if r["role"] == dept), key=lambda r: r["month"]):
+        t, seen = row["month"], row.get("seen")
+        funds = seen["funds"] if seen and seen["funds"] is not None else after.get(t)
+        tgt = seen["target"] if seen else target(dept, t + 1)
+        kind, what = _turn_kind(dept, row, funds, tgt)
+        out.append({"month": t, "kind": kind, "what": what, "funds": funds, "target": tgt, "seen": seen, "row": row})
+    return out
+
+
+def _run(turns: list[dict], kind: str, months: int) -> tuple[int, int, int, list[dict]] | None:
+    found = _longest([(t["month"], t["kind"]) for t in turns], kind, months)
+    return found and (*found, [t for t in turns if found[1] <= t["month"] < found[2]])
+
+
+def _common(run: list[dict], key: str):
+    """The most common `what[key]` over a run's turns (the latest on a tie), None when none has it."""
+    vals = [t["what"][key] for t in reversed(run) if key in t["what"]]
+    return Counter(vals).most_common(1)[0][0] if vals else None
+
+
+def _idle_hint(dept: str, n: int, a: int, end: int, run: list[dict]) -> dict:
+    head = f"{dept}: {n} turns / {end - a} months without "
+    funds = [t["funds"] for t in run if t["funds"] is not None]
+    purpose = _common(run, "purpose")
+    notes = []
+    held = f": it held {_held(funds)}" if funds else ""
+    if purpose is not None:
+        price = next(t["what"]["price"] for t in reversed(run) if t["what"].get("purpose") == purpose)
+        head += (f"a build while it could pay for a ready site ({_span(a, end - 1)}){held}"
+                 + (f", enough for its {money(price)} {_building(dept, purpose, price)}" if price is not None else ""))
+        notes += _metric_notes(dept, purpose, [t for t in run if t["seen"]])
+    else:
+        head += f"a successful action ({_span(a, end - 1)}){held}"
+    asks = [t["row"]["asked"]["mayor"] for t in run if "mayor" in t["row"]["asked"]]
+    if asks:
+        notes.append("asked the mayor" + (f" for up to {money(max(asks))}" if max(asks) else "")
+                     + f" in {len(asks)} of them")
+    fails = sum(not r["ok"] for t in run for r in t["row"]["results"])
+    if fails:
+        notes.append(f"{fails} failed action{'s' * (fails != 1)}")
+    return {"kind": "idle", "role": dept, "turns": n, "months": end - a, "first": a, "last": end - 1,
+            "text": head + "".join(f"; {x}" for x in notes) + " - "
+                    + ("check its playbook and why it didn't build" if purpose is not None else
+                       "check its playbook and whether it is blocked (funds, unlocks, failures)")}
+
+
+def _starved_item(dept: str, n: int, a: int, end: int, run: list[dict]) -> tuple[dict, str]:
+    purpose = _common(run, "purpose")
+    price = purpose and next(t["what"]["price"] for t in reversed(run) if t["what"].get("purpose") == purpose)
+    building = _building(dept, purpose, price) if purpose else None
+    asked = sum("mayor" in t["row"]["asked"] for t in run)
+    held = _held([t["funds"] for t in run if t["funds"] is not None] or [0.0])
+    span = f"for {n} turns / {end - a} months ({_span(a, end - 1)}"
+    if price is not None:
+        text = (f"{dept} short of its {money(price)} {building} {span}; it held {held} and "
+                + (f"asked {asked} time{'s' * (asked != 1)})" if asked else "never asked)"))
+    else:
+        tgt = next((t["target"] for t in reversed(run) if t["target"]), None)
+        text = f"{dept} at {held}" + (f" against its {money(tgt)} target" if tgt else "") + f" {span})"
+    return ({"role": dept, "turns": n, "months": end - a, "first": a, "last": end - 1, "building": building,
+             "price": price, "asked": asked}, text)
+
+
+def _land_item(dept: str, n: int, a: int, end: int, run: list[dict]) -> tuple[dict, str]:
+    """The cheapest buildings blocked over the run, all on a tie, as planning's blocked line names them (smoke v17
+    seed 0 read "police station or jail")."""
+    costs = {p: min(map(_cost, SITE_BUILDS[dept][p]), default=0.0) if p in SITE_BUILDS.get(dept, {}) else 0.0
+             for t in run for p in t["what"]["blocked"]}
+    low = [p for p, c in costs.items() if c == min(costs.values())]
+    names = list(dict.fromkeys(_building(dept, p) for p in low))
+    why = next(t["what"]["blocked"][p] for t in reversed(run) for p in low if p in t["what"]["blocked"])
+    funds = [t["funds"] for t in run if t["funds"] is not None]
+    return ({"role": dept, "turns": n, "months": end - a, "first": a, "last": end - 1, "buildings": names, "why": why},
+            f"{dept} without a lot for its {' or '.join(names)} for {n} turns / {end - a} months ({_span(a, end - 1)}: "
+            f"{why}" + (f"; it held {_held(funds)}" if funds else "") + ")")
+
+
+def _grouped(kind: str, role: str, items: list[tuple[dict, str]], advice: str) -> list[dict]:
+    """One hint for `role` naming every department of `items`, the MAX_NAMED longest runs in full (scripted fleet,
+    seed 0: in turn order, utilities' 2 turns were named and education's 13 were not)."""
+    if not items:
+        return []
+    items = sorted(items, key=lambda it: -it[0]["months"])
+    texts = [t for _, t in items[:MAX_NAMED]]
+    rest = [d["role"] for d, _ in items[MAX_NAMED:]]
+    return [{"kind": kind, "role": role, "depts": [d for d, _ in items],
+             "text": f"{role}: left " + "; ".join(texts)
+                     + (f"; and {len(rest)} more ({', '.join(rest)})" if rest else "") + f" - {advice}"}]
+
+
+def _turn_hints(roles: dict, rows: list[dict], history: list[dict], months: int, target) -> list[dict]:
+    """The idle rule over each department's turns (_dept_turns): its idle hint, and one for the mayor (starved) and
+    one for planning (no_land) naming the departments whose runs fired."""
+    idle, starved, land = [], [], []
+    for dept in (d for d in DEPARTMENTS if d in roles):
+        turns = _dept_turns(dept, rows, history, target)
+        for kind, out, make in (("idle", idle, _idle_hint), ("starved", starved, _starved_item),
+                                ("land", land, _land_item)):
+            if found := _run(turns, kind, months):
+                out.append(make(dept, *found))
+    return (idle
+            + _grouped("starved", "mayor", starved, "fund the first buildings departments ask for, or tell them why "
+                                                     "not")
+            + _grouped("no_land", "planning", land, "leave or free a roadside lot for each, or extend a road into "
+                                                    "open land"))
+
+
+def _failure_hints(roles: dict, rows: list[dict]) -> list[dict]:
+    """REPEATED_FAILURES+ failed actions and tool errors of one role with one cause (CAUSES, else wordings alike:
+    _key), one hint each, the most frequent first. A cause names its first wording per action (tool errors: per
+    wording) with the count: smoke v17 seed 0, planning's build_road into a coal plant, shops, homes and industry read
+    as four wordings."""
     hints = []
-    for role, st in roles.items():
-        for g in st["top_failures"]:
-            if g["count"] >= REPEATED_FAILURES:
-                hints.append({"kind": "repeated_failures", "role": role, "count": g["count"], "message": g["message"],
-                              "text": f"{role}: {g['count']} failures like \"{g['message']}\" - add a lesson to its "
-                                      "playbook (e.g. check find_sites / inspect before acting)"})
+    for role in roles:
+        groups: dict[str, dict] = {}
+        fails = [(r["type"], r["message"]) for row in rows if row["role"] == role for r in row["results"] if not r["ok"]]
+        fails += [(None, e) for row in rows if row["role"] == role for e in row["tool_errors"]]
+        for kind, msg in fails:
+            cause = next((c for c in CAUSES if c[1].search(msg.lower())), None)
+            g = groups.setdefault(cause[0] if cause else "=" + _key(msg), {"cause": cause, "by": {}})
+            g["by"].setdefault(kind or _key(msg), [kind, msg, 0])[2] += 1
+        for g in sorted(groups.values(), key=lambda g: -sum(w[2] for w in g["by"].values())):
+            ws = sorted(g["by"].values(), key=lambda w: -w[2])
+            count, cause = sum(w[2] for w in ws), g["cause"]
+            if count < REPEATED_FAILURES:
+                continue
+            if cause and len(ws) > 1:
+                what = f"failures on {cause[0]} (" + ", ".join(
+                    f"{n}x {kind + ' ' if kind else ''}\"{msg}\"" for kind, msg, n in ws) + ")"
+            else:                                         # one wording, from one action or several
+                acts = [f"{n}x {kind}" if len(ws) > 1 else kind for kind, _, n in ws if kind]
+                what = f"failures like \"{ws[0][1]}\"" + (f" ({', '.join(acts)})" if acts else "")
+            hints.append({"kind": "repeated_failures", "role": role, "cause": cause[0] if cause else None,
+                          "count": count, "message": ws[0][1],
+                          "text": f"{role}: {count} {what} - "
+                                  + (f"add a lesson to its playbook: {cause[2]}" if cause else LESSON)})
+    return hints
+
+
+def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict], months: int) -> list[dict]:
+    hints = _failure_hints(roles, rows)
     versions = [v for v in fleet.plan_versions if v.get("month") is not None]
     def target(dept, m):
         live = [v for v in versions if v["month"] < m]          # history entry m = the state after month m - 1
@@ -159,25 +492,7 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
                           "text": f"{dept}: funds stayed above {FUNDS_MULTIPLE:g}x its plan budget "
                                   f"({money(run[-1][2])}) for {len(run)} months ({_span(a, b)}, up to "
                                   f"{money(max(e[1] for e in run))}) - have it spend, or lower its allocation"})
-    for dept in (d for d in DEPARTMENTS if d in roles):
-        # a turn in month t ends in history entry t + 1 (after the mayor's turn, which comes first, and its own). Only
-        # actions move dept funds, so after a turn without a success the funds there are the funds it had at its turn;
-        # under $1 with no plan budget either, it was blocked, not idle: such turns split idle runs like successful ones
-        after = {m["month"] - 1: ((m.get("dept_funds") or {}).get(dept), target(dept, m["month"])) for m in history}
-        broke = lambda t: t in after and after[t][0] is not None and after[t][0] < 1
-        blocked = lambda t: broke(t) and not after[t][1]
-        turns = sorted((row["month"], any(r["ok"] for r in row["results"]) or blocked(row["month"]))
-                       for row in rows if row["role"] == dept)
-        idle = _idle(turns, months)
-        if idle:
-            n, a, end = idle
-            run = [t for t, _ in turns if a <= t < end]
-            hints.append({"kind": "idle", "role": dept, "turns": n, "months": end - a, "first": a, "last": end - 1,
-                          "text": f"{dept}: {n} turns / {end - a} months without a successful action "
-                                  f"({_span(a, end - 1)}) - "
-                                  + (f"its funds stayed at $0 against a {money(after[run[-1]][1])} target: check the "
-                                     "mayor's allocations" if all(broke(t) for t in run) else
-                                     "check its playbook and whether it is blocked (funds, unlocks, failures)")})
+    hints += _turn_hints(roles, rows, history, months, target)
     neg = [m for m in history if m.get("treasury", 0) < 0]
     if neg:
         low = min(m["treasury"] for m in neg)

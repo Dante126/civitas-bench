@@ -788,11 +788,22 @@ What the runs showed about the tools:
 - No briefing said "can't pay" on a turn the policy built something, and none said "no
   site" for a building the policy then built, except once: health's policy falls back to a
   clinic lot for a landfill when, as the briefing said, no lot away from homes is left.
-- The coaching hints are noisy on a long game. The idle rule fired for 6 or 7 departments
-  per run. That covers departments waiting for money they asked for every turn (police
+- The coaching hints were noisy on a long game. The idle rule fired for 6 or 7 departments
+  per run. That covered departments waiting for money they asked for every turn (police
   held $1,494–2,436 against a $2,500 station in months 6–33 of seed 0) and departments with
   nothing left to do (fire at 83–98% coverage). Planning's repeated failures (a plaza spot
   off the road, zones and parks on taken land) gave 3–4 repeated-failure hints per run.
+  With the idle rule split by what the briefing showed and failures grouped by cause (below),
+  seeds 0–4 give 27 hints instead of 46: 9 idle (30 before), 5 for the mayor (one per run,
+  naming 5–6 departments short of their first building, education longest at 11–20 turns),
+  3 for planning (utilities' sewage outlet lot, taken for 9–15 months), 9 repeated-failure
+  (15) and 1 idle-money. The idle hints left:
+  - transport holding $1,500–2,000 for a ready bus line (4 runs), or an avenue upgrade while
+    it asked for $10k;
+  - health or police holding $3,000 for a ready clinic, landfill or station while asking
+    the mayor for $7,700–8,300 for an upgrade.
+
+  The policies had reasons the briefing doesn't show (bus ridership, the upgrade).
 
 **Reports.** Every run with fleet agents writes `fleet_report.json` and `fleet_report.md`
 next to its summary. They contain:
@@ -805,11 +816,29 @@ next to its summary. They contain:
 
 A hint fires on any of these:
 
-- 3 or more similar failures
+- 3 or more failures of one role with one cause. Taken land, no road access and money
+  group their wordings ("no empty land tiles there", "(21,26) is not an empty land tile",
+  "tile (35,23) is occupied by coal_plant"); any other wording is a cause of its own. The
+  hint names each action's first wording and count, and the lesson to write down.
 - a department holding more than 2× its plan budget for 3+ months
-- a department with no successful action for 2+ turns spanning 6+ months (a turn with no plan budget and
-  under $1 in funds at the turn counts as blocked, not idle, and splits the run; when the funds were under $1
-  against a plan budget at every turn of the run, the hint says to check the mayor's allocations)
+- 2+ consecutive department turns of one kind without a successful action, spanning 6+
+  months. The kind comes from what the turn's briefing showed (its funds, Ready sites and
+  Key metrics):
+  - **idle**: its funds covered a ready site it needed. The department's hint names the
+    funds, the building, the metrics, what it asked the mayor for and its failed actions.
+  - **starved**: its funds were short of the cheapest such site. One hint for the mayor
+    names every such department (the three longest runs in full), what it was short of and
+    how often it asked.
+  - **no land**: none was ready, but some was blocked for lack of land or roads. One hint
+    for planning names the departments and the cheapest buildings.
+  - **nothing needed**: no hint. That covers coverage at 80% or more (for a utility, also
+    demand under 90% of supply), no congested road, "nothing needs it", locked, and
+    supplementary buildings (library, shelter, cemetery, train station, harbour, metro).
+
+  Planning always has a road into open land to build, so it is idle with $1 or more.
+  Without a briefing (older records), the funds come from the history log: under $1
+  against a plan budget is starved, under $1 without one is nothing needed, and anything
+  else is idle.
 - a negative treasury
 - a role ending more than 20% of its turns on a limit
 
