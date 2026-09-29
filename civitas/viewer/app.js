@@ -311,6 +311,60 @@ function roleChips() {
 }
 const roleOn = (r) => S.roleFilter.size === 0 || S.roleFilter.has(r);
 
+// the quarter on show: turns are logged on the frame after the month they were taken in, and agents act every few months
+function turnFrame(idx) { for (let j = Math.min(idx, S.frames.length - 1); j >= 0; j--) if ((S.frames[j].turns || []).length) return j; return -1; }
+function nextTurnFrame(idx) { for (let j = idx + 1; j < S.frames.length; j++) if ((S.frames[j].turns || []).length) return j; return -1; }
+
+// one line per turn from its successful actions: what a reader wants before the detail
+const nOf = (rs, re) => rs.reduce((s, r) => s + (+((r.message || "").match(re) || [])[1] || 0), 0);
+function built(r) {
+  const m = (r.message || "").match(/^built (?:an? )?(.+?)(?: \(tier \d+\))? at /) || (r.message || "").match(/^upgraded (.+?) to/);
+  const name = m ? m[1] : r.action.type.replace(/^build_/, "").replace(/_/g, " ");
+  return BUILT_NAME[name] || name;
+}
+// the build messages use short kinds; the table says what they are
+const BUILT_NAME = { coal: "coal plant", gas: "gas plant", wind: "wind turbine", solar: "solar farm", nuclear: "nuclear plant", pump: "water pump",
+  tower: "water tower", outlet: "sewage outlet", treatment: "treatment plant", elementary: "elementary school", high: "high school" };
+function headlinePart(type, rs) {
+  if (type === "allocate_budget") {
+    const out = rs.filter(r => +r.action.amount > 0), back = rs.filter(r => +r.action.amount < 0);
+    const byDept = (xs, sign) => { const m = new Map(); for (const r of xs) m.set(r.action.department, (m.get(r.action.department) || 0) + sign * +r.action.amount); return [...m].map(([d, v]) => `${d} ${fmt$(v)}`).join(", "); };
+    return [out.length ? "funded " + byDept(out, 1) : "", back.length ? "took back " + byDept(back, -1) : ""].filter(Boolean).join("; ");
+  }
+  const total = (k) => rs.reduce((s, r) => s + (+r.action[k] || 0), 0);
+  if (type === "take_loan") return `borrowed ${fmt$(total("amount"))}`;
+  if (type === "repay_loan") return `repaid ${fmt$(total("amount"))}`;
+  if (type === "zone") return `zoned ${nOf(rs, /zoned (\d+) tiles/)} tiles`;
+  if (type === "dezone") return `dezoned ${nOf(rs, /de-zoned (\d+) tiles/)} tiles`;
+  if (type === "build_road") return `${nOf(rs, /built (\d+) road tiles/)} road tiles`;
+  if (type === "set_tax") return "taxes " + rs.map(r => `${r.action.sector} ${r.action.rate}%`).join(", ");
+  if (type.startsWith("build_") || type.startsWith("upgrade")) return rs.map(built).join(", ");
+  return type.replace(/_/g, " ") + (rs.length > 1 ? ` ×${rs.length}` : "");
+}
+function turnHeadline(t) {
+  const ok = t.results.filter(r => r.ok), groups = new Map();
+  for (const r of ok) { const k = r.action.type; groups.set(k, [...(groups.get(k) || []), r]); }
+  return ok.length ? esc([...groups].map(([k, rs]) => headlinePart(k, rs)).filter(Boolean).join(" · "))
+    : `<span class="muted">${t.results.length ? "nothing succeeded" : "no actions"}</span>`;
+}
+function quarterTable(turns) {
+  const rows = turns.map(t => {
+    const ok = t.results.filter(r => r.ok).length, bad = t.results.length - ok;
+    const spent = t.results.filter(r => r.ok).reduce((s, r) => s + (r.cost || 0), 0);
+    return `<tr class="qrow" data-role="${esc(t.role)}" style="--c:${roleColor(t.role)}">
+      <td class="qrole"><span class="dot"></span>${esc(t.role)}</td><td class="qwhat">${turnHeadline(t)}</td>
+      <td>${spent ? fmt$(spent) : "—"}</td><td>${ok}${bad ? `<span class="bad">/${bad}✗</span>` : ""}</td>
+      <td class="qref" data-role="${esc(t.role)}">·</td><td class="qend" data-role="${esc(t.role)}">·</td></tr>`;
+  }).join("");
+  return `<table class="lb qsum"><tr><th>role</th><th>what it did</th><th>spent</th><th title="successful actions / failed">acts</th><th title="refused calls">⊘</th><th title="how the turn ended">end</th></tr>${rows}</table>`;
+}
+// the trace summary (/turns) fills refusals and how the turn ended once it has loaded
+function fillQuarterRow(role, s) {
+  const ref = document.querySelector(`td.qref[data-role="${role}"]`), end = document.querySelector(`td.qend[data-role="${role}"]`);
+  if (ref) ref.innerHTML = s.refused ? `<span class="warn">${s.refused}</span>` : "—";
+  if (end) end.innerHTML = s.finish_reason === "end_turn" ? `<span class="muted">✓</span>` : `<span class="warn" title="${esc(s.finish_reason || "")}">${esc((s.finish_reason || "?").replace("max_steps", "step limit").replace("no_tool_calls", "no call"))}</span>`;
+}
+
 function renderTab() {
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === S.tab));
   const body = $("tabBody");
@@ -318,10 +372,19 @@ function renderTab() {
   const f = S.frames[S.idx];
   if (S.tab === "agents") {
     roleChips();
-    const turns = f.turns.filter(t => roleOn(t.role));
-    if (!turns.length) { body.innerHTML = `<div class="emptytab">${f.month === 0 ? "Start of the game: press ▶ or step forward to see the agents' first decisions." : "No agent turns this month (agents may act every few months)."}</div>`; return; }
-    body.innerHTML = `<div class="small muted" style="margin-bottom:8px">Decisions taken during month ${f.month - 1} → shown on the map at month ${f.month}. Click an action with 📍 to fly there.</div>` +
-      turns.map((t, ti) => `<div class="turn" style="--c:${roleColor(t.role)}">
+    // agents act every few months: between their turns, keep showing the latest quarter instead of an empty tab
+    const j = turnFrame(S.idx);
+    S.agentsFrame = j;
+    if (j < 0) { body.innerHTML = `<div class="emptytab">${f.month === 0 ? "Start of the game: press ▶ or step forward to see the agents' first decisions." : "No agent turns yet."}</div>`; return; }
+    const tf = S.frames[j], turns = tf.turns.filter(t => roleOn(t.role));
+    const prevJ = turnFrame(j - 1), nextJ = nextTurnFrame(S.idx);
+    const since = j === S.idx ? `shown on the map at month ${tf.month}` : `on the map since month ${tf.month}, now month ${f.month}`;
+    body.innerHTML = `<div class="qhead"><button class="btn qnav" id="qPrev" ${prevJ < 0 ? "disabled" : ""} title="previous quarter">◀</button>
+        <div><b>Decisions from month ${tf.month - 1}</b> <span class="muted">· ${since}</span></div>
+        <button class="btn qnav" id="qNext" ${nextJ < 0 ? "disabled" : ""} title="next quarter">▶</button></div>` +
+      (turns.length ? quarterTable(turns) : `<div class="emptytab">No turns for the selected roles.</div>`) +
+      `<div class="small muted" style="margin:8px 0">Click a row to jump to its card, an action with 📍 to fly there.</div>` +
+      turns.map((t, ti) => `<div class="turn" id="turn-${esc(t.role)}" style="--c:${roleColor(t.role)}">
         <div class="who"><span style="color:${roleColor(t.role)}">${t.role}</span><span class="tag">${esc(S.meta.agents[t.role])}</span></div>
         ${t.parse_error ? `<div class="small" style="color:var(--warn)">⚠ ${esc(t.parse_error).slice(0, 140)}</div>` : ""}
         ${t.thinking ? `<div class="think">${esc(t.thinking)}</div>` : ""}
@@ -330,7 +393,14 @@ function renderTab() {
         ${(t.messages || []).map(m => `<div class="msgline small"><b style="--c:${roleColor(t.role)}">→ ${esc(m.to)}</b> ${esc(m.text)}</div>`).join("")}
         <div class="trace" data-role="${t.role}"></div>
       </div>`).join("");
-    loadTraces(f.month - 1);
+    loadTraces(tf.month - 1);
+    if (prevJ >= 0) $("qPrev").onclick = () => go(prevJ);
+    if (nextJ >= 0) $("qNext").onclick = () => go(nextJ);
+    body.querySelectorAll("tr.qrow").forEach(el => el.onclick = () => {
+      const card = document.getElementById(`turn-${el.dataset.role}`); if (!card) return;
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+      card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash");
+    });
     body.querySelectorAll(".act.loc").forEach(el => el.onclick = () => {
       const r = turns[+el.dataset.t].results[+el.dataset.r], rc = actRect(r.action);
       scene.highlightRect(rc); scene.flyTo((rc.x1 + rc.x2) / 2, (rc.y1 + rc.y2) / 2, 12 + Math.max(Math.abs(rc.x2 - rc.x1), Math.abs(rc.y2 - rc.y1)) * 0.6);
@@ -421,9 +491,10 @@ async function loadTraces(month) {
   if (month < 0 || !S.runId) return;
   const key = `${S.runId}:${month}`;
   if (!S.traces[key]) { try { S.traces[key] = await api(`/api/runs/${encodeURIComponent(S.runId)}/turns?month=${month}`); } catch { S.traces[key] = []; } }
-  if (S.tab !== "agents" || S.frames[S.idx]?.month - 1 !== month) return;
+  if (S.tab !== "agents" || S.frames[S.agentsFrame]?.month - 1 !== month) return;
   for (const tr of S.traces[key]) {
     if (S.city && !tr.role.startsWith(S.city + ".")) continue;
+    if (tr.trace) fillQuarterRow(tr.role.split(".").pop(), tr.trace);
     const el = document.querySelector(`.trace[data-role="${tr.role.split(".").pop()}"]`); if (!el) continue;
     const u = tr.usage || {}, parts = [], fleet = !!tr.trace;
     if (tr.reasoning) parts.push(["Model reasoning", tr.reasoning]);
