@@ -482,11 +482,22 @@ tasks and money, and to let people coach it.
       income, and at month 48 the city had 22 service buildings against the scripted
       fleet's 7.
     - A hospital counts as a clinic. For utilities, any building that makes the same
-      supply counts, and the line shows how much of the supply is used: `another water
-      tower (water 117% used, $30/month)`. A utilities building is named only while the
-      city lacks that supply or uses at least 90% of it. In smoke v14–v15 seed 1 the line
-      named a water tower with water spare, and towers were built until water was 4.7–4.9×
-      demand.
+      supply counts, and a supply is short only while the city lacks it or uses at least
+      90% of it. In smoke v14–v15 seed 1 the line named a water tower with water spare,
+      and towers were built until water was 4.7–4.9× demand.
+    - Utilities' line names one building per short supply, bought together, most urgent
+      first (a lot develops at all only with power, to level 2 with water, to 3 with
+      sewage): `needs $6,200 for its first coal plant and water tower ($110/month)`. For
+      each supply it is the cheapest ready building whose output covers max(1.5 × demand,
+      demand + 60 power or 50 water or sewage) less the city's own output (imports left
+      out), else the one with the most output. The 60 and 50 are a young city's first
+      quarter (smoke v9–v19: a median 62 power and 50 water from month 0 to 3), so a wind
+      turbine's 40 (× its site's wind) falls short of a fresh map's 66 power and a coal
+      plant's 250 doesn't. With one free riverbank lot the outlet, which can go nowhere
+      else, gets it and water a tower. One supply alone reads as before, with the share
+      used: `another water tower (water 117% used, $30/month)`. In smoke v20 seed 1 the
+      line named only the cheapest ($2,200 tower), the mayor gave exactly that, and power
+      stayed at 0–18% until month 10.
     - On a tie each building at that price is named (`another clinic (coverage 21%,
       $40/month) or another landfill (coverage 83%, $30/month)`). A first one is named alone
       (`its first landfill (4 sites, $30/month)` once a clinic is built).
@@ -520,7 +531,9 @@ tasks and money, and to let people coach it.
     came tenth.
   - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
     first building, $1,000); for utilities only buildings the needs line could name
-    count, and for planning its road and zoning. What set it is named: `2 x its $658
+    count, those it names together with any short supply's building blocked for lack of
+    land (a fresh map's coal plant, tower and outlet: $7,400), and for planning its road
+    and zoning. What set it is named: `2 x its $658
     spending`, `for its first university`, `for another fire station`, or `the $1,000
     minimum`. Funds that are $1,000 or more above that,
     excluding this month's top-ups, show as `idle $3,400 (keeps $2,000)`. The to-spend
@@ -605,7 +618,18 @@ tasks and money, and to let people coach it.
   free roadside lot near the homes that need it (around a named tile), no free 2x2
   roadside block, or no roadside lot away from homes for a landfill, cemetery or jail; a site on one of
   the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
-  memory. Every purpose outside planning is priced, and so is planning's `road_extension`,
+  memory. Utilities' lines say which one a scarce lot is kept for, the one its needs
+  line builds there: `- wind: 6 sites, best (34,23), wind 1.39 (not (33,23): riverbank
+  kept for sewage)`, `- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for
+  sewage)`, `- sewage: 1 site, best (33,23) (riverbank: kept for sewage)`. While a supply
+  is short its budget block adds what is short and what its funds pay for, most urgent
+  first, with the buildings its needs line names: `- short now: power (1.80 of 7, 1.80
+  imported), sewage (0 of 7): your $4,400 pays for a coal plant at (0,23) ($4,000); a
+  sewage outlet at (33,23) ($1,200) needs $800 more`. It only names: utilities decides. In
+  smoke v20 seed 1, month 3, utilities held $4,400 with the coal plant ready, read "best
+  (33,23) ... (riverbank: keep for pump/sewage)" for wind and "same site as wind" for the
+  pump and the outlet, spent all 20 steps inspecting sewage sites and built nothing.
+  Every purpose outside planning is priced, and so is planning's `road_extension`,
   with the road and the zoning shown apart
   (`opens 71 land tiles; $150 road + $355 zoning - you have $0`, "you have" when its funds
   are short of the two), though never on its budget line. A library (it only adds to

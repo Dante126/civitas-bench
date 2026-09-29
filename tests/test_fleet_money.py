@@ -65,12 +65,14 @@ def test_needs_lines_carry_upkeep():
     assert ROAD.text() == "a road into open land and zoning it (opens 20 tiles)"
     assert [n.label for n in (N("police station", 5, 0), N("clinic", 6, 1), ROAD)] == [
         "its first police station", "another clinic", "a road into open land and zoning it"]
-    # the fresh map: first_build fills Need.upkeep, road_build doesn't (the road Need gets 0)
-    tower, = T.first_build(env, "utilities").named
+    # the fresh map: first_build fills Need.upkeep, road_build doesn't (the road Need gets 0); utilities names a
+    # building per short supply, their upkeep summed (v20 fixes)
+    coal, tower = T.first_build(env, "utilities").named
     road, = T.road_build(env).named
-    assert (tower.what, tower.upkeep, road.upkeep) == ("water tower", C.TIER_LINES["tower"][0]["upkeep"], 0)
+    assert (coal.what, coal.upkeep, tower.what, tower.upkeep, road.upkeep) == (
+        "coal plant", C.TIER_LINES["coal"][0]["upkeep"], "water tower", C.TIER_LINES["tower"][0]["upkeep"], 0)
     f = funding_gaps(env, FleetState.of(env))
-    assert f.to_fund == [FundItem("utilities", "first/supply", 2200, 30, "its first water tower"),
+    assert f.to_fund == [FundItem("utilities", "first/supply", 6200, 110, "its first coal plant and water tower"),
                          FundItem("health", "first/supply", 2000, 30, "its first landfill"),
                          FundItem("planning", "growth", 600, 0, "a road into open land and zoning it")]
 
@@ -1093,3 +1095,198 @@ def test_money_polish(monkeypatch):
                                             - cf.expenses) < 1e-6
     fin = _mayor_block(env, "## Finances")[1]
     assert fin.endswith(f", city services {money(cf.services)}, imports $173, interest $0"), fin
+
+
+# --- v20 fixes: utilities (tools.py: short_supplies, first_build's supply builds, DeptMoney's bound, bank_keep;
+# briefing.py: utilities' short-now line and its Ready sites' riverbank wording, the mayor's needs line)
+def _to_the_river(env) -> None:
+    """Planning's month-0 road: the main road on to the river and over it (free bank lots (25,23), (29,23), (26,25),
+    (30,25))."""
+    w = env.world
+    w.dept_funds["planning"] = 5000
+    assert apply_action(w, "planning", {"type": "build_road", "x1": 20, "y1": 24, "x2": 38, "y2": 24}).ok
+    w.dept_funds["planning"] = 0
+
+
+def _one_bank_lot(env) -> None:
+    """Smoke v20 seed 1, month 3: a pump built, one free riverbank lot left (29,23), power and sewage short."""
+    w = env.world
+    _to_the_river(env)
+    w.dept_funds["utilities"] = 1500
+    assert apply_action(w, "utilities", {"type": "build_water", "kind": "pump", "x": 25, "y": 23}).ok
+    for x, y in ((26, 25), (30, 25)):
+        w.struct[y, x] = C.RES
+    w.refresh()
+    assert T.scarce_bank(w) == {(29, 23)}
+
+
+def test_a_short_supply_wants_a_quarter_of_growth_or_half_again_its_demand():
+    """What a short supply wants added (supply_need): max(1.5 x demand, demand + a young city's quarter of growth)
+    less what the city's own buildings make (imports left out). Fresh map: power 6 (the town hall in winter), 1.5 of
+    it imported."""
+    assert (T.SUPPLIES, T.SUPPLY_MARGIN, T.SUPPLY_GROWTH) == (("power", "water", "sewage"), 1.5,
+                                                              {"power": 60, "water": 50, "sewage": 50})
+    env = _env()
+    w = env.world
+    m = w.metrics()
+    assert (m["power_supply"], m["service_imports"]["power"]) == (1.5, 1.5)
+    assert [T.supply_need(w, s) for s in T.SUPPLIES] == [66, 55, 55]
+    big = SimpleNamespace(metrics=lambda: {"power_demand": 1000.0, "power_supply": 950.0,
+                                           "service_imports": {"power": 0.0}})
+    assert T.supply_need(big, "power") == 550                           # half again the demand, less 950
+    coal, wind = T.Price(4000, "coal plant", name="coal"), T.Price(2500, "wind turbine", name="wind")
+    opts = [("coal_or_gas", coal, 250.0, {"x": 0, "y": 23}), ("wind", wind, 58.8, {"x": 39, "y": 25})]
+    pick = lambda need: T.pick_supply(need, opts)[0]
+    assert (pick(66), pick(58.8), pick(20), pick(550)) == ("coal_or_gas", "wind", "wind", "coal_or_gas")
+    assert T.pick_supply(66, []) is None
+    # its output: the tier's, a wind turbine's at its site's wind strength
+    assert (T.supply_output("coal", "power", {}), T.supply_output("wind", "power", {"wind": 1.47})) == (250, 40 * 1.47)
+    assert (T.supply_output("pump", "water", {}), T.supply_output("tower", "water", {}),
+            T.supply_output("outlet", "sewage", {})) == (250, 120, 250)
+
+
+def test_the_needs_line_names_a_building_for_every_short_supply():
+    """Smoke v20 seed 1, month 0: the needs line named only the cheapest wanted building ("its first water tower
+    $2,200"), the mayor gave exactly that instead of the playbook's $7,000, utilities built a pump and could pay for
+    no power plant: power stayed at 0-18% until month 10 and the city ended at 504 residents. One building per short
+    supply now, each the cheapest ready one that covers what the supply wants (supply_need; wind's 59 falls short of
+    power's 66, the coal plant's 250 doesn't); a supply with no ready site (the pump and outlet before the road reaches
+    the river) stays blocked, and its building still counts in what utilities keeps."""
+    env = _env()
+    w = env.world
+    b = T.first_build(env, "utilities")
+    assert b.all_of and b.cost == 6200
+    assert [(n.what, n.have, n.first, n.status, n.upkeep) for n in b.named] == [
+        ("coal plant", 0, True, "power 25% covered", 80), ("water tower", 0, True, "water 24% covered", 30)]
+    assert (b.what, b.upkeep) == ("its first coal plant and water tower", 110)
+    assert b.text() == "its first coal plant and water tower ($110/month)"     # the City block has each supply
+    assert T.labels_and(["another coal plant", "its first water pump", "its first sewage outlet"]) == (
+        "another coal plant, its first water pump and sewage outlet")
+    assert (b.dearest, b.keep_for) == (7400, "its first coal plant, water tower and sewage outlet")   # + the outlet
+    line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- utilities:"))
+    assert line == "- utilities: funds $0; needs $6,200 for its first coal plant and water tower ($110/month)"
+    f = funding_gaps(env, FleetState.of(env))
+    assert f.to_fund[0] == FundItem("utilities", "first/supply", 6200, 110, "its first coal plant and water tower")
+    m = f.depts["utilities"]
+    assert (m.bound, m.keep, m.keep_why) == (7400, 7400, "for its first coal plant, water tower and sewage outlet")
+    _to_the_river(env)                                  # the road reaches the river: the pump and outlet are ready
+    b = T.first_build(env, "utilities")
+    assert [(n.what, n.status) for n in b.named] == [("coal plant", "power 25% covered"),
+                                                      ("water pump", "water 24% covered"),
+                                                      ("sewage outlet", "sewage 0% covered")]
+    assert (b.cost, b.upkeep, b.dearest) == (6700, 120, 6700)
+    assert b.text() == "its first coal plant, water pump and sewage outlet ($120/month)"
+    # v20 seed 1, month 6: $4,400 was above the $4,000 coal plant (the old bound: the dearest priced purpose), so the
+    # line read "funds cover its builds" with power at 17% and sewage at 0%
+    w.dept_funds["utilities"] = 4400
+    m = DeptMoney(env, "utilities")
+    assert (m.kind, m.top_up, m.upkeep, m.what) == ("first/supply", 2300, 120,
+                                                    "its first coal plant, water pump and sewage outlet")
+    assert T.topped_up(m) == ("still $2,300 short of its first coal plant, water pump and sewage outlet: less buys "
+                              "fewer of them")
+    w.dept_funds["utilities"] = 6700
+    m = DeptMoney(env, "utilities")
+    assert m.needs is None and m.state == "funds cover its next build"
+    assert T.topped_up(m) == "can pay for its first coal plant, water pump and sewage outlet (upkeep +$120/month)"
+    assert m.cant_pay(4400) == ""                       # what it keeps names them already
+    assert DeptMoney(_env(), "utilities").cant_pay(4000) == "its first coal plant and water tower ($6,200)"
+
+
+def test_supply_builds_share_a_scarce_riverbank_lot():
+    """One free riverbank lot and both water and sewage short: the outlet, which has nowhere else to go, gets the lot,
+    and water a tower near homes (at month 0 the coal plant and the tower, both ranked on (0,23), don't share it
+    either: test_utilities_briefing_says_what_is_short_and_what_its_funds_build)."""
+    env = _env()
+    w = env.world
+    _to_the_river(env)
+    for x, y in ((25, 23), (26, 25), (30, 25)):
+        w.struct[y, x] = C.RES
+    w.refresh()
+    lists = T.site_lists(w, "utilities", T.role_obs(env, "utilities"))
+    builds = T.short_supplies(w, lists)
+    assert [(b.supply, b.purpose, (b.site["x"], b.site["y"])) for b in builds] == [
+        ("power", "coal_or_gas", (0, 23)), ("water", "near_homes", (30, 23)), ("sewage", "sewage", (29, 23))]
+    assert lists["pump"].sites[0] == {"x": 29, "y": 23, "pollution": 0.0} and builds[1].output == 120
+    assert T.bank_keep(w, builds) == {(29, 23): "sewage"}
+    assert [n.what for n in T.first_build(env, "utilities").named] == ["coal plant", "water tower", "sewage outlet"]
+
+
+def test_utilities_briefing_says_what_is_short_and_what_its_funds_build():
+    """Smoke v20 seed 1, month 3: utilities had $4,400, enough for the $4,000 coal plant, but its one riverbank lot read
+    "(riverbank: keep for pump/sewage)" on the wind line and "same site as wind" on the pump and sewage lines; it spent
+    all 20 steps inspecting sewage sites and built nothing. Its budget block now says what is short and what its funds
+    pay for, most urgent first (power lets a lot develop at all, water to level 2, sewage to 3), and the Ready sites
+    lines say which purpose the lot is kept for."""
+    env = _env()
+    w = env.world
+    _one_bank_lot(env)
+    w.dept_funds["utilities"] = 4400
+    text = briefing(env, "utilities", mark=False)
+    budget = _block(text, "## Your budget")
+    power = "power (1.50 of 6, 1.50 imported)"          # the supply as Key metrics give it; imports aren't the city's
+    assert budget[1] == (f"- short now: {power}, sewage (0 of 5): your $4,400 pays for a coal plant at (0,23) "
+                         "($4,000); a sewage outlet at (29,23) ($1,200) needs $800 more")
+    ready = {ln.split(":")[0][2:]: ln for ln in _block(text, "## Ready sites")[:-1]}
+    assert ready["pump"] == "- pump: 1 site, best (29,23), pollution 0 (riverbank: kept for sewage); $1,500"
+    assert ready["sewage"] == "- sewage: 1 site, best (29,23) (riverbank: kept for sewage); $1,200"
+    w.dept_funds["utilities"] = 5200                    # every one paid for
+    assert _block(briefing(env, "utilities", mark=False), "## Your budget")[1] == (
+        f"- short now: {power}, sewage (0 of 5): your $5,200 pays for a coal plant at (0,23) ($4,000) and a sewage "
+        "outlet at (29,23) ($1,200)")
+    w.dept_funds["utilities"] = 400                     # none: the can't-pay line follows
+    budget = _block(briefing(env, "utilities", mark=False), "## Your budget")
+    assert budget[1] == (f"- short now: {power}, sewage (0 of 5): your $400 pays for none of them; a coal plant at "
+                         "(0,23) ($4,000) and a sewage outlet at (29,23) ($1,200) need $4,800 more")
+    assert budget[2].startswith("- You can't pay for any ready site")
+    env = _env()                                        # month 0, no road to the river: the outlet has no site yet
+    w = env.world
+    w.dept_funds["utilities"] = 7000
+    assert _block(briefing(env, "utilities", mark=False), "## Your budget")[1] == (
+        f"- short now: {power}, water (1.20 of 5, 1.20 imported), sewage (0 of 5; no site yet): your $7,000 pays for a "
+        "coal plant at (0,23) ($4,000) and a water tower at (1,23) ($2,200)")    # the two ranked (0,23) first
+    w.dept_funds["utilities"] = 50000
+    _to_the_river(env)                                  # every supply built: nothing short, no line
+    for a in ({"type": "build_power_plant", "kind": "coal", "x": 0, "y": 23},
+              {"type": "build_water", "kind": "pump", "x": 25, "y": 23},
+              {"type": "build_sewage", "kind": "outlet", "x": 30, "y": 25}):
+        assert apply_action(w, "utilities", a).ok, a
+    assert "- short now" not in briefing(env, "utilities", mark=False)
+
+
+def test_the_mayor_playbook_says_what_the_month_0_needs_line_leaves_out():
+    """Month 0: the mayor acts before planning's road reaches the river, so utilities' needs line names a plant and a
+    tower ($6,200), and the pump and outlet it builds on its own turn wait; the playbook's $7,000 covers both."""
+    from civitas.config import load_config
+    books = [" ".join(load_config(p)["agents"]["mayor"]["playbook"].split()) for p in MAYOR_CONFIGS]
+    assert books[0] == books[1] == books[2]
+    assert ("utilities $7,000 for its first plants (its month-0 needs line leaves out the pump and outlet until "
+            "planning's road reaches the river)") in books[0]
+
+
+def test_ready_sites_say_which_purpose_a_scarce_bank_lot_is_kept_for():
+    """Smoke v20 seed 1, month 3: "wind: 6 sites, best (33,23), wind 1.39 (riverbank: keep for pump/sewage)", "pump: 1
+    site, same site as wind", "sewage: 1 site, same site as wind". With utilities' claims (bank_keep: the lot its
+    short-now line builds the outlet on), each line says which purpose the lot is kept for, and a purpose that doesn't
+    need the river is shown its next site."""
+    lot, dry = {"x": 33, "y": 23, "wind": 1.39}, {"x": 34, "y": 23, "wind": 1.39}
+    lists = {"wind": SiteList([lot, dry], None, None),
+             "pump": SiteList([{"x": 33, "y": 23, "pollution": 0.0}], None, None),
+             "sewage": SiteList([{"x": 33, "y": 23, "pollution": 0.0}], None, None),
+             "near_homes": SiteList([{"x": 33, "y": 23, "homes_within_5": 4}], None, None)}
+    prices = {"wind": T.Price(2500, "wind turbine"), "pump": T.Price(1500, "water pump"),
+              "sewage": T.Price(1200, "sewage outlet"), "near_homes": T.Price(2200, "water tower")}
+    assert T.ready_lines("utilities", lists, {(33, 23): "sewage"}, prices, 4400) == [
+        "- wind: 2 sites, best (34,23), wind 1.39 (not (33,23): riverbank kept for sewage); $2,500",
+        "- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for sewage); $1,500",
+        "- sewage: 1 site, best (33,23) (riverbank: kept for sewage); $1,200",
+        "- near_homes: 1 site, best (33,23), 4 homes within 5 (riverbank: kept for sewage); $2,200"]
+    # two lots, one for each: the pump's line moves to its own
+    lists["pump"] = SiteList([{"x": 33, "y": 23, "pollution": 0.0}, {"x": 29, "y": 23, "pollution": 0.0}], None, None)
+    assert T.ready_lines("utilities", {"pump": lists["pump"]}, {(33, 23): "sewage", (29, 23): "pump"}) == [
+        "- pump: 2 sites, best (29,23), pollution 0 (riverbank: kept for pump) (not (33,23): riverbank kept for "
+        "sewage)"]
+    # a lot no short supply claims: kept for either, as before (only purposes that don't need the river are moved)
+    assert T.ready_lines("utilities", {"wind": lists["wind"], "sewage": lists["sewage"]},
+                         {(33, 23): "pump/sewage"}) == [
+        "- wind: 2 sites, best (34,23), wind 1.39 (not (33,23): riverbank kept for pump/sewage)",
+        "- sewage: 1 site, best (33,23)"]
