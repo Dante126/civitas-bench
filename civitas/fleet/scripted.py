@@ -173,10 +173,11 @@ class ScriptedFleetAgent(Agent):
 
     def _actions(self, turn: _Turn, actions: list[dict]) -> None:
         """Each action as its own tool call, in the policy's order, until the turn's successful-action cap. A money
-        call the mayor's guards refuse (a duplicate allocation, a take-back below a department's keep, a loan while
-        the treasury holds $3,000 or its own top-ups emptied it) is one the policy means: it is repeated at once with
-        confirm: true, which that refusal earned (the scripted mayor sends no take-backs and borrows only at a turn's
-        start under $3,000, so only duplicates happen)."""
+        call the mayor's guards refuse (a duplicate allocation, a take-back below a department's keep, a top-up for
+        another building under the reserve, a loan while the treasury holds $3,000, after its own top-ups emptied it
+        or while only other buildings wait) is one the policy means: it is repeated at once with confirm: true, which
+        that refusal earned (the scripted mayor sends no take-backs, tops up only from above its own reserve and
+        borrows only at a turn's start under $3,000)."""
         box, cap = turn.box, self.env.cfg.max_actions_per_turn
         for a in actions:
             args = dict(a)
@@ -186,7 +187,7 @@ class ScriptedFleetAgent(Agent):
             res = turn.call(name, args)
             if res is None:
                 break
-            if res.get("refused") in ("duplicate", "take_back", "loan"):     # the policy means it
+            if res.get("refused") in ("duplicate", "take_back", "reserve", "loan"):     # the policy means it
                 turn.call(name, {**args, "confirm": True})
 
     def _memory(self, turn: _Turn) -> None:

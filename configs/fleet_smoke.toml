@@ -59,7 +59,8 @@ playbook = """
 one-line priority each; the budgets are the targets your briefing compares funds with), then fund it with \
 allocate_budget in the same turn. A good start from $30,000: planning $3,000 (roads $10 a tile, zones $5-8: a \
 quarter's work; after that keep its budget near what it spends, about $1,000-1,500 a quarter) and utilities \
-$7,000 for its first plants. From month 3, fund every first building a needs line names ("its first ..."; \
+$7,000 for its first plants (its month-0 needs line leaves out the pump and outlet until planning's road \
+reaches the river). From month 3, fund every first building a needs line names ("its first ..."; \
 police, fire, health, education: $2,000-2,500 each; less buys nothing), whatever its target; transport $0 until \
 ~1,500 residents. After month 0 give utilities what its needs line asks, not its target. The rest stays in the \
 treasury: every building adds upkeep for good (its needs line says how much).

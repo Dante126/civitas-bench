@@ -17,13 +17,13 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .region import region_lines
 from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SITE_PURPOSES, SPEND_MONTHS, CashFlow, \
-    DeptMoney, Funding, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, funding_gaps, land_blocked, \
-    land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, \
-    site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
+    DeptMoney, Funding, SupplyBuild, bank_keep, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, \
+    funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
+    role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
 from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
@@ -193,12 +193,13 @@ def _map(w, role: str) -> list[str]:
     return ["## Map"] + map_lines(map_facts(w), MAYOR_MAP if role == "mayor" else MAP_PARTS)
 
 
-def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> list[str]:
+def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_bank: dict | None = None) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
     find_sites for every purpose each turn. Planning's also names what funded departments are about to build
     (_leave_line; its zone strips spare those sites: spare_funded) and the first buildings blocked for lack of land
     (_land_line), and says high density is locked while it is (smoke v9-v11: 6 x zoning high density before 1,000
-    residents, repeated across turns)."""
+    residents, repeated across turns). Scarce riverbank lots are marked to keep (scarce_bank); utilities' say what
+    for (`keep_bank`: bank_keep)."""
     w = env.world
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
@@ -212,8 +213,44 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float) -> lis
         roads = lists["road_extension"].sites if "road_extension" in lists else []
         lists = spare_funded(lists, spots)
         land = _leave_line(spots, unclaimed_spots(funded, claims)) + _land_line(env, depts, roads)
-    return (["## Ready sites"] + ready_lines(role, lists, scarce_bank(w), prices, funds) + land + dense
+    keep = scarce_bank(w) if keep_bank is None else keep_bank
+    return (["## Ready sites"] + ready_lines(role, lists, keep, prices, funds) + land + dense
             + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
+
+
+def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
+    """Utilities' line under its funds while a supply is short (short_supplies): what is short, most urgent first (a
+    lot develops at all only with power, to level 2 with water, to 3 with sewage), and what its funds pay for, greedy
+    in that order with the building its needs line names for each (the mayor's line asks the same), then what the rest
+    needs: "- short now: power (1.80 of 7, 1.80 imported), sewage (0 of 7): your $4,400 pays for a coal plant at (0,23)
+    ($4,000); a sewage outlet at (33,23) ($1,200) needs $800 more". The imports it names are in the supply (as Key
+    metrics show it) but not the city's own: imports filling a gap read "514 of 514". A supply with no ready site says
+    so ("sewage (0 of 5; no site yet)"; its Ready sites line says why). It names, it doesn't choose: utilities decides.
+    Smoke v20 seed 1, month 3: $4,400 held and the $4,000 coal plant ready, but 20 steps went on inspecting sewage
+    sites and nothing was built; power stayed at 0-18% until month 10."""
+    if not builds:
+        return []
+    line = "- short now: " + ", ".join(f"{b.supply} ({num(b.have)} of {num(b.demand)}"
+                                       + (f", {num(b.imported)} imported" if round(b.imported, 1) else "")
+                                       + ("" if b.purpose else "; no site yet") + ")" for b in builds)
+    left = math.floor(funds)
+    paid, unpaid = [], []
+    for b in (b for b in builds if b.purpose):
+        at = f"{a_or_an(b.price.building)} at ({b.site['x']},{b.site['y']}) ({money(b.price.cost)})"
+        if short_of(left, b.price.cost):
+            unpaid.append((at, b.price.cost))
+        else:
+            paid.append(at)
+            left -= b.price.cost
+    if not paid and not unpaid:
+        return [line]
+    line += f": your {money(math.floor(funds))} pays for " + (_and(paid) if paid else
+                                                              "none of them" if len(unpaid) > 1 else "nothing yet")
+    if unpaid:
+        more = sum(c for _, c in unpaid) - left
+        line += (f"; {_and([at for at, _ in unpaid])} need{'s' * (len(unpaid) == 1)} {money(math.ceil(more))} "
+                 "more")
+    return [line]
 
 
 def _leave_line(spots: list, unclaimed: list = ()) -> list[str]:
@@ -284,9 +321,11 @@ def _needs(m: DeptMoney) -> str:
     (first_build): "; needs $X for its first <building> (N sites)" or "for another <building> (coverage 74%)" (Need),
     else "". Every building at that price is named ("another clinic (coverage 21%) or another landfill (coverage
     83%)"): the mayor writes what it reads into the plan (smoke v9: "Build first shelter"). Smoke v16: "a police
-    station (5 ready sites)" read the same with one built, and second stations were funded before a first school."""
+    station (5 ready sites)" read the same with one built, and second stations were funded before a first school.
+    Utilities names a building per short supply, bought together (FirstBuild.text: "its first coal plant and water
+    tower ($110/month)"; one alone reads as before)."""
     b = m.needs
-    return "" if b is None else f"; needs {money(b.cost)} for " + " or ".join(n.text() for n in b.named)
+    return "" if b is None else f"; needs {money(b.cost)} for {b.text()}"
 
 
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
@@ -479,6 +518,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
           f"- {money(math.floor(funds))} in department funds"      # rounded down, as against a price (short_of)
           + (f" (plan target {money(target)})" if target is not None else "")
           + f"; spent last month {money(spent)}"]
+    supplies = short_supplies(w, lists) if role == "utilities" else []
+    L += _short_line(supplies, funds)
     # smoke runs: builds tried with $0, stations funded $1,000 of $2,500. Only when funds are short of every ready
     # price (a supplementary one too, else it's false); it names the cheapest primary ones (all on a tie: health's
     # clinic or landfill), else a supplementary one
@@ -491,7 +532,9 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     L += [""] + _digest(env, fleet, role)
     if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
         prices = {**prices, "road_extension": road}
-    return L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds) + [""] + _memory(fleet, role)
+    keep = bank_keep(w, supplies) if role == "utilities" else None
+    return (L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds, keep) + [""]
+            + _memory(fleet, role))
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,

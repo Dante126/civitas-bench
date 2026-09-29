@@ -482,11 +482,22 @@ tasks and money, and to let people coach it.
       income, and at month 48 the city had 22 service buildings against the scripted
       fleet's 7.
     - A hospital counts as a clinic. For utilities, any building that makes the same
-      supply counts, and the line shows how much of the supply is used: `another water
-      tower (water 117% used, $30/month)`. A utilities building is named only while the
-      city lacks that supply or uses at least 90% of it. In smoke v14–v15 seed 1 the line
-      named a water tower with water spare, and towers were built until water was 4.7–4.9×
-      demand.
+      supply counts, and a supply is short only while the city lacks it or uses at least
+      90% of it. In smoke v14–v15 seed 1 the line named a water tower with water spare,
+      and towers were built until water was 4.7–4.9× demand.
+    - Utilities' line names one building per short supply, bought together, most urgent
+      first (a lot develops at all only with power, to level 2 with water, to 3 with
+      sewage): `needs $6,200 for its first coal plant and water tower ($110/month)`. For
+      each supply it is the cheapest ready building whose output covers max(1.5 × demand,
+      demand + 60 power or 50 water or sewage) less the city's own output (imports left
+      out), else the one with the most output. The 60 and 50 are a young city's first
+      quarter (smoke v9–v19: a median 62 power and 50 water from month 0 to 3), so a wind
+      turbine's 40 (× its site's wind) falls short of a fresh map's 66 power and a coal
+      plant's 250 doesn't. With one free riverbank lot the outlet, which can go nowhere
+      else, gets it and water a tower. One supply alone reads as before, with the share
+      used: `another water tower (water 117% used, $30/month)`. In smoke v20 seed 1 the
+      line named only the cheapest ($2,200 tower), the mayor gave exactly that, and power
+      stayed at 0–18% until month 10.
     - On a tie each building at that price is named (`another clinic (coverage 21%,
       $40/month) or another landfill (coverage 83%, $30/month)`). A first one is named alone
       (`its first landfill (4 sites, $30/month)` once a clinic is built).
@@ -520,7 +531,9 @@ tasks and money, and to let people coach it.
     came tenth.
   - **Idle money.** A department keeps max(2 × its 3-month spending, its dearest ready
     first building, $1,000); for utilities only buildings the needs line could name
-    count, and for planning its road and zoning. What set it is named: `2 x its $658
+    count, those it names together with any short supply's building blocked for lack of
+    land (a fresh map's coal plant, tower and outlet: $7,400), and for planning its road
+    and zoning. What set it is named: `2 x its $658
     spending`, `for its first university`, `for another fire station`, or `the $1,000
     minimum`. Funds that are $1,000 or more above that,
     excluding this month's top-ups, show as `idle $3,400 (keeps $2,000)`. The to-spend
@@ -605,7 +618,18 @@ tasks and money, and to let people coach it.
   free roadside lot near the homes that need it (around a named tile), no free 2x2
   roadside block, or no roadside lot away from homes for a landfill, cemetery or jail; a site on one of
   the last two free riverbank lots is marked to keep for a pump or sewage outlet) and its
-  memory. Every purpose outside planning is priced, and so is planning's `road_extension`,
+  memory. Utilities' lines say which one a scarce lot is kept for, the one its needs
+  line builds there: `- wind: 6 sites, best (34,23), wind 1.39 (not (33,23): riverbank
+  kept for sewage)`, `- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for
+  sewage)`, `- sewage: 1 site, best (33,23) (riverbank: kept for sewage)`. While a supply
+  is short its budget block adds what is short and what its funds pay for, most urgent
+  first, with the buildings its needs line names: `- short now: power (1.80 of 7, 1.80
+  imported), sewage (0 of 7): your $4,400 pays for a coal plant at (0,23) ($4,000); a
+  sewage outlet at (33,23) ($1,200) needs $800 more`. It only names: utilities decides. In
+  smoke v20 seed 1, month 3, utilities held $4,400 with the coal plant ready, read "best
+  (33,23) ... (riverbank: keep for pump/sewage)" for wind and "same site as wind" for the
+  pump and the outlet, spent all 20 steps inspecting sewage sites and built nothing.
+  Every purpose outside planning is priced, and so is planning's `road_extension`,
   with the road and the zoning shown apart
   (`opens 71 land tiles; $150 road + $355 zoning - you have $0`, "you have" when its funds
   are short of the two), though never on its budget line. A library (it only adds to
@@ -718,6 +742,24 @@ tasks and money, and to let people coach it.
   at months 9 and 12. On seed 1 it took $1,182 of planning's $1,479, nothing of it idle,
   then its last $297.
 
+  A top-up for another building (the department's kind is "another" on the to-fund line)
+  that would leave the treasury at least $1 under the reserve is refused too
+  (`refused: "reserve"`): `that leaves the treasury at $1,803, $1,413 under the $3,216
+  reserve (6 x $536 expenses: last month's deficit was $22), for another fire station;
+  first/supply and growth come first: education $2,500 (first/supply), planning $315
+  (growth) still wait. To fund it anyway, repeat this exact call with confirm: true.`
+  With nothing of those waiting it reads `first/supply and growth come first and none is
+  waiting`, and it names idle money to take back first when there is some. First
+  buildings, supply, planning's road, a department blocked for lack of land, one with
+  nothing ready, and a top-up that leaves the treasury at or above the reserve all pass,
+  as does fire's while the briefing's forecast names a flood (levees are first/supply, and
+  the playbook's flood rule funds fire at once, although fire's needs line names its
+  cheaper next station). A top-up larger than the treasury gets the action's own failure
+  and its money note. In smoke v20 seed 0, month 6, the to-fund line read `$4,305 covers
+  planning, police; the other $6,500 would go under the reserve`, and the mayor funded
+  another fire station and another clinic anyway, leaving the treasury at $303 of a
+  $3,216 reserve.
+
   A `take_loan` is refused (`refused: "loan"`) while the treasury holds $3,000 or more
   (`the treasury holds $3,598, over the $3,000 minimum: a $5,000 loan costs $25/month
   until repaid (debt would be $5,000 of $50k); borrow only for a first building or supply
@@ -727,12 +769,26 @@ tasks and money, and to let people coach it.
   first building or supply (police $2,500, fire $698) instead of a $3,000 loan at
   $15/month`), or a repayment, which the loan would only borrow back (`repaying $4,000 took
   it under $3,000: a $4,000 loan at $20/month borrows back what you just repaid`). When
-  every top-up was for a first building or supply, the loan is the playbook's own case
-  and runs. A loan the action itself refuses (over the $50,000 cap, not positive) gets
-  the action's message. In smoke v13–v19, 10 of 15 loans ($34.8k of $60.0k) came in turns
+  every top-up was for a first building or supply, that part stays silent. Whatever the
+  treasury at the turn's start, a loan is also refused while no first building, supply or
+  planning road waits on the to-fund line: `no first building, supply or planning road is
+  waiting (only another: police $2,500, fire $2,500); this $3,000 loan would pay for
+  another building at $15/month interest until repaid (debt would be $3,000 of $50k): fund
+  another building only from the money above the reserve.` With nothing listed at all it
+  says the loan `would sit in the treasury`. It stays silent while the treasury is below
+  $0, where a loan pays the bills. With one of the first two cases it comes
+  after that case's text as one refusal (`Also, no first building, supply or planning road
+  is waiting (...): the loan would pay for another building.`), which one override
+  passes. A loan the action itself refuses (over the $50,000 cap, not positive) gets the
+  action's message. In smoke v13–v19, 10 of 15 loans ($34.8k of $60.0k) came in turns
   that started at $3,000 or more, and 14 of 15 after the mayor's own top-ups had emptied
   the treasury. The 120-month run sat at the debt cap from month 45 and paid $23.9k in
-  interest.
+  interest. In smoke v20 seed 0, month 9, a turn that started at $550 took loans of
+  $5,000, $3,000 and $2,500, each sent with `confirm: true` on the first call. No guard
+  fired, and the money paid for another police, fire and health building. Replayed on a
+  state rebuilt from that briefing (its treasury, reserve and needs lines), the police and
+  fire top-ups are refused for the reserve, and the second and third loans for the
+  treasury and because only other buildings wait.
 
   **Earned confirm.** For the mayor's `allocate_budget` and `take_loan` the guard always
   runs, and `confirm: true` overrides a refusal only on a repeat of the exact call
@@ -742,7 +798,8 @@ tasks and money, and to let people coach it.
   `(confirm: true counts only when repeating this exact call after it was refused)`. In
   v19 all 3 take-back refusals were overridden at once, and 3 of 7 duplicate refusals.
   The guards stay soft, since every override is still possible. The harness never picks
-  an amount or enforces the reserve.
+  an amount or enforces the reserve: the reserve and extra-building refusals cost one
+  repeat of the call.
 
   **Money results.** The mayor's `allocate_budget`, `take_loan` and `repay_loan` results
   say where the money stands, for the model only (the history log and `executed` keep the
@@ -982,9 +1039,11 @@ monthly). Each turn:
 - it runs the scripted decision as tool calls, arguments sent as JSON text. The mayor first
   writes its working balances into the plan with `update_plan` (goals, a budget and a
   priority per department). Each action is one call (a duplicate allocation, a
-  take-back below a department's keep, or a loan refusal that the policy means is
-  repeated with `confirm: true`, which earns the override; the scripted mayor borrows
-  only at a turn's start with the treasury under $3,000, so the loan guard never fires),
+  take-back below a department's keep, a top-up for another building under the reserve,
+  or a loan refusal that the policy means is repeated with `confirm: true`, which earns
+  the override; the scripted mayor tops up only from the treasury above its own reserve,
+  bar its flood rule, which the reserve guard lets through, and borrows only at a turn's
+  start with the treasury under $3,000, which on seeds 0–4 never happened),
   then come `send_message`, `update_memory` (open
   requests, one lesson per kind of failed action) and `end_turn` with a report.
 
@@ -998,9 +1057,12 @@ has the same actions, results, costs and council messages
 (`tests/test_fleet_scripted.py` checks a 24-month game). The tool layer changes nothing
 for these policies. The mayor's money picture (the Finances split, the need-ordered
 Departments block, the to-spend and to-fund lines, the money results, earned confirm and
-the loan guard) changed only what the fleet reads. The scripted baseline (77.5 ± 1.5), the
+the loan guard) and the reserve and extra-building guards added after smoke v20 changed
+only what the fleet reads. The scripted baseline (77.5 ± 1.5), the
 fleet reference below (68.8 ± 2.0, 7,341 residents) and the region games score exactly as
-before. On seeds 0–4 no guard refused a scripted call and nothing was overridden. On seed
+before. On seeds 0–4, at both cadences, no guard refused a scripted call and nothing was
+overridden. Before the flood exception, the reserve guard met the monthly games of seeds 3
+and 4 three times, each time on the policy's $3,000 for fire before a flood. On seed
 0 the scripted mayor's longest briefing is 4,577 characters (4,474 before; 4,397 before the
 review fixes named first buildings ahead of cheaper sites and what first/supply may use).
 
@@ -1394,7 +1456,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 | "treasury only has" failures | 2.5 per run | 2 per run |
 | Loans | 8 ($25.4k) | 3 ($10.5k, all seed 0) |
 
-- **Seed 0:** at month 3 the mayor funded exactly what the "to fund" line listed (every first building and planning's road), and all four services built that month. At month 6 the line read "$4,305 covers planning, police; the other $6,500 would go under the reserve", and the mayor funded second fire and health buildings anyway, leaving $303. At month 9 it borrowed $10.5k in a hold for second buildings. The loan guard doesn't cover a turn that starts under $3,000.
+- **Seed 0:** at month 3 the mayor funded exactly what the "to fund" line listed (every first building and planning's road), and all four services built that month. At month 6 the line read "$4,305 covers planning, police; the other $6,500 would go under the reserve", and the mayor funded second fire and health buildings anyway, leaving $303. At month 9 it borrowed $10.5k in a hold for second buildings. The loan guard didn't cover a turn that starts under $3,000. Since v20, a top-up for another building that leaves the treasury under the reserve, and a loan while no first building, supply or planning road waits, are refused once (Guards, under [Agent fleets](#agent-fleets)).
 - **Seed 1:** power coverage stayed at 0–18% until month 10, and the city ended at 504 residents.
   - At month 0 the "to fund" line named only utilities' cheapest wanted building (a $2,200 water tower). The mayor gave exactly that instead of the playbook's $7,000, and utilities built a pump.
   - At month 3, with $4,400, utilities spent all 20 steps on sewage sites (the best riverbank lot was marked for wind, pump and sewage) and built no power plant.
