@@ -1482,6 +1482,20 @@ reached 1,280 / 47.0 and 504 / 42.8.
   - At month 0 the "to fund" line named only utilities' cheapest wanted building (a $2,200 water tower). The mayor gave exactly that instead of the playbook's $7,000, and utilities built a pump.
   - At month 3, with $4,400, utilities spent all 20 steps on sewage sites (the best riverbank lot was marked for wind, pump and sewage) and built no power plant.
 
+**v21** (2026-09-29, main at e783064: utilities' needs line covers every short supply, a "short now" line for utilities, and soft reserve and loan guards) reached 2,472 / 48.9 and 1,084 / 44.8.
+
+| Measure | v16–v19 (8 runs) | v20 | v21 (seed 0 / seed 1) |
+|---|---|---|---|
+| City score (mean) | 45.5 | 44.9 | 46.9 (48.9 / 44.8) |
+| Education score (mean) | 45.8 | 61.9 | 71.7 (74.6 / 68.8) |
+| Loans | 8 ($25.4k) | 3 ($10.5k) | 1 ($3,000, for utilities) |
+| "treasury only has" failures | 2.5 per run | 2 per run | 0 |
+| Overrides | 7 | 3 | 0 |
+
+- **Power:** seed 1 had full power from month 1 (v20: 0–18% until month 10).
+- **Guards:** on seed 0 the reserve refusal led the mayor to take idle money back from planning and transport before funding a second police station. At month 9 it accepted two loan refusals and borrowed only $3,000, for utilities.
+- The review fixes merged after v21 (3958732: one-tile supply picks, the "supply needed now" wording, guards by need) have not had their own smoke run yet.
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
