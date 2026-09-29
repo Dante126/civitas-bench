@@ -1159,6 +1159,34 @@ reached 1,412 / 44.9 and 2,120 / 45.9.
     told it needed a second lot. At month 9 each zone warning named one example tile for
     several buildings, and planning dezoned only that tile. Education never built (33.4).
 
+**v19** (2026-09-28, main at dd24a0d: v18 plus the take-back guard, zoning in planning's
+needs line, "no lot of its own" for funded departments that share a lot, and one dezone
+tile per building in the zone warning) reached 1,776 / 45.0 and 2,016 / 45.1.
+
+- **First buildings on both seeds:** for the first time, police, fire, health and education
+  all built by month 6 on both seeds. Education scored 55.6 and 54.5 (v16–v18: 33 on at least
+  one seed each time).
+- **Failed actions:** 26.7% and 17.1%. Loans were $3,315 and $0.
+- **The new guards fired, but the mayor overrides them when money is tight:**
+  - On seed 1 the take-back guard refused two take-backs, and planning's line named
+    "education (elementary school): no lot of its own".
+  - On seed 0 the guard refused a take-back of planning's $1,342, and the mayor repeated it
+    with `confirm: true` to fund a fire station. At month 9 the treasury ran out on second
+    police and fire stations before it reached planning's $315.
+
+**First 120-month run** (`fleet_trinity.toml`, seed 0, main at 760ea72, i.e. before the v18
+and v19 fixes; 320 turns, 15.8M prompt tokens, 1.9 hours):
+- **Result:** city 47.9 at the end (45.9 on average), 2,892 residents, no bankruptcy.
+- **Against the scripted fleet** on the same 3-month cadence (67.0, about 7,300 residents),
+  that is 19 points and 60% of the population short.
+- **Money:** the mayor reached the $50,000 debt limit at month 48 and stayed there. 46
+  allocations failed on the treasury or the debt limit.
+- **Planning** had $0 for 23 attempted builds ("costs $150 but the planning budget only has
+  $0"). The later fixes target this: planning's road price, the needs line and the
+  take-back guard.
+- **Actions:** 34.7% failed, and turns with no successful action took 46% of the prompt
+  tokens.
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
