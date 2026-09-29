@@ -111,9 +111,9 @@ zoned tiles waiting to develop.
 - Build a road first, then zone the tiles beside it, never the road itself. For more road access, branch roads \
 off the road lines in your Map block into free land (road_extension; bridges at $60/tile open the east bank), and \
 lay side streets before zoning beside them: a road can't cross zoned lots or buildings.
-- Leave room for the other departments: police and fire stations, clinics, schools and landfills need an empty \
-tile touching a road. Zone runs of at most 6 tiles along a road and leave the next roadside tile empty; leave one \
-for each service that asks.
+- Leave room for services and side roads: stations, clinics, schools and landfills need an empty tile touching a \
+road. Zone runs of at most 6 tiles and leave the next roadside tile empty; keep a free lot every ~10 tiles along a \
+long road to branch from, and never zone both sides of the only road end to end.
 - Parks next to homes raise land value (about one per 25 homes). From 1k: high density, offices (they need \
 high-school graduates), plazas.
 """

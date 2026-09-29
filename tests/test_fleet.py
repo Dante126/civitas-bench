@@ -1935,6 +1935,150 @@ def test_a_water_tower_counts_as_water_in_the_riverbank_warning():
                                                  f"({x},{y})"), res
 
 
+# ------------------------------------------------------------ branch roads
+def _boxed_in(lots=(), free=(), rows=(23, 25)):
+    """Smoke v17 seed 0, month 6: one road across the map (y=24 x 0-47, bridging the river at x 26-28) and a level-1
+    home on every land tile of `rows` (the two beside it), but the empty zoned `lots` and the `free` tiles: no dead
+    end to extend (the road ends at the map edge) and, without `free`, no free lot beside the road."""
+    env = _env()
+    w = env.world
+    w.struct[:], w.anchor[:], w.level[:] = C.NONE, -1, 0
+    w.struct[24, 0], w.struct[24, 1:] = C.HIGHWAY, C.ROAD
+    for y in rows:
+        land = w.terrain[y] == C.LAND
+        w.struct[y, land], w.level[y, land] = C.RES, 1
+    for x, y in lots:
+        w.level[y, x] = 0
+    for x, y in free:
+        w.struct[y, x], w.level[y, x] = C.NONE, 0
+    w.refresh()
+    w.dept_funds["planning"] = 1000
+    return env
+
+
+def _road_line(env) -> str:
+    line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- road_extension: ")]
+    return line
+
+
+def test_boxed_in_planning_is_offered_branch_roads():
+    """Smoke v17 seed 0, months 6-9: the only road ran across the map with every tile beside it zoned or built;
+    planning read "no straight extension from a dead end: build_road from any road into free land" and spent 3 turns
+    on roads into buildings and past the map edge. A branch starts from a free lot, else an empty lot (dezone: free),
+    else the cheapest building to bulldoze, ranked by land opened."""
+    from civitas.fleet.tools import BRANCH_APART, branch_sites
+    head = "- road_extension: none - no dead end; branch: "
+    env = _boxed_in(free=[(12, 23)], lots=[(40, 25)])
+    assert _road_line(env) == head + "build_road (12,23)-(12,9), opens 75 land tiles"          # nothing to clear
+    env = _boxed_in(lots=[(12, 23)])
+    assert _road_line(env) == head + ("dezone (12,23) (empty lot, free), then build_road (12,23)-(12,9), opens 75 "
+                                      "land tiles")
+    res = ToolBox(env, "planning").call("find_sites", {"purpose": "road_extension"})
+    assert res["sites"][0] == {"x": 12, "y": 23, "x1": 12, "y1": 23, "x2": 12, "y2": 9, "tiles": 15,
+                               "bridge_tiles": 0, "opens_land": 75, "branch_from": [12, 24], "cost": 150,
+                               "first": "dezone (12,23) (empty lot, free)"}, res
+    assert res["note"].startswith("no straight extension from a dead end into open land, so these are branch roads")
+    assert "first" in res["note"] and len(res["sites"]) == 6
+    assert res["sites"][1]["first"] == "bulldoze (17,23) (a level-1 home, $5)"       # then buildings, nearest the
+    near = ToolBox(env, "planning").call("find_sites", {"purpose": "road_extension", "near_x": 12, "near_y": 15})
+    assert near["sites"][0]["x1"] == 12 and near["sites"][0]["distance"] == 0        # on it (it runs north)
+    for i, a in enumerate(branch_sites(env.world)):                                  # town hall on a tie
+        for b in branch_sites(env.world)[:i]:
+            assert a.way != b.way or abs(a.start[0] - b.start[0]) + abs(a.start[1] - b.start[1]) > BRANCH_APART
+    env = _boxed_in()                                                                # only buildings beside the road
+    assert _road_line(env) == head + ("bulldoze (17,23) (a level-1 home, $5), then build_road (17,23)-(17,9), "
+                                      "opens 75 land tiles")
+    deep = (22, 23, 25, 26)                                                          # zoned 2 deep, as v17 did
+    assert _road_line(_boxed_in(lots=[(12, 22), (12, 23)], rows=deep)) == head + (
+        "dezone (12,22)-(12,23) (empty lots, free), then build_road (12,23)-(12,9), opens 75 land tiles")
+    assert _road_line(_boxed_in(lots=[(12, 23)], rows=deep)) == head + (               # the fewest levels first
+        "bulldoze (12,22)-(12,23) (a level-1 home and an empty lot, $10), then build_road (12,23)-(12,9), opens 75 "
+        "land tiles")
+    assert _road_line(_boxed_in(rows=(21, 22, 23, 25, 26, 27))) == (                 # 3 deep: none within reach
+        "- road_extension: none - no straight extension from a dead end: build_road from any road into free land")
+    env = _boxed_in(lots=[(12, 23)])
+    env.world.struct[22:24, 40] = C.ROAD                                             # a dead end at (40,22)
+    env.world.refresh()
+    assert _road_line(env).startswith("- road_extension: 1 site, best (40,22)-(40,") and "branch" not in _road_line(env)
+    assert "note" not in ToolBox(env, "planning").call("find_sites", {"purpose": "road_extension"})
+
+
+def test_a_road_into_a_building_points_to_a_branch_while_no_dead_end_extends():
+    """Smoke v17 seed 0, months 6-9: 6 roads into buildings ("occupied by coal_plant / commercial / residential ...
+    route around") and 2 past the map edge ("(52,24) is outside the 48x48 map"), with no dead end left to extend."""
+    env = _boxed_in(lots=[(12, 23)])
+    box = ToolBox(env, "planning")
+    branch = ("no dead end to extend: branch instead, e.g. dezone (12,23) (empty lot, free), then build_road "
+              "(12,23)-(12,9) (find_sites road_extension)")
+    res = box.call("build_road", {"x1": 17, "y1": 24, "x2": 17, "y2": 20})
+    assert res["message"] == ("tile (17,23) is occupied by residential; bulldoze it or route around - in the way: "
+                              f"building (17,23){AROUND}; {branch}"), res
+    res = box.call("build_road", {"x1": 47, "y1": 24, "x2": 52, "y2": 24})
+    assert res["message"] == f"(52,24) is outside the 48x48 map - {branch}", res
+    env.world.struct[22:24, 40] = C.ROAD                                             # a dead end: no branch hint
+    env.world.refresh()
+    box = ToolBox(env, "planning")
+    assert box.call("build_road", {"x1": 47, "y1": 24, "x2": 52, "y2": 24})["message"] == \
+        "(52,24) is outside the 48x48 map"
+    res = box.call("build_road", {"x1": 17, "y1": 24, "x2": 17, "y2": 20})
+    assert res["message"].endswith(f"building (17,23){AROUND}"), res
+
+
+def test_zoning_the_last_lot_a_road_could_branch_from_warns():
+    """Smoke v17 seed 0, months 0-3: planning zoned both sides of its only road nearly end to end (R at y=22 and y=23,
+    I at y=25) with no dead end left to extend, and the last free lots beside it went too; nothing said so."""
+    warning = " WARNING: that zoned the last lot a new road could branch from; leave one free, e.g. dezone ({},{})"
+    zone = lambda env, x, y: ToolBox(env, "planning").call("zone", {"zone": "R", "x1": x, "y1": y, "x2": x, "y2": y})
+    env = _boxed_in(free=[(12, 23)])
+    res = zone(env, 12, 23)
+    assert res["ok"] and res["message"] == "zoned 1 tiles R (low density)" + warning.format(12, 23), res
+    assert "WARNING" not in FleetState.of(env).history(kind="action", role="planning")[-1]["message"]   # result only
+    res = zone(env, 5, 22)                                           # boxed in already: nothing more to warn about
+    assert res["ok"] and "WARNING" not in res["message"], res
+    env = _boxed_in(free=[(12, 23), (40, 25)])
+    res = zone(env, 12, 23)                                          # one lot left: no warning
+    assert res["ok"] and "WARNING" not in res["message"], res
+    res = zone(env, 40, 25)
+    assert res["ok"] and res["message"].endswith(warning.format(40, 25)), res
+    env = _boxed_in(free=[(12, 23)])
+    res = zone(env, 12, 22)                                          # the lot free, the way through it zoned
+    assert res["ok"] and res["message"].endswith(warning.format(12, 22)), res
+    env = _boxed_in(free=[(12, 23)])
+    res = zone(env, 12, 21)                                          # after the game's own warning: one WARNING
+    assert res["message"] == ("zoned 1 tiles R (low density) WARNING: 1 of them have no road access yet; it also "
+                              "zoned the last lot a new road could branch from (dezone (12,21) to leave one)"), res
+    env = _boxed_in(free=[(12, 23)])
+    env.world.struct[22:24, 40] = C.ROAD                             # a dead end still extends: no warning
+    env.world.refresh()
+    res = zone(env, 12, 23)
+    assert res["ok"] and "WARNING" not in res["message"], res
+    env = _boxed_in(free=[(25, 23)])                                 # the last lot is also the last riverbank lot
+    res = zone(env, 25, 23)
+    assert res["ok"] and res["message"].count("WARNING") == 1, res
+    assert res["message"].endswith("utilities still needs one for its pump and sewage outlet - dezone one near "
+                                   "(25,23); it also zoned the last lot a new road could branch from"), res
+
+
+def test_a_landfill_blocked_away_from_homes_is_tagged_with_where_to_leave_its_lot():
+    """Smoke v15 seed 1, months 6-9: health's landfill read "blocked ... no roadside lot away from homes", planning
+    never made a lot at the town edge, and garbage coverage stayed 0 all run."""
+    from civitas.fleet.tools import edge_site, land_fix
+    env = _boxed_in(free=[(12, 23)])                               # its one free lot has homes all round
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    i, = [i for i, ln in enumerate(block) if ln.startswith("- blocked for lack of land: ")]
+    assert "health (landfill: away from homes)" in block[i], block[i]
+    assert block[i + 1] == ("- away from homes (health's landfill): leave a lot free by (12,9), the far end of "
+                            "road_extension (12,23)-(12,9), with no homes within 4 tiles")
+    env = _boxed_in(rows=(21, 22, 23, 25, 26, 27))                 # no branch within reach, no dead end
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    assert ("- away from homes (health's landfill): extend a road into open land at the town edge and leave a lot free "
+            "by its far end, with no homes within 4 tiles") in block, block
+    w = env.world
+    assert land_fix(w, "police", "jail") == land_fix(w, "health", "landfill") == "away from homes"
+    among, clear = {"x2": 12, "y2": 23}, {"x2": 12, "y2": 9}         # a far end among the homes is skipped
+    assert edge_site(w, [among, clear]) is clear and edge_site(w, [among]) is None
+
+
 # ------------------------------------------------------------ explained failures
 AROUND = "; route around the building (the Map block has the road extent)"
 
@@ -2527,7 +2671,8 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         lines = _ready_sites(text)
         purposes = list(SITE_PURPOSES[role])
         dense = role == "planning" and not w.unlocked("high_density")                 # + the high density line
-        land = sum(role == "planning" and ln.startswith(("- blocked for lack of land: ", "- leave free (funded): "))
+        land = sum(role == "planning" and ln.startswith(("- blocked for lack of land: ", "- leave free (funded): ",
+                                                          "- away from homes ("))
                    for ln in lines)
         assert len(lines) == len(purposes) + 1 + dense + land
         assert lines[-1] == "find_sites <purpose> lists up to 6 with details"
@@ -3235,10 +3380,12 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
         env.end_month()
     _fill_roadside(env.world)                          # every roadside tile taken; pump and outlet have room
     block = _ready_sites(briefing(env, "planning", mark=False))
-    line = (head + "police (police station), fire (fire station), health (clinic, landfill), education (elementary "
-            "school)" + tail)                          # the cheapest first buildings, all on a tie; water has room
-    assert len(line) == 185
-    assert block[-3] == line and block[-2].startswith("- high density: locked")          # before the high density
+    line = (head + "police (police station), fire (fire station), health (clinic, landfill: away from homes), "
+            "education (elementary school)" + tail)    # the cheapest first buildings, all on a tie; water has room
+    assert len(line) == 202
+    assert block[-4] == line and block[-2].startswith("- high density: locked")          # before the high density
+    assert block[-3] == ("- away from homes (health's landfill): leave a lot free by (40,19), the far end of "
+                         "road_extension (25,19)-(40,19), with no homes within 4 tiles")      # a dead end's extension
     import civitas.fleet.briefing as B
     B.BLOCKED_LINE_CHARS, keep = 150, B.BLOCKED_LINE_CHARS
     try:                                               # too long: the departments alone
@@ -3250,14 +3397,17 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
 
 def test_planning_blocked_line_fits_in_full_past_1000_residents(grown_env):
     """Review probes, months 24, 60 and 120: naming every blocked first building, planning's line always fell back to
-    the department names alone."""
+    the department names alone. The "away from homes" tag goes first (248 characters with it): the next line says it."""
     from civitas.fleet.briefing import BLOCKED_LINE_CHARS
     env = copy.deepcopy(grown_env)                     # 2,6xx residents, water at capacity
     _fill_roadside(env.world)
-    line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
-    assert line == ("- blocked for lack of land: utilities (water pump: a free riverbank lot), police (police "
-                    "station), fire (fire station), health (clinic, landfill), education (elementary school): extend a "
-                    "road into open land, or free a lot, for them") and len(line) == 231 <= BLOCKED_LINE_CHARS
+    block = _ready_sites(briefing(env, "planning", mark=False))
+    i, = [i for i, ln in enumerate(block) if ln.startswith("- blocked")]
+    assert block[i] == ("- blocked for lack of land: utilities (water pump: a free riverbank lot), police (police "
+                        "station), fire (fire station), health (clinic, landfill), education (elementary school): "
+                        "extend a road into open land, or free a lot, for them") and len(block[i]) == 231 <= \
+        BLOCKED_LINE_CHARS
+    assert block[i + 1].startswith("- away from homes (health's landfill): "), block[i + 1]
 
 
 def _best(env, role: str, purpose: str) -> str:
