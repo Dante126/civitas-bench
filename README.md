@@ -1504,7 +1504,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **heeded or overridden:** for a guard refusal, it changed course, or repeated the call with `confirm`;
 - **recurred:** the same role hit the same cause on its next turn.
 
-Hitting the per-turn action cap doesn't count. The tab shows these rates for the run and per role, the fleet report's coaching hints, and a filterable list; clicking an item opens that quarter's card with the call outlined. The timeline marks quarters with problems, red when one went unsolved. On the 120-month seed-0 run: 214 problems, 32% fixed in turn, 42% escalated, 26% unsolved, 58 recurred; planning had 83 of them.
+Hitting the per-turn action cap doesn't count. The tab shows these rates for the run and per role, the fleet report's coaching hints, and a filterable list; clicking an item opens that quarter's card with the call outlined. The timeline marks quarters with problems, red when one went unsolved. On the 120-month seed-0 run: 208 problems, 33% fixed in turn, 43% escalated, 24% unsolved, 58 recurred; planning had most of them.
 
 ### Output files (`runs/<run_id>/`)
 
