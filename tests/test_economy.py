@@ -78,6 +78,21 @@ def test_zone_density_and_office_zone():
     assert not apply_action(w, "planning", {"type": "zone", "zone": "R", "density": "medium", "x1": 2, "y1": y + 2, "x2": 3, "y2": y + 2}).ok
 
 
+def test_industry_and_mixed_use_zones_do_not_report_a_density():
+    """I and M ignore the density setting (stored and charged as high); the result says so rather than
+    '(high density)', which read as a contradiction while high density is locked."""
+    env = CivitasEnv(GameConfig(seed=0, months=12, milestones=False))
+    w = env.world
+    y = w.highway[1]
+    w.dept_funds["planning"] = 1000
+    r = apply_action(w, "planning", {"type": "zone", "zone": "I", "density": "low", "x1": 2, "y1": y + 1, "x2": 5, "y2": y + 1})
+    assert r.ok and r.message.startswith("zoned 4 tiles I (industry has no density setting)"), r.message
+    assert r.cost == 4 * C.CATALOG["zone_high"]["cost"] and w.density[y + 1, 3] == 1
+    r = apply_action(w, "planning", {"type": "zone", "zone": "M", "x1": 2, "y1": y + 2, "x2": 4, "y2": y + 2})
+    assert r.ok and r.message.startswith("zoned 3 tiles M (mixed use is always dense)"), r.message
+    assert r.cost == 3 * C.CATALOG["zone_high"]["cost"] and w.density[y + 2, 3] == 1
+
+
 def test_rent_rises_with_land_value():
     w = World(seed=0)
     y = w.highway[1]
