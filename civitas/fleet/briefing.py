@@ -20,10 +20,10 @@ from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, REPORT_PREVIEW_CHARS, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .region import region_lines
-from .tools import HOLD, MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
+from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, SITE_PURPOSES, SPEND_MONTHS, DeptMoney, \
     Funding, cheapest, claim_spots, dept_lists, funded_sites, funding_gaps, land_blocked, land_fix, map_facts, \
     map_lines, overview, plan_slice, ready_lines, ready_prices, role_obs, scarce_bank, short_of, site_lists, \
-    site_price, spare_funded, unclaimed_firsts, unclaimed_spots
+    site_price, spare_funded, unclaimed_spots
 from .tools import AWAY_FROM_HOMES, _and, _where, edge_site, road_price
 
 # paths into build_observation(...)["city"]
@@ -396,7 +396,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     spent = min(len(w.history), SPEND_MONTHS)
     notes = [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped
     L += ["", "## Departments" + (f" ({'; '.join(notes)})" if notes else "")]
-    unclaimed = unclaimed_firsts(f.depts)
+    unclaimed = f.unclaimed
     for d, m in f.depts.items():
         L.append(_dept_line(d, m, f, budgets, unclaimed.get(d, ()))
                  + (f"; priority: {cut(priorities[d], PRIORITY_CHARS)}" if priorities.get(d) else ""))
@@ -411,7 +411,8 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     L += _firsts_line(f)
     if f.gaps:
         L.append(f"- {len(f.gaps)} below target ({money(f.total)} short; treasury {money(w.treasury)}"
-                 + (f", at or under the {money(f.reserve)} reserve): {HOLD}" if f.hold else
+                 + (f", at or under the {money(f.reserve)} reserve): hold; lower targets or wait for income"
+                    if f.spare <= 0 else
                     f", {money(f.spare)} above the {money(f.reserve)} reserve): allocate_budget" if f.short else
                     "): allocate_budget"))
     L += [""]
