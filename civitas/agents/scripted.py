@@ -17,6 +17,17 @@ from .mapview import MapView
 # ====================================================================== mayor
 class ScriptedMayor(Agent):
     kind = "scripted"
+    last_turn_month: int | None = None      # month of its previous turn this episode (None: no turn yet)
+
+    def reset(self, seed: int = 0) -> None:
+        self.last_turn_month = None
+
+    def _since(self, month: int) -> int:
+        """First month of council requests it reads: that of its previous turn, since departments post theirs after
+        the mayor's turn (acting every 3 months, reading only the month before missed them all); the month before on
+        a first turn. Acting monthly the two are the same."""
+        last = self.last_turn_month
+        return last if last is not None and last < month else month - 1
 
     def act(self, obs: dict) -> Decision:
         f, c = obs["finance"], obs["city"]
@@ -26,8 +37,10 @@ class ScriptedMayor(Agent):
         funds = f["department_funds"]
         acts, why = [], []
 
+        since = self._since(obs["month"])
+        self.last_turn_month = obs["month"]
         requests = " ".join(m["text"].lower() for m in obs["council"]
-                            if m["month"] >= obs["month"] - 1 and m["sender"] != "mayor")
+                            if m["month"] >= since and m["sender"] != "mayor")
         # --- loans
         if treasury < 3000 and f["debt"] < 30000 and obs["month"] < 96:
             acts.append({"type": "take_loan", "amount": 10000})
@@ -46,7 +59,7 @@ class ScriptedMayor(Agent):
         power, water = c["power"], c["water"]
         tight = (power["supply"] < 1.3 * power["demand"] + 10 or water["supply"] < 1.3 * water["demand"] + 10
                  or "utilities" in requests and "fund" in requests)
-        asks = _requested_amounts(obs["council"], obs["month"])
+        asks = _requested_amounts(obs["council"], since)
         targets = [("utilities", 7000 if tight else 3000, 0.45 if tight else 0.25), ("planning", 9000, 0.6)]
         if pop >= 150:
             targets = [targets[0], ("health", 3000, 0.35), ("fire", 3000, 0.35), ("police", 3000, 0.35),
@@ -111,12 +124,12 @@ class ScriptedMayor(Agent):
         return Decision(actions=acts[: obs.get("max_actions", 8)], messages=msgs, thinking="; ".join(why))
 
 
-def _requested_amounts(council: list[dict], month: int) -> dict[str, float]:
-    """Parse '$1,234' amounts that departments asked the mayor for last month."""
+def _requested_amounts(council: list[dict], since: int) -> dict[str, float]:
+    """Parse '$1,234' amounts that departments asked the mayor for from month `since` on."""
     import re
     out: dict[str, float] = {}
     for m in council:
-        if m["month"] < month - 1 or m["sender"] == "mayor" or m["to"] not in ("mayor", "all"):
+        if m["month"] < since or m["sender"] == "mayor" or m["to"] not in ("mayor", "all"):
             continue
         amounts = [float(a.replace(",", "")) for a in re.findall(r"\$([0-9][0-9,]*)", m["text"])]
         if amounts:

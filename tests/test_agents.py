@@ -10,6 +10,7 @@ import pytest
 from civitas.agents.llm import LLMAgent, extract_json
 from civitas.agents.llm_client import ProviderConfig
 from civitas.agents.remote import LiveHub
+from civitas.agents.scripted import SCRIPTED
 from civitas.bench.runner import run_episode
 from civitas.config import apply_cli_overrides, load_config
 from civitas.core.env import CivitasEnv, GameConfig
@@ -85,6 +86,35 @@ def test_scripted_episode_logs_everything(tmp_path):
     traj = [json.loads(line) for line in (d / "trajectories.jsonl").read_text().splitlines()]
     assert {t["role"] for t in traj} == set(TURN_ORDER)
     assert all("reward" in t for t in traj)
+
+
+def test_scripted_mayor_reads_the_requests_since_its_previous_turn():
+    """Acting every 3 months, a request posted right after the mayor's turn (departments act after it) is read at
+    its next turn; acting monthly the window is the month before, as it always was."""
+    env = CivitasEnv(GameConfig(seed=0, months=12))
+    obs = env.observe("mayor")
+    city = {**obs["city"], "power": {"supply": 500, "demand": 10}, "water": {"supply": 500, "demand": 10}}
+    mayor = SCRIPTED["mayor"]("mayor")
+    ask = lambda month: {"month": month, "sender": "planning", "to": "mayor", "text": "Planning needs $12,000."}
+    fund = lambda month: {"month": month, "sender": "utilities", "to": "mayor", "text": "Utilities needs funds."}
+
+    def turn(month, *council):          # the working balances the mayor aims for (planning 9,000, utilities 3,000)
+        mayor.act({**obs, "month": month, "city": city, "council": list(council)})
+        return mayor.targets["planning"], mayor.targets["utilities"]
+
+    mayor.reset(0)                                                  # every 3 months
+    assert turn(0) == (9000, 3000)
+    assert turn(3, ask(0), fund(0)) == (12200, 7000)                # posted after its month-0 turn: read
+    assert turn(6, ask(0), fund(0)) == (9000, 3000)                 # read last turn
+    assert turn(9, ask(6), fund(6)) == (12200, 7000)
+    mayor.reset(0)                                                  # monthly: the month before, as before
+    assert turn(0) == (9000, 3000)
+    assert turn(1, ask(0), fund(0)) == (12200, 7000)
+    assert turn(2, ask(0), fund(0)) == (9000, 3000)
+    mayor.reset(0)                                                  # a new episode: no previous turn
+    assert turn(5, ask(3), fund(3)) == (9000, 3000)
+    assert turn(6, ask(5)) == (12200, 3000)
+    assert turn(3, ask(2)) == (12200, 3000)                         # a turn before the last one: the month before
 
 
 def test_remote_agent_over_http(tmp_path):

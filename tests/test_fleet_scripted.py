@@ -1,8 +1,10 @@
 """The scripted fleet: the scripted baselines playing through the fleet tools (civitas/fleet/scripted.py)."""
 import json
+import re
 
 import pytest
 
+from civitas.agents import scripted
 from civitas.agents.scripted import SCRIPTED
 from civitas.bench import runner
 from civitas.config import apply_cli_overrides, build_agents, game_config, load_config, scoring_config
@@ -167,6 +169,26 @@ def test_it_plays_exactly_as_the_scripted_baseline(tmp_path, monkeypatch):
     assert len(b) == len(f) == months * 8
     assert key(b) == key(f)
     assert sum(len(t["results"]) for t in f) > 100
+
+
+def test_the_mayor_reads_every_request_since_its_previous_turn(tmp_path, monkeypatch):
+    """At act_every 3 the departments' requests go out right after the mayor's turn; its next turn reads them all
+    (reading only the month before its turn, it read none of them)."""
+    read = []
+    real = scripted._requested_amounts
+    monkeypatch.setattr(scripted, "_requested_amounts", lambda *a, **k: read.append(real(*a, **k)) or read[-1])
+    s, env, d, traj = _run(tmp_path, monkeypatch, _cfg(24))
+    turns = [t["month"] for t in traj if t["role"] == "mayor"]
+    assert turns == list(range(0, 24, 3)) and len(read) == len(turns)
+    for since, month, got in zip([None, *turns], turns, read):
+        want = {}
+        for m in env.council.messages:
+            amounts = [float(a.replace(",", "")) for a in re.findall(r"\$([0-9][0-9,]*)", m.text)]
+            if since is not None and since <= m.month < month and m.sender != "mayor" and m.to in ("mayor", "all") \
+                    and amounts:
+                want[m.sender] = max(want.get(m.sender, 0.0), *amounts)
+        assert got == want, month
+    assert sum(map(len, read)) >= 10
 
 
 def test_a_duplicate_allocation_the_policy_means_is_confirmed(monkeypatch):
