@@ -267,7 +267,8 @@ def zone(world: World, p: dict) -> tuple[str, float]:
         world.density[y, x] = 1 if density == "high" else 0
     warn = f" WARNING: {no_access} of them have no road access yet" if no_access else ""
     extra = f", changed density of {len(rezone)} zoned tiles" if rezone else ""
-    return f"zoned {len(tiles)} tiles {letter} ({density} density){extra}{warn}", cost
+    note = {"I": "industry has no density setting", "M": "mixed use is always dense"}.get(letter, f"{density} density")
+    return f"zoned {len(tiles)} tiles {letter} ({note}){extra}{warn}", cost
 
 
 def dezone(world: World, p: dict) -> tuple[str, float]:
