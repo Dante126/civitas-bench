@@ -1381,6 +1381,24 @@ and v19 fixes; 320 turns, 15.8M prompt tokens, 1.9 hours):
   baseline's 14,092 (city 76.7).
 - **Weak spots:** transport (56.3 and 64.1) and, on seed 1, fire (56.8).
 
+**v20** (2026-09-29, main at c2947f0, adding the mayor money picture from
+`docs/plans/2026-09-29-mayor-money.md`: a Finances split, a need-ordered Departments block with
+upkeep, "to spend" / "to fund" lines, earned confirm, the loan guard and money result notes)
+reached 1,280 / 47.0 and 504 / 42.8.
+
+| Measure | v16–v19 (8 runs) | v20 (seed 0 / seed 1) |
+|---|---|---|
+| Education school by month 12 | 4 of 8 | 2 of 2 |
+| Education score (mean) | 45.8 | 61.9 (66.8 / 56.9) |
+| City score (mean) | 45.5 | 44.9 (47.0 / 42.8) |
+| "treasury only has" failures | 2.5 per run | 2 per run |
+| Loans | 8 ($25.4k) | 3 ($10.5k, all seed 0) |
+
+- **Seed 0:** at month 3 the mayor funded exactly what the "to fund" line listed (every first building and planning's road), and all four services built that month. At month 6 the line read "$4,305 covers planning, police; the other $6,500 would go under the reserve", and the mayor funded second fire and health buildings anyway, leaving $303. At month 9 it borrowed $10.5k in a hold for second buildings. The loan guard doesn't cover a turn that starts under $3,000.
+- **Seed 1:** power coverage stayed at 0–18% until month 10, and the city ended at 504 residents.
+  - At month 0 the "to fund" line named only utilities' cheapest wanted building (a $2,200 water tower). The mayor gave exactly that instead of the playbook's $7,000, and utilities built a pump.
+  - At month 3, with $4,400, utilities spent all 20 steps on sewage sites (the best riverbank lot was marked for wind, pump and sewage) and built no power plant.
+
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
