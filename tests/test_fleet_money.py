@@ -281,3 +281,192 @@ def test_cash_flow_identity(monkeypatch):
     cf = cash_flow(env.world)
     assert C.MILESTONES[0]["name"] in env.world.milestones_reached and abs(cf.other - 5000) < 0.5
     assert cash_flow(_env().world) == T.CashFlow(None, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0)
+
+
+# --- Unit D: result notes and look-ups (tools.py: ToolBox._money_note, MONEY_DOCS, update_plan, overview)
+from civitas.fleet.tools import ToolBox, overview  # noqa: E402
+
+STATION = FB(2500, (N("police station", 4, 1, "coverage 40%", upkeep=55),), 2500, ())
+SCHOOL = FB(2500, (N("elementary school", 3, 0, first=True, upkeep=45),), 2500, ())
+NO_LOT = FB(None, (), 2500, ("a fire station",))
+ROAD_315 = FB(315, (ROAD,), 315, ())
+
+
+def _money(box, name: str, confirm: bool = False, **args) -> str:
+    """Run one of the mayor's money actions as the model does, and return its result note: what the hook in _act
+    appends to the model's message (Unit C), and only there; `executed` and the history log keep the core text. With
+    `confirm`, a refused call is repeated once with confirm: true, as an earned override takes."""
+    sent = {**args, "confirm": True} if confirm else args
+    res = box.call(name, sent)
+    if confirm and res.get("refused"):
+        res = box.call(name, sent)
+    core = box.executed[-1]
+    assert core["action"]["type"] == name and core["ok"] == res["ok"]
+    note = box._money_note(name, args, core)
+    assert res["message"] in (core["message"], core["message"] + note)        # with or without the hook
+    assert box.fleet.log[-1]["message"] == core["message"] and " | " not in core["message"]
+    return note
+
+
+def test_money_results_show_the_treasury_and_what_is_left(monkeypatch):
+    env = _env()
+    w = env.world
+    _months_spent(env, {"planning": 620})               # planning keeps 2 x $620
+    assert reserve(w) == RESERVE_MIN and reserve_why(w) == ""
+    _builds(monkeypatch, {"police": STATION, "education": SCHOOL, "fire": NO_LOT}, road=ROAD_315)
+    w.treasury, w.dept_funds["planning"] = 5288, 2748     # planning: $1,508 idle
+    box = ToolBox(env, "mayor")
+    school = "still to fund: education $2,500 (first/supply)"
+    # top-ups: what the department can buy now, then the treasury against the reserve and what is still to fund
+    assert _money(box, "allocate_budget", department="police", amount=2500) == (
+        " | police: can pay for another police station (+$55/month); treasury $2,788, $212 under the $3,000 "
+        f"reserve; {school}")
+    school = "still to fund: education $1,000 (first/supply)"
+    assert _money(box, "allocate_budget", department="education", amount=1500) == (
+        " | education: still $1,000 short of its first elementary school: less buys nothing; treasury $1,288, "
+        f"$1,712 under the $3,000 reserve; {school}")
+    assert _money(box, "allocate_budget", department="health", amount=200) == (
+        f" | health: had nothing ready to buy; treasury $1,088, $1,912 under the $3,000 reserve; {school}")
+    assert _money(box, "allocate_budget", department="fire", amount=88) == (
+        " | fire: blocked for lack of land: this buys nothing until planning frees a lot; treasury $1,000, $2,000 "
+        f"under the $3,000 reserve; {school}")
+    # the treasury can't pay: where it stands, the idle money to take back instead and what is still to fund
+    assert _money(box, "allocate_budget", department="education", amount=2000) == (
+        f" | treasury $1,000, $2,000 under the $3,000 reserve; idle to take back: planning $1,508; {school}")
+    # take-backs: what the department holds against what it keeps
+    assert _money(box, "allocate_budget", department="planning", amount=-1000) == (
+        f" | planning now $1,748, $508 over what it keeps; treasury $2,000, $1,000 under the $3,000 reserve; {school}")
+    assert _money(box, "allocate_budget", department="planning", amount=-508) == (
+        " | planning now $1,240, what it keeps (nothing idle); treasury $2,508, $492 under the $3,000 reserve; "
+        f"{school}")
+    assert _money(box, "allocate_budget", department="planning", amount=-1240, confirm=True) == (
+        " | planning now $0, $1,240 below what it keeps (2 x its $620 spending): it can't build next quarter; "
+        f"treasury $3,748, $748 above the $3,000 reserve; {school}, planning $315 (growth)")
+    # other failures and other actions: no note
+    assert _money(box, "allocate_budget", department="parks", amount=100) == ""
+    assert _money(box, "repay_loan", amount=100) == ""                      # nothing to repay
+    assert box._money_note("set_tax", {"zone": "R", "rate": 0.1}, {"ok": True, "message": "taxes set"}) == ""
+
+
+def test_money_results_show_the_reserve_reason_and_an_idle_top_up(monkeypatch):
+    env = _env()
+    w = env.world
+    _months_spent(env, {"police": 700})
+    w.history[-1].update(income=2000, expenses=1237)     # last month: 3 x $1,237
+    _builds(monkeypatch, {"police": STATION})
+    w.treasury, w.dept_funds["police"] = 9711, 5000       # police keeps $2,500 of $5,000: idle
+    box = ToolBox(env, "mayor")
+    assert _money(box, "allocate_budget", department="police", amount=1000) == (
+        " | police: can pay for another police station (+$55/month); treasury $8,711, $5,000 above the $3,711 "
+        "reserve (3 x $1,237 expenses); still to fund: none")
+    assert _money(box, "allocate_budget", department="police", amount=-3500) == (
+        " | police now $2,500, what it keeps (nothing idle); treasury $12.2k, $8,500 above the $3,711 reserve "
+        "(3 x $1,237 expenses); still to fund: none")
+    w.dept_funds["police"] = 4000
+    assert box._money_note("allocate_budget", {"department": "police", "amount": -1},
+                           {"ok": True, "message": "reclaimed $1 from police"}).startswith(
+        " | police now $4,000, $1,500 over what it keeps: still idle; treasury")
+
+
+def test_loan_results_show_the_interest(monkeypatch):
+    env = _env()
+    w = env.world
+    _builds(monkeypatch, {"police": STATION, "education": SCHOOL})
+    still = "still to fund: education $2,500 (first/supply), police $2,500 (another)"
+    w.treasury = 1000                                   # a turn that starts under the $3,000 minimum
+    box = ToolBox(env, "mayor")
+    assert _money(box, "take_loan", amount=3000) == (
+        f" | interest now $15/month (+$15); $47k more can be borrowed; treasury $4,000, $1,000 above the $3,000 "
+        f"reserve; {still}")
+    w.treasury, w.debt = 500, 48000
+    assert _money(box, "take_loan", amount=5000) == " | only $2,000 more can be borrowed (interest $240/month)"
+    assert _money(box, "take_loan", amount=2000) == (
+        f" | interest now $250/month (+$10); no more can be borrowed; treasury $2,500, $500 under the $3,000 "
+        f"reserve; {still}")
+    assert _money(box, "take_loan", amount=1000) == (
+        " | no more credit: repay_loan from money above the reserve cuts the $250/month interest")
+    assert _money(box, "repay_loan", amount=3000) == (
+        f" | treasury $2,500, $500 under the $3,000 reserve; idle to take back: none; {still}")   # treasury only has
+    w.treasury, w.debt = 5000, 3000
+    assert _money(box, "repay_loan", amount=1000) == (
+        " | interest now $10/month (saves $5/month); treasury $4,000, $1,000 above the $3,000 reserve")
+    assert _money(box, "repay_loan", amount=5000) == (
+        " | no debt left: no more interest; treasury $2,000, $1,000 under the $3,000 reserve")
+    assert w.debt == 0
+
+
+def test_a_money_note_never_fails_an_action(monkeypatch):
+    env = _env()
+    box = ToolBox(env, "mayor")
+    res = apply_action(env.world, "mayor", {"type": "allocate_budget", "department": "police", "amount": 100})
+
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(T, "funding_gaps", boom)
+    assert res.ok and box._money_note("allocate_budget", {"department": "police", "amount": 100}, res.to_dict()) == ""
+
+
+def test_money_docs_say_what_a_loan_costs():
+    assert T.MONEY_DOCS == {
+        "take_loan": " Interest is $5 a month per $1,000 until repaid; the finance score reads net worth (treasury + "
+                     "department funds - debt).",
+        "repay_loan": " Each $1,000 repaid saves $5 a month in interest."}
+
+
+def test_update_plan_reports_what_to_fund(monkeypatch):
+    """Needs-based, whatever the targets: to_spend, to_fund (most urgent first) and the first buildings at a $0
+    target, with the briefing's to spend / to fund lines as `next`."""
+    env = _env()
+    w = env.world
+    fleet = FleetState.of(env)
+    _builds(monkeypatch, {"police": STATION, "education": SCHOOL, "fire": NO_LOT}, road=ROAD_315)
+    w.dept_funds["education"] = 500
+    w.treasury = 29500
+    mayor = ToolBox(env, "mayor")
+    res = mayor.call("update_plan", {"budgets": {"police": 2500, "planning": 3000}})
+    f = funding_gaps(env, fleet)
+    assert res["to_spend"] == 26500 and "idle" not in res
+    assert res["to_fund"] == [
+        {"department": "education", "kind": "first/supply", "amount": 2000, "upkeep_per_month": 45},
+        {"department": "planning", "kind": "growth", "amount": 315, "upkeep_per_month": 0},
+        {"department": "police", "kind": "another", "amount": 2500, "upkeep_per_month": 55}]
+    assert res["first_buildings"] == ["education"]
+    assert res["next"] == "; ".join(ln.removeprefix("- ") for ln in spend_lines(w, f)) + (
+        "; first buildings with a $0 target: education")
+    assert res["next"] == (
+        "to spend: $26.5k above the $3,000 reserve; operations +$0/month; to fund: first/supply education $2,000 "
+        "(+$45/month) | growth planning $315 | another police $2,500 (+$55/month): $26.5k covers education, planning, "
+        "police; first buildings with a $0 target: education")
+    assert set(res["below_target"]) == {"police", "planning"} and res["treasury"] == 29500     # targets, as before
+    res = mayor.call("update_plan", {"budgets": {"education": 2500}})
+    assert "first_buildings" not in res and "$0 target" not in res["next"]
+    w.treasury = 2000                                   # a hold
+    res = mayor.call("update_plan", {"notes": "hold"})
+    assert res["to_spend"] == 0 and res["next"].startswith("to spend: none (hold): the treasury is $1,000 under")
+    w.treasury = 30000
+    _builds(monkeypatch, {})
+    res = mayor.call("update_plan", {"notes": "nothing ready"})
+    assert res["to_fund"] == [] and res["next"] == (
+        "to spend: $27k above the $3,000 reserve; operations +$0/month; to fund: nothing ready")
+
+
+def test_city_overview_splits_the_treasury_change():
+    env = _env()
+    w = env.world
+    ov = overview(env)
+    assert ov["operations_3_months"] is None and ov["costs_last_month"] == {}          # before the first month
+    mayor = lambda **a: apply_action(w, "mayor", a).ok
+    assert mayor(type="allocate_budget", department="police", amount=2000)
+    env.end_month()
+    env.end_month()
+    assert mayor(type="allocate_budget", department="fire", amount=500) and mayor(type="take_loan", amount=1000)
+    cf = cash_flow(w)
+    ov = ToolBox(env, "police").call("city_overview", {})
+    assert ov["operations_3_months"] == {
+        "since_month": 1, "months": 1, "treasury_change": round(cf.change), "operations": round(cf.ops),
+        "top_ups": 500, "loans": 1000, "other": 0}
+    assert ov["operations_3_months"]["since_month"] == ov["trend"]["since_month"]
+    spent = w.history[-1]["expense_breakdown"]
+    assert list(ov["costs_last_month"].items()) == sorted(
+        ((k, round(v)) for k, v in spent.items() if round(v)), key=lambda kv: -kv[1])
+    assert ov["costs_last_month"]["town_hall"] == 20 and "police" not in ov["costs_last_month"]    # $0 left out
