@@ -123,7 +123,7 @@ function switchCity(c) {
 async function openRun(id, { month = null } = {}) {
   stop(); clearInterval(S.poll);
   S.runId = id; S.frames = []; S.raw = []; S.idx = 0; S.selected = -1; $("inspector").hidden = true;
-  S.collab = null; S.teamPick = null; collabAt = 0;
+  S.collab = null; S.collabErr = null; S.teamPick = null; collabAt = 0;
   try { S.metaRaw = await api(`/api/runs/${encodeURIComponent(id)}/meta`); } catch (e) { toast("Could not open run: " + esc(e.message), true); return; }
   S.city = S.metaRaw.region ? S.metaRaw.cities[0] : null;
   S.meta = cityMeta(S.metaRaw, S.city);
@@ -463,9 +463,16 @@ async function loadCollab(force = false) {
   if (!id || (!force && S.status === "running" && Date.now() - collabAt < 6000 && S.collab)) return;
   collabAt = Date.now();
   let d;
-  try { d = await api(`/api/runs/${encodeURIComponent(id)}/collab${S.city ? `?city=${encodeURIComponent(S.city)}` : ""}`); } catch { return; }
+  try { d = await api(`/api/runs/${encodeURIComponent(id)}/collab${S.city ? `?city=${encodeURIComponent(S.city)}` : ""}`); }
+  catch (e) {
+    if (S.runId !== id) return;
+    S.collabErr = /404/.test(e.message) ? "This server has no Team data yet: restart <code>civitas serve</code> (it doesn't reload Python changes)."
+      : `Could not load the team: ${esc(e.message)}`;
+    if (S.tab === "team") renderTeam();
+    return;
+  }
   if (S.runId !== id) return;
-  S.collab = d;
+  S.collab = d; S.collabErr = null;
   for (const gph of [teamGraph, teamBig]) if (gph) gph.setData(d);
   if (S.tab === "team") renderTeam(); updateTeamView();
 }
@@ -526,7 +533,11 @@ function renderTeam() {
   const body = $("tabBody");
   $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the full-screen Team view">⤢ Expand</button>`);
   $("teamExpand").onclick = openTeamView;
-  if (!S.collab) { body.innerHTML = `<div class="emptytab">Loading the team…</div>`; loadCollab(true); return; }
+  if (!S.collab) {
+    body.innerHTML = `<div class="emptytab">${S.collabErr || "Loading the team…"}</div>`;
+    if (!S.collabErr && Date.now() - collabAt > 3000) loadCollab(true);
+    return;
+  }
   if (!teamGraph || !document.getElementById("teamCanvas")) {
     if (teamGraph) teamGraph.destroy();
     body.innerHTML = `<canvas id="teamCanvas" class="teamcanvas"></canvas>${TEAM_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
