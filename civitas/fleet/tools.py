@@ -18,9 +18,11 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..core.actions import (OWNED_STRUCTS, POWER_LINES, SCHOOL_KINDS, SEWAGE_LINES, WATER_LINES, _kind_name, _line,
-                            _point, _rect, action_docs, apply_action)
-from ..core.observation import MAP_LEGEND, _far_from_homes, _road_extensions, _uncrowded_first, build_observation
+from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
+                            WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
+                            zone_density, zone_price, zone_tiles)
+from ..core.observation import (MAP_LEGEND, _far_from_homes, _road_extensions, _uncrowded_first, _zone_suggestions,
+                                build_observation)
 from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
@@ -690,6 +692,62 @@ def _zone_beside(w, tiles: list[tuple[int, int]], spare=()) -> list[str]:
             if not bank[y1:y2 + 1, x1:x2 + 1].any():
                 sides.append((-len(hits), f"x1={x1},y1={y1},x2={x2},y2={y2}"))
     return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
+
+
+def zone_fit(w, args: dict, funds: float) -> str:
+    """For a zone its department's funds can't pay (`args` as sent): the price per tile it was charged, as actions.zone
+    charges it (zone_density: industry and mixed use at the high-density price; REZONE_COST per zoned tile changing
+    density), how many new tiles `funds` buy, and the sub-rectangle of the requested area with the most tiles `funds`
+    pay for (then the most with road access, then the smallest); for R/C/O at high density, whether "low" zones it all.
+    "" when the funds don't pay for one tile, or on any error. v19 (120 months, seeds 0-1): 43 zones failed on "costs
+    $48 but the planning budget only has $46; ask the mayor for funds", 41 of them with money for some tiles, and
+    planning asked the mayor instead of zoning less; industry zoned "low" was charged high density unseen."""
+    try:
+        letter = str(args.get("zone", "")).upper()[:1]
+        density = zone_density(letter, str(args.get("density", "low")).lower())
+        rect = _rect(w, args)
+        (xa, ya), (xb, yb) = rect[0], rect[-1]
+        tiles, rezone = zone_tiles(w, letter, density, rect)
+        price = zone_price(density)
+        grids = [np.zeros((yb - ya + 1, xb - xa + 1), int) for _ in range(3)]    # new tiles, re-zoned, road access
+        for x, y in tiles:
+            grids[0][y - ya, x - xa] = 1
+            grids[2][y - ya, x - xa] = int(bool(w.access[y, x]))
+        for x, y in rezone:
+            grids[1][y - ya, x - xa] = 1
+        sums = [np.pad(g.cumsum(0).cumsum(1), ((1, 0), (1, 0))).tolist() for g in grids]
+        box = lambda t, a, b, c, d: t[d + 1][c + 1] - t[b][c + 1] - t[d + 1][a] + t[b][a]
+        H, W = grids[0].shape
+        best = None
+        for y1 in range(H):
+            for y2 in range(y1, H):
+                for x1 in range(W):
+                    for x2 in range(x1, W):
+                        n, r, a = (box(t, x1, y1, x2, y2) for t in sums)
+                        cost = zone_cost(n, r, density)
+                        if n + r == 0 or short_of(funds, cost):
+                            continue
+                        key = (n + r, a, -(x2 - x1 + 1) * (y2 - y1 + 1))
+                        if best is None or key > best[0]:
+                            best = (key, (x1 + xa, y1 + ya, x2 + xa, y2 + ya), n + r, cost)
+        if best is None:
+            return ""
+        why = (" (industry and mixed use are always charged the high-density price)" if letter in NO_DENSITY
+               else f" ({density} density)")
+        buys = int((funds + 1e-9) // price)
+        (x1, y1, x2, y2), n, cost = best[1:]
+        out = (f" - zone {letter} costs {money(price)}/tile{why}"
+               + (f", {money(REZONE_COST)} per zoned tile changing density" if rezone else "")
+               + f"; {money(math.floor(funds + 1e-9))} pays for {buys} new tile{'s' * (buys != 1)}: zone "
+               f"x1={x1},y1={y1},x2={x2},y2={y2} ({n} tile{'s' * (n != 1)}, {money(cost)}) now")
+        if letter not in NO_DENSITY and density == "high":
+            low_tiles, low_re = zone_tiles(w, letter, "low", rect)
+            low = zone_cost(len(low_tiles), len(low_re), "low")
+            if not short_of(funds, low):
+                out += f', or zone it all with density "low" for {money(low)}'
+        return out + "; zone fewer tiles rather than waiting for funds"
+    except Exception:
+        return ""
 
 
 def _river_cols(w) -> tuple[int, int, int, int] | None:
@@ -1432,11 +1490,15 @@ def role_obs(env, role: str, site_hints: bool = True) -> dict:
 def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
     """Every find_sites purpose of `role` from one build_observation(..., site_hints=True): the find_sites tool
     and the briefing's Ready sites block both read this, so they can't disagree."""
-    out = {}
+    out, strips = {}, None
     for purpose, path in SITE_PURPOSES[role].items():
         found = obs
         for key in path:
             found = found.get(key) if isinstance(found, dict) else None
+        if path[0] == "zoning_suggestions" and found is not None:   # MAX_SITES strips per type, the first ones as
+            if strips is None:                                      # observation's 2: each type its own (ready_lines)
+                strips = _zone_suggestions(w, per_type=MAX_SITES)
+            found = strips.get(path[1], found)
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
         if purpose in BANK_TOP_UP and len(sites) < len(found or []):
             sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
@@ -2486,6 +2548,30 @@ def road_build(env) -> FirstBuild | None:
     return FirstBuild(pr.cost, (need,), pr.cost, ())
 
 
+def _overlaps(a: dict, b: dict) -> bool:
+    return not (a["x2"] < b["x1"] or a["x1"] > b["x2"] or a["y2"] < b["y1"] or a["y1"] > b["y2"])
+
+
+ZONE_RULE = "one zone type per strip"
+
+
+def zone_line(purpose: str, sites: list[dict], strips: dict[str, dict], site: Callable) -> tuple[str, dict | None]:
+    """A zone purpose's Ready sites text after its count, and the strip it shows: its best strip no earlier zone line
+    shows (`strips`: purpose -> strip, which it adds to; overlapping counts as the same), as "best ..." when that is
+    its first, else "next free ..." with ZONE_RULE; with none left, which lines took them. v19 (120 months, seeds
+    0-1): "zone_C: best as zone_R; next ...", "zone_I: same strip as zone_R"; planning zoned R on a strip, then I on
+    the same rectangle, 19 times ("all 40 tiles are zoned R")."""
+    own = next((s for s in sites if not any(_overlaps(s, t) for t in strips.values())), None)
+    if own is None:
+        took = _and([p + "'s" for p, t in strips.items() if any(_overlaps(s, t) for s in sites)])
+        return f"all {took} strips ({ZONE_RULE}): extend the roads", None
+    strips[purpose] = own
+    if own is sites[0]:
+        return f"best {site(purpose, own)}", own
+    text = f"next free {site(purpose, own)}"
+    return (text + f" ({ZONE_RULE})" if len(purpose) + len(text) + len(ZONE_RULE) <= 88 else text), own
+
+
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = frozenset(),
                 prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
@@ -2498,8 +2584,10 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
     with sites ends with its price (`prices`: ready_prices, and planning's road_price), and with `funds` (rounded
     down) when they are short of it; so does a reason with sites (planning's branch roads). Smoke v20 seed 1, month 3:
     "wind: best (33,23) (riverbank: keep for pump/sewage)", "pump: same site as wind", "sewage: same site as wind";
-    utilities spent the turn inspecting sewage sites."""
-    lines, shown, paths = [], {}, {}                 # shown: where -> purpose; paths: hint path -> purpose
+    utilities spent the turn inspecting sewage sites. Zone purposes (planning's strips) each show a strip of their own
+    instead (zone_line: one zone type per strip)."""
+    lines, shown, paths = [], {}, {}                # shown: where -> purpose; paths: hint path -> purpose
+    strips: dict[str, dict] = {}                     # zone purpose -> the strip its line shows (zone_line)
     kept = keep_bank if isinstance(keep_bank, dict) else None
 
     def kept_for(s: dict) -> str | None:
@@ -2536,6 +2624,12 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
             continue
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
+        if purpose.startswith("zone_") and "x2" in sites[0]:     # one zone type per strip (zone_line)
+            text, own = zone_line(purpose, sites, strips, site)
+            if own is not None:
+                shown[_where(own)] = purpose
+            lines.append(head + text + price(purpose))
+            continue
         if path in paths:
             lines.append(head + f"same list as {paths[path]}" + price(purpose))
             continue
@@ -2575,11 +2669,12 @@ class Took(NamedTuple):
 
 
 class ToolBox:
-    def __init__(self, env, role: str):
+    def __init__(self, env, role: str, branch_dezone: bool = False):
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
         self.env, self.role = env, role
         self.world = env.world
+        self.branch_dezone = branch_dezone                # planning's branch road dezones its empty lots (_branch_clear)
         self.fleet = FleetState.of(env)
         self.ended = False
         self.report = ""
@@ -2801,6 +2896,7 @@ class ToolBox:
             refusal = self._disconnect_refusal(name, args)
             if refusal:
                 return {"ok": False, "refused": "disconnect", "error": refusal}
+        cleared = self._branch_clear(args) if name == "build_road" and self.branch_dezone else ""
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
         ways = self._ways_out() if name == "zone" else None
         before, debt = w.struct.copy(), w.debt
@@ -2826,11 +2922,48 @@ class ToolBox:
             note += self._branch_warning(ways, before, prior) if ways is not None else ""
         else:
             note = self._explain(name, args, res["message"])
-        out = {"ok": res["ok"], "message": res["message"] + note, "cost": res["cost"],
+        out = {"ok": res["ok"], "message": cleared + res["message"] + note, "cost": res["cost"],
                "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
         if override:
             out["override"] = override
         return out
+
+    def _branch_clear(self, args: dict) -> str:
+        """For planning's build_road that is a listed branch road (branch_sites: the same two ends) whose way is blocked
+        only by empty zoned lots (no building): dezone them first within the same call (free; executed and the
+        history log get it as its own action), when the road is affordable and the turn has room for both actions.
+        Returns the text put before the road's message, "" when it did nothing. ToolAgent only (branch_dezone): the
+        scripted fleet plays its own dezones. v19 (120 months, seeds 0-1): 10 of planning's 29 roads into zoned lots
+        were the briefing's own branch road ("dezone (19,5)-(20,5) (empty lots, free), then build_road ...") sent
+        without the dezone."""
+        try:
+            w = self.world
+            if self.role != "planning":
+                return ""
+            line = _line(w, args)
+            if not any(w.struct[y, x] in C.ZONES for x, y in line):
+                return ""
+            ends = {(args["x1"], args["y1"]), (args["x2"], args["y2"])}
+            b = next((b for b in branch_sites(w) if b.clear and not b.built and {b.start, b.end} == ends), None)
+            cap = self.env.cfg.max_actions_per_turn
+            if b is None or sum(r["ok"] for r in self.executed) + 2 > cap:
+                return ""
+            cost = sum(C.CATALOG["bridge" if w.terrain[y, x] == C.WATER else "road"]["cost"]
+                       for x, y in line if w.struct[y, x] not in (C.ROAD, C.HIGHWAY))
+            if short_of(w.dept_funds["planning"], cost):
+                return ""
+            xs, ys = zip(*b.clear)
+            rect = {"x1": min(xs), "y1": min(ys), "x2": max(xs), "y2": max(ys)}
+            res = apply_action(w, self.role, {**rect, "type": "dezone"}).to_dict()
+            self.executed.append(res)
+            self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"],
+                              message=res["message"], cost=res["cost"])
+            if not res["ok"]:
+                return ""
+            self._funded = None
+            return f"{res['message']} at {_tiles_text(b.clear)} first (the branch road's empty lots, free); "
+        except Exception:
+            return ""
 
     def _taken(self, name: str, args: dict, before: np.ndarray) -> frozenset:
         """The tiles a successful action took (Took.tiles): a build_road's whole line, else the tiles it filled
@@ -3253,6 +3386,8 @@ class ToolBox:
         w = self.world
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
+        if name == "zone" and message.startswith("costs $") and " budget only has " in message:
+            return zone_fit(w, args, w.dept_funds["planning"])
         if (name, message) in (("zone", "no empty land tiles in that area"), ("dezone", "no zoned tiles in that area")):
             try:
                 tiles = _rect(w, args)
@@ -3261,6 +3396,8 @@ class ToolBox:
             beside = _zone_beside(w, tiles, [t for sp in self._funded_spots() for t in sp.tiles]) if name == "zone" \
                 else []
             mine = self._own_zones(tiles) if name == "zone" else ""
+            if mine and (strip := self._next_strip(args)):
+                mine += f"; {strip}"
             return (f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
                     + (f"; zone beside it instead: {' or '.join(beside)}" if beside else ""))
         if name != "build_road":
@@ -3361,6 +3498,26 @@ class ToolBox:
             return f"you zoned them at call{'s' * (len(calls) > 1)} {_and([str(c) for c, _ in calls])} this turn"
         each = [f"{n} at call {c}" for c, n in calls]
         return f"you zoned {_and([each[0].replace(' at', ' of them at', 1)] + each[1:])} this turn"
+
+    def _next_strip(self, args: dict) -> str:
+        """For a zone that found no empty land on this turn's own zoning (_own_zones): the next free strip on its type's
+        list (site_lists; strips sparing funded sites first, as the Ready sites block ranks them), or why there is
+        none; "" on any error. v19 (120 months, seeds 0-1): 19 zones re-zoned the exact rectangle planning had just
+        zoned with another type (R (0,25)-(19,26), then I there)."""
+        try:
+            letter = str(args.get("zone", "")).upper()[:1]
+            purpose = f"zone_{letter}"
+            if purpose not in SITE_PURPOSES["planning"]:
+                return ""
+            lists = site_lists(self.world, "planning", role_obs(self.env, "planning"))
+            lst = spare_funded({purpose: lists[purpose]}, self._funded_spots())[purpose]
+            if lst.sites:
+                s = lst.sites[0]
+                return (f"{ZONE_RULE}: next free {purpose} strip x1={s['x1']},y1={s['y1']},x2={s['x2']},y2={s['y2']} "
+                        f"({s['tiles']} tiles" + (f", leave {s['leave']}" if "leave" in s else "") + ")")
+            return f"{ZONE_RULE}: no free {purpose} strip ({lst.short})" if lst.short else ""
+        except Exception:
+            return ""
 
     def _taken_hint(self, name: str, args: dict, xy: tuple[int, int], want: str) -> str:
         """For a build refused because its tile (`xy`, the first one of its footprint not free) isn't empty `want`

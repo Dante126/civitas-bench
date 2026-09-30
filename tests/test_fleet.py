@@ -2309,7 +2309,8 @@ def test_zoning_high_density_before_town_says_zone_low():
     res = box.call("zone", {"zone": "R", "density": "low", **rect})
     assert res["ok"] and res["message"] == "zoned 6 tiles R (low density)", res
     assert box.call("zone", {"zone": "C", **rect})["message"] == (   # row 24 is road, row 26 off the road, and the
-        "no empty land tiles in that area - all 6 tiles are zoned R; you zoned them at call 3 this turn")  # 1-tile end
+        "no empty land tiles in that area - all 6 tiles are zoned R; you zoned them at call 3 this turn; one zone type "
+        "per strip: next free zone_C strip x1=0,y1=22,x2=16,y2=23 (34 tiles)")  # 1-tile end
                                                                      # caps aren't offered as single lots
 
 
@@ -2355,7 +2356,8 @@ def test_failed_zone_counts_a_mixed_area_and_ranks_the_sides():
     assert (w.terrain[23, 26:29] == C.WATER).all() and (w.terrain[25, 27:30] == C.WATER).all()
     res = box.call("zone", {"zone": "C", "x1": 25, "y1": 23, "x2": 29, "y2": 24})
     assert res["message"] == (f"{NO_LAND} - 5 road, 3 river, 2 zoned R (1 developed); you zoned 2 of them at call 2 "
-                              "this turn; zone beside it instead: x1=24,y1=23,x2=24,y2=23 or x1=30,y1=23,x2=30,y2=23"
+                              "this turn; one zone type per strip: next free zone_C strip x1=0,y1=25,x2=26,y2=26 (54 "
+                              "tiles); zone beside it instead: x1=24,y1=23,x2=24,y2=23 or x1=30,y1=23,x2=30,y2=23"
                               ), res                                                          # 2-tile sides: 1 lot is half
     assert box.call("zone", {"zone": "C", "x1": 24, "y1": 23, "x2": 24, "y2": 23})["ok"]   # (south: only (25,25) is
     hall = {"x1": 17, "y1": 23, "x2": 17, "y2": 23}                                        # free, off the bank)
@@ -2366,7 +2368,8 @@ def test_failed_zone_counts_a_mixed_area_and_ranks_the_sides():
     assert box.call("zone", {"zone": "C", **hall})["message"] == f"{NO_LAND} - the tile is a town hall"   # none free,
     res = box.call("zone", {"zone": "C", "x1": 16, "y1": 23, "x2": 18, "y2": 24})                      # none its own
     assert res["message"] == (f"{NO_LAND} - 3 road, 2 zoned R, 1 town hall; you zoned 2 of them at call 6 this turn; "
-                              "zone beside it instead: x1=16,y1=25,x2=18,y2=25 or x1=15,y1=23,x2=15,y2=23"), res
+                              "one zone type per strip: next free zone_C strip x1=0,y1=25,x2=26,y2=26 (54 tiles); zone "
+                              "beside it instead: x1=16,y1=25,x2=18,y2=25 or x1=15,y1=23,x2=15,y2=23"), res
 
 
 def test_zoning_over_its_own_zone_names_the_call():
@@ -2381,18 +2384,21 @@ def test_zoning_over_its_own_zone_names_the_call():
     rect = {"x1": 3, "y1": 22, "x2": 8, "y2": 23}
     assert box.call("zone", {"zone": "C", **rect})["ok"]                                        # call 1
     res = box.call("zone", {"zone": "I", **rect})
-    assert res["message"] == (f"{NO_LAND} - all 12 tiles are zoned C; you zoned them at call 1 this turn; zone beside "
-                              "it instead: x1=2,y1=23,x2=2,y2=23 or x1=9,y1=23,x2=9,y2=23"), res
+    assert res["message"] == (f"{NO_LAND} - all 12 tiles are zoned C; you zoned them at call 1 this turn; one zone type "
+                              "per strip: next free zone_I strip x1=0,y1=25,x2=19,y2=26 (40 tiles); zone beside it "
+                              "instead: x1=2,y1=23,x2=2,y2=23 or x1=9,y1=23,x2=9,y2=23"), res
     assert box.executed[-1]["message"] == NO_LAND
     assert FleetState.of(env).history(kind="failure", role="planning")[-1]["message"] == NO_LAND
     assert box.call("zone", {"zone": "R", "x1": 9, "y1": 23, "x2": 12, "y2": 23})["ok"]       # call 3
     res = box.call("zone", {"zone": "I", "x1": 7, "y1": 23, "x2": 10, "y2": 24})              # two calls, and road
     assert res["message"] == (f"{NO_LAND} - 4 road, 2 zoned C, 2 zoned R; you zoned 2 of them at call 1 and 2 at call "
-                              "3 this turn; zone beside it instead: x1=7,y1=25,x2=10,y2=25"), res
+                              "3 this turn; one zone type per strip: next free zone_I strip x1=0,y1=25,x2=19,y2=26 (40 "
+                              "tiles); zone beside it instead: x1=7,y1=25,x2=10,y2=25"), res
     assert box.call("dezone", {"x1": 5, "y1": 23, "x2": 6, "y2": 23})["ok"]                   # call 5
     assert box.call("build_road", {"x1": 5, "y1": 23, "x2": 6, "y2": 23})["ok"]               # call 6: road now
     res = box.call("zone", {"zone": "I", "x1": 5, "y1": 22, "x2": 6, "y2": 23})
-    assert res["message"] == f"{NO_LAND} - 2 zoned C, 2 road; you zoned 2 of them at call 1 this turn", res
+    assert res["message"] == (f"{NO_LAND} - 2 zoned C, 2 road; you zoned 2 of them at call 1 this turn; one zone type "
+                              "per strip: next free zone_I strip x1=0,y1=25,x2=19,y2=26 (40 tiles)"), res
     box = ToolBox(env, "planning")                                                              # a new turn: not its own
     res = box.call("zone", {"zone": "I", **rect})
     assert res["message"].startswith(f"{NO_LAND} - 10 zoned C, 2 road; zone beside it instead: "), res
@@ -2863,7 +2869,7 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
                 n = len(sites)
                 assert line.startswith(f"- {purpose}: {n} site{'s' * (n != 1)}, "), (role, line)
                 assert (f"best ({sites[0]['x']},{sites[0]['y']})" in line
-                        or re.search(r"(best as|same (strip|site|list) as) \w+", line)), (role, line)
+                        or re.search(r"(best as|same (strip|site|list) as) \w+|next free \(| strips \(one zone type per strip\)", line)), (role, line)
             else:
                 assert ": none - " in line and note, (role, line)
     if not grown:                                       # fresh seed 0: the road stops short of the river
@@ -2874,21 +2880,23 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
 
 
 def test_ready_sites_never_repeat_a_best_site(grown_env):
-    """Zoning ranks one strip first for several zone types: later lines show the next distinct strip, or say it's
-    the same; zone_M reads zone_C's list by design."""
+    """Zoning ranks one strip first for several zone types: later zone lines show a strip of their own ("next free",
+    one zone type per strip: v19 planning zoned R on a strip, then I on the same rectangle, 19 times), or say which
+    lines took them; zone_M reads zone_C's list but shows a strip zone_C's line doesn't."""
     fresh = CivitasEnv(GameConfig(seed=0, months=24))
     plan = _ready_sites(briefing(fresh, "planning", mark=False))
-    assert plan[0].startswith("- zone_R: 2 sites, best (0,25)-(19,26)"), plan
-    for line in plan[1:3]:                              # zone_C, zone_I: same top strip as zone_R
-        assert "best (0,25)-(19,26)" not in line and ("best as zone_R; next (" in line
-                                                     or "same strip as zone_R" in line), line
+    assert plan[0].startswith("- zone_R: ") and "best (0,25)-(19,26)" in plan[0], plan
+    for line in plan[1:3]:                              # zone_C, zone_I: the top strip is zone_R's
+        assert "(0,25)-(19,26)" not in line and ("next free (" in line or " strips (one zone type per strip)" in line
+                                                  ), line
     for env in (fresh, grown_env):
         for role in DEPTS:
             shown = [m.group(1) for ln in _ready_sites(briefing(env, role, mark=False))
                      for m in [re.search(r"(?:best|next) (\(\d+,\d+\)(?:-\(\d+,\d+\))?)", ln)] if m]
             assert len(shown) == len(set(shown)), (role, shown)
     zone_m, = [ln for ln in _ready_sites(briefing(grown_env, "planning", mark=False)) if ln.startswith("- zone_M:")]
-    assert zone_m.endswith("same list as zone_C"), zone_m
+    zone_c, = [ln for ln in _ready_sites(briefing(grown_env, "planning", mark=False)) if ln.startswith("- zone_C:")]
+    assert "next free (" in zone_m and zone_m.split("next free ")[1] not in zone_c, (zone_c, zone_m)   # its own strip
 
 
 def test_planning_ready_sites_say_high_density_is_locked(env12):
@@ -3681,11 +3689,13 @@ def test_planning_zone_strips_spare_funded_sites(env12):
     w.dept_funds.update(fire=2500, health=2000)
     assert _best(env, "fire", "station") == _best(env, "health", "clinic") == "(20,22)"
     ready = _ready_sites(briefing(env, "planning", mark=False))
-    assert next(ln for ln in ready if ln.startswith("- zone_R:")) == "- zone_R: 2 sites, best (0,22)-(3,23), 8 tiles"
-    assert next(ln for ln in ready if ln.startswith("- zone_C:")) == (       # the other strip has the landfill's
-        "- zone_C: 2 sites, best (20,20)-(21,22), 6 tiles (leave (20,22) for the fire station)")    # the clinic's
-    sites = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})["sites"]            # is (22,20)
-    assert [s.get("leave") for s in sites] == [None, "(20,22) for the fire station"], sites
+    assert next(ln for ln in ready if ln.startswith("- zone_R:")) == "- zone_R: 5 sites, best (0,22)-(3,23), 8 tiles"
+    assert next(ln for ln in ready if ln.startswith("- zone_C:")) == (       # a strip of its own sparing the lots
+        "- zone_C: 5 sites, best (0,25)-(6,26), 14 tiles")
+    sites = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})["sites"]
+    leaves = [s.get("leave") for s in sites]                                  # marked ones after the others
+    assert leaves[0] is None and "(20,22) for the fire station" in leaves and \
+        leaves == sorted(leaves, key=lambda v: v is not None), sites
     assert zone()["message"] == road                   # (20,21)-(20,22) takes the funded lot
     only = {"zone_R": SiteList([{"x": 20, "y": 20, "x1": 20, "y1": 20, "x2": 21, "y2": 22, "tiles": 6}], None, None)}
     fire, clinic = Spot("fire", "station", "fire station", (20, 22)), Spot("health", "clinic", "clinic", (21, 20))

@@ -3,7 +3,8 @@
 A problem is a tool call that failed (an action that ran and failed, or a tool error: bad arguments, an unknown
 tool), a refused call (a guard, or a repeat of a failed call), or a turn that ended badly (the step limit, a reply
 with no tool call, the token budget, an unreadable reply). What the agent did next is the point: fixed (a later
-call of the same tool in the turn succeeded), heeded (a guard refused and the agent did something else), overridden
+call of the same tool in the turn succeeded, with other arguments or, after another action changed what failed, the
+same ones), heeded (a guard refused and the agent did something else), overridden
 (it repeated the refused call with confirm), repeated (it sent the same failing call again), escalated (it gave up on
 it but messaged another role, e.g. asked the mayor for money), dropped (it gave up on that tool this turn), and, across turns, recurred (the same role hit the same cause on its next turn). Rates over
 these say how an agent solves problems, not only how often it makes them.
@@ -53,8 +54,9 @@ def turn_problems(rec: dict) -> list[dict]:
             kind = ("guard" if guard else "repeat" if c["outcome"] == "refused" else
                     "failed action" if c["ran"] or c["action"] else "tool error")
             same = [d for d in later if d["tool"] == c["tool"] and _same(_plain(d["args"]), _plain(c["args"]))]
-            fixed = next((d for d in later if d["tool"] == c["tool"] and d["outcome"] == "ok"
-                          and not _same(_plain(d["args"]), _plain(c["args"]))), None)
+            # fixed: a later call of the tool worked, other arguments or the same ones after something else changed
+            # what failed (v19 planning: dezone the lots the tool result named, then the same build_road again)
+            fixed = next((d for d in later if d["tool"] == c["tool"] and d["outcome"] == "ok"), None)
             if guard:
                 over = next((d for d in same if d["outcome"] == "ok"), None)
                 handled, at = ("overridden", over["n"]) if over else ("heeded", None)

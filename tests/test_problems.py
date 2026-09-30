@@ -22,6 +22,18 @@ def test_a_failed_call_fixed_by_a_later_call_of_the_same_tool():
     assert [(p["kind"], p["handled"], p["at"], p["cause"]) for p in ps] == [("failed action", "fixed", 2, "taken land")]
 
 
+def test_a_failed_call_retried_unchanged_after_another_action_is_fixed():
+    """v19 planning: build_road into empty lots, the dezone the result named, then the same build_road: fixed (the
+    identical retry was counted escalated or dropped)."""
+    road = {"x1": 19, "y1": 5, "x2": 19, "y2": 20}
+    ps = turn_problems(rec(9, "planning", [
+        call("build_road", road, ok=False, error="tile (19,5) is occupied by residential - dezone x1=19,y1=5,x2=19,y2=6"),
+        call("dezone", {"x1": 19, "y1": 5, "x2": 19, "y2": 6}),
+        call("build_road", road),
+        call("send_message", {"to": "mayor", "text": "need $200"})]))
+    assert [(p["kind"], p["handled"], p["at"]) for p in ps] == [("failed action", "fixed", 3)]
+
+
 def test_repeated_escalated_and_dropped():
     ps = turn_problems(rec(3, "utilities", [
         call("build_power_plant", {"kind": "coal"}, ok=False, error="costs $4,000 but the utilities budget only has $0"),
