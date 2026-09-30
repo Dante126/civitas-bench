@@ -94,21 +94,24 @@
 
   <!-- ============================== timeline -->
   <footer id="timeline" class="glass">
-    <button class="btn icon" id="tFirst" title="First month (Home)">⏮</button>
-    <button class="btn icon" id="tPrev" title="Previous month (←)">◀</button>
-    <button class="btn icon play" id="tPlay" title="Play / pause (Space)">▶</button>
-    <button class="btn icon" id="tNext" title="Next month (→)">▶︎|</button>
-    <button class="btn icon" id="tLast" title="Latest month (End)">⏭</button>
-    <select id="speed" title="Playback speed">
+    <div class="transport" role="group" aria-label="Playback">
+      <button class="tbtn" id="tFirst" title="First month (Home)" aria-label="First month"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="1.8" height="10" rx=".6"/><path d="M13 3.6v8.8a.6.6 0 0 1-.9.5L5.6 8.5a.6.6 0 0 1 0-1l6.5-4.4a.6.6 0 0 1 .9.5z"/></svg></button>
+      <button class="tbtn" id="tPrev" title="Previous month (←)" aria-label="Previous month"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 3.6v8.8a.6.6 0 0 1-.9.5L4.1 8.5a.6.6 0 0 1 0-1l6.5-4.4a.6.6 0 0 1 .9.5z"/></svg></button>
+      <button class="tbtn play" id="tPlay" title="Play / pause (Space)" aria-label="Play"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.1v9.8a.6.6 0 0 0 .9.5l7.6-4.9a.6.6 0 0 0 0-1L5.9 2.6a.6.6 0 0 0-.9.5z"/></svg></button>
+      <button class="tbtn" id="tNext" title="Next month (→)" aria-label="Next month"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 3.6v8.8a.6.6 0 0 0 .9.5l6.5-4.4a.6.6 0 0 0 0-1L5.4 3.1a.6.6 0 0 0-.9.5z"/></svg></button>
+      <button class="tbtn" id="tLast" title="Latest month (End)" aria-label="Latest month"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="11.7" y="3" width="1.8" height="10" rx=".6"/><path d="M3 3.6v8.8a.6.6 0 0 0 .9.5l6.5-4.4a.6.6 0 0 0 0-1L3.9 3.1a.6.6 0 0 0-.9.5z"/></svg></button>
+    </div>
+    <select id="speed" class="speed" title="Playback speed" aria-label="Playback speed">
       <option value="900">0.3×</option><option value="450">1×</option><option value="200" selected>2×</option>
       <option value="90">5×</option><option value="30">15×</option>
     </select>
-    <div class="track">
-      <canvas id="trackMarks"></canvas>
+    <div class="track" id="track">
+      <canvas id="trackMarks" aria-hidden="true"></canvas>
       <input id="slider" type="range" min="0" max="0" value="0" aria-label="Month">
+      <div id="trackTip" class="tracktip" hidden></div>
     </div>
-    <div class="when"><div id="monthLabel" class="mono">—</div><div id="monthSub" class="muted small">—</div></div>
-    <label class="follow" title="Follow the live run (L)"><input type="checkbox" id="follow" checked> live</label>
+    <div class="when"><div id="monthLabel">—</div><div id="monthSub" class="muted small">—</div></div>
+    <label class="follow" id="followWrap" title="Follow the live run (L)" hidden><input type="checkbox" id="follow" checked><span class="livedot"></span>Live</label>
   </footer>
 
   <div id="empty" class="empty glass" hidden>

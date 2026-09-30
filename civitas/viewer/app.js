@@ -157,8 +157,9 @@ async function fetchFrames(first) {
   S.raw.push(...d.frames);
   S.frames.push(...d.frames.map(f => cityFrame(f, S.city)));
   const prevStatus = S.status; S.status = d.status;
+  $("followWrap").hidden = d.status !== "running";
   $("statusPill").className = "pill " + d.status; $("statusPill").textContent = d.status;
-  $("slider").max = Math.max(0, S.frames.length - 1);
+  $("slider").max = Math.max(1, S.meta.months || S.frames.length - 1);    // the whole game, like the track; go() stops at the latest
   if (d.frames.length) loadProblems();          // the timeline's problem marks; refetched as a live run grows
   if (d.frames.length) loadCollab();
   if (d.status !== "running") clearInterval(S.poll);
@@ -171,8 +172,11 @@ async function fetchFrames(first) {
 }
 
 // ================================================================ playback
-function play() { if (S.idx >= S.frames.length - 1) S.idx = 0; S.playing = true; $("tPlay").textContent = "❚❚"; render(null, false); tick(); }
-function stop() { S.playing = false; clearTimeout(S.timer); $("tPlay").textContent = "▶"; }
+const PLAY_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.1v9.8a.6.6 0 0 0 .9.5l7.6-4.9a.6.6 0 0 0 0-1L5.9 2.6a.6.6 0 0 0-.9.5z"/></svg>`;
+const PAUSE_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3" width="3" height="10" rx=".8"/><rect x="9.5" y="3" width="3" height="10" rx=".8"/></svg>`;
+function setPlayIcon(on) { $("tPlay").innerHTML = on ? PAUSE_ICON : PLAY_ICON; $("tPlay").setAttribute("aria-label", on ? "Pause" : "Play"); }
+function play() { if (S.idx >= S.frames.length - 1) S.idx = 0; S.playing = true; setPlayIcon(true); render(null, false); tick(); }
+function stop() { S.playing = false; clearTimeout(S.timer); setPlayIcon(false); }
 function tick() {
   if (!S.playing) return;
   if (S.idx < S.frames.length - 1) { const p = S.frames[S.idx]; S.idx++; render(p, true); }
@@ -196,8 +200,9 @@ function render(prev, animate) {
   scene.setFrame(f, prev, { animate });
   $("slider").value = S.idx;
   const arrow = f.wind ? "→↘↓↙←↖↑↗"[((Math.round(Math.atan2(f.wind[1], f.wind[0]) / (Math.PI / 4)) % 8) + 8) % 8] : "";
-  $("monthLabel").textContent = `Year ${Math.floor(f.month / 12) + 1} · M${(f.month % 12) + 1}` + (f.season ? ` · ${f.season}` : "") + (arrow ? ` ${arrow}` : "");
-  $("monthSub").textContent = `month ${f.month} / ${S.meta.months}`;
+  $("monthLabel").textContent = `Year ${Math.floor(f.month / 12) + 1}` + (f.season ? `, ${f.season}` : `, month ${(f.month % 12) + 1}`);
+  $("monthSub").textContent = `Month ${f.month} of ${S.meta.months}`;
+  $("monthSub").title = arrow ? `wind ${arrow}` : "";
   renderScores(f); renderKpis(f); renderDemand(f); renderUtil(f); renderServices(f); renderMoney(f);
   renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap(); updateTeamView(); updateBeams();
   if (S.selected >= 0) renderInspector(S.selected);
@@ -1195,24 +1200,57 @@ function drawMinimap() {
   g.beginPath(); g.moveTo((c.x + 0.5) * s, (c.y + 0.5) * s); g.lineTo((c.x + 0.5) * s - Math.sin(c.angle) * -r * 0.6, (c.y + 0.5) * s - Math.cos(c.angle) * -r * 0.6); g.stroke();
   if (S.selected >= 0) { g.strokeStyle = "#ffd23f"; g.strokeRect((S.selected % W) * s - 1, Math.floor(S.selected / W) * s - 1, s + 2, s + 2); }
 }
+// the timeline track: played part filled, years marked, city events above the line (red crises, blue disasters and
+// offers, gold milestones) and the agents' problems below it (amber, red when unsolved); hover names the month
+const TRACK_Y = 22, TRACK_PAD = 7;
+function trackEvents(f) {
+  const out = [];
+  for (const e of f.events || []) {
+    if (/negative|BANKRUPT|recall|LOST/.test(e)) out.push(["#ff6b5e", e, 3]);
+    else if (/^(FLOOD|HEATWAVE|RECESSION|OFFER)/.test(e)) out.push(["#4aa3ff", e, 2]);
+    else if (/^MILESTONE/.test(e)) out.push(["#ffd23f", e, 1]);
+  }
+  return out.sort((a, b) => b[2] - a[2]);
+}
 function drawTrackMarks() {
   const cv = $("trackMarks"); if (!S.meta) return;
-  const w = cv.clientWidth, h = 12; cv.width = w; cv.height = h;
-  const g = cv.getContext("2d"), n = Math.max(1, S.frames.length - 1);
-  g.clearRect(0, 0, w, h);
-  S.frames.forEach((f, i) => {
-    const x = 7 + (w - 14) * i / n;
-    const bad = (f.turns || []).reduce((a, t) => a + (t.invalid || 0), 0), msgs = (f.council || []).length;
-    if ((f.events || []).some(e => /negative|BANKRUPT|recall|LOST/.test(e))) { g.fillStyle = "#ff6b5e"; g.fillRect(x - 1, 0, 2, h); }
-    else if ((f.events || []).some(e => /^(FLOOD|HEATWAVE|RECESSION|OFFER)/.test(e))) { g.fillStyle = "#4aa3ff"; g.fillRect(x - 1, 0, 3, h); }
-    else if ((f.events || []).some(e => /^MILESTONE/.test(e))) { g.fillStyle = "#ffd23f"; g.fillRect(x - 1, 0, 3, h); }
-    else if (bad) { g.fillStyle = "rgba(255,200,87,.8)"; g.fillRect(x - 1, 6, 2, 6); }
-    if (msgs) { g.fillStyle = "rgba(185,155,255,.9)"; g.fillRect(x - 1, 0, 2, 4); }
-    if (f.month && f.month % 12 === 0) { g.fillStyle = "rgba(255,255,255,.35)"; g.fillRect(x, 4, 1, 4); }
-    const pr = probsAt(f.month - 1);          // this frame shows the turns of month - 1
-    if (pr.length) { g.fillStyle = pr.some(p => UNSOLVED.has(p.handled)) ? "#ff6b5e" : "#ffc857"; g.fillRect(x - 2, h - 3, 4, 3); }
-  });
+  const dpr = Math.min(2, window.devicePixelRatio || 1), w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const months = Math.max(1, S.meta.months || S.frames.length - 1), X = (m) => TRACK_PAD + (w - 2 * TRACK_PAD) * m / months;
+  const cur = S.frames.length ? S.frames[S.idx].month : 0, have = S.frames.length ? S.frames[S.frames.length - 1].month : 0;
+  const bar = (x1, x2, color) => { g.fillStyle = color; g.beginPath(); g.roundRect(x1, TRACK_Y - 2, Math.max(0, x2 - x1), 4, 2); g.fill(); };
+  bar(X(0), X(months), "rgba(255,255,255,.08)");            // the whole game
+  bar(X(0), X(have), "rgba(255,255,255,.16)");              // months played so far (a live run grows)
+  bar(X(0), X(cur), "#3ecf9e");                             // up to the month on show
+  g.font = "600 9.5px ui-sans-serif, system-ui, sans-serif"; g.textAlign = "center";
+  const years = Math.floor(months / 12), every = Math.max(1, Math.ceil(years / Math.max(1, Math.floor((w - 2 * TRACK_PAD) / 34))));
+  for (let y = 0; y < years; y++) {                        // a tick between years, a label in the middle of each
+    if (y) { g.fillStyle = "rgba(255,255,255,.28)"; g.fillRect(Math.round(X(y * 12)), TRACK_Y - 5, 1, 10); }
+    if (y % every === 0) { g.fillStyle = y * 12 <= cur ? "rgba(233,236,239,.75)" : "rgba(154,163,173,.55)"; g.fillText(`Y${y + 1}`, X(y * 12 + 6), h - 1); }
+  }
+  for (const f of S.frames) {
+    const x = X(f.month), ev = trackEvents(f);
+    if (ev.length) { g.fillStyle = ev[0][0]; g.beginPath(); g.arc(x, TRACK_Y - 10, ev[0][2] > 1 ? 3 : 2.6, 0, 2 * Math.PI); g.fill(); }
+    const pr = probsAt(f.month - 1);                         // this frame shows the turns of month - 1
+    if (pr.length) { g.fillStyle = pr.some(p => UNSOLVED.has(p.handled)) ? "rgba(255,107,94,.9)" : "rgba(255,200,87,.75)"; g.fillRect(x - 1, TRACK_Y + 5, 2, Math.min(6, 2 + pr.length)); }
+  }
 }
+function trackTip(e) {
+  if (!S.meta || !S.frames.length) return;
+  const r = $("track").getBoundingClientRect(), months = Math.max(1, S.meta.months || S.frames.length - 1);
+  const m = Math.round((e.clientX - r.left - TRACK_PAD) / (r.width - 2 * TRACK_PAD) * months);
+  const f = S.frames.find(fr => fr.month === m), tip = $("trackTip");
+  if (!f) { tip.hidden = true; return; }
+  const ev = trackEvents(f), pr = probsAt(m - 1), msgs = (f.council || []).length;
+  const lines = ev.slice(0, 3).map(([c, t]) => `<div class="ev"><i style="background:${c}"></i>${esc(t.length > 70 ? t.slice(0, 70) + "…" : t)}</div>`);
+  if (pr.length) lines.push(`<div class="ev"><i style="background:${pr.some(p => UNSOLVED.has(p.handled)) ? "#ff6b5e" : "#ffc857"}"></i>${pr.length} agent problem${pr.length > 1 ? "s" : ""}</div>`);
+  if (msgs) lines.push(`<div class="ev muted"><i style="background:#9aa3ad"></i>${msgs} message${msgs > 1 ? "s" : ""}</div>`);
+  tip.innerHTML = `<b>Year ${Math.floor(m / 12) + 1}${f.season ? `, ${f.season}` : ""} · month ${m}</b>` + (lines.join("") || `<div class="muted">nothing notable</div>`);
+  tip.style.left = `${Math.max(90, Math.min(r.width - 90, e.clientX - r.left))}px`; tip.hidden = false;
+}
+$("track").addEventListener("mousemove", trackTip);
+$("track").addEventListener("mouseleave", () => { $("trackTip").hidden = true; });
 function minimapJump(e) {
   if (!S.meta) return;
   const cv = $("minimap"), r = cv.getBoundingClientRect(), s = r.width / Math.max(S.meta.width, S.meta.height);
