@@ -29,29 +29,19 @@
 
   <!-- ============================== left dock -->
   <aside id="left" class="dock glass">
-    <section>
-      <div id="scoreCards" class="scores"></div>
+    <section id="hero" class="hero"></section>
+    <section id="alerts" class="alerts" aria-live="polite"></section>
+    <section id="vitals" class="vitals"></section>
+    <section class="depts">
+      <div class="shead"><span>Departments</span><span id="lineup" class="fsum"></span></div>
+      <div id="scoreCards"></div>
     </section>
-    <section>
-      <h4>City</h4>
-      <div id="kpis" class="kpis"></div>
-    </section>
-    <section>
-      <h4>Demand <span class="muted small">(what the city wants)</span></h4>
-      <div id="demand" class="demand"></div>
-    </section>
-    <section>
-      <h4>Utilities</h4>
-      <div id="utilBars"></div>
-    </section>
-    <section hidden>
-      <h4>Services</h4>
-      <div id="services"></div>
-    </section>
-    <section>
-      <h4>Money</h4>
-      <div id="money"></div>
-    </section>
+    <details class="fold" data-fold="demand"><summary><span>Demand</span><span class="fsum" id="demandSum"></span></summary>
+      <div class="fnote">What the city wants built. Positive means more of it would grow.</div><div id="demand" class="demand"></div></details>
+    <details class="fold" data-fold="utilities"><summary><span>Utilities</span><span class="fsum" id="utilSum"></span></summary><div id="utilBars"></div></details>
+    <details class="fold" data-fold="services"><summary><span>Services</span><span class="fsum" id="servSum"></span></summary><div id="services"></div></details>
+    <details class="fold" data-fold="money"><summary><span>Money</span><span class="fsum" id="moneySum"></span></summary><div id="money"></div></details>
+    <details class="fold" data-fold="stats"><summary><span>All stats</span><span class="fsum" id="statSum"></span></summary><div id="kpis" class="statlist"></div></details>
   </aside>
 
   <!-- ============================== right dock -->

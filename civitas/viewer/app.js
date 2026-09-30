@@ -212,90 +212,166 @@ function spark(values, color, w = 70, h = 22) {
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="1.5" points="${pts}"/></svg>`;
 }
 
-function renderScores(f) {
-  const prev = S.frames[Math.max(0, S.idx - 12)], keys = ["city", ...S.meta.roles];
-  if (f.regionScores) $("scoreCards").dataset.region = `region ${(f.regionScores.city || 0).toFixed(1)}`;
-  $("scoreCards").innerHTML = keys.map(k => {
-    const v = f.scores[k] ?? 0, d = v - (prev.scores[k] ?? 0);
-    const hist = S.frames.slice(0, S.idx + 1).map(fr => fr.scores[k] ?? 0);
-    const dtxt = Math.abs(d) < 0.05 ? "" : `<span class="delta ${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}${Math.abs(d).toFixed(1)}</span>`;
-    return `<div class="score ${k === "city" ? "city" : ""}" style="--c:${roleColor(k)}" title="${k} score (change vs 12 months ago)">
-      <div class="name"><span>${k}</span>${dtxt}</div><div class="val">${v.toFixed(1)}</div>
-      <div class="agent">${esc(k === "city" ? (f.regionScores ? `${S.city} city · region avg ${(f.regionScores.city || 0).toFixed(1)}` : "overall · 0-100") : S.meta.agents[k])}</div>${spark(hist, roleColor(k))}</div>`;
+// ---------------------------------------------------------------- left dock
+// read top to bottom: the city score, what needs attention now, four vitals, the departments, then folded detail
+const YEAR = 12;
+const ago = () => S.frames[Math.max(0, S.idx - YEAR)];
+function trend(v, p, { digits = 1, pct: asPct = false, zero = "" } = {}) {
+  const d = v - p, show = asPct ? Math.round(d * 100) : +d.toFixed(digits);
+  if (!show) return zero;
+  return `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}${Math.abs(show).toLocaleString()}${asPct ? " pts" : ""}</span>`;
+}
+function renderScores(f) { renderHero(f); renderAlerts(f); renderVitals(f); renderDepts(f); }
+function heroSpark(vals, months) {         // the score over the whole game so far, on a 0-100 scale
+  const w = 272, h = 38, n = Math.max(months || vals.length, 2), y = (v) => (h - 3 - v / 100 * (h - 6)).toFixed(1);
+  if (vals.length < 2) return `<svg viewBox="0 0 ${w} ${h}" aria-hidden="true"></svg>`;
+  const line = vals.map((v, i) => `${(i / (n - 1) * w).toFixed(1)},${y(v)}`).join(" "), xe = ((vals.length - 1) / (n - 1) * w).toFixed(1);
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+    <defs><linearGradient id="heroFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#3ecf9e" stop-opacity=".32"/><stop offset="1" stop-color="#3ecf9e" stop-opacity="0"/></linearGradient></defs>
+    <line x1="0" x2="${w}" y1="${y(50)}" y2="${y(50)}" stroke="rgba(255,255,255,.09)" stroke-dasharray="2 4" vector-effect="non-scaling-stroke"/>
+    <polygon fill="url(#heroFill)" points="0,${h} ${line} ${xe},${h}"/>
+    <polyline fill="none" stroke="#3ecf9e" stroke-width="1.8" stroke-linejoin="round" vector-effect="non-scaling-stroke" points="${line}"/></svg>`;
+}
+function renderHero(f) {
+  const v = f.scores.city ?? 0, hist = S.frames.slice(0, S.idx + 1).map(fr => fr.scores.city ?? 0);
+  const side = f.regionScores ? `${esc(S.city)} · region ${(f.regionScores.city || 0).toFixed(1)}` : "out of 100";
+  $("hero").innerHTML = `<div class="hlab"><span>City score</span><span>${side}</span></div>
+    <div class="hval"><b>${v.toFixed(1)}</b><span class="d">${trend(v, ago().scores.city ?? 0, { zero: '<span class="flat">steady</span>' })}</span>
+    <span class="muted small">${S.idx >= YEAR ? "over the last year" : "since the start"}</span></div>${heroSpark(hist, S.meta.months)}`;
+}
+function alertsOf(m) {
+  const out = [], bad = "var(--bad)", warn = "var(--warn)";
+  const short = (what, sup, dem) => { if (dem > 0 && sup < dem * 0.98) out.push([`${what} short by ${Math.round(dem - sup).toLocaleString()}: ${Math.round(100 * sup / dem)}% of demand met`, bad]); };
+  short("Power", m.power_supply, m.power_demand); short("Water", m.water_supply, m.water_demand);
+  if (m.sewage_demand != null) short("Sewage", m.sewage_supply, m.sewage_demand);
+  if (m.treasury < 0) out.push([`Treasury in the red at ${fmt$(m.treasury)}${m.months_negative ? ` for ${m.months_negative} month${m.months_negative > 1 ? "s" : ""}` : ""}`, bad]);
+  if (m.fires > 0) out.push([`${m.fires} fire${m.fires > 1 ? "s" : ""} burning`, bad]);
+  if (m.approval != null && m.approval < 0.35) out.push([`Mayor approval at ${pct(m.approval)}: recall risk`, bad]);
+  if (m.debt >= 40000) out.push([`Debt ${fmt$(m.debt)}, near the $50k limit`, warn]);
+  if (m.unemployment > 0.1) out.push([`Unemployment at ${pct(m.unemployment)}`, warn]);
+  if (m.happiness < 0.45) out.push([`Happiness down to ${pct(m.happiness)}`, warn]);
+  const unserved = (m.zoned_no_power || 0) + (m.zoned_no_water || 0);
+  if (unserved >= 10) out.push([`${unserved} zoned lots without power or water`, warn]);
+  if ((m.zoned_no_access || 0) >= 10) out.push([`${m.zoned_no_access} zoned lots with no road access`, warn]);
+  if ((m.garbage_backlog || 0) > 50) out.push([`Garbage piling up: ${Math.round(m.garbage_backlog).toLocaleString()} uncollected`, warn]);
+  return out;
+}
+function renderAlerts(f) {
+  const a = alertsOf(f.metrics), shown = a.slice(0, 4);
+  $("alerts").innerHTML = a.length ? shown.map(([t, c]) => `<div class="alert" style="--c:${c}">${esc(t)}</div>`).join("")
+    + (a.length > shown.length ? `<div class="alert calm" title="${esc(a.slice(4).map(x => x[0]).join("\n"))}">and ${a.length - 4} more</div>` : "")
+    : `<div class="alert calm">Nothing urgent this month</div>`;
+}
+function renderVitals(f) {
+  const m = f.metrics, p = ago().metrics, net = m.income - m.expenses;
+  const V = [["Population", m.population.toLocaleString(), trend(m.population, p.population, { digits: 0 }) || "no change"],
+    ["Happiness", pct(m.happiness), trend(m.happiness, p.happiness, { pct: true }) || "no change"],
+    ["Treasury", fmt$(m.treasury), `<span class="${net >= 0 ? "up" : "down"}">${net >= 0 ? "+" : ""}${fmt$(net)}</span> a month`],
+    ["Unemployment", pct(m.unemployment), `${(m.workers || 0).toLocaleString()} workers`]];
+  $("vitals").innerHTML = V.map(([k, v, sub]) => `<div class="vital"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join("");
+}
+function renderDepts(f) {
+  const roles = S.meta.roles, p = ago();
+  const kinds = [...new Set(roles.map(r => S.meta.agents[r]))];
+  $("lineup").textContent = kinds.length === 1 ? kinds[0] : `${kinds.length} kinds of agent`;
+  $("lineup").title = roles.map(r => `${r}: ${S.meta.agents[r]}`).join("\n");
+  $("scoreCards").innerHTML = roles.map(r => {
+    const v = f.scores[r] ?? 0;
+    return `<div class="drow ${roleOn(r) ? "" : "off"}" data-role="${r}" style="--c:${roleColor(r)}" title="${esc(r)} (${esc(S.meta.agents[r])}): click to show only this department in the right panel">
+      <span class="n">${r}</span><span class="t"><i style="width:${Math.max(0, Math.min(100, v)).toFixed(1)}%"></i></span>
+      <span class="sc">${v.toFixed(1)}</span><span class="dd">${trend(v, p.scores[r] ?? 0)}</span></div>`;
   }).join("");
+  $("scoreCards").querySelectorAll(".drow").forEach(el => el.onclick = () => {
+    const r = el.dataset.role;
+    S.roleFilter = S.roleFilter.size === 1 && S.roleFilter.has(r) ? new Set() : new Set([r]);
+    renderDepts(S.frames[S.idx]); renderTab(); updateBeams();
+  });
 }
 function renderKpis(f) {
   const m = f.metrics;
   const k = [["Population", m.population.toLocaleString()], ["Happiness", pct(m.happiness)],
-    ["Jobs C / I / O", `${m.jobs_com} <small>/ ${m.jobs_ind}${m.jobs_off != null ? " / " + m.jobs_off : ""}</small>`], ["Unemployment", pct(m.unemployment)],
-    ["Pollution @ homes", pct(m.pollution_res)], ["Land value", pct(m.land_value_dev)],
-    ["Developed / zoned", `${m.developed_total} <small>/ ${m.zoned_total}</small>`], ["Roads · parks", `${m.road_tiles} <small>· ${m.parks}</small>`]];
+    ["Jobs in shops / industry / offices", `${m.jobs_com.toLocaleString()} <small>/ ${m.jobs_ind.toLocaleString()}${m.jobs_off != null ? " / " + m.jobs_off.toLocaleString() : ""}</small>`], ["Unemployment", pct(m.unemployment)],
+    ["Pollution at homes", pct(m.pollution_res)], ["Land value", pct(m.land_value_dev)],
+    ["Developed / zoned lots", `${m.developed_total} <small>/ ${m.zoned_total}</small>`], ["Road tiles · parks", `${m.road_tiles} <small>· ${m.parks}</small>`]];
   if (m.approval != null) k.splice(2, 0, ["Mayor approval", `<span style="color:${m.approval < 0.3 ? "var(--bad)" : m.approval < 0.45 ? "var(--warn)" : "inherit"}">${pct(m.approval)}</span>`],
-    ["Noise @ homes", pct(m.noise_res)]);
-  if (m.soil_res != null) k.push(["Soil pollution @ homes", pct(m.soil_res)], ["Historic · mixed use", `${m.historic_tiles} <small>· ${m.mixed_use}</small>`]);
+    ["Noise at homes", pct(m.noise_res)]);
+  if (m.soil_res != null) k.push(["Soil pollution at homes", pct(m.soil_res)], ["Historic · mixed use", `${m.historic_tiles} <small>· ${m.mixed_use}</small>`]);
   if (m.metro_lines) k.push(["Metro", `${m.metro_lines} lines <small>· ${Math.round(m.metro_riders)} riders</small>`]);
   if (m.exports != null) k.push(["Exports · imports", `${Math.round(m.exports)} <small>· ${Math.round(m.imports)} / ${Math.round(m.freight_capacity)}</small>`],
-    ["Businesses losing", `${m.businesses_losing} <small>· ${m.business_closures} closed</small>`]);
-  if (m.milestones) k.push(["Milestones", m.milestones.length ? esc(m.milestones[m.milestones.length - 1]) + ` <small>(${m.milestones.length})</small>` : "—"],
-    ["Tourists / month", Math.round(m.tourists || 0).toLocaleString()]);
-  if (m.wealth) k.push(["Homes by wealth", `${m.wealth.low} <small>/ ${m.wealth.middle} / ${m.wealth.high}</small>`],
+    ["Businesses losing money", `${m.businesses_losing} <small>· ${m.business_closures} closed</small>`]);
+  if (m.milestones) k.push(["Latest milestone", m.milestones.length ? esc(m.milestones[m.milestones.length - 1]) + ` <small>(${m.milestones.length})</small>` : "none yet"],
+    ["Tourists a month", Math.round(m.tourists || 0).toLocaleString()]);
+  if (m.wealth) k.push(["Homes by wealth, low / mid / high", `${m.wealth.low} <small>/ ${m.wealth.middle} / ${m.wealth.high}</small>`],
     ["Level 4-5 buildings", `${m.levels_4_5}`]);
   if (m.commute_minutes != null) k.push(["Commute", `${Math.round(m.commute_minutes)} <small>min</small>`],
-    ["Jammed roads · bus", `${pct(m.congestion_index)} <small>· ${pct(m.transit_share)} ride</small>`]);
-  if (m.crime_res != null) k.push(["Crime @ homes", pct(m.crime_res)], ["Health", pct(m.health)],
-    ["Adults high school+", pct(m.education_index)], ["Fires · lost", `${m.fires} <small>· ${m.fire_tiles_lost}</small>`]);
-  $("kpis").innerHTML = k.map(([a, b]) => `<div class="kpi"><div class="k">${a}</div><div class="v">${b}</div></div>`).join("");
+    ["Jammed roads · by bus", `${pct(m.congestion_index)} <small>· ${pct(m.transit_share)}</small>`]);
+  if (m.crime_res != null) k.push(["Crime at homes", pct(m.crime_res)], ["Health", pct(m.health)],
+    ["Adults with high school+", pct(m.education_index)], ["Fires · tiles lost", `${m.fires} <small>· ${m.fire_tiles_lost}</small>`]);
+  $("kpis").innerHTML = k.map(([a, b]) => `<div class="srow"><span>${a}</span><b>${b}</b></div>`).join("");
+  $("statSum").textContent = `${k.length} figures`;
 }
+const DEMAND = { R: ["Homes", "#5fd38d"], C: ["Shops", "#4aa3ff"], I: ["Industry", "#ffc857"], O: ["Offices", "#a99cf0"] };
 function renderDemand(f) {
-  const d = f.metrics.demand, C = { R: "#5fd38d", C: "#4aa3ff", I: "#ffc857", O: "#a99cf0" }, N = { R: "Residential", C: "Commercial", I: "Industrial", O: "Offices" };
-  $("demand").innerHTML = "RCIO".split("").filter(k => d[k] != null).map(k => {
-    const v = d[k], h = Math.abs(v) * 50;
-    const style = v >= 0 ? `bottom:50%;height:${h}%;background:${C[k]}` : `top:50%;height:${h}%;background:${C[k]};opacity:.45`;
-    return `<div class="dbar" title="${N[k]} demand ${v.toFixed(2)}"><div class="col"><div class="fill" style="${style}"></div></div>
-      <div class="lab"><b style="color:${C[k]}">${k}</b> ${v >= 0 ? "+" : ""}${v.toFixed(2)}</div></div>`;
+  const d = f.metrics.demand, keys = "RCIO".split("").filter(k => d[k] != null);
+  $("demand").innerHTML = keys.map(k => {
+    const v = d[k], wdt = Math.min(50, Math.abs(v) * 100), [name, c] = DEMAND[k];
+    const bar = v >= 0 ? `left:50%;width:${wdt}%;background:${c}` : `right:50%;width:${wdt}%;background:${c};opacity:.45`;
+    return `<div class="drg" title="${name} demand ${v.toFixed(2)}"><span>${name}</span><span class="axis"><i style="${bar}"></i></span><span class="vv">${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}</span></div>`;
   }).join("");
+  const want = keys.filter(k => d[k] > 0.05).sort((a, b) => d[b] - d[a]).map(k => DEMAND[k][0].toLowerCase());
+  $("demandSum").textContent = want.length ? `wants ${want.join(", ")}` : "nothing wanted";
 }
 function meter(label, supply, demand, color) {
-  const max = Math.max(supply, demand, 1) * 1.1, cov = demand ? Math.min(1, supply / demand) : 1;
+  const max = Math.max(supply, demand, 1) * 1.1;
   const warn = supply < demand ? `<span style="color:var(--bad)">short ${Math.round(demand - supply)}</span>` : `<span class="muted">${Math.round((supply / Math.max(demand, 1e-9) - 1) * 100)}% spare</span>`;
   return `<div class="meter"><div class="top"><span>${label} <b>${Math.round(supply)}</b> <span class="muted">/ ${Math.round(demand)} used</span></span>${demand ? warn : ""}</div>
     <div class="bar"><i style="width:${supply / max * 100}%;background:${color};opacity:.35"></i><i style="width:${Math.min(supply, demand) / max * 100}%;background:${color}"></i>
     ${demand > supply ? `<b style="left:${demand / max * 100}%"></b>` : ""}</div></div>`;
 }
+const covered = (label, v) => `<span style="color:${v < 0.9 ? "var(--bad)" : "inherit"}">${label} ${pct(v)}</span>`;
 function renderUtil(f) {
   const m = f.metrics;
-  $("utilBars").innerHTML = meter("⚡ Power", m.power_supply, m.power_demand, "#ffc857") + meter("💧 Water", m.water_supply, m.water_demand, "#4aa3ff") +
-    (m.sewage_supply != null ? meter("🚽 Sewage", m.sewage_supply, m.sewage_demand, "#a1887f") : "") +
-    `<div class="small muted">coverage: power ${pct(m.power_coverage)} · water ${pct(m.water_coverage)}${m.sewage_coverage !== undefined ? ` · sewage ${pct(m.sewage_coverage)}` : ""} · clean power ${m.power_supply ? Math.round(100 * (m.power_clean_capacity || 0) / m.power_supply) : 0}%` +
-    (m.river_pollution != null ? ` · river ${pct(m.river_pollution)} polluted (max ${pct(m.river_pollution_max)})` : "") + `</div>`;
+  $("utilBars").innerHTML = meter("Power", m.power_supply, m.power_demand, "#ffc857") + meter("Water", m.water_supply, m.water_demand, "#4aa3ff") +
+    (m.sewage_supply != null ? meter("Sewage", m.sewage_supply, m.sewage_demand, "#a1887f") : "") +
+    `<div class="small muted">Homes covered: power ${pct(m.power_coverage)}, water ${pct(m.water_coverage)}${m.sewage_coverage !== undefined ? `, sewage ${pct(m.sewage_coverage)}` : ""}. Clean power ${m.power_supply ? Math.round(100 * (m.power_clean_capacity || 0) / m.power_supply) : 0}%` +
+    (m.river_pollution != null ? `. River ${pct(m.river_pollution)} polluted (worst ${pct(m.river_pollution_max)})` : "") + `.</div>`;
+  $("utilSum").innerHTML = [covered("power", m.power_coverage), covered("water", m.water_coverage), m.sewage_coverage != null ? covered("sewage", m.sewage_coverage) : ""].filter(Boolean).join(" · ");
 }
 function renderServices(f) {
   const m = f.metrics, el = $("services");
-  if (m.police_coverage == null) { el.closest("section").hidden = true; return; }
-  el.closest("section").hidden = false;
+  if (m.police_coverage == null) { el.closest("details").hidden = true; return; }
+  el.closest("details").hidden = false;
   const bar = (label, v, color, note = "") => `<div class="meter"><div class="top"><span>${label}</span><span>${pct(v)}${note ? ` <span class="muted">${note}</span>` : ""}</span></div>
     <div class="bar"><i style="width:${Math.round(100 * (v || 0))}%;background:${color}"></i></div></div>`;
   const e = m.enrollment || {}, sb = m.service_buildings || {};
-  el.innerHTML = bar("🚓 Police cover", m.police_coverage, ROLE_C.police, `${sb.police_station || 0} stations`) +
-    bar("🚒 Fire cover", m.fire_coverage, ROLE_C.fire, `${sb.fire_station || 0} stations`) +
-    bar("🏥 Clinic cover", m.health_coverage, ROLE_C.health, `${(sb.clinic || 0) + (sb.hospital || 0)} buildings`) +
-    bar("🗑 Garbage collection", m.garbage_coverage, "#b0916b", m.landfill_fill_pct != null ? `landfills ${Math.round(m.landfill_fill_pct)}% full` : "") +
-    bar("🏫 School enrolment", e.elementary, ROLE_C.education, `high ${pct(e.high)}`);
+  el.innerHTML = bar("Police cover", m.police_coverage, ROLE_C.police, `${sb.police_station || 0} stations`) +
+    bar("Fire cover", m.fire_coverage, ROLE_C.fire, `${sb.fire_station || 0} stations`) +
+    bar("Clinic cover", m.health_coverage, ROLE_C.health, `${(sb.clinic || 0) + (sb.hospital || 0)} buildings`) +
+    bar("Garbage collected", m.garbage_coverage, "#b0916b", m.landfill_fill_pct != null ? `landfills ${Math.round(m.landfill_fill_pct)}% full` : "") +
+    bar("School enrolment", e.elementary, ROLE_C.education, `high school ${pct(e.high)}`);
+  $("servSum").innerHTML = [covered("police", m.police_coverage), covered("fire", m.fire_coverage), covered("clinics", m.health_coverage)].join(" · ");
 }
 function renderMoney(f) {
-  const m = f.metrics, net = m.income - m.expenses;
-  const rows = [["Treasury", fmt$(m.treasury)], ...Object.entries(m.dept_funds).map(([d, v]) => [`<span style="color:${roleColor(d)}">${d}</span> budget`, fmt$(v)]),
-    ["Income / month", fmt$(m.income)], ["Expenses / month", fmt$(m.expenses)],
-    ["Net / month", `<span style="color:${net >= 0 ? "var(--ok)" : "var(--bad)"}">${net >= 0 ? "+" : ""}${fmt$(net)}</span>`],
-    ["Debt", fmt$(m.debt)], ["Taxes R / C / I", `${Math.round(m.taxes.R * 100)} / ${Math.round(m.taxes.C * 100)} / ${Math.round(m.taxes.I * 100)} %`]];
+  const m = f.metrics, net = m.income - m.expenses, sign = (v) => `<span class="${v >= 0 ? "up" : "down"}">${v >= 0 ? "+" : ""}${fmt$(v)}</span>`;
+  const rows = [["Treasury", fmt$(m.treasury)], ["Net a month", sign(net)], ["Income a month", fmt$(m.income)], ["Expenses a month", fmt$(m.expenses)],
+    ["Debt", m.debt ? fmt$(m.debt) : "none"], ["Taxes: homes / shops / industry", `${Math.round(m.taxes.R * 100)}% / ${Math.round(m.taxes.C * 100)}% / ${Math.round(m.taxes.I * 100)}%`]];
+  const extra = [];
   if (m.funding) {
     const off = Object.entries(m.funding).filter(([, v]) => Math.abs(v - 1) > 1e-6);
-    rows.push(["Funding", off.length ? off.map(([d, v]) => `${d} ${Math.round(100 * v)}%`).join(", ") : "all 100%"]);
+    extra.push(["Service funding", off.length ? off.map(([d, v]) => `${d} ${Math.round(100 * v)}%`).join(", ") : "all at 100%"]);
   }
-  if (m.policies) rows.push(["Policies", m.policies.length ? `${m.policies.map(esc).join(", ")} <span class="muted">(${fmt$(m.policy_cost || 0)}/mo)</span>` : "none"]);
+  if (m.policies) extra.push(["Policies", m.policies.length ? `${m.policies.map(esc).join(", ")} <span class="muted">(${fmt$(m.policy_cost || 0)} a month)</span>` : "none"]);
   $("money").innerHTML = rows.map(([a, b]) => `<div class="moneyrow"><span class="muted">${a}</span><b>${b}</b></div>`).join("") +
-    (m.months_negative ? `<div class="small" style="color:var(--bad);margin-top:6px">⚠ treasury negative for ${m.months_negative} month(s)</div>` : "");
+    `<div class="budgets" title="What each department holds to spend">${Object.entries(m.dept_funds).map(([d, v]) => `<span style="--c:${roleColor(d)}"><em>${d}</em><b>${fmt$(v)}</b></span>`).join("")}</div>` +
+    extra.map(([a, b], i) => `<div class="moneyrow wrap ${i ? "" : "mfirst"}"><span class="muted">${a}</span><b>${b}</b></div>`).join("") +
+    (m.months_negative ? `<div class="small" style="color:var(--bad);margin-top:6px">Treasury negative for ${m.months_negative} month(s)</div>` : "");
+  $("moneySum").innerHTML = `${fmt$(m.treasury)} · ${sign(net)} a month`;
 }
+// folded sections remember whether they are open
+document.querySelectorAll("#left details.fold").forEach(d => {
+  d.open = store.get("fold." + d.dataset.fold, false);
+  d.addEventListener("toggle", () => store.set("fold." + d.dataset.fold, d.open));
+});
 
 // ================================================================ tabs
 function actRect(a) {
