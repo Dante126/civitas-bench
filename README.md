@@ -809,7 +809,10 @@ tasks and money, and to let people coach it.
   fired, and the money paid for another police, fire and health building. Replayed on a
   state rebuilt from that briefing (its treasury, reserve and needs lines), the police and
   fire top-ups are refused for the reserve, and the second and third loans for the
-  treasury and because only other buildings wait.
+  treasury and because only other buildings wait. The treasury case stays silent while
+  the first buildings, supply and planning road waiting cost more than the treasury and
+  idle money above $3,000 cover: in smoke v22 seed 1, month 9, a $4,500 loan with $3,607
+  in the treasury and a $5,000 first high school waiting was refused and overridden.
 
   **Earned confirm.** For the mayor's `allocate_budget` and `take_loan` the guard always
   runs, and `confirm: true` overrides a refusal only on a repeat of the exact call
@@ -818,7 +821,10 @@ tasks and money, and to let people coach it.
   report counts it. A call that sent `confirm: true` without earning it is refused with
   `(confirm: true counts only when repeating this exact call after it was refused)`. In
   v19 all 3 take-back refusals were overridden at once, and 3 of 7 duplicate refusals.
-  The guards stay soft, since every override is still possible. The harness never picks
+  One exception: after a loan this turn, a reserve refusal can't be overridden (a loan pays
+  only for first buildings, supply and planning's road). In smoke v22 seed 1, month 9, the
+  mayor borrowed $4,500 for a first high school, then confirmed another landfill that left
+  $1,107 of a $3,000 reserve. The other guards stay soft. The harness never picks
   an amount or enforces the reserve: the reserve and extra-building refusals cost one
   repeat of the call.
 

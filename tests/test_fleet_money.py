@@ -534,20 +534,25 @@ def test_identical_take_backs_are_duplicates():
     assert take(-1720)["refused"] == "take_back"       # below what it keeps: that guard first
 
 
-def test_a_self_inflicted_loan_is_refused_until_confirmed():
+def test_a_self_inflicted_loan_is_refused_until_confirmed(monkeypatch):
     """Smoke v13-v19: 10 of 15 loans ($34.8k of $60.0k) came in turns that started at $3,000 or more, and 14 of 15
-    after the mayor's own top-ups had emptied the treasury; none was repaid."""
+    after the mayor's own top-ups had emptied the treasury; none was repaid. (The fresh map's first buildings cost
+    more than the $598 above $3,000, which lets a loan pass since v22: the first part is checked with nothing ready.)"""
     env = _env()
     w = env.world
     box = _mayor(env, treasury=3598)
     loan = lambda amount, **kw: box.call("take_loan", {"amount": amount, **kw})
     over = ("the treasury holds $3,598, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
-            "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover." + BORROW)
-    assert loan(5000) == {"ok": False, "refused": "loan", "error": over}
-    assert w.debt == 0 and box.executed == [] and box._failed == {}
-    res = loan("5000", confirm=True)                   # the earned repeat
-    assert res["ok"] and res["override"] == "loan" and (w.debt, w.treasury) == (5000, 8598), res
-    assert res["message"].startswith("borrowed $5,000 at 0.5%/month (debt $5,000)")
+            "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover. Also, no "
+            "first building, supply or planning road is waiting (nothing is ready to fund): the loan would sit in the "
+            "treasury." + BORROW)
+    with monkeypatch.context() as m:
+        _builds(m, {})
+        assert loan(5000) == {"ok": False, "refused": "loan", "error": over}
+        assert w.debt == 0 and box.executed == [] and box._failed == {}
+        res = loan("5000", confirm=True)                   # the earned repeat
+        assert res["ok"] and res["override"] == "loan" and (w.debt, w.treasury) == (5000, 8598), res
+        assert res["message"].startswith("borrowed $5,000 at 0.5%/month (debt $5,000)")
     # started at $3,000 or more, and this turn's own top-ups took it under
     w.debt = 0
     box = _mayor(env, treasury=5698)
@@ -616,7 +621,7 @@ def test_money_results_carry_the_money_note(monkeypatch):
     assert [r["message"] for r in box.executed][:4] == core
     assert [e["message"] for e in FleetState.of(env).log if e["kind"] == "action"][:4] == core
     monkeypatch.setattr(T.ToolBox, "_money_note", lambda self, *a: 1 / 0)          # advice never fails an action
-    res = _topup(box, "fire", 100)
+    res = _topup(_mayor(env, treasury=w.treasury), "fire", 100)     # a new turn: no loan, so the confirm counts
     assert res["ok"] and res["message"] == "transferred $100 to fire (now $100)" and w.dept_funds["fire"] == 100
 
 
@@ -1486,7 +1491,9 @@ def test_the_report_counts_the_new_refusals():
 
 
 def test_the_scripted_mayor_confirms_the_new_refusals(monkeypatch):
-    """The scripted fleet's mayor repeats a refusal its policy means with confirm: true, the new kinds included."""
+    """The scripted fleet's mayor repeats a refusal its policy means with confirm: true, the new kinds included; after
+    a loan this turn a reserve refusal stays (the scripted mayor borrows only at a turn's start under $3,000 and tops
+    up only above its own reserve, never on seeds 0-4)."""
     from civitas.core.decision import Decision
     from civitas.fleet.scripted import ScriptedFleetAgent
     env = _env()
@@ -1503,8 +1510,8 @@ def test_the_scripted_mayor_confirms_the_new_refusals(monkeypatch):
     tr = [(c["tool"], c["result"].get("refused"), c["result"].get("override")) for c in d.meta["tool_trace"]
           if c["tool"] in ("take_loan", "allocate_budget")]
     assert tr == [("take_loan", "loan", None), ("take_loan", None, "loan"), ("allocate_budget", "reserve", None),
-                  ("allocate_budget", None, "reserve")]
-    assert w.debt == 10000 and w.dept_funds["police"] == 11000 and [r["ok"] for r in d.executed] == [True, True]
+                  ("allocate_budget", "reserve", None)]
+    assert w.debt == 10000 and w.dept_funds["police"] == 0 and [r["ok"] for r in d.executed] == [True]
 
 
 # --- v20 fixes: integration (briefing.py: _short_line's wording with one unpaid building)
@@ -1643,8 +1650,12 @@ def test_a_loan_is_refused_only_beyond_what_first_buildings_growth_and_the_reser
     # nothing but first/supply waits: the rest would sit in the treasury; stacked after the first part as one text
     _builds(monkeypatch, {"utilities": tower})
     w.debt = 0
+    # $900 waiting, more than the $100 above $3,000: only the part over the need is refused
     assert _mayor(env, treasury=3100).call("take_loan", {"amount": 5000})["error"] == (
-        "the treasury holds $3,100, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
+        "only $900 of this $5,000 loan is needed ($900 for first/supply and growth): the other $4,100 would sit in "
+        "the treasury at $20/month interest until repaid (debt would be $5,000 of $50k): borrow $900 or less." + BORROW)
+    assert _mayor(env, treasury=4100).call("take_loan", {"amount": 5000})["error"] == (   # the treasury covers it
+        "the treasury holds $4,100, over the $3,000 minimum: a $5,000 loan costs $25/month until repaid (debt would "
         "be $5,000 of $50k); borrow only for a first building or supply need the treasury can't cover. Also, only $900 "
         "of this $5,000 loan is needed ($900 for first/supply and growth): the other $4,100 would sit in the "
         "treasury." + BORROW)
@@ -1687,3 +1698,52 @@ def test_a_loan_that_pays_the_bills_before_the_next_turn_runs(monkeypatch):
         "interest until repaid (debt would be $9,000 of $50k): borrow $7,500 or less." + BORROW)
     w.history[-1].update(income=900, expenses=100)                     # a surplus: no bills
     assert T.bills_ahead(w, 3) == 0
+
+
+# --- v22 fixes: the loan guard's treasury part and the reserve guard after a loan (tools.py: ToolBox._own_loan_refusal,
+# _reserve_refusal, _act)
+HIGH_SCHOOL = FB(5000, (N("high school", 3, 0, first=True, upkeep=75),), 5000, ())
+CLINIC_2B = FB(2000, (N("landfill", 3, 1, "garbage 70% full", upkeep=30),), 2000, ())
+
+
+def test_a_loan_for_a_first_building_the_treasury_can_t_cover_runs(monkeypatch):
+    """Smoke v22 seed 1, month 9: treasury $3,607 and education's $5,000 first high school waiting; take_loan 4500 was
+    refused as "the treasury holds $3,607, over the $3,000 minimum ... borrow only for a first building or supply need
+    the treasury can't cover", the very case, and the mayor overrode it. Over $3,000 the treasury part stays silent
+    while the first/supply and growth waiting come to more than what they may use (Funding.dip)."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"education": HIGH_SCHOOL, "police": STATION})
+    res = _mayor(env, treasury=3607).call("take_loan", {"amount": 4500})
+    assert res["ok"] and "override" not in res and w.debt == 4500, res
+    # what the treasury covers: still refused (the $4,000 above $3,000 pays the $2,500 school)
+    _builds(monkeypatch, {"education": SCHOOL, "police": STATION})
+    w.debt = 0
+    assert _mayor(env, treasury=7000).call("take_loan", {"amount": 2000})["error"].startswith(
+        "the treasury holds $7,000, over the $3,000 minimum")
+
+
+def test_after_a_loan_a_top_up_under_the_reserve_can_t_be_confirmed(monkeypatch):
+    """Smoke v22 seed 1, month 9: after borrowing $4,500 for a first high school the mayor funded another landfill with
+    confirm: true, leaving $1,107 of a $3,000 reserve. After a loan this turn the reserve refusal says so and no
+    confirm overrides it; without a loan the earned confirm still works."""
+    env = _env()
+    w = env.world
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"education": HIGH_SCHOOL, "health": CLINIC_2B})
+    box = _mayor(env, treasury=3607)
+    assert box.call("take_loan", {"amount": 4500})["ok"] and box.borrowed == 4500
+    assert box.call("allocate_budget", {"department": "education", "amount": 5000})["ok"] and round(w.treasury) == 3107
+    health = {"department": "health", "amount": 2000}
+    why = ("this top-up for another landfill leaves the treasury at $1,107, $1,893 under the $3,000 reserve; the "
+           "reserve keeps the city solvent and pays for first buildings, supply and planning's road when they come "
+           "(none waits now). You borrowed $4,500 this turn, and a loan pays only for first buildings, supply and "
+           "planning's road: fund this from money above the reserve next turn (confirm: true doesn't count after a "
+           "loan).")
+    assert box.call("allocate_budget", health) == {"ok": False, "refused": "reserve", "error": why}
+    assert box.call("allocate_budget", {**health, "confirm": True}) == {"ok": False, "refused": "reserve", "error": why}
+    assert w.dept_funds["health"] == 0
+    box = _mayor(env, treasury=3107)                                   # a new turn, no loan: earned confirm
+    assert box.call("allocate_budget", health)["refused"] == "reserve"
+    assert box.call("allocate_budget", {**health, "confirm": True})["override"] == "reserve"

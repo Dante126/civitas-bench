@@ -2597,6 +2597,7 @@ class ToolBox:
                                                           # until confirm: true overrides it once
         self.start_treasury = self.world.treasury         # at the turn's start: the loan guard (_loan_refusal)
         self.repaid = 0.0                                 # debt the mayor repaid this turn: the loan guard too
+        self.borrowed = 0.0                               # debt the mayor took on this turn: the reserve guard
         self.tools: dict[str, Tool] = {}
         lookups = self._lookup_tools()
         self.lookups = {t.name for t in lookups}
@@ -2789,9 +2790,10 @@ class ToolBox:
                              else ("loan", self._loan_refusal(args)))
             if refusal:
                 key = _money_key(name, args)
-                if not (confirm and key in self._refused):
+                hard = kind == "reserve" and self.borrowed > 0    # a loan this turn: no override (_reserve_refusal)
+                if hard or not (confirm and key in self._refused):
                     self._refused.add(key)
-                    if confirm:                           # "... with confirm: true (confirm: true counts only ...)."
+                    if confirm and not hard:              # "... with confirm: true (confirm: true counts only ...)."
                         refusal = (refusal[:-1] + EARNED_NOTE + "." if refusal.endswith(".")
                                    else refusal + EARNED_NOTE)
                     return {"ok": False, "refused": kind, "error": refusal}
@@ -2810,6 +2812,8 @@ class ToolBox:
             self.took.append(Took(self.n_calls, name, dict(args), self._taken(name, args, before)))
             if name == "repay_loan":
                 self.repaid += debt - w.debt
+            elif name == "take_loan":
+                self.borrowed += w.debt - debt
         self.executed.append(res)
         self.fleet.record(w.month, self.role, "action", action=res["action"], ok=res["ok"], message=res["message"],
                           cost=res["cost"])
@@ -2922,8 +2926,10 @@ class ToolBox:
         does, though fire's needs line names a cheaper station and no levee site may be listed: fleet_scripted acting
         monthly met the guard only there, seeds 3 and 4, months 43, 65 and 66), a top-up that leaves the treasury at
         or above the reserve, a department not in the game, and one the action refuses (more than the treasury holds:
-        its money note names the idle money). The scripted mayor tops up only from the treasury above its own
-        reserve, bar that flood rule."""
+        its money note names the idle money). After a loan this turn (`borrowed`) the refusal says so and no confirm
+        overrides it (_act): smoke v22 seed 1, month 9, the mayor borrowed $4,500 for a first high school, then
+        confirmed another landfill down to $1,107 of a $3,000 reserve. The scripted mayor tops up only from the
+        treasury above its own reserve, bar that flood rule."""
         w = self.world
         if dept not in DEPARTMENTS or dept not in self.env.roles or amount > w.treasury:
             return None
@@ -2947,7 +2953,10 @@ class ToolBox:
         return (f"this top-up {buys} leaves the treasury at {money(after)}, {money(keep - after)} under the "
                 f"{money(keep)} reserve{reserve_why(w)}; {wait}"
                 + (f"; take back idle money first ({idle})" if idle else "")
-                + ". To fund it anyway, repeat this exact call with confirm: true.")
+                + (f". You borrowed {money(self.borrowed)} this turn, and a loan pays only for first buildings, supply "
+                   "and planning's road: fund this from money above the reserve next turn (confirm: true doesn't "
+                   "count after a loan)." if self.borrowed > 0 else
+                   ". To fund it anyway, repeat this exact call with confirm: true."))
 
     def _take_back_refusal(self, dept: str, amount: float) -> str | None:
         """Why a take-back (allocate_budget with a negative `amount`; guarded()) must not run: it leaves `dept` below
@@ -3003,12 +3012,12 @@ class ToolBox:
             return None
         interest = money(amount * C.LOAN_INTEREST)
         anyway = " To borrow anyway, repeat this exact call with confirm: true."
-        own = self._own_loan_refusal(amount, interest)
         f = self._funding() if w.treasury >= 0 else None
+        flood = flood_ahead(w)
+        firsts = [i for i in f.to_fund if i.kind in NEED_KINDS[:2] or (flood and i.dept == "fire")] if f else []
+        own = self._own_loan_refusal(amount, interest, short=sum(i.amount for i in firsts) > f.dip if f else False)
         if f is None:
             return own + anyway if own else None
-        flood = flood_ahead(w)
-        firsts = [i for i in f.to_fund if i.kind in NEED_KINDS[:2] or (flood and i.dept == "fire")]
         extras = [f"{i.dept} {money(i.amount)}" for i in f.to_fund if i not in firsts]
         buys = "pay for another building" if extras else "sit in the treasury"
         debt = f"(debt would be {money(w.debt + amount)} of {money(C.MAX_DEBT)})"
@@ -3035,9 +3044,12 @@ class ToolBox:
         return (f"{none}; this {money(amount)} loan would {buys} at {interest}/month interest until repaid {debt}"
                 + (": fund another building only from the money above the reserve" if extras else "") + "." + anyway)
 
-    def _own_loan_refusal(self, amount: float, interest: str) -> str | None:
+    def _own_loan_refusal(self, amount: float, interest: str, short: bool = False) -> str | None:
         """_loan_refusal's first part, a sentence without the confirm advice: (a) the treasury holds RESERVE_MIN or
-        more, or (b) the turn started with that much and this turn's own moves took it under: top-ups (net of
+        more, unless `short` (the first/supply and growth top-ups waiting come to more than Funding.dip, what they may
+        use: smoke v22 seed 1, month 9, $3,607 and a $5,000 first high school waiting, the loan the refusal itself
+        allows was refused and overridden), or (b) the turn started with that much and this turn's own moves took it
+        under: top-ups (net of
         take-backs) that aren't for a first building or supply (DeptMoney.buys), named with their amounts to take
         back instead, or a repayment (`repaid`), which the loan would only borrow back. Smoke v13-v19: 10 of 15 loans
         ($34.8k of $60.0k) came in turns that started at $3,000 or more, 14 of 15 after the mayor's own top-ups had
@@ -3046,7 +3058,7 @@ class ToolBox:
         playbook allows), and blamed a $100 top-up for what a $3,000 repayment drained. None otherwise."""
         w = self.world
         if w.treasury >= RESERVE_MIN:
-            return (f"the treasury holds {money(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
+            return None if short else (f"the treasury holds {money(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
                     f"{money(amount)} loan costs {interest}/month until repaid (debt would be "
                     f"{money(w.debt + amount)} of {money(C.MAX_DEBT)}); borrow only for a first building or supply "
                     "need the treasury can't cover.")
