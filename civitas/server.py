@@ -8,6 +8,7 @@ Endpoints
                                      fleet turn's tool-call summary under "trace")
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
   GET  /api/runs/<id>/problems   every failed / refused call and bad turn end, how the agent handled it, per-role rates
+  GET  /api/runs/<id>/collab?city=C   requests between agents, the money and builds that answered them (bench/collab.py)
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -163,6 +164,7 @@ def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
 
 
 _PROBLEMS: dict[str, tuple] = {}   # trajectories path -> ((path, size), run_problems result): recomputed as a live run grows
+_COLLAB: dict[tuple, tuple] = {}    # (frames path, city) -> ((path, size, city), run_collab result): likewise
 
 
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
@@ -410,6 +412,14 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                             _PROBLEMS[str(traj)] = (key, run_problems(traj, d / "fleet_report.json") if traj.exists()
                                                     else {"problems": [], "roles": {}, "total": {}, "hints": []})
                         return self._json(_PROBLEMS[str(traj)][1])
+                    if parts[3] == "collab":        # who asked whom for what, and what came of it (Team tab)
+                        from .bench.collab import run_collab
+                        city = (q.get("city") or [None])[0]
+                        fr = d / "frames.jsonl"
+                        key = (str(fr), fr.stat().st_size if fr.exists() else 0, city)
+                        if _COLLAB.get((str(fr), city), (None,))[0] != key:
+                            _COLLAB[(str(fr), city)] = (key, run_collab(d, city))
+                        return self._json(_COLLAB[(str(fr), city)][1])
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []

@@ -3,6 +3,7 @@
 import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } from "./scene.js";
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
+import { CollabGraph } from "./collab.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -113,6 +114,7 @@ function switchCity(c) {
   if (c === S.city) return;
   S.city = c; S.meta = cityMeta(S.metaRaw, c); scene.setMeta(S.meta);
   S.frames = S.raw.map(f => cityFrame(f, c)); S.traces = {};
+  S.collab = null; S.teamPick = null; loadCollab(true);
   renderCitySwitch();
   $("agentsLine").innerHTML = `<b>${c}</b> · ` + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
   render(null, false);
@@ -121,6 +123,7 @@ function switchCity(c) {
 async function openRun(id, { month = null } = {}) {
   stop(); clearInterval(S.poll);
   S.runId = id; S.frames = []; S.raw = []; S.idx = 0; S.selected = -1; $("inspector").hidden = true;
+  S.collab = null; S.teamPick = null; collabAt = 0;
   try { S.metaRaw = await api(`/api/runs/${encodeURIComponent(id)}/meta`); } catch (e) { toast("Could not open run: " + esc(e.message), true); return; }
   S.city = S.metaRaw.region ? S.metaRaw.cities[0] : null;
   S.meta = cityMeta(S.metaRaw, S.city);
@@ -156,6 +159,7 @@ async function fetchFrames(first) {
   $("statusPill").className = "pill " + d.status; $("statusPill").textContent = d.status;
   $("slider").max = Math.max(0, S.frames.length - 1);
   if (d.frames.length) loadProblems();          // the timeline's problem marks; refetched as a live run grows
+  if (d.frames.length) loadCollab();
   if (d.status !== "running") clearInterval(S.poll);
   if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); }
   if (!first && d.frames.length) {
@@ -186,6 +190,7 @@ function go(i, animate = false) {
 function render(prev, animate) {
   if (!S.frames.length) return;
   const f = S.frames[S.idx];
+  S.anim = !!animate;
   if (scene.setRegion) scene.setRegion(S.metaRaw && S.metaRaw.region ? { meta: S.metaRaw, frame: S.raw[S.idx], city: S.city } : null);
   scene.setFrame(f, prev, { animate });
   $("slider").value = S.idx;
@@ -193,7 +198,7 @@ function render(prev, animate) {
   $("monthLabel").textContent = `Year ${Math.floor(f.month / 12) + 1} · M${(f.month % 12) + 1}` + (f.season ? ` · ${f.season}` : "") + (arrow ? ` ${arrow}` : "");
   $("monthSub").textContent = `month ${f.month} / ${S.meta.months}`;
   renderScores(f); renderKpis(f); renderDemand(f); renderUtil(f); renderServices(f); renderMoney(f);
-  renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap();
+  renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap(); updateTeamView();
   if (S.selected >= 0) renderInspector(S.selected);
 }
 
@@ -375,7 +380,11 @@ function renderTab() {
   const body = $("tabBody");
   if (!S.frames.length && S.tab !== "runs") { $("tabTools").innerHTML = ""; body.innerHTML = `<div class="emptytab">Open or launch a run.</div>`; return; }
   const f = S.frames[S.idx];
-  if (S.tab === "agents") {
+  if (S.tab !== "team" && teamGraph) { teamGraph.destroy(); teamGraph = null; }
+  if (S.tab === "team") {
+    roleChips();
+    renderTeam();
+  } else if (S.tab === "agents") {
     roleChips();
     // agents act every few months: between their turns, keep showing the latest quarter instead of an empty tab
     const j = turnFrame(S.idx);
@@ -444,6 +453,109 @@ function renderTab() {
     $("rNew").onclick = openLaunch;
     renderRunsTab();
   }
+}
+
+// ---------------------------------------------------------------- team (collab.js)
+// the departments as a live network: requests, money and builds of each turn play out as the replay moves
+let teamGraph = null, teamBig = null, collabAt = 0;
+async function loadCollab(force = false) {
+  const id = S.runId;
+  if (!id || (!force && S.status === "running" && Date.now() - collabAt < 6000 && S.collab)) return;
+  collabAt = Date.now();
+  let d;
+  try { d = await api(`/api/runs/${encodeURIComponent(id)}/collab${S.city ? `?city=${encodeURIComponent(S.city)}` : ""}`); } catch { return; }
+  if (S.runId !== id) return;
+  S.collab = d;
+  for (const gph of [teamGraph, teamBig]) if (gph) gph.setData(d);
+  if (S.tab === "team") renderTeam(); updateTeamView();
+}
+const teamMonth = () => S.frames.length ? S.frames[S.idx].month - 1 : -1;     // turns are logged on the next frame
+function teamStep(gph) {
+  const f = S.frames[S.idx], m = f.metrics || {};
+  const act = (S.collab && S.collab.act_every) || 1;
+  gph.setMonth(teamMonth(), { funds: { ...(m.dept_funds || {}), __treasury: m.treasury }, animate: S.anim, filter: roleOn,
+    budgetMs: S.playing ? Math.min(2600, +$("speed").value * act * 0.9) : 1600 });
+}
+// a thread's state as of the month on show
+function threadState(t, em) {
+  if (t.response && t.response.month <= em) return t.status;
+  return em - t.month > (S.collab.window || 6) ? "unanswered" : "waiting";
+}
+const ST_TEXT = { met: "funded", partial: "partly funded", acted: "acted on", replied: "replied", waiting: "waiting", unanswered: "no answer", open: "waiting" };
+function teamThreads(em) {
+  const d = S.collab, pick = S.teamPick, win = 2 * (d.act_every || 1);
+  return d.threads.filter(t => t.month <= em && t.month > em - win && (roleOn(t.from) || roleOn(t.to))
+    && (!pick || (pick.role ? t.from === pick.role || t.to === pick.role : t.from === pick.from && t.to === pick.to))).reverse();
+}
+function threadHTML(t, em) {
+  const st = threadState(t, em), r = t.response, o = t.outcome, see = (x) => x && x.month <= em;
+  const steps = [];
+  if (see(r)) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${r.month}">m${r.month}</span> ${r.kind === "money" ? `${t.to} sent <b>${fmt$(r.amount)}</b>` : `${t.to}: ${esc(r.text).slice(0, 90)}`}</div>`);
+  if (see(o)) steps.push(`<div class="tstep ${o.tile ? "loc" : ""}" data-x="${o.tile ? o.tile[0] : ""}" data-y="${o.tile ? o.tile[1] : ""}">↳ <span class="jump" data-m="${o.month}">m${o.month}</span> ${t.from} <b>${esc(o.what)}</b>${o.tile ? ` at (${o.tile[0]},${o.tile[1]}) 📍` : ""}</div>`);
+  return `<div class="thread" style="--c:${roleColor(t.from)}"><span class="tag jump" data-m="${t.month}">m${t.month}</span>
+    <b style="color:${roleColor(t.from)}">${esc(t.from)}</b> → <b style="color:${roleColor(t.to)}">${esc(t.to)}</b>${t.amount ? ` · ${fmt$(t.amount)}` : ""}
+    <span class="st st-${st}">${ST_TEXT[st] || st}</span><div class="ttext">${esc(t.text)}</div>${steps.join("")}</div>`;
+}
+function teamSummary(em) {
+  const d = S.collab, act = d.act_every || 1, inQ = (m) => m <= em && m > em - act;
+  const asks = d.threads.filter(t => inQ(t.month));
+  const answered = asks.filter(t => t.response && t.response.month <= em).length;
+  const money = d.events.filter(e => e.kind === "money" && inQ(e.month) && !e.take_back).reduce((a, e) => a + e.amount, 0);
+  const builds = d.events.filter(e => e.kind === "build" && inQ(e.month)).length;
+  return `<div class="teamsum"><div><b>${asks.length}</b><span>requests</span></div><div><b>${asks.length ? Math.round(100 * answered / asks.length) + "%" : "—"}</b><span>answered so far</span></div>
+    <div><b>${fmt$(money)}</b><span>money moved</span></div><div><b>${builds}</b><span>builds</span></div></div>`;
+}
+const TEAM_LEGEND = `<div class="teamlegend"><span><i style="background:#fff;box-shadow:0 0 6px #fff"></i>request</span><span><i style="background:#8a93a0"></i>report</span>
+  <span><i style="background:#ffd34d"></i>money</span><span><i style="border:2px solid #5fd38d;background:none"></i>build</span>
+  <span><i style="background:#45d483"></i>answered</span><span><i style="background:#ffc857"></i>open / partly</span><span><i style="background:#ff6b5e"></i>no answer</span></div>`;
+function bindThreads(root) {
+  root.querySelectorAll(".jump").forEach(el => el.onclick = (e) => {
+    e.stopPropagation(); const m = +el.dataset.m, i = S.frames.findIndex(fr => fr.month === m + 1); if (i >= 0) go(i);
+  });
+  root.querySelectorAll(".tstep.loc").forEach(el => el.onclick = () => {
+    const x = +el.dataset.x, y = +el.dataset.y; scene.highlightRect({ x1: x, y1: y, x2: x, y2: y }); scene.flyTo(x, y, 12);
+  });
+}
+function teamList(em) {
+  const th = teamThreads(em), pick = S.teamPick;
+  const head = pick ? `<div class="teampick muted">Showing ${pick.role ? `<b style="color:${roleColor(pick.role)}">${esc(pick.role)}</b>'s threads` : `<b>${esc(pick.from)} → ${esc(pick.to)}</b>`} · <a href="#" class="unpick">show all</a></div>` : "";
+  return head + (th.length ? th.map(t => threadHTML(t, em)).join("") : `<div class="emptytab">No requests in the last ${2 * (S.collab.act_every || 1)} months${pick ? " here" : ""}.</div>`);
+}
+function onTeamPick(h) { S.teamPick = h; if (S.tab === "team") renderTeam(); updateTeamView(); }
+function renderTeam() {
+  const body = $("tabBody");
+  $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the full-screen Team view">⤢ Expand</button>`);
+  $("teamExpand").onclick = openTeamView;
+  if (!S.collab) { body.innerHTML = `<div class="emptytab">Loading the team…</div>`; loadCollab(true); return; }
+  if (!teamGraph || !document.getElementById("teamCanvas")) {
+    if (teamGraph) teamGraph.destroy();
+    body.innerHTML = `<canvas id="teamCanvas" class="teamcanvas"></canvas>${TEAM_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
+    teamGraph = new CollabGraph($("teamCanvas"), { colorOf: roleColor, onPick: onTeamPick });
+    teamGraph.setData(S.collab);
+    S.anim = false;
+  }
+  teamStep(teamGraph);
+  const em = teamMonth();
+  $("teamSum").innerHTML = teamSummary(em);
+  $("teamList").innerHTML = teamList(em);
+  bindThreads($("teamList"));
+  const un = $("teamList").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamGraph.selected = null; onTeamPick(null); };
+}
+function openTeamView() {
+  $("teamModal").hidden = false;
+  if (!teamBig) teamBig = new CollabGraph($("teamBig"), { colorOf: roleColor, onPick: onTeamPick, big: true });
+  teamBig.setActive(true); teamBig.resize();
+  if (S.collab) teamBig.setData(S.collab);
+  S.anim = false; updateTeamView();
+}
+function updateTeamView() {
+  if (!teamBig || $("teamModal").hidden || !S.collab || !S.frames.length) { if (teamBig) teamBig.setActive(!$("teamModal").hidden); return; }
+  teamStep(teamBig);
+  const em = teamMonth();
+  $("teamMonth").textContent = `month ${S.frames[S.idx].month}`;
+  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + teamList(em);
+  bindThreads($("teamSide"));
+  const un = $("teamSide").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamBig.selected = null; onTeamPick(null); };
 }
 
 // ---------------------------------------------------------------- region map
@@ -1078,7 +1190,7 @@ document.addEventListener("click", (e) => { if (!$("runMenu").contains(e.target)
 $("newRunBtn").onclick = openLaunch; $("emptyLaunch").onclick = openLaunch;
 $("helpBtn").onclick = () => ($("helpModal").hidden = false);
 $("regionBtn").onclick = openRegionMap;
-document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest(".modal").hidden = true);
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".modal").hidden = true; if (teamBig) teamBig.setActive(!$("teamModal").hidden); });
 document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.target === m) m.hidden = true; });
 $("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); renderTab(); });

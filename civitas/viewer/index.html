@@ -57,6 +57,7 @@
   <aside id="right" class="dock glass">
     <nav id="tabs" class="tabs">
       <button data-tab="agents" class="on">Agents</button>
+      <button data-tab="team" title="How the departments work together: requests, money and builds as a live network">Team</button>
       <button data-tab="problems" title="Failed and refused calls, bad turn ends, and how the agents handled them">Problems</button>
       <button data-tab="money" title="The mayor's money picture, what it moved, and each department's money over the quarter">Money</button>
       <button data-tab="council">Council</button>
@@ -166,6 +167,12 @@
     <div class="modal-card glass region-card">
       <div class="modal-head"><h3>Region map <span id="regionMonth" class="muted small"></span></h3><button class="btn icon" data-close>✕</button></div>
       <div class="region-body"><canvas id="regionBig" class="regioncanvas big"></canvas><div id="regionSide"></div></div>
+    </div>
+  </div>
+  <div id="teamModal" class="modal" hidden>
+    <div class="modal-card glass team-card">
+      <div class="modal-head"><h3>Team view <span id="teamMonth" class="muted small"></span></h3><button class="btn icon" data-close>✕</button></div>
+      <div class="team-body"><canvas id="teamBig" class="teamcanvas big"></canvas><div id="teamSide" class="teamside"></div></div>
     </div>
   </div>
   <div id="toasts"></div>

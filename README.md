@@ -1570,6 +1570,16 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **Transport:** neither city reached the 1,500 residents that open the bus stops before month 12 ended, so the bus-line changes need a long run.
 - **Money:** one allocation failed on seed 1 because the money line rounds the treasury ($1,938) above what it held.
 
+**Team tab** (viewer). The departments as a live network (`viewer/collab.js`): the mayor in the centre, the departments on a ring, each node sized by its funds with an arc for its open requests. Edges glow with the last 12 months of messages and money. As the replay steps, each turn's events play out:
+- requests fly as comets with the amount asked, and reports as small pulses;
+- the mayor's money is a stream of gold coins, with "+$2,500" at the receiver;
+- builds burst on the builder;
+- a request's edge flashes green when it was answered, amber when partly, and red ✕ when nobody answered.
+
+Hover a node or edge for its numbers, and click one to filter the thread list under the graph. Each thread is a request, its response (money, a reply, or an action near the tiles it named) and its outcome (the requester's next build). Click a thread's month to jump there, or its 📍 to fly to the building. ⤢ Expand opens the same view full-screen.
+
+The data comes from `GET /api/runs/<id>/collab` (`bench/collab.py`), built from `frames.jsonl` alone, so it works for scripted, LLM and fleet runs and for runs already stored. A thread's window is 2 × `act_every` months. On the v23 120-month seed-1 run, 325 threads: 169 met, 53 partial, 49 unanswered, 34 replied, 12 acted, 8 open.
+
 **Problems tab** (viewer). `GET /api/runs/<id>/problems` (`bench/problems.py`) lists every failed or refused tool call and every turn that ended badly (step limit, no tool call, token budget, unreadable reply), each with what the agent did next:
 - **fixed:** a later call of the same tool worked in the same turn (the same arguments count too, after another action changed what failed, e.g. the dezone a road needed);
 - **escalated:** it gave up but messaged another role, e.g. asked the mayor for money;

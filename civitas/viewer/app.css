@@ -325,3 +325,28 @@ table.mtab .good { color: var(--ok); } table.mtab tr.midle td { background: rgba
 .pcmp-h select { max-width: 60%; font-size: 11px; }
 table.pcmp-t th { font-weight: 500; font-size: 10.5px; white-space: nowrap; } table.pcmp-t td.best { color: var(--ok); font-weight: 700; }
 .pcmp-x { cursor: pointer; color: var(--muted); margin-left: 3px; } .pcmp-x:hover { color: var(--bad); }
+
+/* Team tab / Team view (collab.js) */
+.teamcanvas { display: block; width: 100%; margin: 6px 0 4px; border-radius: 12px; }
+.teamcanvas.big { height: calc(100vh - 150px); margin: 0; }
+.team-card { width: min(1500px, calc(100vw - 32px)); max-height: calc(100vh - 32px); }
+.team-body { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+.teamside { max-height: calc(100vh - 150px); overflow: auto; }
+@media (max-width: 900px) { .team-body { grid-template-columns: 1fr; } }
+.teamlegend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted); margin: 2px 0 8px; }
+.teamlegend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+.teamsum { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 4px 0 10px; }
+.teamsum div { background: rgba(255,255,255,.04); border-radius: 8px; padding: 6px 8px; }
+.teamsum b { display: block; font-size: 15px; }
+.teamsum span { font-size: 10.5px; color: var(--muted); }
+.thread { border-left: 3px solid var(--c); background: rgba(255,255,255,.03); border-radius: 0 8px 8px 0; padding: 6px 9px; margin: 6px 0; font-size: 12px; }
+.thread .ttext { color: #c9cfd6; margin: 3px 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.thread .tstep { color: var(--muted); font-size: 11.5px; }
+.thread .tstep.loc { cursor: pointer; } .thread .tstep.loc:hover { color: var(--ink); }
+.thread .jump { cursor: pointer; } .thread .jump:hover { color: var(--ink); text-decoration: underline; }
+.st { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; margin-left: 6px; font-weight: 600; }
+.st-met, .st-acted, .st-replied { background: rgba(69,212,131,.18); color: var(--ok); }
+.st-partial { background: rgba(255,200,87,.18); color: var(--warn); }
+.st-waiting, .st-open { background: rgba(154,163,173,.16); color: var(--muted); }
+.st-unanswered { background: rgba(255,107,94,.18); color: var(--bad); }
+.teampick { font-size: 11.5px; margin: 2px 0 6px; }
