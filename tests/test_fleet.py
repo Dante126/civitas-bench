@@ -387,6 +387,11 @@ def _check_sites(env):
             assert isinstance(found, list) or purpose in CONDITIONAL_SITES, (role, purpose, path)
             res = box.call("find_sites", {"purpose": purpose, "near_x": 10, "near_y": 10})
             assert res["ok"], (role, purpose, res)
+            if "stops" in res:                         # bus_stops: one line through every stop
+                assert purpose == "bus_stops" and 2 <= len(res["stops"]) <= C.MAX_STOPS, res
+                assert res["line"].startswith(f"{len(res['stops'])} stops for one line: create_bus_line stops [[")
+                json.dumps(res)
+                continue
             assert len(res["sites"]) <= 6 and all(isinstance(s["x"], int) and isinstance(s["y"], int)
                                                   for s in res["sites"])
             assert res["sites"] or res.get("note"), (role, purpose)
@@ -1188,7 +1193,8 @@ def _check_mayor_sites(env):
                 mine = mayor.call("find_sites", {"purpose": f"{dept}.{purpose}", **near})
                 theirs = box.call("find_sites", {"purpose": purpose, **near})
                 assert mine["ok"] and mine["purpose"] == f"{dept}.{purpose}", (dept, purpose, mine)
-                assert mine["sites"] == theirs["sites"], (dept, purpose)
+                assert mine.get("sites") == theirs.get("sites") and mine.get("stops") == theirs.get("stops"), \
+                    (dept, purpose)
                 assert mine.get("note") == (theirs["note"] and f"({dept} department's note) {theirs['note']}"
                                             if "note" in theirs else None), (dept, purpose)
 
@@ -2853,10 +2859,14 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         assert lines[-1] == "find_sites <purpose> lists up to 6 with details"
         box = ToolBox(env, role)
         for purpose, line in zip(purposes, lines):
-            assert line.startswith(f"- {purpose}: ") and len(line) <= 110, (role, line)
+            # bus_stops names every stop of its one line (up to C.MAX_STOPS)
+            assert line.startswith(f"- {purpose}: ") and len(line) <= (170 if purpose == "bus_stops" else 110), \
+                (role, line)
             res = box.call("find_sites", {"purpose": purpose})
-            sites, note = res["sites"], res.get("note", "")
-            if note.startswith("locked"):
+            sites, note = res.get("sites", []), res.get("note", "")
+            if "stops" in res and not note:
+                assert line.startswith(f"- bus_stops: {res['line']}"), (role, line)
+            elif note.startswith("locked"):
                 pop = min(C.UNLOCK_POP[k] for k in SITE_UNLOCKS[purpose])
                 assert f"locked (unlocks at {pop:,} residents)" in line, (role, line)
             elif sites:
@@ -2975,7 +2985,8 @@ def test_build_cost_is_what_the_build_charges(open_env, role, purpose):
     env = copy.deepcopy(open_env)
     w = env.world
     cost = _building_cost(w, role, purpose)
-    sites = ToolBox(env, role).call("find_sites", {"purpose": purpose})["sites"]
+    res = ToolBox(env, role).call("find_sites", {"purpose": purpose})
+    sites = res["sites"] if "sites" in res else [{"x": x, "y": y} for x, y in res["stops"]]    # bus_stops
     dept = ROLES[role]["budget"]
     action = _build_action(role, purpose, sites)
     w.dept_funds[dept] = cost - 1
@@ -3316,11 +3327,13 @@ def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
                               if ln.startswith("- transport:"))
     w.dept_funds["transport"] = 3000
     text = briefing(env, "transport", mark=False)
-    assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text, text
+    budget = _block(text, "## Your budget")          # the funds line, then the first bus line's priority line
+    assert len(budget) == 2 and budget[1].startswith("- First bus line ($1,500) before any avenue") and \
+        "can't pay" not in text, text
     assert fleet_line() == "- transport: funds $3,000, spent $0; idle $1,500 (keeps $1,500)"     # one bus line, not
     # a harbour
     w.dept_funds["transport"] = 0
-    n = len(ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})["sites"])
+    n = min(6, len(ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})["stops"]))
     assert "(cheapest: bus_stops $1,500)" in briefing(env, "transport", mark=False)
     assert fleet_line() == f"- transport: funds $0, spent $0; needs $1,500 for its first bus line ({n} sites, $76/month)"
 
@@ -3398,8 +3411,9 @@ def test_the_needs_line_says_first_or_another(grown_env):
     _no_spending(env)                                  # station, school or bus line
     w = env.world
     w.dept_funds.update({d: 0 for d in DEPTS})
-    n = {p: len(ToolBox(env, d).call("find_sites", {"purpose": p})["sites"])
-         for d, p in (("police", "station"), ("education", "school"), ("transport", "bus_stops"))}
+    n = {p: min(6, len(res.get("sites") or res["stops"]))          # bus_stops: its line's stops, at most 6 counted
+         for d, p in (("police", "station"), ("education", "school"), ("transport", "bus_stops"))
+         for res in [ToolBox(env, d).call("find_sites", {"purpose": p})]}
     m = w.metrics()
     got = _dept_lines(env)
     assert got["police"] == (f"- police: funds $0, spent $0; needs $2,500 for its first police station "
@@ -5768,3 +5782,71 @@ def test_export_sft_skips_fleet_turns(tmp_path):
     res = subprocess.run([sys.executable, "examples/export_sft.py", str(tmp_path / "runs"), "--out", str(out)],
                          capture_output=True, text=True, check=True)
     assert len(out.read_text().splitlines()) == 1 and "2 fleet turns skipped" in res.stdout
+
+
+# --- transport: the first bus line before avenues, one line through every stop, another only near full
+# (tools.py: first_bus_line, bus_room, ToolBox._bus_line_refusal / _stops_hint; briefing.py: _bus_first, _bus_riders)
+def _street(w) -> dict:
+    """An upgrade_road call for one street tile on land: $30 to an avenue."""
+    ys, xs = np.nonzero((w.struct == C.ROAD) & (w.road_class == 1) & (w.terrain != C.WATER))
+    x, y = int(xs[0]), int(ys[0])
+    return {"x1": x, "y1": y, "x2": x, "y2": y, "to": "avenue"}
+
+
+def test_the_first_bus_line_comes_before_avenues(open_env):
+    """120-month LLM runs: transit 0.00 (no bus line in 120 months) and 0.28; seed 0, month 78: of $2,000 transport
+    put $690 into avenues, then create_bus_line failed at $1,310. While the city has no bus line and its first is
+    ready, an upgrade_road that leaves transport short of it is refused (confirm: true runs it); the briefing says
+    the line comes first, and a failed create_bus_line names the suggested stops as one call."""
+    import civitas.fleet.tools as T
+    env = copy.deepcopy(open_env)
+    _no_spending(env)
+    w = env.world
+    assert not w.bus_lines
+    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    call = T.bus_line_call(T.bus_stops(lst))
+    w.dept_funds["transport"] = 1520                   # $30 of avenue leaves $1,490: short of the $1,500 line
+    box = ToolBox(env, "transport")
+    up = _street(w)
+    res = box.call("upgrade_road", up)
+    assert res["refused"] == "bus_line" and res["error"] == (
+        "this upgrade ($30) would leave transport $1,490, short of the $1,500 first bus line, and the city has none "
+        f"yet (transit is a fifth of your score): build the line first, {call}, asking the mayor for what you lack; "
+        "to upgrade anyway repeat with confirm: true"), res
+    assert w.dept_funds["transport"] == 1520
+    text = briefing(env, "transport", mark=False)
+    assert "- First bus line ($1,500) before any avenue: create_bus_line through all the bus_stops stops" in text
+    assert f"- bus_stops: {len(T.bus_stops(lst))} stops for one line: {call}" in text
+    assert "- bus riders: no bus line yet" in text
+    assert box.call("upgrade_road", {**up, "confirm": True})["ok"] and w.dept_funds["transport"] == 1490
+    # short of the line: create_bus_line's failure asks for the gap, then names the call
+    res = box.call("create_bus_line", {"stops": T.bus_stops(lst)})
+    assert res["ok"] is False and res["message"].endswith(f" - ask the mayor for $10 (send_message), then {call}"), res
+    # enough for both: the upgrade runs unrefused
+    w.dept_funds["transport"] = 5000
+    assert ToolBox(env, "transport").call("upgrade_road", _street(w))["ok"]
+
+
+def test_another_bus_line_only_when_buses_run_full(open_env):
+    """The mayor read "needs $1,500 for another bus line (transit 4.6%)" with buses at ~210 of 1,500 seats, and s1 ran
+    four lines on the same stops (riders take the best line). With a line under BUS_FULL of its seats the bus_stops
+    list says the buses have room and prices nothing; near full another line is ready again."""
+    import civitas.fleet.tools as T
+    env = copy.deepcopy(open_env)
+    _no_spending(env)
+    w = env.world
+    stops = T.bus_stops(T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"])
+    w.dept_funds["transport"] = 1500
+    assert apply_action(w, "transport", {"type": "create_bus_line", "stops": stops}).ok and len(w.bus_lines) == 1
+    w.bus_lines[0].update(riders=210, capacity=1500)
+    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    assert lst.short == "buses have room (210 of 1,500 seats used; another line pays once buses run 90% full)", lst
+    assert "bus_stops" not in T.ready_prices(w, "transport", {"bus_stops": lst})
+    text = briefing(env, "transport", mark=False)
+    assert "- bus riders: 210 of 1,500 seats (1 line)" in text and "First bus line" not in text
+    w.bus_lines[0]["riders"] = 1400
+    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    assert lst.short is None and "bus_stops" in T.ready_prices(w, "transport", {"bus_stops": lst})
+    # an upgrade with a bus line in place: never refused for it
+    w.dept_funds["transport"] = 30
+    assert ToolBox(env, "transport").call("upgrade_road", _street(w))["ok"]

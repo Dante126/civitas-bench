@@ -187,7 +187,7 @@ class ScriptedFleetAgent(Agent):
             res = turn.call(name, args)
             if res is None:
                 break
-            if res.get("refused") in ("duplicate", "take_back", "reserve", "loan"):     # the policy means it
+            if res.get("refused") in ("duplicate", "take_back", "reserve", "loan", "bus_line"):     # the policy means it
                 turn.call(name, {**args, "confirm": True})
 
     def _memory(self, turn: _Turn) -> None:

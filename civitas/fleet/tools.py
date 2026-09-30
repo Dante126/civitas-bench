@@ -98,7 +98,9 @@ CONFIRM = {**{a: f"true only to repeat a {a} refused for cutting roads off the {
            "allocate_budget": "true only to repeat an allocate_budget refused this turn with the same department and "
                               "amount, once you are sure; on any other call it doesn't count",
            "take_loan": "true only to repeat a take_loan refused this turn with the same amount, once you are sure; on "
-                        "any other call it doesn't count"}
+                        "any other call it doesn't count",
+           "upgrade_road": "true only to repeat an upgrade_road refused for coming before the city's first bus line, "
+                           "once you are sure"}
 # the mayor's guarded money actions: their guard always runs, and confirm: true overrides a refusal only on a repeat of
 # the exact call (action, department, amount) refused this turn, one override per refusal (ToolBox._refused). v19: all
 # 3 take-back refusals were overridden at once and 3 of 7 duplicate refusals; confirm was a free pass
@@ -143,7 +145,8 @@ SITE_UNLOCKS = {"zone_O": ("office_zone",), "zone_M": ("mixed_use",), "casino": 
 # purpose -> (short reason for the briefing, full note for find_sites) when its list is empty
 SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 months; riverbank stretches to protect "
                         "appear with a flood warning"),
-              "congested_roads": ("no road is congested", "no road is congested right now"),
+              "congested_roads": ("no road over capacity", "no road carries more than its capacity right now; an "
+                                  "avenue pays only on a stretch at 1.0x or more"),
               "bus_stops": ("too few homes and jobs on the roads yet (~1,500 residents)",
                             "too few homes and job centres on the highway-connected roads yet to suggest stops; "
                             "bus lines pay off once the city is bigger (~1,500 residents)")}
@@ -151,6 +154,11 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
 # stops have no floor, so from month 1 transport read "can't pay (cheapest: bus_stops $1,500)" and the mayor "needs
 # $1,500 for a bus line", against both playbooks (no bus line before ~1,500 residents)
 SITE_MIN_POP = {"bus_stops": 1500}
+# bus lines, as the scripted transport builds them: another line only once every line carries BUS_FULL of its seats,
+# and at most BUS_LINES_MAX lines. Riders pick the line with the best share (max over lines), so a second line on
+# the same stops buys nothing: the 120-month LLM runs built lines at ~210 of 1,500 seats. Congested stretches are
+# listed from CONGESTED_LOAD x capacity (the scripted transport upgrades only there; observation lists from 0.8)
+BUS_FULL, BUS_LINES_MAX, CONGESTED_LOAD = 0.9, 4, 1.0
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 # utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
@@ -261,6 +269,7 @@ COVERAGE_LABEL = {"transit_share": "transit"}       # else "coverage"
 ALL_ACTIONS = {a for spec in ROLES.values() for a in spec["actions"]} | set(DEAL_ACTIONS)
 # a build refused for its tile, as World.footprint_tiles, build_train_station and build_harbour word it
 NOT_EMPTY = re.compile(r"\((\d+),(\d+)\) is not an empty (land|river|riverbank) tile")
+BUDGET_SHORT = re.compile(r"costs \$([\d,]+) but the \w+ budget only has \$([\d,]+)")    # actions._spend
 # int in the doc example, but the handler reads a float (actions._num)
 NUMBER_PARAMS = {("set_tax", "rate"), ("set_funding", "percent"), ("allocate_budget", "amount"),
                  ("take_loan", "amount"), ("repay_loan", "amount"), ("set_fare", "fare"), ("set_district_tax", "delta")}
@@ -469,6 +478,29 @@ def cut_off(w, tiles, drop=frozenset()) -> np.ndarray:
     return before & ~gone & ~np.isin(labels, list(_outside_labels(w, labels, drop)))
 
 
+def upgrade_cost(w, p: dict) -> float | None:
+    """What upgrade_road charges for these arguments (actions.upgrade_road's rule: the class difference per tile
+    below the target, BRIDGE_UPGRADE times on a bridge); None when it would fail anyway (bad class or line, locked,
+    off the road, nothing to upgrade)."""
+    to = str(p.get("to", p.get("kind", "avenue"))).lower()
+    if to not in ("avenue", "highway") or not w.unlocked(to):
+        return None
+    cls = C.ROAD_CLASSES[to]
+    try:
+        pts = _line(w, p)
+    except Exception:
+        return None
+    cost = 0.0
+    for x, y in pts:
+        if w.struct[y, x] != C.ROAD:
+            return None
+        cur = int(w.road_class[y, x])
+        if cur < cls:
+            per = C.ROAD_UPGRADE_COST[cls] - (C.ROAD_UPGRADE_COST.get(cur, 0) if cur > 1 else 0)
+            cost += per * (BRIDGE_UPGRADE if w.terrain[y, x] == C.WATER else 1)
+    return cost or None
+
+
 def guarded(role: str, action: str) -> bool:
     """Whether `role`'s `action` can be refused before it runs (its schema then has a confirm parameter): a bulldoze,
     and a demolish by a role that can take a train station, harbour or airport (transport; LINK_OWNERS), that would
@@ -476,9 +508,10 @@ def guarded(role: str, action: str) -> bool:
     taking a department below what it keeps (DeptMoney.keep), or topping up another building under the reserve, and
     its take_loan while the treasury holds RESERVE_MIN, its own top-ups this turn took it under, or no first
     building, supply or planning road waits (EARNED_CONFIRM: confirm: true counts only on a repeat of the refused
-    call)."""
+    call); transport's upgrade_road that would leave it short of the city's first bus line while one is ready
+    (confirm: true lets it run)."""
     return (action in ROAD_REMOVERS or (action == "demolish" and role in LINK_OWNERS)
-            or (role == "mayor" and action in EARNED_CONFIRM))
+            or (role == "mayor" and action in EARNED_CONFIRM) or (role == "transport" and action == "upgrade_road"))
 
 
 def _allocation(p: dict) -> tuple[str, float] | None:
@@ -1441,6 +1474,7 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
         if purpose in BANK_TOP_UP and len(sites) < len(found or []):
             sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
         if purpose == "congested_roads":         # avenues already last (kept): an avenue upgrade charges nothing there
+            sites = [s for s in sites if s.get("load_vs_capacity", 0) >= CONGESTED_LOAD]
             sites.sort(key=lambda s: not site_tiles(w, purpose, s)[0])
         keys, blocked = SITE_UNLOCKS.get(purpose, ()), False
         if keys and not any(w.unlocked(k) for k in keys):
@@ -1448,6 +1482,8 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             short, note = f"locked (unlocks at {C.UNLOCK_POP[key]:,} residents)", "locked: " + w.unlock_note(key)
         elif w.metrics()["population"] < SITE_MIN_POP.get(purpose, 0):
             sites, (short, note) = [], SITE_NOTES[purpose]
+        elif purpose == "bus_stops" and (room := bus_room(w, sites)):    # sites kept: find_sites still shows them
+            short, note = room
         elif sites:
             short = note = None
         elif purpose == "road_extension" and (branches := branch_sites(w)):    # no dead end: branch off a road
@@ -1979,6 +2015,55 @@ def buildings_of(w, name: str) -> int | None:
     lines, tier = ([ln for ln in C.TIER_LINES if supply_of(ln) == supply], 1) if supply else ([line], tier)
     structs = {t["struct"] for ln in lines for t in C.TIER_LINES[ln][tier - 1:]}
     return sum(w.facility_tier(x, y) >= tier for st in structs for x, y in w.facilities(st))
+
+
+def bus_seats(w) -> tuple[int, int]:
+    """(riders, seats) over the city's bus lines, as traffic sets them each month (a line not yet run: 0 riders)."""
+    return (round(sum(ln.get("riders", 0) for ln in w.bus_lines)),
+            round(sum(ln.get("capacity", C.LINE_CAPACITY) for ln in w.bus_lines)))
+
+
+def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
+    """(short, note) when the bus_stops list offers no line to build: fewer than the 2 stops create_bus_line needs, or
+    BUS_LINES_MAX lines already, or buses with room (a line under BUS_FULL of its seats: the scripted transport's
+    rule); None when a line is worth building (none yet, or every line near full). Smoke / 120-month LLM runs: the
+    mayor read "needs $1,500 for another bus line (transit 4.6%)" with buses at ~210 of 1,500 seats. None without
+    stops (SITE_NOTES says why)."""
+    if not sites:
+        return None
+    if len(sites) < 2:
+        return ("one stop only: a line needs 2 (more homes and jobs on the roads)",
+                "only one stop is suggested and a bus line needs 2 or more; wait for more homes and job centres")
+    lines = w.bus_lines
+    if len(lines) >= BUS_LINES_MAX:
+        return (f"{len(lines)} bus lines already", f"the city has {len(lines)} bus lines; more add upkeep, not riders")
+    if not lines or all(ln.get("riders", 0) >= BUS_FULL * ln.get("capacity", C.LINE_CAPACITY) for ln in lines):
+        return None
+    riders, seats = bus_seats(w)
+    full = f"another line pays once buses run {pct(100 * BUS_FULL)} full"
+    return (f"buses have room ({riders:,} of {seats:,} seats used; {full})",
+            f"the bus lines carry {riders:,} riders of {seats:,} seats; riders take the best line, so another line "
+            f"on these stops buys nothing: {full}")
+
+
+def bus_stops(lst: SiteList) -> list[list[int]]:
+    """Every suggested stop of a bus_stops list, up to C.MAX_STOPS: one line through all of them, never a choice of
+    sites (the LLM runs built lines of 1-2 stops from "6 sites, best (40,5)")."""
+    return [[int(s["x"]), int(s["y"])] for s in lst.sites[:C.MAX_STOPS]]
+
+
+def bus_line_call(stops: list[list[int]]) -> str:
+    """The create_bus_line call through `stops`: "create_bus_line stops [[12,24],[30,24]]"."""
+    return "create_bus_line stops " + json.dumps(stops, separators=(",", ":"))
+
+
+def first_bus_line(w, lists: dict[str, SiteList]) -> Price | None:
+    """The first bus line's price while the city has none and its stops are ready (bus_stops listed with 2+ stops):
+    transport's priority line (briefing) and the upgrade_road guard (ToolBox._bus_line_refusal). None otherwise."""
+    lst = lists.get("bus_stops")
+    if w.bus_lines or lst is None or lst.short or len(lst.sites) < 2:
+        return None
+    return site_price(w, "transport", "bus_stops")
 
 
 def build_status(w, dept: str, purpose: str, name: str) -> str:
@@ -2534,6 +2619,10 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
             lines.append(head + (lst.short if locked else f"none - {lst.short}")
                          + (price(purpose) if lst.sites and not locked else ""))
             continue
+        if purpose == "bus_stops":                   # one line through every stop, not a choice of sites
+            stops = bus_stops(lst)
+            lines.append(head + f"{len(stops)} stops for one line: {bus_line_call(stops)}" + price(purpose))
+            continue
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
         if path in paths:
@@ -2800,9 +2889,10 @@ class ToolBox:
                 self._refused.discard(key)
                 override = kind
         elif not confirm and guarded(self.role, name):
-            refusal = self._disconnect_refusal(name, args)
+            kind, refusal = (("bus_line", self._bus_line_refusal(args)) if name == "upgrade_road"
+                             else ("disconnect", self._disconnect_refusal(name, args)))
             if refusal:
-                return {"ok": False, "refused": "disconnect", "error": refusal}
+                return {"ok": False, "refused": kind, "error": refusal}
         bank, funded = (free_bank(w), self._funded_sites()) if name == "zone" else (None, None)
         ways = self._ways_out() if name == "zone" else None
         before, debt = w.struct.copy(), w.debt
@@ -2872,6 +2962,28 @@ class ToolBox:
         i = min(range(len(xs)), key=lambda i: min(abs(xs[i] - x) + abs(ys[i] - y) for x, y in gone))
         return (f"this would cut {len(xs)} road tile{'s' * (len(xs) > 1)} (e.g. around ({xs[i]},{ys[i]})) off the "
                 f"{CUT_FROM[name]}{why}; to do it anyway repeat with confirm: true")
+
+    def _bus_line_refusal(self, args: dict) -> str | None:
+        """Why transport's upgrade_road (guarded()) must not run: the city has no bus line, its first one is ready
+        (first_bus_line) and the upgrade, which transport's funds cover, would leave them short of it. The 120-month
+        LLM runs: transit 0.00 (no bus line in 120 months) and 0.28 (a first line at month 72); seed 0, month 78:
+        $2,000 went $690 on avenues, then create_bus_line failed at $1,310. The scripted transport builds the line
+        first. None when it may run or the arguments are bad (the action reports those)."""
+        w = self.world
+        if w.bus_lines or w.metrics()["population"] < SITE_MIN_POP["bus_stops"]:
+            return None
+        cost = upgrade_cost(w, args)
+        funds = w.dept_funds["transport"]
+        if cost is None or short_of(funds, cost):
+            return None
+        lists = site_lists(w, "transport", role_obs(self.env, "transport"))
+        bus = first_bus_line(w, lists)
+        if bus is None or not short_of(funds - cost, bus.cost):
+            return None
+        return (f"this upgrade ({money(cost)}) would leave transport {money(math.floor(funds - cost))}, short of the "
+                f"{money(bus.cost)} first bus line, and the city has none yet (transit is a fifth of your score): "
+                f"build the line first, {bus_line_call(bus_stops(lists['bus_stops']))}, asking the mayor for what "
+                "you lack; to upgrade anyway repeat with confirm: true")
 
     def _allocations(self) -> list[tuple[str, float]]:
         """This turn's successful allocate_budget calls as (department, amount), oldest first (take-backs negative)."""
@@ -3276,6 +3388,8 @@ class ToolBox:
             return (f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
                     + (f"; zone beside it instead: {' or '.join(beside)}" if beside else ""))
         if name != "build_road":
+            if name == "create_bus_line":          # the suggested stops as one call (the LLM runs: lines of 1-2 stops)
+                return self._stops_hint(message)
             m = NOT_EMPTY.match(message)
             return self._taken_hint(name, args, (int(m[1]), int(m[2])), m[3]) if m else ""
         if message == "every tile on that line is already road":
@@ -3329,6 +3443,25 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _stops_hint(self, message: str) -> str:
+        """For a failed create_bus_line: the suggested stops as one call (bus_line_call), after asking the mayor for
+        what transport lacks when the line's price was the failure; with buses that have room (bus_room), why another
+        line buys nothing instead; "" when no stops are suggested, or on any error."""
+        try:
+            w = self.world
+            lst = site_lists(w, "transport", role_obs(self.env, "transport"))["bus_stops"]
+            if not lst.sites:
+                return ""
+            if lst.short:
+                return f" - {lst.note}"
+            call = bus_line_call(bus_stops(lst))
+            if (m := BUDGET_SHORT.search(message)) and (lack := float(m[1].replace(",", "")) -
+                                                        float(m[2].replace(",", ""))) > 0:
+                return f" - ask the mayor for {money(math.ceil(lack))} (send_message), then {call}"
+            return f" - the suggested stops, all on one road network: {call}"
+        except Exception:
+            return ""
 
     def _branch_hint(self) -> str:
         """For a failed build_road while no dead end extends (observation's road_suggestions empty): the best branch
@@ -3581,6 +3714,13 @@ class ToolBox:
         if role == "planning" and key.startswith("zone_"):
             lst = spare_funded({key: lst}, self._funded_spots())[key]
         sites = lst.sites
+        if key == "bus_stops" and sites:           # one line through all of them (near_x/near_y don't reorder it)
+            stops = bus_stops(lst)
+            out = {"ok": True, "purpose": purpose, "stops": stops,
+                   "line": f"{len(stops)} stops for one line: {bus_line_call(stops)}"}
+            if lst.note:
+                out["note"] = lst.note if role == self.role else f"({role} department's note) {lst.note}"
+            return out
         if near_x is not None:
             near = (int(near_x), int(near_y))
             sites = sorted(({**s, "distance": _distance(s, near)} for s in sites), key=lambda s: s["distance"])

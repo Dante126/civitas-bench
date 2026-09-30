@@ -732,7 +732,19 @@ tasks and money, and to let people coach it.
   first or repeat with `confirm: true`. Transport's `demolish` of a train station, harbour or
   airport that is some roads' only link to the region (metro stations don't link) is refused
   the same way; the refusal suggests asking planning for a road to the highway or building
-  another link first. The mayor's `allocate_budget` identical to one that already succeeded
+  another link first. Transport's `upgrade_road` is refused (`refused: "bus_line"`) while
+  the city has no bus line, its first one is ready and the upgrade would leave transport
+  short of it; the refusal names the line as one `create_bus_line` call. In the 120-month
+  LLM runs (v19) transit scored 0.00 and 0.28: seed 0 never built a bus line, and at month
+  78 put $690 of $2,000 into avenues, after which the $1,500 line failed. Transport's
+  briefing says the first line comes before any avenue, and its Key metrics count bus
+  riders against seats. The bus_stops list reads as one line (`6 stops for one line:
+  create_bus_line stops [[40,5],...]`, and `find_sites bus_stops` returns `stops`),
+  since the model had built lines of 1–2 stops from "6 sites, best (40,5)". It offers
+  another line only while every line carries 90% of its seats (riders take the best
+  line, so a second line on the same stops buys nothing; at most 4 lines), and congested
+  roads are listed from 1.0× capacity, as the scripted transport upgrades them. A failed
+  `create_bus_line` names the suggested stops. The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too
   (`refused: "duplicate"`), naming what the department now holds; other amounts pass. An
   identical take-back is a duplicate as well (`you already took $1,140 back from planning

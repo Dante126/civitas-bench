@@ -25,6 +25,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
+from .tools import bus_seats, first_bus_line
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -511,6 +512,25 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     return L + [""] + _map(w, "mayor") + [""] + _memory(fleet, "mayor")
 
 
+def _bus_first(bus, funds: float) -> str:
+    """Transport's priority line while the city has no bus line and its first is ready (first_bus_line): the line
+    before any avenue, and what to ask the mayor for when short. The 120-month LLM runs listed bus stops ($1,500) and
+    congested roads ($30/tile) side by side; transport spent on avenues first and never afforded the line."""
+    lack = "" if not short_of(funds, bus.cost) else \
+        f"; you have {money(math.floor(funds))}: ask the mayor for {money(math.ceil(bus.cost - funds))} (send_message)"
+    return (f"- First bus line ({bus.text()}) before any avenue: create_bus_line through all the bus_stops stops "
+            f"below; upgrade_road is refused while it would leave you short of it{lack}")
+
+
+def _bus_riders(w) -> str:
+    """The Key metrics line on transport's buses: riders against seats (another line pays only near full)."""
+    if not w.bus_lines:
+        return "- bus riders: no bus line yet"
+    riders, seats = bus_seats(w)
+    n = len(w.bus_lines)
+    return f"- bus riders: {riders:,} of {seats:,} seats ({n} line{'s' * (n != 1)})"
+
+
 def _department(env, fleet: FleetState, role: str) -> list[str]:
     w = env.world
     dept = ROLES[role]["budget"]
@@ -552,7 +572,11 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                  + ". Don't call build tools this turn: ask the mayor for "
                  + (money(more) if more else "the amount") + " with a reason (send_message) unless you already "
                  "did, then end_turn.")
+    if role == "transport" and (bus := first_bus_line(w, lists)):
+        L.append(_bus_first(bus, funds))
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
+    if role == "transport":
+        L.append(_bus_riders(w))
     L += [""] + _digest(env, fleet, role)
     if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
         prices = {**prices, "road_extension": road}
