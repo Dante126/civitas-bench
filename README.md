@@ -705,6 +705,21 @@ tasks and money, and to let people coach it.
   - While no dead end extends, a road blocked by a building or run off the map also names
     the best branch road (`no dead end to extend: branch instead, e.g. dezone (12,23)
     (empty lot, free), then build_road (12,23)-(12,9) (find_sites road_extension)`).
+  - A model's `build_road` that is a listed branch road blocked only by empty zoned lots
+    runs the free `dezone` first within the same call, when the road is affordable and the
+    turn has room for both actions (the scripted fleet runs its own dezones). In the
+    120-month runs (v19), 10 of planning's 29 roads into zoned lots were the briefing's own
+    branch road sent without its dezone.
+  - A zone the planning budget can't pay says what a tile costs (industry and mixed use
+    always at the high-density price), how many tiles the money buys, and the part of the
+    rectangle that fits (`zone x1=5,y1=10,x2=7,y2=11 (6 tiles, $30) now`). In v19, 43 zones
+    failed on a few dollars, 41 with money for some tiles, and planning asked the mayor
+    instead of zoning less.
+  - One zone type per strip. Each zone line in Ready sites shows a strip no earlier zone
+    line shows (`next free (0,22)-(16,23), 34 tiles (one zone type per strip)`) instead of
+    `same strip as zone_R`. A zone that fails on the role's own zoning this turn names the
+    next free strip for its type. In v19, planning re-zoned the rectangle it had just zoned
+    with another type 19 times.
   - "Already road" names the road line it runs along ("branch off it into free land") and
     points to `find_sites road_extension`. When the line runs along the role's own
     `build_road` of that turn, it names that call (`you built y=24 x 19-34 at call 2 this
@@ -1515,7 +1530,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - The review fixes merged after v21 (3958732: one-tile supply picks, the "supply needed now" wording, guards by need) have not had their own smoke run yet.
 
 **Problems tab** (viewer). `GET /api/runs/<id>/problems` (`bench/problems.py`) lists every failed or refused tool call and every turn that ended badly (step limit, no tool call, token budget, unreadable reply), each with what the agent did next:
-- **fixed:** a later call of the same tool worked in the same turn;
+- **fixed:** a later call of the same tool worked in the same turn (the same arguments count too, after another action changed what failed, e.g. the dezone a road needed);
 - **escalated:** it gave up but messaged another role, e.g. asked the mayor for money;
 - **dropped:** it gave up;
 - **repeated:** it sent the same failing call again;

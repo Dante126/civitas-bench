@@ -235,6 +235,32 @@ def build_road(world: World, p: dict) -> tuple[str, float]:
     return f"built {len(new)} road tiles{extra}", cost
 
 
+NO_DENSITY = ("I", "M")                 # industry and mixed use have no density setting: charged as high density
+REZONE_COST = 2                          # per zoned tile of the same type whose density a zone changes
+
+
+def zone_density(letter: str, density: str) -> str:
+    """The density a zone of `letter` is built and charged at."""
+    return "high" if letter in NO_DENSITY else density
+
+
+def zone_tiles(world: World, letter: str, density: str, rect) -> tuple[list, list]:
+    """The tiles of `rect` a zone fills (empty land) and re-zones (same type, other density)."""
+    z = C.ZONE_BY_LETTER[letter]
+    tiles = [(x, y) for x, y in rect if world.struct[y, x] == C.NONE and world.terrain[y, x] == C.LAND]
+    rezone = [(x, y) for x, y in rect if world.struct[y, x] == z and world.density[y, x] != (density == "high")]
+    return tiles, rezone
+
+
+def zone_price(density: str) -> float:
+    """Per new tile at that density (zone_density)."""
+    return C.CATALOG["zone_high" if density == "high" else "zone"]["cost"]
+
+
+def zone_cost(new: int, rezone: int, density: str) -> float:
+    return new * zone_price(density) + rezone * REZONE_COST
+
+
 def zone(world: World, p: dict) -> tuple[str, float]:
     letter = str(p.get("zone", "")).upper()[:1]
     if letter not in C.ZONE_BY_LETTER:
@@ -246,17 +272,15 @@ def zone(world: World, p: dict) -> tuple[str, float]:
         _require(world, "office_zone")
     if letter == "M":
         _require(world, "mixed_use")
-    if letter in ("I", "M"):
-        density = "high"                 # industry and mixed use have no density setting
-    elif density == "high":
+    density = zone_density(letter, density)
+    if density == "high" and letter not in NO_DENSITY:
         _require(world, "high_density")
     rect = _rect(world, p)
-    tiles = [(x, y) for x, y in rect if world.struct[y, x] == C.NONE and world.terrain[y, x] == C.LAND]
+    tiles, rezone = zone_tiles(world, letter, density, rect)
     z = C.ZONE_BY_LETTER[letter]
-    rezone = [(x, y) for x, y in rect if world.struct[y, x] == z and world.density[y, x] != (density == "high")]
     if not tiles and not rezone:
         raise ActionError("no empty land tiles in that area")
-    cost = len(tiles) * C.CATALOG["zone_high" if density == "high" else "zone"]["cost"] + len(rezone) * 2
+    cost = zone_cost(len(tiles), len(rezone), density)
     _spend(world, "planning", cost)
     no_access = 0
     for x, y in tiles:
