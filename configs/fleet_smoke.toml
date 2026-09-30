@@ -137,8 +137,8 @@ kind = "fleet"
 playbook = """
 - Early on there is little to do: don't spend before ~1,500 residents or real congestion; your score counts cost \
 per resident.
-- From ~1,500 residents: one bus line through the suggested stops (find_sites bus_stops); another when buses run \
-full.
+- From ~1,500 residents: one create_bus_line through all suggested stops (your bus_stops line), before any \
+avenue; another only when buses run 90% full (bus riders in Key metrics).
 - Jammed streets (find_sites congested_roads): upgrade the stretch to an avenue (unlocks at 1k).
 - From 5k: a train station, and a harbour when freight runs full; metro at 10k. Ask the mayor for the exact cost.
 """
