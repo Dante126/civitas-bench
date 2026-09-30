@@ -1527,7 +1527,23 @@ reached 1,280 / 47.0 and 504 / 42.8.
 
 - **Power:** seed 1 had full power from month 1 (v20: 0–18% until month 10).
 - **Guards:** on seed 0 the reserve refusal led the mayor to take idle money back from planning and transport before funding a second police station. At month 9 it accepted two loan refusals and borrowed only $3,000, for utilities.
-- The review fixes merged after v21 (3958732: one-tile supply picks, the "supply needed now" wording, guards by need) have not had their own smoke run yet.
+
+**v22** (2026-09-29, main at b461bc6, the first run with the v21 review fixes) reached 1,432 / 49.6 and 1,732 / 44.1. On seed 1, month 9, the loan guard refused a $4,500 loan while the treasury held $3,607 and a $5,000 first high school waited, which is a case the playbook allows. The mayor overrode it, then confirmed another landfill that left $1,107 of a $3,000 reserve. Both are fixed in a8a0ee8 (Guards, Earned confirm).
+
+**v23** (2026-09-30, main at b99b235: the loan and reserve fixes, transport's first bus line before avenues, and planning's zone hints, one zone type per strip and branch roads that clear their own lots) reached 1,796 / 48.3 and 1,424 / 46.7.
+
+| Measure | v21 | v22 | v23 (seed 0 / seed 1) |
+|---|---|---|---|
+| City score (mean) | 46.9 | 46.9 (49.6 / 44.1) | 47.5 (48.3 / 46.7) |
+| Planning score (mean) | 42.1 | 43.8 | 45.5 (47.6 / 43.3) |
+| Zones over budget (zoned less next) | – | 16 (0) | 8 (6) |
+| Re-zones of its own strip / roads into zoned lots | – | 5 / 2 | 0 / 0 |
+| Loans | 1 ($3,000) | 1 ($4,500, overridden) | 1 ($3,333) |
+| Overrides | 0 | 4 | 1 |
+
+- **Planning:** after a zone over budget it zoned the part that fits in 6 of 8 cases. In v22 it sent a message or moved on every time.
+- **Transport:** neither city reached the 1,500 residents that open the bus stops before month 12 ended, so the bus-line changes need a long run.
+- **Money:** one allocation failed on seed 1 because the money line rounds the treasury ($1,938) above what it held.
 
 **Problems tab** (viewer). `GET /api/runs/<id>/problems` (`bench/problems.py`) lists every failed or refused tool call and every turn that ended badly (step limit, no tool call, token budget, unreadable reply), each with what the agent did next:
 - **fixed:** a later call of the same tool worked in the same turn (the same arguments count too, after another action changed what failed, e.g. the dezone a road needed);
