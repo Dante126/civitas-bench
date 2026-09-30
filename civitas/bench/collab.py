@@ -28,6 +28,8 @@ LAND = re.compile(r"\broad|\blot\b|\blots\b|\bzone|\bdezone|\briverbank|\bland\b
 AMOUNT = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k\b)?", re.I)
 TILE = re.compile(r"\((\d{1,3})\s*,\s*(\d{1,3})\)")
 BUILDS = ("build_", "create_", "upgrade_")      # outcomes: something new stands in the city
+OPENERS = {"build_road": "road", "dezone": "freed lot", "bulldoze": "cleared land", "demolish": "cleared land"}
+HANDOFF_NEAR = 2
 MET_SHARE = 0.8
 NEAR = 3
 TEXT_CHARS = 400
@@ -66,6 +68,19 @@ def action_tile(a: dict) -> list[int] | None:
             x, y = a["stops"][0]
             return [int(x), int(y)]
     except (TypeError, ValueError, KeyError):
+        return None
+    return None
+
+
+def action_rect(a: dict) -> list[int] | None:
+    """[x1, y1, x2, y2] an action covered (its rectangle or road line's box, or its one tile), else None."""
+    try:
+        if "x1" in a and "y1" in a:
+            x1, y1, x2, y2 = int(a["x1"]), int(a["y1"]), int(a.get("x2", a["x1"])), int(a.get("y2", a["y1"]))
+            return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+        if "x" in a and "y" in a:
+            return [int(a["x"]), int(a["y"]), int(a["x"]), int(a["y"])]
+    except (TypeError, ValueError):
         return None
     return None
 
@@ -127,8 +142,8 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
                 tile = action_tile(a)
                 if typ.startswith(BUILDS) or typ in ("zone", "dezone", "bulldoze", "demolish"):
                     events.append({"month": month, "kind": "build" if typ.startswith(BUILDS) else "act",
-                                   "from": role, "to": role, "text": _what(a), "tile": tile,
-                                   "amount": float(r.get("cost") or 0) or None})
+                                   "from": role, "to": role, "text": _what(a), "tile": tile, "rect": action_rect(a),
+                                   "type": typ, "amount": float(r.get("cost") or 0) or None})
     key = lambda e: (e["month"], order.get(e["from"], len(order)), 0 if e["kind"] == "message" else 1)
     events.sort(key=key)
     for i, e in enumerate(events):
@@ -142,7 +157,34 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
                 events[eid]["thread"] = i
     return {"roles": roles, "act_every": act_every, "last_month": last, "window": window,
             "events": [{k: v for k, v in e.items() if k != "tiles" or v} for e in events],
-            "threads": threads, "stats": _stats(roles, events, threads)}
+            "threads": threads, "handoffs": handoffs(events, key, window), "stats": _stats(roles, events, threads)}
+
+
+def _gap(rect: list[int], tile: list[int]) -> int:
+    """Chebyshev distance from a tile to a rectangle (0 inside it)."""
+    x1, y1, x2, y2 = rect
+    return max(x1 - tile[0], tile[0] - x2, y1 - tile[1], tile[1] - y2, 0)
+
+
+def handoffs(events: list[dict], key, window: int) -> list[dict]:
+    """Land handed over: another department's build within HANDOFF_NEAR tiles of an earlier planning road, dezone or
+    clearance (OPENERS) inside the window; the latest such opener for each build. The Team view draws them on the map."""
+    opens = [e for e in events if e["from"] == "planning" and e.get("type") in OPENERS and e.get("rect")]
+    out = []
+    for b in events:
+        if b["kind"] != "build" or b["from"] == "planning" or not b.get("tile"):
+            continue
+        kb = key(b)
+        src = [e for e in opens if key(e) < kb and b["month"] - e["month"] <= window and _gap(e["rect"], b["tile"]) <= HANDOFF_NEAR]
+        if not src:
+            continue
+        e = src[-1]
+        x1, y1, x2, y2 = e["rect"]
+        at = [min(max(b["tile"][0], x1), x2), min(max(b["tile"][1], y1), y2)]     # the opener's tile nearest the build
+        out.append({"month": e["month"], "from": "planning", "what_from": OPENERS[e["type"]], "rect_from": e["rect"],
+                    "tile_from": at, "month_to": b["month"], "to": b["from"], "what": b["text"], "tile_to": b["tile"],
+                    "event_from": e["id"], "event_to": b["id"]})
+    return out
 
 
 def _thread(req: dict, events: list[dict], key, window: int, last: int) -> dict:

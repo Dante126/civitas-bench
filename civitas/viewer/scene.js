@@ -1296,6 +1296,12 @@ export class CityScene {
     this.scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
     this.resize();
   }
+  tileToScreen(x, y, h = 0.2) {   // a tile's centre -> CSS pixels in the view (app.js beams layer); null behind the camera
+    const v = new THREE.Vector3(this.wx(x), h, this.wz(y)).project(this.camera);
+    if (v.z > 1) return null;
+    const r = this.renderer.domElement.getBoundingClientRect();
+    return [(v.x + 1) / 2 * r.width, (1 - v.y) / 2 * r.height];
+  }
   cameraFootprint() {         // for the minimap: target tile + view direction
     const t = this.controls.target, d = new THREE.Vector3(); this.camera.getWorldDirection(d);
     return { x: t.x + this.W / 2 - 0.5, y: t.z + this.H / 2 - 0.5, angle: Math.atan2(d.x, d.z),

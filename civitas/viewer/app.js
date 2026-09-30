@@ -3,7 +3,7 @@
 import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } from "./scene.js";
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
-import { CollabGraph } from "./collab.js";
+import { CollabGraph, BeamLayer } from "./collab.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -198,7 +198,7 @@ function render(prev, animate) {
   $("monthLabel").textContent = `Year ${Math.floor(f.month / 12) + 1} · M${(f.month % 12) + 1}` + (f.season ? ` · ${f.season}` : "") + (arrow ? ` ${arrow}` : "");
   $("monthSub").textContent = `month ${f.month} / ${S.meta.months}`;
   renderScores(f); renderKpis(f); renderDemand(f); renderUtil(f); renderServices(f); renderMoney(f);
-  renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap(); updateTeamView();
+  renderTab(); drawMinimap(); drawTrackMarks(); updateRegionMap(); updateTeamView(); updateBeams();
   if (S.selected >= 0) renderInspector(S.selected);
 }
 
@@ -458,6 +458,15 @@ function renderTab() {
 // ---------------------------------------------------------------- team (collab.js)
 // the departments as a live network: requests, money and builds of each turn play out as the replay moves
 let teamGraph = null, teamBig = null, collabAt = 0;
+const beams = new BeamLayer($("beams"), { colorOf: roleColor, project: (x, y) => scene.tileToScreen ? scene.tileToScreen(x, y) : null });
+const beamsOn = () => store.get("beams", true);
+function updateBeams() {
+  if (!S.collab || !S.frames.length) { beams.setMonth(-1, { on: false }); return; }
+  beams.setData(S.collab);
+  beams.setMonth(teamMonth(), { animate: S.anim, filter: roleOn, on: beamsOn(),
+    budgetMs: S.playing ? Math.min(2600, +$("speed").value * (S.collab.act_every || 1) * 0.9) : 1600 });
+}
+function setBeams(on) { store.set("beams", on); toggleBtn("vBeams", on); updateBeams(); }
 async function loadCollab(force = false) {
   const id = S.runId;
   if (!id || (!force && S.status === "running" && Date.now() - collabAt < 6000 && S.collab)) return;
@@ -474,6 +483,7 @@ async function loadCollab(force = false) {
   if (S.runId !== id) return;
   S.collab = d; S.collabErr = null;
   for (const gph of [teamGraph, teamBig]) if (gph) gph.setData(d);
+  S.anim = false; updateBeams();
   if (S.tab === "team") renderTeam(); updateTeamView();
 }
 const teamMonth = () => S.frames.length ? S.frames[S.idx].month - 1 : -1;     // turns are logged on the next frame
@@ -528,6 +538,22 @@ function teamList(em) {
   const head = pick ? `<div class="teampick muted">Showing ${pick.role ? `<b style="color:${roleColor(pick.role)}">${esc(pick.role)}</b>'s threads` : `<b>${esc(pick.from)} → ${esc(pick.to)}</b>`} · <a href="#" class="unpick">show all</a></div>` : "";
   return head + (th.length ? th.map(t => threadHTML(t, em)).join("") : `<div class="emptytab">No requests in the last ${2 * (S.collab.act_every || 1)} months${pick ? " here" : ""}.</div>`);
 }
+function handoffList(em) {
+  const win = S.collab.window || 6, pick = S.teamPick;
+  const hs = (S.collab.handoffs || []).filter(h => h.month_to <= em && em - h.month_to < win && roleOn(h.to)
+    && (!pick || (pick.role ? h.to === pick.role || h.from === pick.role : pick.from === h.from && pick.to === h.to))).reverse();
+  if (!hs.length) return "";
+  return `<div class="teamh">Land handed over · ⇢ on the map</div>` + hs.slice(0, 8).map(h =>
+    `<div class="handoff" data-x="${h.tile_to[0]}" data-y="${h.tile_to[1]}" data-r="${h.rect_from.join(",")}"><span class="tag">m${h.month_to}</span>
+      <b style="color:${roleColor(h.from)}">${esc(h.from)}</b>'s ${esc(h.what_from)} (m${h.month}) → <b style="color:${roleColor(h.to)}">${esc(h.to)}</b> ${esc(h.what)} 📍</div>`).join("");
+}
+function bindHandoffs(root) {
+  root.querySelectorAll(".handoff").forEach(el => el.onclick = () => {
+    const [x1, y1, x2, y2] = el.dataset.r.split(",").map(Number), x = +el.dataset.x, y = +el.dataset.y;
+    scene.highlightRect({ x1: Math.min(x1, x), y1: Math.min(y1, y), x2: Math.max(x2, x), y2: Math.max(y2, y) });
+    scene.flyTo((Math.min(x1, x) + Math.max(x2, x)) / 2, (Math.min(y1, y) + Math.max(y2, y)) / 2, 16);
+  });
+}
 function onTeamPick(h) { S.teamPick = h; if (S.tab === "team") renderTeam(); updateTeamView(); }
 function renderTeam() {
   const body = $("tabBody");
@@ -548,8 +574,8 @@ function renderTeam() {
   teamStep(teamGraph);
   const em = teamMonth();
   $("teamSum").innerHTML = teamSummary(em);
-  $("teamList").innerHTML = teamList(em);
-  bindThreads($("teamList"));
+  $("teamList").innerHTML = handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em);
+  bindThreads($("teamList")); bindHandoffs($("teamList"));
   const un = $("teamList").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamGraph.selected = null; onTeamPick(null); };
 }
 function openTeamView() {
@@ -564,8 +590,8 @@ function updateTeamView() {
   teamStep(teamBig);
   const em = teamMonth();
   $("teamMonth").textContent = `month ${S.frames[S.idx].month}`;
-  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + teamList(em);
-  bindThreads($("teamSide"));
+  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em);
+  bindThreads($("teamSide")); bindHandoffs($("teamSide"));
   const un = $("teamSide").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamBig.selected = null; onTeamPick(null); };
 }
 
@@ -1211,6 +1237,8 @@ $("vReset").onclick = () => scene.resetView(); $("vTop").onclick = () => scene.t
 $("vMode").onclick = () => setView(viewMode === "3d" ? "pixel" : "3d");
 $("vRotate").onclick = () => { const on = !$("vRotate").classList.contains("on"); scene.setAutoRotate(on); toggleBtn("vRotate", on); };
 $("vNight").onclick = () => setNight(!$("vNight").classList.contains("on"));
+$("vBeams").onclick = () => setBeams(!beamsOn());
+toggleBtn("vBeams", beamsOn());
 $("vQuality").onclick = () => setQuality(scene.quality === "low" ? "high" : "low");
 $("vShot").onclick = () => { const a = document.createElement("a"); a.href = scene.screenshot(); a.download = `civitas_${S.runId || "city"}_m${S.frames[S.idx]?.month ?? 0}.png`; a.click(); };
 $("vFull").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
@@ -1240,7 +1268,7 @@ document.addEventListener("keydown", (e) => {
     "0": () => scene.resetView(), t: () => scene.topView(), o: () => $("vRotate").click(), n: () => $("vNight").click(), g: () => $("vQuality").click(),
     p: () => $("vShot").click(), f: () => $("vFull").click(), l: () => { $("follow").checked = !$("follow").checked; $("follow").onchange({ target: $("follow") }); },
     "[": () => $("vLeft").click(), "]": () => $("vRight").click(), r: () => $("runBtn").click(), "?": () => ($("helpModal").hidden = false),
-    v: () => $("layerBtn").click(), x: () => $("vMode").click(),
+    v: () => $("layerBtn").click(), x: () => $("vMode").click(), b: () => $("vBeams").click(),
   };
   OVERLAYS.slice(0, 9).forEach((o, k) => { map[String(k + 1)] = () => setOverlay(o.id); });
   const fn = map[k] || map[k.toLowerCase()];

@@ -78,6 +78,11 @@ export class PixelScene {
     return [x + this.cxm, y + this.cym];
   }
   get scale() { return ZOOMS[this.zi] * this.dpr; }
+  tileToScreen(x, y, z = 0) {                       // a tile's centre -> CSS pixels in the view (app.js beams layer)
+    const r = this.cv.getBoundingClientRect(), s = ZOOMS[this.zi];
+    const [ox, oy] = this.world(this.cam.x, this.cam.y), [wx, wy] = this.world(x, y, z);
+    return [(wx - ox) * s + r.width / 2, (wy - oy) * s + r.height / 2];
+  }
   _screenToWorld(cx, cy) {
     const r = this.cv.getBoundingClientRect(), s = ZOOMS[this.zi];
     const [ox, oy] = this.world(this.cam.x, this.cam.y);

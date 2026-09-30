@@ -105,3 +105,20 @@ def test_collab_endpoint(tmp_path):
         assert d["act_every"] == 3 and d["threads"][0]["status"] == "open" and d["threads"][0]["amount"] == 2000
     finally:
         srv.shutdown()
+
+
+def test_handoffs_link_planning_openers_to_buildings_nearby():
+    """A department's build within 2 tiles of planning's earlier road, dezone or clearance, inside the window, is a
+    hand-off from the latest such opener; planning's own builds and builds far away are not."""
+    frames = [
+        frame(1, [], [turn(0, "planning", res("build_road", x1=10, y1=20, x2=18, y2=20), res("build_road", x1=30, y1=5, x2=30, y2=9))]),
+        frame(4, [], [turn(3, "planning", res("dezone", x1=16, y1=21, x2=17, y2=21), res("build_park", x=12, y=21)),
+                      turn(3, "health", res("build_clinic", cost=2000, x=17, y=22)),
+                      turn(3, "police", res("build_police_station", cost=2500, x=40, y=40))]),
+        frame(13, [], [turn(12, "fire", res("build_fire_station", cost=2500, x=12, y=19))]),    # past the window
+    ]
+    d = collab(frames, ROLES, act_every=3)
+    assert len(d["handoffs"]) == 1, d["handoffs"]
+    h = d["handoffs"][0]
+    assert (h["from"], h["what_from"], h["month"], h["rect_from"]) == ("planning", "freed lot", 3, [16, 21, 17, 21])
+    assert (h["to"], h["what"], h["month_to"], h["tile_to"], h["tile_from"]) == ("health", "built clinic", 3, [17, 22], [17, 21])

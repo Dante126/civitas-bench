@@ -9,6 +9,7 @@
 <body>
 <div id="app">
   <div id="viewport" aria-label="City view"></div>
+  <canvas id="beams" aria-hidden="true"></canvas>
 
   <!-- ============================== top bar -->
   <header id="topbar" class="glass">
@@ -82,6 +83,7 @@
     <button class="btn icon" id="vTop" title="Top-down view (T)">⊤</button>
     <button class="btn icon" id="vRotate" title="Auto-rotate (O)">↻</button>
     <button class="btn icon" id="vNight" title="Day / night (N)">☾</button>
+    <button class="btn icon" id="vBeams" title="Hand-off beams: planning's roads and lots to the buildings that went there (B)">⇢</button>
     <button class="btn icon" id="vQuality" title="Graphics quality (G)">HQ</button>
     <button class="btn icon" id="vShot" title="Save screenshot (P)">⎙</button>
     <button class="btn icon" id="vFull" title="Fullscreen (F)">⛶</button>
@@ -154,7 +156,7 @@
           <p><kbd>Space</kbd> play/pause · <kbd>←</kbd><kbd>→</kbd> month · <kbd>Shift+←/→</kbd> year</p>
           <p><kbd>Home</kbd><kbd>End</kbd> first/last · <kbd>L</kbd> follow live run</p></div>
         <div><h4>View</h4>
-          <p><kbd>V</kbd> layer menu · <kbd>1</kbd>–<kbd>9</kbd> layers · <kbd>N</kbd> night · <kbd>G</kbd> quality · <kbd>P</kbd> screenshot · <kbd>F</kbd> fullscreen</p>
+          <p><kbd>V</kbd> layer menu · <kbd>1</kbd>–<kbd>9</kbd> layers · <kbd>B</kbd> hand-off beams · <kbd>N</kbd> night · <kbd>G</kbd> quality · <kbd>P</kbd> screenshot · <kbd>F</kbd> fullscreen</p>
           <p><kbd>[</kbd><kbd>]</kbd> panels · <kbd>R</kbd> runs · <kbd>Esc</kbd> close</p></div>
         <div><h4>Inspect</h4>
           <p>Click a tile to see its stats, history, and which agent built it.</p>

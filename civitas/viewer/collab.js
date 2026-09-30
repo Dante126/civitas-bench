@@ -264,7 +264,7 @@ export class CollabGraph {
     } else if (q.type === "comet") this.pulse.set(q.b, { t0: now, color: q.color });
     else if (q.type === "burst" && q.text) {
       const [x, y] = this.pos[q.a];
-      this.floats.push({ text: q.text, x, y: y + this._radius(q.a) + 24 * this.scale, color: q.color, t0: now - 200, dur: 1500, size: 10 });
+      this.floats.push({ text: q.text, x, y: y + this._radius(q.a) + 40 * this.scale, color: q.color, t0: now - 200, dur: 1500, size: 10 });
     }
   }
 
@@ -332,5 +332,104 @@ export class CollabGraph {
     const msgs = this.data.events.filter(e => e.kind === "message" && e.from === from && e.to === to && e.month <= this.month).length;
     const done = th.filter(t => t.response && t.response.month <= this.month).length;
     return [`${from} → ${to}`, `${msgs} messages · ${th.length} requests (${done} answered)`, money ? `${fmtK(money)} moved` : "no money moved", "click to see the threads"];
+  }
+}
+
+// Hand-off beams over the city: planning's road or freed lot glows, an arc carries a light from it to the building
+// another department put there, and the building bursts with "road → school". Drawn on an overlay canvas above
+// either city renderer through its tileToScreen(); recent hand-offs stay as faint arcs while paused.
+export class BeamLayer {
+  constructor(canvas, { colorOf, project }) {
+    this.cv = canvas; this.g = canvas.getContext("2d"); this.colorOf = colorOf; this.project = project;
+    this.data = null; this.month = -1; this.on = true; this.filter = () => true; this.live = [];
+    this._loop = this._loop.bind(this);
+    this.ro = new ResizeObserver(() => this.resize()); this.ro.observe(canvas.parentElement);
+    this.resize(); requestAnimationFrame(this._loop);
+  }
+  resize() {
+    const dpr = Math.min(2, window.devicePixelRatio || 1), el = this.cv.parentElement;
+    this.W = el.clientWidth; this.H = el.clientHeight; this.dpr = dpr;
+    this.cv.width = Math.round(this.W * dpr); this.cv.height = Math.round(this.H * dpr);
+  }
+  setData(data) { this.data = data; }
+  setMonth(month, { animate = false, budgetMs = 1600, filter, on = true } = {}) {
+    this.on = on; if (filter) this.filter = filter;
+    const prev = this.month; this.month = month;
+    if (!this.data || !on) { this.live = []; return; }
+    if (animate && prev >= 0 && month > prev && month - prev <= 12) {
+      const now = performance.now(), hs = this.data.handoffs.filter(h => h.month_to > prev && h.month_to <= month && this.filter(h.to));
+      const dur = Math.max(900, Math.min(2200, budgetMs * 0.8));
+      hs.forEach((h, i) => this.live.push({ h, t0: now + i * Math.min(350, budgetMs * 0.25), dur }));
+    } else if (!animate) this.live = [];
+  }
+  _arc(a, b) {                                     // screen-space arc lifted above the city
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    return [(a[0] + b[0]) / 2, Math.min(a[1], b[1]) - Math.min(170, 30 + d * 0.45)];
+  }
+  _pt(a, c, b, t) { const u = 1 - t; return [u * u * a[0] + 2 * u * t * c[0] + t * t * b[0], u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]]; }
+  _from(h) { const r = h.rect_from; return this.project((r[0] + r[2]) / 2, (r[1] + r[3]) / 2); }   // the opener's middle
+  _rect(r) {                                       // a tile rectangle's corners on screen
+    const P = [[r[0] - 0.5, r[1] - 0.5], [r[2] + 0.5, r[1] - 0.5], [r[2] + 0.5, r[3] + 0.5], [r[0] - 0.5, r[3] + 0.5]].map(([x, y]) => this.project(x, y));
+    return P.every(Boolean) ? P : null;
+  }
+  _loop(now) {
+    if (this.ro === null) return;
+    const g = this.g;
+    g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); g.clearRect(0, 0, this.W, this.H);
+    if (this.on && this.data) {
+      const m = this.month, win = this.data.window || 6;
+      // resting arcs: the hand-offs of the last window, fading with age
+      for (const h of this.data.handoffs) {
+        if (h.month_to > m || m - h.month_to >= win || !this.filter(h.to)) continue;
+        if (this.live.some(l => l.h === h)) continue;
+        const a = this._from(h), b = this.project(...h.tile_to);
+        if (!a || !b) continue;
+        const c = this._arc(a, b), al = 0.75 * (1 - (m - h.month_to) / win) + 0.2;
+        g.strokeStyle = `rgba(7,10,18,${0.45 * al})`; g.lineWidth = 4.5;           // a dark underlay reads on snow too
+        g.beginPath(); g.moveTo(a[0], a[1]); g.quadraticCurveTo(c[0], c[1], b[0], b[1]); g.stroke();
+        const gr = g.createLinearGradient(a[0], a[1], b[0], b[1]);
+        gr.addColorStop(0, hexA(this.colorOf(h.from), al)); gr.addColorStop(1, hexA(this.colorOf(h.to), al));
+        g.strokeStyle = gr; g.lineWidth = 2.2;
+        g.beginPath(); g.moveTo(a[0], a[1]); g.quadraticCurveTo(c[0], c[1], b[0], b[1]); g.stroke();
+        g.setLineDash([2, 14]); g.lineDashOffset = -now / 45; g.strokeStyle = `rgba(255,255,255,${0.8 * al})`; g.lineWidth = 2.2;
+        g.beginPath(); g.moveTo(a[0], a[1]); g.quadraticCurveTo(c[0], c[1], b[0], b[1]); g.stroke(); g.setLineDash([]);
+        g.save(); g.shadowColor = this.colorOf(h.to); g.shadowBlur = 10; g.fillStyle = hexA(this.colorOf(h.to), Math.min(1, al + 0.2));
+        g.beginPath(); g.arc(b[0], b[1], 3.5, 0, 2 * Math.PI); g.fill(); g.restore();
+      }
+      this.live = this.live.filter(l => { const p = (now - l.t0) / l.dur; if (p >= 1) return false; if (p >= 0) this._beam(l.h, p); return true; });
+    }
+    requestAnimationFrame(this._loop);
+  }
+  _beam(h, p) {
+    const g = this.g, a = this._from(h), b = this.project(...h.tile_to);
+    if (!a || !b) return;
+    const cf = this.colorOf(h.from), ct = this.colorOf(h.to), c = this._arc(a, b);
+    const rc = this._rect(h.rect_from);
+    if (rc && p < 0.6) {                           // 1. the road or lot planning opened glows
+      const al = Math.sin(Math.min(1, p / 0.6) * Math.PI);
+      g.save(); g.shadowColor = cf; g.shadowBlur = 18; g.strokeStyle = hexA(cf, 0.9 * al); g.fillStyle = hexA(cf, 0.18 * al); g.lineWidth = 2.5;
+      g.beginPath(); rc.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); g.fill(); g.stroke(); g.restore();
+    }
+    const q = Math.min(1, Math.max(0, (p - 0.15) / 0.55)), t = ease(q);
+    if (q > 0) {                                   // 2. the light travels, leaving the arc behind it
+      const gr = g.createLinearGradient(a[0], a[1], b[0], b[1]);
+      gr.addColorStop(0, hexA(cf, 0.85)); gr.addColorStop(1, hexA(ct, 0.85));
+      g.strokeStyle = gr; g.lineWidth = 2.5; g.beginPath(); g.moveTo(a[0], a[1]);
+      for (let i = 1; i <= 24; i++) { const [x, y] = this._pt(a, c, b, t * i / 24); g.lineTo(x, y); }
+      g.stroke();
+      if (q < 1) {
+        const [x, y] = this._pt(a, c, b, t);
+        g.save(); g.shadowColor = "#fff"; g.shadowBlur = 20; g.fillStyle = "#fff"; g.beginPath(); g.arc(x, y, 4.5, 0, 2 * Math.PI); g.fill(); g.restore();
+      }
+    }
+    if (p > 0.68) {                                // 3. the new building bursts, and the hand-off is named
+      const r = (p - 0.68) / 0.32;
+      g.strokeStyle = hexA(ct, 1 - r); g.lineWidth = 3;
+      g.beginPath(); g.arc(b[0], b[1], 6 + ease(r) * 34, 0, 2 * Math.PI); g.stroke();
+      g.font = "600 13px Inter, system-ui, sans-serif"; g.textAlign = "center";
+      const text = `${h.what_from} → ${h.what.replace(/^built /, "")}`, y = b[1] - 16 - r * 14;
+      g.lineWidth = 4; g.strokeStyle = `rgba(7,10,18,${0.85 * (1 - r * r)})`; g.strokeText(text, b[0], y);
+      g.fillStyle = hexA(ct, 1 - r * r); g.fillText(text, b[0], y);
+    }
   }
 }
