@@ -756,8 +756,13 @@ tasks and money, and to let people coach it.
   riders against seats. The bus_stops list reads as one line (`6 stops for one line:
   create_bus_line stops [[40,5],...]`, and `find_sites bus_stops` returns `stops`),
   since the model had built lines of 1–2 stops from "6 sites, best (40,5)". It offers
-  another line only while every line carries 90% of its seats (riders take the best
-  line, so a second line on the same stops buys nothing; at most 4 lines), and congested
+  another line only while every line carries 90% of its seats, or once 40% of the
+  residents live away from every stop and the next line has 2+ stops there (a trip rides
+  the best line covering both its ends, so a second line on the same stops buys nothing
+  but one in new areas adds riders; at most 4 lines). The next line's stops are the big
+  job centres plus the home areas no stop reaches. In the v23 120-month runs one 7-stop
+  line from month 12–18 took transit to 15–21%, then the city outgrew it (4–6% by month
+  48, 124–196 riders of 1,500 seats) and no second line was offered, and congested
   roads are listed from 1.0× capacity, as the scripted transport upgrades them. A failed
   `create_bus_line` names the suggested stops. The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too

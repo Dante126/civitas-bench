@@ -5850,13 +5850,23 @@ def test_another_bus_line_only_when_buses_run_full(open_env):
     assert apply_action(w, "transport", {"type": "create_bus_line", "stops": stops}).ok and len(w.bus_lines) == 1
     w.bus_lines[0].update(riders=210, capacity=1500)
     lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
-    assert lst.short == "buses have room (210 of 1,500 seats used; another line pays once buses run 90% full)", lst
+    assert lst.short == ("buses have room (210 of 1,500 seats, 73% of residents near a stop); another line at 90% "
+                         "full or 40% away from stops"), lst
     assert "bus_stops" not in T.ready_prices(w, "transport", {"bus_stops": lst})
     text = briefing(env, "transport", mark=False)
     assert "- bus riders: 210 of 1,500 seats (1 line)" in text and "First bus line" not in text
     w.bus_lines[0]["riders"] = 1400
     lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
     assert lst.short is None and "bus_stops" in T.ready_prices(w, "transport", {"bus_stops": lst})
+    # a city grown past its line (v23 120-month runs: transit 15-21% at month 24, 4-6% by month 48 with one line):
+    # with 40% of residents away from every stop the next line is offered, through homes the line doesn't reach
+    w.bus_lines[0]["riders"] = 210
+    w.bus_lines[0]["stops"] = [list(p) for p in stops[:2]]
+    cover = T.bus_cover(w)
+    assert T.bus_away(w, cover) >= T.BUS_AWAY
+    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    assert lst.short is None and sum(not cover[s["y"], s["x"]] for s in lst.sites) >= 2, lst
+    assert [[s["x"], s["y"]] for s in lst.sites] == T.new_line_stops(w)[:len(lst.sites)]
     # an upgrade with a bus line in place: never refused for it
     w.dept_funds["transport"] = 30
     assert ToolBox(env, "transport").call("upgrade_road", _street(w))["ok"]

@@ -502,14 +502,17 @@ def _transport_section(world: World, site_hints: bool) -> dict:
     return out
 
 
-def _suggest_stops(world: World, n_homes: int = 4, n_jobs: int = 3) -> list[list[int]]:
-    """Road tiles in the biggest residential areas and at the biggest job centres (main network)."""
+def _suggest_stops(world: World, n_homes: int = 4, n_jobs: int = 3, avoid: np.ndarray | None = None) -> list[list[int]]:
+    """Road tiles in the biggest residential areas and at the biggest job centres (main network); with `avoid` (a
+    tile mask, e.g. the bus lines' coverage) only homes outside it count (the fleet's next line: tools.new_line_stops)."""
     res = _residents(world)
     anchor = world._anchors()
     main = max(range(len(world.networks)), key=lambda i: (world.networks[i].outside_connected,
                                                            world.networks[i].road_tiles)) if world.networks else -1
     ok = anchor >= 0
     mass = np.bincount(anchor[ok].ravel(), weights=res[ok].ravel(), minlength=world.h * world.w).reshape(world.h, world.w)
+    if avoid is not None:
+        mass = mass * ~avoid
     mass = box_sum(mass, 3) * (world.road_labels == main)
     stops = []
     for h in sorted([h for h in world.hubs if h["kind"] == "jobs"], key=lambda h: -h["jobs"])[:n_jobs]:

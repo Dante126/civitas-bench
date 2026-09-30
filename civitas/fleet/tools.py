@@ -21,8 +21,8 @@ import numpy as np
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
                             WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
                             zone_density, zone_price, zone_tiles)
-from ..core.observation import (MAP_LEGEND, _far_from_homes, _road_extensions, _uncrowded_first, _zone_suggestions,
-                                build_observation)
+from ..core.observation import (MAP_LEGEND, _far_from_homes, _residents, _road_extensions, _suggest_stops,
+                                _uncrowded_first, _zone_suggestions, build_observation)
 from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
@@ -161,6 +161,11 @@ SITE_MIN_POP = {"bus_stops": 1500}
 # the same stops buys nothing: the 120-month LLM runs built lines at ~210 of 1,500 seats. Congested stretches are
 # listed from CONGESTED_LOAD x capacity (the scripted transport upgrades only there; observation lists from 0.8)
 BUS_FULL, BUS_LINES_MAX, CONGESTED_LOAD = 0.9, 4, 1.0
+# ... or once BUS_AWAY of the residents live beyond every stop's reach and the next line (new_line_stops) has at least
+# 2 stops there: a trip rides the best line covering both its ends, so a line in new areas adds riders. v23 120-month
+# runs: one 7-stop line from month 12-18 took transit to 15-21%, then the city outgrew it (4-6% by month 48, riders
+# 124-196 of 1,500 seats) and the full-buses rule offered no second line
+BUS_AWAY = 0.4
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 # utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
@@ -1532,6 +1537,8 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             if strips is None:                                      # observation's 2: each type its own (ready_lines)
                 strips = _zone_suggestions(w, per_type=MAX_SITES)
             found = strips.get(path[1], found)
+        if purpose == "bus_stops" and w.bus_lines:        # the next line: homes the lines don't reach
+            found = new_line_stops(w)
         sites = [_site(s) for s in (found or []) if _on_connected_road(w, s)]
         if purpose in BANK_TOP_UP and len(sites) < len(found or []):
             sites += _bank_top_up(w, sites, BANK_TOP_UP[purpose])
@@ -2101,11 +2108,43 @@ def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
         return (f"{len(lines)} bus lines already", f"the city has {len(lines)} bus lines; more add upkeep, not riders")
     if not lines or all(ln.get("riders", 0) >= BUS_FULL * ln.get("capacity", C.LINE_CAPACITY) for ln in lines):
         return None
+    cover = bus_cover(w)
+    away = bus_away(w, cover)
+    fresh = sum(not cover[s["y"], s["x"]] for s in sites)
+    if away >= BUS_AWAY and fresh >= 2:                  # a line in new areas (new_line_stops)
+        return None
     riders, seats = bus_seats(w)
-    full = f"another line pays once buses run {pct(100 * BUS_FULL)} full"
-    return (f"buses have room ({riders:,} of {seats:,} seats used; {full})",
-            f"the bus lines carry {riders:,} riders of {seats:,} seats; riders take the best line, so another line "
-            f"on these stops buys nothing: {full}")
+    full = (f"another line pays once buses run {pct(100 * BUS_FULL)} full or {pct(100 * BUS_AWAY)} of residents live "
+            "away from the stops")
+    return (f"buses have room ({riders:,} of {seats:,} seats, {pct(100 * (1 - away))} of residents near a stop); "
+            f"another line at {pct(100 * BUS_FULL)} full or {pct(100 * BUS_AWAY)} away from stops",
+            f"the bus lines carry {riders:,} riders of {seats:,} seats and reach {pct(100 * (1 - away))} of residents; "
+            f"a trip rides the best line covering both its ends, so another line pays only in new areas: {full}")
+
+
+def bus_cover(w) -> np.ndarray:
+    """The tiles within C.STOP_RADIUS of a bus stop, from the lines' stops as they are now (World.transit_cov is
+    recomputed only by the next tick, so it misses a line created this turn)."""
+    cover = np.zeros((w.h, w.w), bool)
+    for line in w.bus_lines:
+        for x, y in line["stops"]:
+            cover |= w._disk(x, y, C.STOP_RADIUS)
+    return cover
+
+
+def bus_away(w, cover: np.ndarray | None = None) -> float:
+    """The share of residents beyond every bus stop's reach (bus_cover); 1.0 with no line, 0.0 with nobody."""
+    res = _residents(w)
+    total = float(res.sum())
+    cover = bus_cover(w) if cover is None else cover
+    return float(res[~cover].sum()) / total if total > 0 else 0.0
+
+
+def new_line_stops(w) -> list[list[int]]:
+    """The next bus line's stops once the city has one: the biggest job centres and the biggest home areas outside the
+    lines' reach (observation._suggest_stops with avoid; its default suggestions, which the scripted transport reads,
+    keep naming the first line's stops)."""
+    return _suggest_stops(w, avoid=bus_cover(w))
 
 
 def bus_stops(lst: SiteList) -> list[list[int]]:
