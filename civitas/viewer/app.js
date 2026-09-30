@@ -35,8 +35,9 @@ const store = { get(k, d) { try { const v = localStorage.getItem("civitas." + k)
 const S = {
   runs: [], runId: null, meta: null, frames: [], idx: 0, status: "—", playing: false, timer: null, poll: null,
   tab: store.get("tab", "agents"), overlay: store.get("overlay", "none"), roleFilter: new Set(), selected: -1,
-  follow: true, configs: [],
+  follow: true, configs: [], issuesView: store.get("issues", "agents"),
 };
+if (S.tab === "problems" || S.tab === "events") { S.issuesView = S.tab === "events" ? "city" : "agents"; S.tab = "issues"; }
 
 // ================================================================ api
 async function api(path, body) {
@@ -382,7 +383,8 @@ function actRect(a) {
 function actText(a) { const { type, ...rest } = a; return `<b>${esc(type)}</b> ${esc(Object.entries(rest).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" "))}`; }
 function roleChips() {
   const roles = S.meta ? S.meta.roles : [];
-  $("tabTools").innerHTML = roles.map(r => `<button class="chip ${S.roleFilter.size === 0 || S.roleFilter.has(r) ? "on" : ""}" data-role="${r}" style="--c:${roleColor(r)}"><span class="dot"></span>${r}</button>`).join("");
+  const SHORT = { planning: "plan", utilities: "util", transport: "trans", education: "edu" };
+  $("tabTools").innerHTML = roles.map(r => `<button class="chip ${S.roleFilter.size === 0 || S.roleFilter.has(r) ? "on" : ""}" data-role="${r}" data-name="${r}" style="--c:${roleColor(r)}"><span class="dot"></span>${SHORT[r] || r}</button>`).join("");
   // a click shows only that role (again: all roles); shift / cmd / ctrl-click adds or removes one
   $("tabTools").querySelectorAll(".chip").forEach(b => b.onclick = (ev) => {
     const r = b.dataset.role;
@@ -393,7 +395,7 @@ function roleChips() {
     if (S.roleFilter.size === roles.length) S.roleFilter.clear();
     renderTab();
   });
-  $("tabTools").querySelectorAll(".chip").forEach(b => b.title = "Show only this role (click again for all; shift-click to add or remove)");
+  $("tabTools").querySelectorAll(".chip").forEach(b => b.title = `${b.dataset.name}: show only this department (click again for all; shift-click to add or remove)`);
 }
 const roleOn = (r) => S.roleFilter.size === 0 || S.roleFilter.has(r);
 
@@ -433,26 +435,17 @@ function turnHeadline(t) {
   return ok.length ? esc([...groups].map(([k, rs]) => headlinePart(k, rs)).filter(Boolean).join(" · "))
     : `<span class="muted">${t.results.length ? "nothing succeeded" : "no actions"}</span>`;
 }
-function quarterTable(turns) {
-  const rows = turns.map(t => {
-    const ok = t.results.filter(r => r.ok).length, bad = t.results.length - ok;
-    const spent = t.results.filter(r => r.ok).reduce((s, r) => s + (r.cost || 0), 0);
-    return `<tr class="qrow" data-role="${esc(t.role)}" style="--c:${roleColor(t.role)}">
-      <td class="qrole"><span class="dot"></span>${esc(t.role)}</td><td class="qwhat">${turnHeadline(t)}</td>
-      <td>${spent ? fmt$(spent) : "—"}</td><td>${ok}${bad ? `<span class="bad">/${bad}✗</span>` : ""}</td>
-      <td class="qref" data-role="${esc(t.role)}">·</td><td class="qend" data-role="${esc(t.role)}">·</td></tr>`;
-  }).join("");
-  return `<table class="lb qsum"><tr><th>role</th><th>what it did</th><th>spent</th><th title="successful actions / failed">acts</th><th title="refused calls">⊘</th><th title="how the turn ended">end</th></tr>${rows}</table>`;
-}
 // the trace summary (/turns) fills refusals and how the turn ended once it has loaded
 function fillQuarterRow(role, s) {
-  const ref = document.querySelector(`td.qref[data-role="${role}"]`), end = document.querySelector(`td.qend[data-role="${role}"]`);
-  if (ref) ref.innerHTML = s.refused ? `<span class="warn">${s.refused}</span>` : "—";
-  if (end) end.innerHTML = s.finish_reason === "end_turn" ? `<span class="muted">✓</span>` : `<span class="warn" title="${esc(s.finish_reason || "")}">${esc((s.finish_reason || "?").replace("max_steps", "step limit").replace("no_tool_calls", "no call"))}</span>`;
+  const ref = document.querySelector(`.qref[data-role="${role}"]`), end = document.querySelector(`.qend[data-role="${role}"]`);
+  if (ref) ref.innerHTML = s.refused ? `<span class="warn" title="calls refused by a guard">⊘ ${s.refused}</span>` : "";
+  if (end) end.innerHTML = !s.finish_reason || s.finish_reason === "end_turn" ? "" : `<span class="warn" title="how the turn ended: ${esc(s.finish_reason)}">${esc(s.finish_reason.replace("max_steps", "step limit").replace("no_tool_calls", "no call").replace("turn_tokens", "token budget"))}</span>`;
 }
 
 function renderTab() {
-  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === S.tab));
+  document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === S.tab));
+  const more = document.querySelector(`#moreMenu button[data-tab="${S.tab}"]`);
+  $("moreBtn").classList.toggle("on", !!more); $("moreBtn").textContent = more ? `${more.textContent} ▾` : "⋯";
   const body = $("tabBody");
   if (!S.frames.length && S.tab !== "runs") { $("tabTools").innerHTML = ""; body.innerHTML = `<div class="emptytab">Open or launch a run.</div>`; return; }
   const f = S.frames[S.idx];
@@ -462,42 +455,13 @@ function renderTab() {
     renderTeam();
   } else if (S.tab === "agents") {
     roleChips();
-    // agents act every few months: between their turns, keep showing the latest quarter instead of an empty tab
-    const j = turnFrame(S.idx);
-    S.agentsFrame = j;
-    if (j < 0) { body.innerHTML = `<div class="emptytab">${f.month === 0 ? "Start of the game: press ▶ or step forward to see the agents' first decisions." : "No agent turns yet."}</div>`; return; }
-    const tf = S.frames[j], turns = tf.turns.filter(t => roleOn(t.role));
-    const prevJ = turnFrame(j - 1), nextJ = nextTurnFrame(S.idx);
-    const since = j === S.idx ? `shown on the map at month ${tf.month}` : `on the map since month ${tf.month}, now month ${f.month}`;
-    body.innerHTML = `<div class="qhead"><button class="btn qnav" id="qPrev" ${prevJ < 0 ? "disabled" : ""} title="previous quarter">◀</button>
-        <div><b>Decisions from month ${tf.month - 1}</b> <span class="muted">· ${since}</span></div>
-        <button class="btn qnav" id="qNext" ${nextJ < 0 ? "disabled" : ""} title="next quarter">▶</button></div>` +
-      (turns.length ? quarterTable(turns) : `<div class="emptytab">No turns for the selected roles.</div>`) +
-      `<div class="small muted" style="margin:8px 0">Click a row to jump to its card, an action with 📍 to fly there.</div>` +
-      turns.map((t, ti) => `<div class="turn" id="turn-${esc(t.role)}" style="--c:${roleColor(t.role)}">
-        <div class="who"><span style="color:${roleColor(t.role)}">${t.role}</span><span class="tag">${esc(S.meta.agents[t.role])}</span></div>
-        ${t.parse_error ? `<div class="small" style="color:var(--warn)">⚠ ${esc(t.parse_error).slice(0, 140)}</div>` : ""}
-        ${t.thinking ? `<div class="think">${esc(t.thinking)}</div>` : ""}
-        ${t.results.map((r, ri) => { const rc = actRect(r.action); return `<div class="act ${r.ok ? "ok" : "bad"} ${rc ? "loc" : ""}" data-t="${ti}" data-r="${ri}">
-          <span class="st">${r.ok ? "✓" : "✗"}</span><span><code>${actText(r.action)}</code><span class="msg">${esc(r.message)}${r.cost ? ` · ${fmt$(r.cost)}` : ""}</span></span>${rc ? `<span class="pin">📍</span>` : ""}</div>`; }).join("") || `<div class="small muted">no actions</div>`}
-        ${(t.messages || []).map(m => `<div class="msgline small"><b style="--c:${roleColor(t.role)}">→ ${esc(m.to)}</b> ${esc(m.text)}</div>`).join("")}
-        <div class="trace" data-role="${t.role}"></div>
-      </div>`).join("");
-    loadTraces(tf.month - 1);
-    if (prevJ >= 0) $("qPrev").onclick = () => go(prevJ);
-    if (nextJ >= 0) $("qNext").onclick = () => go(nextJ);
-    body.querySelectorAll("tr.qrow").forEach(el => el.onclick = () => {
-      const card = document.getElementById(`turn-${el.dataset.role}`); if (!card) return;
-      card.scrollIntoView({ behavior: "smooth", block: "start" });
-      card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash");
-    });
-    body.querySelectorAll(".act.loc").forEach(el => el.onclick = () => {
-      const r = turns[+el.dataset.t].results[+el.dataset.r], rc = actRect(r.action);
-      scene.highlightRect(rc); scene.flyTo((rc.x1 + rc.x2) / 2, (rc.y1 + rc.y2) / 2, 12 + Math.max(Math.abs(rc.x2 - rc.x1), Math.abs(rc.y2 - rc.y1)) * 0.6);
-    });
-  } else if (S.tab === "problems") {
-    roleChips();
-    renderProblems();
+    renderTurns(f);
+  } else if (S.tab === "issues") {
+    const v = S.issuesView;
+    if (v === "agents") roleChips(); else $("tabTools").innerHTML = "";
+    $("tabTools").insertAdjacentHTML("afterbegin", `<div class="seg issueseg" role="tablist"><button data-v="agents" class="${v === "agents" ? "on" : ""}">Agent mistakes</button><button data-v="city" class="${v === "city" ? "on" : ""}">City events</button></div>`);
+    $("tabTools").querySelectorAll(".issueseg button").forEach(b => b.onclick = () => { S.issuesView = b.dataset.v; store.set("issues", S.issuesView); renderTab(); });
+    if (v === "agents") renderProblems(); else renderEvents(f);
   } else if (S.tab === "money") {
     roleChips();
     renderMoneyTab();
@@ -505,18 +469,7 @@ function renderTab() {
     roleChips();
     const msgs = S.frames.slice(0, S.idx + 1).flatMap(fr => fr.council || []).filter(m => roleOn(m.sender)).reverse();
     body.innerHTML = msgs.length ? msgs.map(m => `<div class="msgline" style="--c:${roleColor(m.sender)}"><span class="tag">m${m.month}</span>
-      <b>${esc(m.sender)}</b> <span class="muted">→ ${esc(m.to)}</span><div>${esc(m.text)}</div></div>`).join("") : `<div class="emptytab">No council messages yet.</div>`;
-  } else if (S.tab === "events") {
-    $("tabTools").innerHTML = "";
-    const ev = S.frames.slice(0, S.idx + 1).flatMap(fr => {
-      const out = (fr.events || []).map(e => [fr.month, e, /BANKRUPT|negative|recall|FULL|destroyed|approval|FLOOD|HEATWAVE|RECESSION|OFFER|MILESTONE/i.test(e)]);
-      for (const t of fr.turns || []) for (const r of t.results) if (!r.ok) out.push([fr.month, `${t.role}: ${r.action.type} failed: ${r.message}`, true]);
-      return out;
-    }).reverse();
-    const comp = (f.metrics.complaints || []);
-    const head = comp.length ? `<div class="complaints"><h4>What residents complain about (month ${f.month})</h4>${comp.map(c =>
-      `<div class="complaint"><span class="bar" style="width:${Math.min(100, Math.round(c.drag * 600))}%"></span><span>${esc(c.text)}</span></div>`).join("")}</div>` : "";
-    body.innerHTML = head + (ev.length ? ev.slice(0, 300).map(([m, e, w]) => `<div class="msgline"><span class="tag ${w ? "warn" : ""}">m${m}</span> ${esc(e)}</div>`).join("") : `<div class="emptytab">Nothing notable yet.</div>`);
+      <b>${esc(m.sender)}</b> <span class="muted">→ ${esc(m.to)}</span><div>${esc(m.text)}</div></div>`).join("") : `<div class="emptytab">No messages yet.</div>`;
   } else if (S.tab === "charts") {
     $("tabTools").innerHTML = "";
     renderCharts();
@@ -529,6 +482,77 @@ function renderTab() {
     $("rNew").onclick = openLaunch;
     renderRunsTab();
   }
+}
+
+// ---------------------------------------------------------------- turns
+// one compact row per department that opens into its card: reasoning, actions (📍 flies there), the messages it
+// sent with whether they were answered (the Team data), and its tool calls. Open rows stay open across quarters.
+S.openTurns = new Set(store.get("openTurns", []));
+function msgThread(t, m) {
+  if (!S.collab) return null;
+  const head = String(m.text || "").slice(0, 60);
+  return S.collab.threads.find(th => th.from === t.role && th.month === t.month && th.to === m.to && th.text.startsWith(head)) || null;
+}
+function turnCard(t, ti, em) {
+  const ok = t.results.filter(r => r.ok).length, bad = t.results.length - ok, open = S.openTurns.has(t.role);
+  const spent = t.results.filter(r => r.ok).reduce((a, r) => a + (r.cost || 0), 0);
+  const acts = t.results.map((r, ri) => { const rc = actRect(r.action); return `<div class="act ${r.ok ? "ok" : "bad"} ${rc ? "loc" : ""}" data-t="${ti}" data-r="${ri}">
+    <span class="st">${r.ok ? "✓" : "✗"}</span><span><code>${actText(r.action)}</code><span class="msg">${esc(r.message)}${r.cost ? ` · ${fmt$(r.cost)}` : ""}</span></span>${rc ? `<span class="pin">📍</span>` : ""}</div>`; }).join("");
+  const msgs = (t.messages || []).map(m => {
+    const th = msgThread(t, m), st = th ? threadState(th, em) : null;
+    return `<div class="tmsg"><span class="tto" style="color:${roleColor(m.to)}">to ${esc(m.to)}</span>${st ? `<span class="st st-${st}">${ST_TEXT[st] || st}</span>` : ""}<div class="ttxt">${esc(m.text)}</div></div>`;
+  }).join("");
+  return `<div class="tcard ${open ? "open" : ""}" id="turn-${esc(t.role)}" style="--c:${roleColor(t.role)}">
+    <button class="thead" data-role="${esc(t.role)}" aria-expanded="${open}"><span class="trole">${esc(t.role)}</span><span class="twhat">${turnHeadline(t)}</span>
+      <span class="tmeta">${spent ? `<span>${fmt$(spent)}</span>` : ""}<span>${ok} ✓</span>${bad ? `<span class="badn">${bad} ✗</span>` : ""}${(t.messages || []).length ? `<span title="messages sent">✉ ${t.messages.length}</span>` : ""}<span class="qref" data-role="${esc(t.role)}"></span><span class="qend" data-role="${esc(t.role)}"></span></span><span class="chev">▸</span></button>
+    <div class="tbody" ${open ? "" : "hidden"}>
+      <div class="tagline"><span>${esc(S.meta.agents[t.role] || "")}</span><span>month ${t.month}</span></div>
+      ${t.parse_error ? `<div class="small" style="color:var(--warn)">⚠ ${esc(t.parse_error).slice(0, 140)}</div>` : ""}
+      ${t.thinking ? `<div class="think" title="click to read it all">${esc(t.thinking)}</div>` : ""}
+      <div class="tsec">Actions</div>${acts || `<div class="small muted">no actions</div>`}
+      ${msgs ? `<div class="tsec">Messages sent</div>${msgs}` : ""}
+      <div class="trace" data-role="${esc(t.role)}"></div>
+    </div></div>`;
+}
+function renderTurns(f) {
+  const body = $("tabBody");
+  // agents act every few months: between their turns, keep showing the latest quarter instead of an empty tab
+  const j = turnFrame(S.idx);
+  S.agentsFrame = j;
+  if (j < 0) { body.innerHTML = `<div class="emptytab">${f.month === 0 ? "Start of the game: press ▶ or step forward to see the agents' first decisions." : "No agent turns yet."}</div>`; return; }
+  const tf = S.frames[j], turns = tf.turns.filter(t => roleOn(t.role));
+  const prevJ = turnFrame(j - 1), nextJ = nextTurnFrame(S.idx), em = tf.month - 1;
+  const since = j === S.idx ? "" : ` <span class="muted">· now month ${f.month}</span>`;
+  const allOpen = turns.length && turns.every(t => S.openTurns.has(t.role));
+  body.innerHTML = `<div class="qhead"><button class="btn qnav" id="qPrev" ${prevJ < 0 ? "disabled" : ""} title="previous quarter">◀</button>
+      <div><b>Decisions from month ${em}</b>${since}</div><button class="qall" id="qAll">${allOpen ? "Close all" : "Open all"}</button>
+      <button class="btn qnav" id="qNext" ${nextJ < 0 ? "disabled" : ""} title="next quarter">▶</button></div>` +
+    (turns.length ? turns.map((t, ti) => turnCard(t, ti, teamMonth())).join("") : `<div class="emptytab">No turns for the selected roles.</div>`);
+  loadTraces(em);
+  if (prevJ >= 0) $("qPrev").onclick = () => go(prevJ);
+  if (nextJ >= 0) $("qNext").onclick = () => go(nextJ);
+  const save = () => store.set("openTurns", [...S.openTurns]);
+  $("qAll").onclick = () => { for (const t of turns) allOpen ? S.openTurns.delete(t.role) : S.openTurns.add(t.role); save(); renderTurns(f); };
+  body.querySelectorAll(".thead").forEach(el => el.onclick = () => {
+    const r = el.dataset.role, card = el.parentElement, open = !S.openTurns.has(r);
+    open ? S.openTurns.add(r) : S.openTurns.delete(r); save();
+    card.classList.toggle("open", open); card.querySelector(".tbody").hidden = !open; el.setAttribute("aria-expanded", open);
+  });
+  body.querySelectorAll(".think, .ttxt").forEach(el => el.onclick = () => el.classList.toggle("full"));
+  body.querySelectorAll(".act.loc").forEach(el => el.onclick = () => {
+    const r = turns[+el.dataset.t].results[+el.dataset.r], rc = actRect(r.action);
+    scene.highlightRect(rc); scene.flyTo((rc.x1 + rc.x2) / 2, (rc.y1 + rc.y2) / 2, 12 + Math.max(Math.abs(rc.x2 - rc.x1), Math.abs(rc.y2 - rc.y1)) * 0.6);
+  });
+}
+// the city's own events (disasters, milestones, offers, recalls) and what residents complain about; the agents'
+// failed calls are under Agent mistakes
+function renderEvents(f) {
+  const body = $("tabBody");
+  const ev = S.frames.slice(0, S.idx + 1).flatMap(fr => (fr.events || []).map(e => [fr.month, e, /BANKRUPT|negative|recall|FULL|destroyed|approval|FLOOD|HEATWAVE|RECESSION|OFFER|MILESTONE/i.test(e)])).reverse();
+  const comp = (f.metrics.complaints || []);
+  const head = comp.length ? `<div class="complaints"><div class="tsec">What residents complain about this month</div>${comp.map(c =>
+    `<div class="complaint"><span class="bar" style="width:${Math.min(100, Math.round(c.drag * 600))}%"></span><span>${esc(c.text)}</span></div>`).join("")}</div>` : "";
+  body.innerHTML = head + (ev.length ? ev.slice(0, 300).map(([m, e, w]) => `<div class="msgline"><span class="tag ${w ? "warn" : ""}">m${m}</span> ${esc(e)}</div>`).join("") : `<div class="emptytab">Nothing has happened to the city yet.</div>`);
 }
 
 // ---------------------------------------------------------------- team (collab.js)
@@ -896,7 +920,7 @@ async function loadProblems() {
     d.byMonth = {}; for (const p of d.problems) (d.byMonth[p.month] = d.byMonth[p.month] || []).push(p);
     S.problems = { runId, at: n, data: d };
   } catch (e) { S.problems = { runId, at: n, data: null, error: e.message }; }
-  if (S.runId === runId) { drawTrackMarks(); if (S.tab === "problems") renderProblems(); }
+  if (S.runId === runId) { drawTrackMarks(); if (S.tab === "issues" && S.issuesView === "agents") renderProblems(); }
 }
 const pct0 = (a, b) => b ? `${Math.round(100 * a / b)}%` : "—";
 function renderProblems() {
@@ -960,7 +984,7 @@ async function loadCompare(id) {
     const [p, sm] = await Promise.all([api(`/api/runs/${encodeURIComponent(id)}/problems`), api(`/api/runs/${encodeURIComponent(id)}/summary`).catch(() => null)]);
     S.cmpData[id] = { p, sm };
   } catch (e) { S.cmpData[id] = { error: e.message }; }
-  if (S.tab === "problems") renderProblems();
+  if (S.tab === "issues" && S.issuesView === "agents") renderProblems();
 }
 function cmpRates(p, sm) {
   const t = p.total || {}, turns = t.turns || 1;
@@ -1003,6 +1027,7 @@ function bindCompare() {
 // jump to the quarter, the role's card and (for a call) its tool calls with that call shown
 function openProblem(month, role, n) {
   const j = S.frames.findIndex(f => f.month === month + 1); if (j < 0) return;
+  S.openTurns.add(role); store.set("openTurns", [...S.openTurns]);
   go(j); S.tab = "agents"; renderTab();
   const cardEl = document.getElementById(`turn-${role}`); if (!cardEl) return;
   cardEl.scrollIntoView({ behavior: "smooth", block: "start" }); cardEl.classList.remove("flash"); void cardEl.offsetWidth; cardEl.classList.add("flash");
@@ -1306,7 +1331,9 @@ $("regionBtn").onclick = openRegionMap;
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".modal").hidden = true; if (teamBig) teamBig.setActive(!$("teamModal").hidden); });
 document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.target === m) m.hidden = true; });
 $("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
-document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); renderTab(); });
+document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); $("moreMenu").hidden = true; renderTab(); });
+$("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("moreMenu").hidden; };
+document.addEventListener("click", (e) => { if (!e.target.closest(".tabmore")) $("moreMenu").hidden = true; });
 buildLayerMenu();
 $("layerBtn").onclick = (e) => { e.stopPropagation(); $("layerMenu").hidden = !$("layerMenu").hidden; };
 $("vReset").onclick = () => scene.resetView(); $("vTop").onclick = () => scene.topView();

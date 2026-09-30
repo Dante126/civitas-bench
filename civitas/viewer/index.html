@@ -47,15 +47,19 @@
   <!-- ============================== right dock -->
   <aside id="right" class="dock glass">
     <nav id="tabs" class="tabs">
-      <button data-tab="agents" class="on">Agents</button>
+      <button data-tab="agents" class="on" title="What each department did this quarter, and the messages it sent">Turns</button>
       <button data-tab="team" title="How the departments work together: requests, money and builds as a live network">Team</button>
-      <button data-tab="problems" title="Failed and refused calls, bad turn ends, and how the agents handled them">Problems</button>
+      <button data-tab="issues" title="What went wrong: the agents' failed and refused calls, and the city's events">Issues</button>
       <button data-tab="money" title="The mayor's money picture, what it moved, and each department's money over the quarter">Money</button>
-      <button data-tab="council">Council</button>
-      <button data-tab="events">Events</button>
-      <button data-tab="charts">Charts</button>
-      <button data-tab="region" id="regionTab" hidden>Region</button>
-      <button data-tab="runs">Runs</button>
+      <div class="tabmore">
+        <button id="moreBtn" class="morebtn" title="More views" aria-haspopup="true">⋯</button>
+        <div id="moreMenu" class="menu glass moremenu" hidden>
+          <button data-tab="charts">Charts</button>
+          <button data-tab="region" id="regionTab" hidden>Region</button>
+          <button data-tab="council">All messages</button>
+          <button data-tab="runs">Runs</button>
+        </div>
+      </div>
     </nav>
     <div id="tabTools" class="tabtools"></div>
     <div id="tabBody" class="tabbody"></div>

@@ -1570,6 +1570,13 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **Transport:** neither city reached the 1,500 residents that open the bus stops before month 12 ended, so the bus-line changes need a long run.
 - **Money:** one allocation failed on seed 1 because the money line rounds the treasury ($1,938) above what it held.
 
+**Right panel** (viewer). Four tabs and a menu:
+- **Turns:** a compact row per department for the quarter, with what it did, spent, ✓ / ✗, messages, refusals and a bad turn end. A row opens into its card: reasoning, actions with 📍, the messages it sent with whether they were answered, and its tool calls. Open rows stay open across quarters.
+- **Team.**
+- **Issues:** *Agent mistakes* (the Problems analysis) or *City events* (disasters, milestones, offers, and what residents complain about).
+- **Money.**
+- **⋯:** Charts, Region, All messages (the full council log) and Runs.
+
 **Team tab** (viewer). The departments as a live network (`viewer/collab.js`): the mayor in the centre, the departments on a ring, each node sized by its funds with an arc for its open requests. Edges glow with the last 12 months of messages and money. As the replay steps, each turn's events play out:
 - requests fly as comets with the amount asked, and reports as small pulses;
 - the mayor's money is a stream of gold coins, with "+$2,500" at the receiver;
