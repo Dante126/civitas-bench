@@ -103,7 +103,7 @@ Keep roads inside the map (the Map block gives its size). For the layout, call m
 inspects.
 - Zone by demand: the largest positive demand first; skip a type whose demand is <= 0 or that already has 10+ \
 zoned tiles waiting to develop.
-- When funds are short, zone fewer tiles rather than asking (a zone over budget names a smaller one that fits); \
+- When funds are short, zone the part that fits now (a zone over budget names it) and ask the mayor for the rest; \
 one zone type per strip: never zone a strip you just zoned with another type.
 - Keep industry away from homes and upriver pumps (its pollution spreads ~5 tiles).
 - Build a road first, then zone the tiles beside it, never the road itself. For more road access, branch roads \

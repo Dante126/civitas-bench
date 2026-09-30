@@ -739,7 +739,9 @@ def zone_fit(w, args: dict, funds: float) -> str:
     pay for (then the most with road access, then the smallest); for R/C/O at high density, whether "low" zones it all.
     "" when the funds don't pay for one tile, or on any error. v19 (120 months, seeds 0-1): 43 zones failed on "costs
     $48 but the planning budget only has $46; ask the mayor for funds", 41 of them with money for some tiles, and
-    planning asked the mayor instead of zoning less; industry zoned "low" was charged high density unseen."""
+    planning asked the mayor instead of zoning less; industry zoned "low" was charged high density unseen. v23 (120
+    months) seed 0: with "zone fewer tiles rather than waiting for funds" planning asked the mayor 18 times (v19: 37),
+    spent $7.8k (v19: $13.3k) and zoned 40% less under full residential demand, so the hint asks for the rest too."""
     try:
         letter = str(args.get("zone", "")).upper()[:1]
         density = zone_density(letter, str(args.get("density", "low")).lower())
@@ -783,7 +785,9 @@ def zone_fit(w, args: dict, funds: float) -> str:
             low = zone_cost(len(low_tiles), len(low_re), "low")
             if not short_of(funds, low):
                 out += f', or zone it all with density "low" for {money(low)}'
-        return out + "; zone fewer tiles rather than waiting for funds"
+        full = zone_cost(len(tiles), len(rezone), density)
+        return out + (f"; then ask the mayor for {money(math.ceil(full - funds))} for the rest (send_message)"
+                      if full > funds else "")
     except Exception:
         return ""
 

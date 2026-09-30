@@ -712,9 +712,9 @@ tasks and money, and to let people coach it.
     branch road sent without its dezone.
   - A zone the planning budget can't pay says what a tile costs (industry and mixed use
     always at the high-density price), how many tiles the money buys, and the part of the
-    rectangle that fits (`zone x1=5,y1=10,x2=7,y2=11 (6 tiles, $30) now`). In v19, 43 zones
+    rectangle that fits (`zone x1=5,y1=10,x2=7,y2=11 (6 tiles, $30) now; then ask the mayor for $18 for the rest`). In v19, 43 zones
     failed on a few dollars, 41 with money for some tiles, and planning asked the mayor
-    instead of zoning less.
+    instead of zoning less. The first wording ("zone fewer tiles rather than waiting for funds", and "rather than asking" in the playbooks) cut planning's requests on the v23 120-month seed 0 from 37 to 18 and its spending from $13.3k to $7.8k, under full residential demand, so the hint now asks for the rest as well.
   - One zone type per strip. Each zone line in Ready sites shows a strip no earlier zone
     line shows (`next free (0,22)-(16,23), 34 tiles (one zone type per strip)`) instead of
     `same strip as zone_R`. A zone that fails on the role's own zoning this turn names the
@@ -1501,6 +1501,26 @@ and v19 fixes; 320 turns, 15.8M prompt tokens, 1.9 hours):
   to three times the population. Seed 0's 18,412 residents is more than the monthly scripted
   baseline's 14,092 (city 76.7).
 - **Weak spots:** transport (56.3 and 64.1) and, on seed 1, fire (56.8).
+
+**120-month runs on main at b684672** (2026-09-30: the v22/v23 fixes; 17.3M and 20.6M prompt tokens, run in
+parallel; the Mac slept overnight, so wall times don't count):
+
+| | seed 0 | seed 1 | v19 (fd5112f) |
+|---|---|---|---|
+| city score at month 120 (average over the run) | 64.3 (51.4) | **75.4** (60.5) | 73.5 / 69.7 |
+| population | 10,848 | **16,156** | 18,412 / 13,064 |
+| transport | **70.0** | 59.2 | 56.3 / 64.1 |
+| debt at the end (months at the cap) | $49.0k (0) | $23.8k (0) | $47.5k / $22.0k |
+| failed actions | 20.5% | 23.8% | 23.8% / 22.0% |
+
+- **Transport:** both cities built a 7-stop bus line early (months 18 and 12; v19: never on seed 0, month 72 on
+  seed 1), with transit at 15–21% by month 24. It then fell to 4–6% by month 48 and 1–4% by the end as the cities
+  outgrew the line, and the full-buses rule offered no second line. Since 49fdafd another line goes where no stop
+  reaches.
+- **Seed 0:** planning asked the mayor for money 18 times (v19: 37), spent $7.8k (v19: $13.3k) and zoned 40% fewer
+  tiles while residential demand stayed at its maximum. The zone hint and playbook line said "zone fewer tiles rather
+  than asking"; they now say to zone the part that fits and ask for the rest.
+- **Utilities:** power and water coverage stayed at 96–100% all game on both seeds; v19 dipped to 77–89% power.
 
 **v20** (2026-09-29, main at c2947f0, adding the mayor money picture from
 `docs/plans/2026-09-29-mayor-money.md`: a Finances split, a need-ordered Departments block with

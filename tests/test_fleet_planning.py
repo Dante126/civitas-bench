@@ -45,6 +45,8 @@ def test_a_zone_over_budget_names_the_price_and_a_smaller_zone_that_fits():
     hint = res["message"][res["message"].index(" - zone I"):]
     assert "costs $8/tile (industry and mixed use are always charged the high-density price)" in hint, hint
     assert "$46 pays for 5 new tiles: zone x1=" in hint and "(5 tiles, $40) now" in hint, hint
+    # v23 seed 0: "zone fewer tiles rather than waiting for funds" halved planning's requests; it asks for the rest
+    assert hint.endswith("; then ask the mayor for $274 for the rest (send_message)"), hint
     m = re.search(r"zone x1=(\d+),y1=(\d+),x2=(\d+),y2=(\d+)", hint)
     sub = dict(zip(("x1", "y1", "x2", "y2"), map(int, m.groups())))
     assert all(rect[k[0] + "1"] <= sub[k] <= rect[k[0] + "2"] for k in sub)             # inside the request
