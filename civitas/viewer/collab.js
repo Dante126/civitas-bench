@@ -654,7 +654,10 @@ export class RegionGraph {
       const [ax, ay] = this.pos[l.a], [bx, by] = this.pos[l.b];
       g.strokeStyle = "rgba(140,160,210,0.16)"; g.lineWidth = 6 * s; g.lineCap = "round";
       g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke();
-      if (!dealPairs.has(key)) this._label(kinds.join(" · "), (ax + bx) / 2, (ay + by) / 2 + 3 * s, "rgba(160,175,205,0.6)", 9 * s, true);
+      const text = kinds.join(" · ");
+      g.font = `600 ${Math.round(9 * s)}px Inter, system-ui, sans-serif`;       // named only where it fits between the halos
+      const room = Math.hypot(bx - ax, by - ay) - this._radius(l.a) - this._radius(l.b) - 24 * s;
+      if (!dealPairs.has(key) && g.measureText(text).width <= room) this._label(text, (ax + bx) / 2, (ay + by) / 2 + 3 * s, "rgba(160,175,205,0.6)", 9 * s, true);
     }
     // message traffic: arcs between the cities, brighter with recent messages
     for (const [k, v] of this.act) {
