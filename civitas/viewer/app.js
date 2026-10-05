@@ -3,7 +3,7 @@
 import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } from "./scene.js";
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
-import { CollabGraph, BeamLayer } from "./collab.js";
+import { CollabGraph, BeamLayer, RegionGraph, cityColor, dealState, dealPaid, dealEnd, cityTally, RES_C } from "./collab.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -35,7 +35,7 @@ const store = { get(k, d) { try { const v = localStorage.getItem("civitas." + k)
 const S = {
   runs: [], runId: null, meta: null, frames: [], idx: 0, status: "—", playing: false, timer: null, poll: null,
   tab: store.get("tab", "agents"), overlay: store.get("overlay", "none"), roleFilter: new Set(), selected: -1,
-  follow: true, configs: [], issuesView: store.get("issues", "agents"),
+  follow: true, configs: [], issuesView: store.get("issues", "agents"), teamView: store.get("teamView", "city"),
 };
 if (S.tab === "problems" || S.tab === "events") { S.issuesView = S.tab === "events" ? "city" : "agents"; S.tab = "issues"; }
 
@@ -125,6 +125,7 @@ async function openRun(id, { month = null } = {}) {
   stop(); clearInterval(S.poll);
   S.runId = id; S.frames = []; S.raw = []; S.idx = 0; S.selected = -1; $("inspector").hidden = true;
   S.collab = null; S.collabErr = null; S.teamPick = null; collabAt = 0;
+  S.rcollab = null; S.rcollabErr = null; S.regionPick = null; rcollabAt = 0;
   try { S.metaRaw = await api(`/api/runs/${encodeURIComponent(id)}/meta`); } catch (e) { toast("Could not open run: " + esc(e.message), true); return; }
   S.city = S.metaRaw.region ? S.metaRaw.cities[0] : null;
   S.meta = cityMeta(S.metaRaw, S.city);
@@ -455,8 +456,9 @@ function renderTab() {
   if (!S.frames.length && S.tab !== "runs") { $("tabTools").innerHTML = ""; body.innerHTML = `<div class="emptytab">Open or launch a run.</div>`; return; }
   const f = S.frames[S.idx];
   if (S.tab !== "team" && teamGraph) { teamGraph.destroy(); teamGraph = null; }
+  if (S.tab !== "team" && teamRGraph) { teamRGraph.destroy(); teamRGraph = null; }
   if (S.tab === "team") {
-    roleChips();
+    if (regionTeam()) $("tabTools").innerHTML = ""; else roleChips();
     renderTeam();
   } else if (S.tab === "agents") {
     roleChips();
@@ -563,6 +565,8 @@ function renderEvents(f) {
 // ---------------------------------------------------------------- team (collab.js)
 // the departments as a live network: requests, money and builds of each turn play out as the replay moves
 let teamGraph = null, teamBig = null, collabAt = 0;
+let teamRGraph = null, teamBigR = null, rcollabAt = 0;         // the Region view (region runs)
+const regionTeam = () => !!(S.metaRaw && S.metaRaw.region && S.teamView === "region");
 const beams = new BeamLayer($("beams"), { colorOf: roleColor, project: (x, y) => scene.tileToScreen ? scene.tileToScreen(x, y) : null });
 const beamsOn = () => store.get("beams", true);
 function updateBeams() {
@@ -576,6 +580,7 @@ async function loadCollab(force = false) {
   const id = S.runId;
   if (!id || (!force && S.status === "running" && Date.now() - collabAt < 6000 && S.collab)) return;
   collabAt = Date.now();
+  if (S.metaRaw && S.metaRaw.region && (!force || !S.rcollab)) loadRegionCollab();
   let d;
   try { d = await api(`/api/runs/${encodeURIComponent(id)}/collab${S.city ? `?city=${encodeURIComponent(S.city)}` : ""}`); }
   catch (e) {
@@ -662,8 +667,15 @@ function bindHandoffs(root) {
 function onTeamPick(h) { S.teamPick = h; if (S.tab === "team") renderTeam(); updateTeamView(); }
 function renderTeam() {
   const body = $("tabBody");
-  $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the full-screen Team view">⤢ Expand</button>`);
+  if (S.metaRaw && S.metaRaw.region && !$("tabTools").querySelector(".teamseg")) {
+    $("tabTools").insertAdjacentHTML("afterbegin", `<div class="seg teamseg" role="tablist" title="This city's departments, or the cities and their deals">
+      <button data-v="city" class="${regionTeam() ? "" : "on"}">${esc(S.city)}</button><button data-v="region" class="${regionTeam() ? "on" : ""}">Region</button></div>`);
+    $("tabTools").querySelectorAll(".teamseg button").forEach(b => b.onclick = () => setTeamView(b.dataset.v));
+  }
+  if (!$("teamExpand")) $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the full-screen Team view">⤢ Expand</button>`);
   $("teamExpand").onclick = openTeamView;
+  if (regionTeam()) { renderRegionTeam(body); return; }
+  if (teamRGraph) { teamRGraph.destroy(); teamRGraph = null; }
   if (!S.collab) {
     body.innerHTML = `<div class="emptytab">${S.collabErr || "Loading the team…"}</div>`;
     if (!S.collabErr && Date.now() - collabAt > 3000) loadCollab(true);
@@ -679,25 +691,203 @@ function renderTeam() {
   teamStep(teamGraph);
   const em = teamMonth();
   $("teamSum").innerHTML = teamSummary(em);
-  $("teamList").innerHTML = handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em);
-  bindThreads($("teamList")); bindHandoffs($("teamList"));
+  $("teamList").innerHTML = handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
+  bindThreads($("teamList")); bindHandoffs($("teamList")); bindRegionList($("teamList"));
   const un = $("teamList").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamGraph.selected = null; onTeamPick(null); };
 }
 function openTeamView() {
   $("teamModal").hidden = false;
-  if (!teamBig) teamBig = new CollabGraph($("teamBig"), { colorOf: roleColor, onPick: onTeamPick, big: true });
-  teamBig.setActive(true); teamBig.resize();
-  if (S.collab) teamBig.setData(S.collab);
+  bigCanvas();
   S.anim = false; updateTeamView();
 }
+// the full-screen view shows the department graph or, in the Region view, the region graph (one canvas each)
+function bigCanvas() {
+  const reg = regionTeam(), open = !$("teamModal").hidden;
+  $("teamBig").style.display = reg ? "none" : ""; $("teamBigR").style.display = reg ? "" : "none";
+  if (reg && !teamBigR) teamBigR = new RegionGraph($("teamBigR"), { colorOf: roleColor, onPick: onRegionPick, onOpen: openCityTeam, big: true });
+  if (!reg && !teamBig) teamBig = new CollabGraph($("teamBig"), { colorOf: roleColor, onPick: onTeamPick, big: true });
+  const on = reg ? teamBigR : teamBig, off = reg ? teamBig : teamBigR;
+  if (off) off.setActive(false);
+  on.setActive(open);
+  if (!open) return;
+  on.resize();
+  if (reg && S.rcollab && teamBigR.data !== S.rcollab) teamBigR.setData(S.rcollab, S.metaRaw.layout);
+  if (!reg && S.collab && teamBig.data !== S.collab) teamBig.setData(S.collab);
+}
 function updateTeamView() {
-  if (!teamBig || $("teamModal").hidden || !S.collab || !S.frames.length) { if (teamBig) teamBig.setActive(!$("teamModal").hidden); return; }
+  if ($("teamModal").hidden) { for (const gph of [teamBig, teamBigR]) if (gph) gph.setActive(false); return; }
+  if (regionTeam() ? !teamBigR || teamBigR.cv.style.display === "none" : !teamBig || teamBig.cv.style.display === "none") bigCanvas();
+  if (regionTeam()) { updateRegionView(); return; }
+  if (!teamBig || !S.collab || !S.frames.length) return;
+  if (teamBig.data !== S.collab) teamBig.setData(S.collab);
   teamStep(teamBig);
   const em = teamMonth();
   $("teamMonth").textContent = `month ${S.frames[S.idx].month}`;
-  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em);
-  bindThreads($("teamSide")); bindHandoffs($("teamSide"));
+  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
+  bindThreads($("teamSide")); bindHandoffs($("teamSide")); bindRegionList($("teamSide"));
   const un = $("teamSide").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamBig.selected = null; onTeamPick(null); };
+}
+
+// ---------------------------------------------------------------- team: the Region view (region runs)
+// the cities as a network: the mayors' deals as edges, messages between cities as comets (collab.js RegionGraph);
+// below it the cities' tallies, the deals and the threads between cities up to the month on show
+async function loadRegionCollab() {
+  const id = S.runId;
+  if (!id || !(S.metaRaw && S.metaRaw.region)) return;
+  rcollabAt = Date.now();
+  let d;
+  try { d = await api(`/api/runs/${encodeURIComponent(id)}/collab?region=1`); }
+  catch (e) {
+    if (S.runId !== id) return;
+    S.rcollabErr = `Could not load the region: ${esc(e.message)}`;
+    if (S.tab === "team" && regionTeam()) renderTeam();
+    return;
+  }
+  if (S.runId !== id) return;
+  if (!d.region) { S.rcollabErr = "This server has no Region team data yet: restart <code>civitas serve</code> (it doesn't reload Python changes)."; d = null; }
+  else S.rcollabErr = null;
+  S.rcollab = d;
+  if (d) for (const gph of [teamRGraph, teamBigR]) if (gph) gph.setData(d, S.metaRaw.layout);
+  S.anim = false;
+  if (S.tab === "team" && regionTeam()) renderTeam();
+  updateTeamView();
+}
+function setTeamView(v) {
+  if (v === S.teamView) return;
+  S.teamView = v; store.set("teamView", v); S.anim = false;
+  if (S.tab === "team") renderTab();
+  updateTeamView();
+}
+function openCityTeam(c) {
+  S.teamView = "city"; store.set("teamView", "city"); S.regionPick = null;
+  if (c && c !== S.city) switchCity(c); else if (S.tab === "team") renderTab();
+  updateTeamView();
+}
+function onRegionPick(h) { S.regionPick = h; if (S.tab === "team" && regionTeam()) renderTeam(); updateTeamView(); }
+function regionStep(gph) {
+  const f = S.raw[S.idx] || {}, info = {};
+  for (const [c, cf] of Object.entries(f.cities || {})) info[c] = { pop: (cf.metrics || {}).population, treasury: (cf.metrics || {}).treasury };
+  gph.setMonth(teamMonth(), { info, links: f.links || [], animate: S.anim,
+    budgetMs: S.playing ? Math.min(2600, +$("speed").value * (S.rcollab.act_every || 1) * 0.9) : 1600 });
+}
+const cityTag = (c) => `<b style="color:${cityColor(S.metaRaw.cities, c)}">${esc(c)}</b>`;
+const whoTag = (r) => { const [c, role] = String(r).split("."); return cityTag(c) + (role ? `<span style="color:${roleColor(role)}">.${esc(role)}</span>` : ` <span class="muted">team</span>`); };
+const REGION_LEGEND = `<div class="teamlegend"><span><i style="background:${RES_C.power};box-shadow:0 0 6px ${RES_C.power}"></i>power deal</span>
+  <span><i style="background:${RES_C.water};box-shadow:0 0 6px ${RES_C.water}"></i>water deal</span><span><i style="border:2px dashed #c9cfd6;background:none"></i>offer</span>
+  <span><i style="background:#8a93a0"></i>ended</span><span><i style="background:#fff;box-shadow:0 0 6px #fff"></i>message</span><span><i style="background:#ffd34d"></i>payment</span>
+  <span><i style="background:#ffc857"></i>waiting</span></div>`;
+function regionTeamSummary(em) {
+  const d = S.rcollab, msgs = d.events.filter(e => e.kind === "message" && !e.deal && e.month <= em).length;
+  const asks = d.threads.filter(t => t.month <= em), ok = asks.filter(t => t.response && t.response.month <= em && ["met", "partial", "acted", "replied"].includes(t.status)).length;
+  const active = d.deals.filter(x => dealState(x, em) === "active"), per = active.reduce((a, x) => a + x.monthly, 0);
+  return `<div class="teamsum"><div><b>${msgs}</b><span>messages between cities</span></div><div><b>${asks.length ? Math.round(100 * ok / asks.length) + "%" : "—"}</b><span>asks & offers answered</span></div>
+    <div><b>${active.length}</b><span>active deals</span></div><div><b>${fmt$(per)}</b><span>traded / month</span></div></div>`;
+}
+function cityTable(em) {
+  const d = S.rcollab;
+  const rows = d.cities.map(c => {
+    const t = cityTally(d, c, em), st = d.stats[c] || {};
+    return `<tr data-city="${esc(c)}" title="Open ${esc(c)}'s team"><td>${cityTag(c)}</td><td>${t.sent} / ${t.received}</td><td>${t.asks_out_ok}/${t.asks_out}</td>
+      <td>${t.proposed} / ${t.accepted}${t.active ? ` <span class="muted">(${t.active} on)</span>` : ""}</td><td>${fmt$(t.sold)} / ${fmt$(t.bought)}</td>
+      <td>${st.requests ? Math.round(100 * st.answered / st.requests) + "%" : "—"}</td></tr>`;
+  }).join("");
+  return `<table class="lb regionteam"><tr><th>city</th><th title="messages to / from other cities">msgs out/in</th><th title="its asks to other cities that were answered">asks met</th>
+    <th title="deals it proposed / offers to it it accepted">deals prop/acc</th><th title="paid to it / by it through deals">sold / bought</th><th title="requests answered inside the city, whole run">team</th></tr>${rows}</table>`;
+}
+function dealHTML(x, em, compact = false) {
+  const st = dealState(x, em), paid = dealPaid(x, em), col = RES_C[x.resource] || "#ccc";
+  const pill = st === "active" ? `<span class="st st-active">active · ${x.months - paid} mo left</span>` : st === "offered" ? `<span class="st st-offered">offered</span>`
+    : `<span class="st st-ended">${esc(dealEnd(x))}</span>`;
+  const steps = [];
+  if (x.accepted != null && x.accepted <= em) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${x.accepted}">m${x.accepted}</span> ${cityTag(x.partner)} accepted</div>`);
+  if (x.ended != null && x.ended <= em) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${x.ended}">m${x.ended}</span> ${esc(dealEnd(x))}</div>`);
+  if (compact) steps.length = 0;
+  if (paid) steps.push(`<div class="tstep">${cityTag(x.buyer)} paid ${cityTag(x.seller)} <b>${fmt$(x.monthly * paid)}</b> over ${paid} month${paid > 1 ? "s" : ""}</div>`);
+  return `<div class="thread deal" style="--c:${col}" data-deal="${x.id}"><span class="tag jump" data-m="${x.offered}">m${x.offered}</span>
+    <b style="color:${col}">#${x.id} ${esc(x.resource)}</b> · ${cityTag(x.seller)} → ${cityTag(x.buyer)} ${pill}
+    <div class="ttext">${Math.round(x.amount)} units at $${x.price}/unit/month (${fmt$(x.monthly)}/month) for ${x.months} months · proposed by ${esc(x.proposer)}</div>${steps.join("")}</div>`;
+}
+const RST_TEXT = { met: "funded", partial: "partly", acted: "acted on", replied: "replied", waiting: "waiting", unanswered: "no answer", open: "waiting", declined: "declined", withdrawn: "withdrawn" };
+function regionThreadHTML(t, em, win) {
+  const r = t.response, o = t.outcome, see = (x) => x && x.month <= em;
+  const st = see(r) ? t.status : em - t.month > win && t.kind !== "deal" ? "unanswered" : "waiting";
+  const label = t.kind === "deal" && st === "met" ? "accepted" : RST_TEXT[st] || st;
+  const steps = [];
+  if (see(r)) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${r.month}">m${r.month}</span> ${cityTag(t.to_city)}: ${esc(r.text).slice(0, 110)}</div>`);
+  if (see(o)) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${o.month}">m${o.month}</span> <b>${esc(o.what)}</b></div>`);
+  return `<div class="thread" style="--c:${cityColor(S.metaRaw.cities, t.from_city)}"><span class="tag jump" data-m="${t.month}">m${t.month}</span>
+    ${whoTag(t.from)} → ${whoTag(t.to)}${t.amount ? ` · ${fmt$(t.amount)}` : ""} <span class="st st-${st === "met" || st === "acted" || st === "replied" ? "met" : st}">${label}</span>
+    <div class="ttext">${esc(t.text)}</div>${steps.join("")}</div>`;
+}
+function newsHTML(e) {
+  return `<div class="thread news" style="--c:${cityColor(S.metaRaw.cities, e.from_city)}"><span class="tag jump" data-m="${e.month}">m${e.month}</span>
+    ${whoTag(e.from)} → ${whoTag(e.to)}<div class="ttext">${esc(e.text)}</div></div>`;
+}
+// what the region pick (a city, a deal or a pair of cities on the graph) keeps
+function regionKeeps(pick, x) {
+  if (!pick) return true;
+  if (pick.city) return [x.from_city, x.to_city, x.seller, x.buyer].includes(pick.city);
+  if (pick.deal != null) return x.deal === pick.deal || x.id === pick.deal && x.seller != null || (x.response && x.response.deal === pick.deal);
+  return x.from_city === pick.from && x.to_city === pick.to;
+}
+function regionLists(em) {
+  const d = S.rcollab, pick = S.regionPick, win = d.window || 2;
+  const head = pick ? `<div class="teampick muted">Showing ${pick.city ? `${cityTag(pick.city)} · <a href="#" class="opencity" data-city="${esc(pick.city)}">open its team →</a>` : pick.deal != null ? `deal #${pick.deal}` : `${cityTag(pick.from)} → ${cityTag(pick.to)}`} · <a href="#" class="unpick">show all</a></div>` : "";
+  const deals = d.deals.filter(x => dealState(x, em) && regionKeeps(pick, x)).sort((a, b) => b.offered - a.offered || b.id - a.id);
+  const feed = [...d.threads.filter(t => t.month <= em && regionKeeps(pick, t)).map(t => [t.month, 1, regionThreadHTML(t, em, win)]),
+    ...d.events.filter(e => e.kind === "message" && !e.ask && !e.deal && e.month <= em && regionKeeps(pick, e)).map(e => [e.month, 0, newsHTML(e)])]
+    .sort((a, b) => b[0] - a[0] || b[1] - a[1]).slice(0, 60);
+  return head + cityTable(em) + `<div class="teamh">Deals</div>` + (deals.length ? deals.map(x => dealHTML(x, em)).join("")
+    : `<div class="small muted">No deals yet. Mayors offer power or water to a neighbour with offer_deal; the other mayor accepts.</div>`)
+    + `<div class="teamh">Between cities</div>` + (feed.length ? feed.map(x => x[2]).join("") : `<div class="emptytab">No messages between the cities yet${pick ? " here" : ""}.</div>`);
+}
+function bindRegionList(root) {
+  bindThreads(root);
+  root.querySelectorAll("tr[data-city]").forEach(el => el.onclick = () => openCityTeam(el.dataset.city));
+  root.querySelectorAll(".opencity").forEach(el => el.onclick = (e) => { e.preventDefault(); openCityTeam(el.dataset.city); });
+  root.querySelectorAll(".toregion").forEach(el => el.onclick = (e) => { e.preventDefault(); setTeamView("region"); });
+  const un = root.querySelector(".unpick");
+  if (un && regionTeam()) un.onclick = (e) => { e.preventDefault(); for (const gph of [teamRGraph, teamBigR]) if (gph) gph.selected = null; onRegionPick(null); };
+}
+function renderRegionTeam(body) {
+  if (teamGraph) { teamGraph.destroy(); teamGraph = null; }
+  if (!S.rcollab) {
+    if (teamRGraph) { teamRGraph.destroy(); teamRGraph = null; }
+    body.innerHTML = `<div class="emptytab">${S.rcollabErr || "Loading the region…"}</div>`;
+    if (!S.rcollabErr && Date.now() - rcollabAt > 3000) loadRegionCollab();
+    return;
+  }
+  if (!teamRGraph || !document.getElementById("teamRCanvas")) {
+    if (teamRGraph) teamRGraph.destroy();
+    body.innerHTML = `<canvas id="teamRCanvas" class="teamcanvas"></canvas>${REGION_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
+    teamRGraph = new RegionGraph($("teamRCanvas"), { colorOf: roleColor, onPick: onRegionPick, onOpen: openCityTeam });
+    teamRGraph.setData(S.rcollab, S.metaRaw.layout);
+    S.anim = false;
+  }
+  regionStep(teamRGraph);
+  const em = teamMonth();
+  $("teamSum").innerHTML = regionTeamSummary(em);
+  $("teamList").innerHTML = regionLists(em);
+  bindRegionList($("teamList"));
+}
+function updateRegionView() {
+  if (!teamBigR || !S.rcollab || !S.frames.length) return;
+  if (teamBigR.data !== S.rcollab) teamBigR.setData(S.rcollab, S.metaRaw.layout);
+  regionStep(teamBigR);
+  const em = teamMonth();
+  $("teamMonth").textContent = `region · month ${S.frames[S.idx].month}`;
+  $("teamSide").innerHTML = regionTeamSummary(em) + REGION_LEGEND + regionLists(em);
+  bindRegionList($("teamSide"));
+}
+// a city's Team view in a region run: its deals with the neighbours and its latest messages with other cities
+function externalList(em) {
+  const d = S.collab;
+  if (!d || !d.deals || !(S.metaRaw && S.metaRaw.region)) return "";
+  const deals = d.deals.filter(x => dealState(x, em) && !(dealState(x, em) === "ended" && em - x.ended >= 12));
+  const msgs = (d.external || []).filter(e => e.kind === "message" && !e.deal && e.month <= em && em - e.month < 12).slice(-3).reverse();
+  const head = `<div class="teamh">With other cities · <a href="#" class="toregion">region view →</a></div>`;
+  if (!deals.length && !msgs.length) return head + `<div class="small muted">No deals or messages with other cities in the last year.</div>`;
+  return head + deals.map(x => dealHTML(x, em, true)).join("") + msgs.map(newsHTML).join("");
 }
 
 // ---------------------------------------------------------------- region map
@@ -1366,7 +1556,7 @@ document.addEventListener("click", (e) => { if (!$("runMenu").contains(e.target)
 $("newRunBtn").onclick = openLaunch; $("emptyLaunch").onclick = openLaunch;
 $("helpBtn").onclick = () => ($("helpModal").hidden = false);
 $("regionBtn").onclick = openRegionMap;
-document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".modal").hidden = true; if (teamBig) teamBig.setActive(!$("teamModal").hidden); });
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".modal").hidden = true; updateTeamView(); });
 document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.target === m) m.hidden = true; });
 $("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
 document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); $("moreMenu").hidden = true; renderTab(); });
