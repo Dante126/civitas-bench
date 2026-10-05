@@ -27,7 +27,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, shift
-from .fmt import TOOL_MESSAGE_CHARS, a_or_an, money, months, pct, signed
+from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -941,7 +941,7 @@ def overview(env) -> dict:
            "population": m["population"], "happiness_pct": pct(m["happiness"]),
            "approval_pct": pct(m["approval"]), "unemployment_pct": pct(m["unemployment"]),
            "jobs": {"commercial": m["jobs_com"], "industrial": m["jobs_ind"], "offices": m["jobs_off"]},
-           "treasury": round(w.treasury), "debt": round(w.debt),
+           "treasury": math.floor(w.treasury), "debt": round(w.debt),
            "last_month": {"income": round(last["income"]), "expenses": round(last["expenses"])},
            "department_funds": {k: round(v) for k, v in w.dept_funds.items()},
            "tax_pct": {k: round(100 * v, 1) for k, v in w.taxes.items()},
@@ -1469,7 +1469,7 @@ def treasury_state(w, f: Funding) -> str:
     ("$2,000 above the", "at the"), with what sets the reserve after it (reserve_why)."""
     gap = round(f.spare)
     where = f"{money(gap)} above" if gap > 0 else f"{money(-gap)} under" if gap < 0 else "at"
-    return f"treasury {money(w.treasury)}, {where} the {money(f.reserve)} reserve{reserve_why(w)}"
+    return f"treasury {cash(w.treasury)}, {where} the {money(f.reserve)} reserve{reserve_why(w)}"
 
 
 def topped_up(m: DeptMoney) -> str:
@@ -3346,7 +3346,7 @@ class ToolBox:
         playbook allows), and blamed a $100 top-up for what a $3,000 repayment drained. None otherwise."""
         w = self.world
         if w.treasury >= RESERVE_MIN:
-            return None if short else (f"the treasury holds {money(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
+            return None if short else (f"the treasury holds {cash(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
                     f"{money(amount)} loan costs {interest}/month until repaid (debt would be "
                     f"{money(w.debt + amount)} of {money(C.MAX_DEBT)}); borrow only for a first building or supply "
                     "need the treasury can't cover.")
@@ -4045,7 +4045,7 @@ class ToolBox:
         if f.idle:
             out["idle"] = f.idle
         if f.gaps:
-            out.update(below_target=f.gaps, treasury=round(w.treasury))
+            out.update(below_target=f.gaps, treasury=math.floor(w.treasury))
         out["to_spend"] = max(0, round(f.spendable))
         out["to_fund"] = [{"department": i.dept, "kind": i.kind, "amount": i.amount,
                            "upkeep_per_month": round(i.upkeep)} for i in f.to_fund]

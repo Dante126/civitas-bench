@@ -17,7 +17,7 @@ from ..bench.scoring import ScoringConfig
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, cash, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
 from .region import region_lines
 from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SITE_PURPOSES, SPEND_MONTHS, CashFlow, \
@@ -429,7 +429,7 @@ def _finances(w, cf: CashFlow) -> list[str]:
     Smoke v13-v19: the treasury change mixed in the mayor's own transfers, so 30 of 81 turns showed a "loss" while
     operations ran a surplus; interest never showed in dollars, and there were 0 repay_loan calls in 96 turns."""
     debt = round(w.debt) > 0
-    head = f"- treasury {money(w.treasury)}"
+    head = f"- treasury {cash(w.treasury)}"
     if cf.since is not None:
         parts = [f"{k} {signed(v, money)}" for k, v in (("operations", cf.ops), ("top-ups", -cf.top_ups),
                                                          ("loans", cf.loans), ("other", cf.other)) if round(v)]

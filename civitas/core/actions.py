@@ -6,6 +6,7 @@ scripted agents, remote HTTP agents and RL policies.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -95,10 +96,16 @@ def _require(world: World, key: str) -> None:
         raise ActionError(world.unlock_note(key))
 
 
+def _floor(v: float) -> int:
+    """Whole dollars rounded down, for what a treasury or department holds: asking for the figure shown never fails
+    (rounded, $1,937.60 read as $1,938 and "allocate 1938" failed)."""
+    return math.floor(v + 1e-9)
+
+
 def _spend(world: World, dept: str, cost: float) -> None:
     have = world.dept_funds[dept]
     if cost > have + 1e-9:
-        raise ActionError(f"costs ${cost:,.0f} but the {dept} budget only has ${have:,.0f}; "
+        raise ActionError(f"costs ${cost:,.0f} but the {dept} budget only has ${_floor(have):,}; "
                           f"ask the mayor for funds")
     world.dept_funds[dept] = have - cost
     world.ledger["spent"][dept] += cost
@@ -175,14 +182,14 @@ def allocate_budget(world: World, p: dict) -> tuple[str, float]:
     amount = _num(p, "amount")
     if amount >= 0:
         if amount > world.treasury:
-            raise ActionError(f"treasury only has ${world.treasury:,.0f}")
+            raise ActionError(f"treasury only has ${_floor(world.treasury):,}")
         world.treasury -= amount
         world.dept_funds[dept] += amount
         world.ledger["allocated"][dept] += amount
         return f"transferred ${amount:,.0f} to {dept} (now ${world.dept_funds[dept]:,.0f})", 0.0
     amount = -amount
     if amount > world.dept_funds[dept]:
-        raise ActionError(f"{dept} only holds ${world.dept_funds[dept]:,.0f}")
+        raise ActionError(f"{dept} only holds ${_floor(world.dept_funds[dept]):,}")
     world.dept_funds[dept] -= amount
     world.treasury += amount
     world.ledger["allocated"][dept] -= amount
@@ -205,7 +212,7 @@ def repay_loan(world: World, p: dict) -> tuple[str, float]:
     if amount <= 0:
         raise ActionError("nothing to repay")
     if amount > world.treasury:
-        raise ActionError(f"treasury only has ${world.treasury:,.0f}")
+        raise ActionError(f"treasury only has ${_floor(world.treasury):,}")
     world.debt -= amount
     world.treasury -= amount
     return f"repaid ${amount:,.0f} (debt ${world.debt:,.0f})", 0.0

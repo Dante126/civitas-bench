@@ -1,6 +1,8 @@
 """Number and text formatting shared by fleet briefings and reports."""
 from __future__ import annotations
 
+import math
+
 LINE_CHARS = 120
 TOOL_MESSAGE_CHARS = 4000      # the agent cuts each tool result message to this
 REPORT_PREVIEW_CHARS = 200     # end_turn reports quoted in briefings and the fleet report
@@ -22,6 +24,16 @@ def num(v) -> str:
 
 def money(v) -> str:
     return ("-" if v < 0 else "") + "$" + num(round(abs(v)))
+
+
+def cash(v) -> str:
+    """Money an agent may spend all of (the treasury), rounded down so that asking for the figure shown never fails:
+    $1,937.60 is $1,937 and $12,380 is $12.3k (money() rounds: the mayor read $1,938 and its "allocate 1938" failed).
+    Below zero it is money()."""
+    if v < 0:
+        return money(v)
+    d = math.floor(v + 1e-9)
+    return "$" + (f"{math.floor(d / 100) / 10:.1f}".removesuffix(".0") + "k" if d >= 10000 else f"{d:,}")
 
 
 def pct(v) -> str:

@@ -302,7 +302,7 @@ def test_cash_flow_identity(monkeypatch):
 # --- Unit B: briefing (briefing.py: the mayor's Finances and Departments blocks, the system prompt)
 from civitas.fleet.briefing import BLOCKED_NOTE, COSTS_SHOWN, MAYOR_REPORT_CHARS, briefing, system_prompt  # noqa: E402
 from civitas.fleet.config import FleetAgentConfig  # noqa: E402
-from civitas.fleet.fmt import money, signed  # noqa: E402
+from civitas.fleet.fmt import cash, money, signed  # noqa: E402
 from civitas.fleet.tools import ToolBox  # noqa: E402
 
 
@@ -329,11 +329,11 @@ def test_mayor_finances_lines(monkeypatch):
     env.end_month()
     ops = lambda: sum(h["income"] - h["expenses"] for h in w.history[1:])
     change = lambda: signed(round(w.treasury - w.history[0]["treasury"]), money)
-    assert fin()[0] == (f"- treasury {money(w.treasury)} ({change()} since month 1: operations "
+    assert fin()[0] == (f"- treasury {cash(w.treasury)} ({change()} since month 1: operations "
                         f"{signed(ops(), money)}), debt $0")          # no top-ups since month 1: left out
     assert mayor(type="allocate_budget", department="fire", amount=2500)
     env.end_month()                                     # month 3
-    assert fin()[0] == (f"- treasury {money(w.treasury)} ({change()} since month 1: operations {signed(ops(), money)}, "
+    assert fin()[0] == (f"- treasury {cash(w.treasury)} ({change()} since month 1: operations {signed(ops(), money)}, "
                         "top-ups -$2,500), debt $0")
     last = w.history[-1]
     b = {k: v for k, v in last["expense_breakdown"].items() if k in last["dept_upkeep"] and v > 0}
@@ -762,6 +762,17 @@ def test_a_money_note_never_fails_an_action(monkeypatch):
         raise RuntimeError("no")
     monkeypatch.setattr(T, "funding_gaps", boom)
     assert res.ok and box._money_note("allocate_budget", {"department": "police", "amount": 100}, res.to_dict()) == ""
+
+
+def test_the_treasury_shown_can_be_allocated():
+    """Treasury figures round down: $1,937.60 read as $1,938 and the mayor's "allocate 1938" failed."""
+    env = _env()
+    box = _mayor(env, treasury=1937.6)
+    res = box.call("allocate_budget", {"department": "police", "amount": 5000})
+    assert res["ok"] is False and res["message"].startswith("treasury only has $1,937 ")
+    assert "treasury $1,937, " in res["message"] and box.call("city_overview", {})["treasury"] == 1937
+    assert box.call("allocate_budget", {"department": "utilities", "amount": 1937})["ok"]     # first/supply: no guard
+    assert cash(12399.9) == "$12.3k" and cash(1937.6) == "$1,937" and cash(-5.4) == "-$5"
 
 
 def test_update_plan_reports_what_to_fund(monkeypatch):
