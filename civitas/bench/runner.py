@@ -356,7 +356,8 @@ def _play(run: dict) -> dict:
             (log.dir / name).unlink(missing_ok=True)
     if prompts:
         try:
-            report, md = fleet_report(env, summary, fleet_rows)
+            log.frames.flush()                       # the collaboration score reads frames.jsonl
+            report, md = fleet_report(env, summary, fleet_rows, log.dir)
             (log.dir / "fleet_report.json").write_text(json.dumps(_jsonable(report), indent=2))
             (log.dir / "fleet_report.md").write_text(md)
             summary["fleet"] = {"report": "fleet_report.md", "hints": len(report["hints"])}

@@ -171,7 +171,8 @@ def test_a_fleet_city_and_a_scripted_city_play_a_region_episode(tmp_path, monkey
     assert s["fleet"] == {"report": "fleet_report.md", "hints": len(rep["hints"])}
     assert "## NORTH" in md and "### Scoreboard" in md and "### Roles" in md and "## SOUTH" not in md
     assert "| south |" in md and "fleet agents in north" in md
-    rebuilt, _ = fleet_report(region, s, rows_from_trajectories(d / "trajectories.jsonl"))
+    assert "collaboration" in north and "### Collaboration" in md      # per city, from frames.jsonl
+    rebuilt, _ = fleet_report(region, s, rows_from_trajectories(d / "trajectories.jsonl"), d)
     assert json.loads(json.dumps(rebuilt)) == rep
 
 

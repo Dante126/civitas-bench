@@ -4555,7 +4555,7 @@ def test_fleet_episode_over_http(tmp_path, monkeypatch):
     assert rep["roles"]["mayor"]["completion_tokens"] == 60 and rep["scoreboard"]["city"] == s["final_scores"]["city"]
     assert s["fleet"] == {"report": "fleet_report.md", "hints": len(rep["hints"])}
     assert "2 of 2 months played" in md and "saved in months 0, 1" in md and "- mayor: plan set" in md
-    rebuilt, _ = fleet_report(env, s, rows_from_trajectories(d / "trajectories.jsonl"))
+    rebuilt, _ = fleet_report(env, s, rows_from_trajectories(d / "trajectories.jsonl"), d)
     assert json.loads(json.dumps(rebuilt)) == rep
 
 
