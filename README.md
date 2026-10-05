@@ -1221,7 +1221,8 @@ unanswered requests. `fleet_report.md`'s Collaboration section shows the score, 
 and a per-department table (asked, answered by others, asked of it, answered for others,
 responsiveness, follow-through, hand-offs), then lists the oldest unanswered requests. A region
 report has one per city; requests to another city are left out. On a finished run folder,
-`fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env.
+`fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env. The
+viewer shows it too, at the playhead (Team tab, below).
 Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
 84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 55.4 (v17,
 seed 0), then 72.7 / 73.5 (v19) and 63.6 / 74.5 (v23, seeds 0 / 1).
@@ -1614,12 +1615,14 @@ reached 1,280 / 47.0 and 504 / 42.8.
 
 **Hand-off beams** (toolbar ⇢, key <kbd>B</kbd>, on by default) draw the land planning handed over on the city itself, in both the pixel and the 3D view. A hand-off is another department's build within 2 tiles of an earlier planning road, dezone or clearance, inside the window. When one happens, planning's road or lot glows, a light arcs from it to the new building, and the building bursts with "road → school". The hand-offs of the last window stay as arcs while you scrub, and the Team tab lists them (📍 flies there). The v23 seed-1 run has 72, most of them a road and then a school, power plant, pump or police station.
 
+**Teamwork score.** A strip at the top of the tab shows the collaboration score (the fleet report's "Collaboration score", see [Agent fleets](#agent-fleets)) as the run stood at the playhead: the overall score, the four components as small bars (n/a greyed out under 3 cases; hover one for its definition and counts, e.g. "95 of 165 requests answered") and a sparkline over the months. A request counts once it is answered or its window has passed, so the score at month m is the one a live run showed then (one gap: a money request partly funded by then and met later counts as met). Each node reads its department's responsiveness as the one asked ("answers 59%", or "answers 2 of 2" under 3 cases), the left panel's Departments list ends with a Teamwork row (click it for the Team tab), and in the Region view a strip gives each city's score and, between the cities, the asks answered and deal offers accepted, with each city's score in the city table. The collab response carries it as `score` (`fleet/report.py:collab_score`: the report's numbers plus `series`, one entry per frame month; `region_score` for `?region=1`).
+
 Hover a node or edge for its numbers, and click one to filter the thread list under the graph. Each thread is a request, its response (money, a reply, or an action near the tiles it named) and its outcome (the requester's next build). Click a thread's month to jump there, or its 📍 to fly to the building. ⤢ Expand opens the same view full-screen.
 
 The data comes from `GET /api/runs/<id>/collab` (`bench/collab.py`), built from `frames.jsonl` alone, so it works for scripted, LLM and fleet runs and for runs already stored. A thread's window is 2 × `act_every` months. On the v23 120-month seed-1 run, 325 threads: 169 met, 53 partial, 49 unanswered, 34 replied, 12 acted, 8 open.
 
 **Region runs** get a city / Region switch at the top of the Team tab. A city's view is its own team: a message to another city isn't one of its requests. Below the requests, a "With other cities" section lists the city's deals with its neighbours and its latest messages to other cities. The **Region** view draws the cities at their place in the region, sized by population, with the links they built drawn faintly underneath. Each mayor deal is an edge labelled with amount, resource and price (power yellow, water blue). An active deal is solid, with light flowing from seller to buyer and its payment travelling back as coins each month. An offer is dashed, and an ended deal stays faint for a year. As the replay steps, messages between cities fly as comets and an offer flies as a contract. An acceptance flashes the edge green and a cancellation flashes it red ✕. Below the graph:
-- each city's tally: messages out and in, asks answered, deals proposed and accepted, sold and bought, and how many of its team's requests were answered;
+- each city's tally: messages out and in, asks answered, deals proposed and accepted, sold and bought, and its teamwork score at the playhead;
 - the deals, with their state at the playhead and what was paid;
 - the threads between cities, newest first. A deal offer is accepted, declined or withdrawn. Another ask is acted on when the other mayor offers or accepts a deal with the asker inside the window, and replied to when the other city writes back.
 

@@ -8,8 +8,10 @@ Endpoints
                                      fleet turn's tool-call summary under "trace")
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
   GET  /api/runs/<id>/problems   every failed / refused call and bad turn end, how the agent handled it, per-role rates
-  GET  /api/runs/<id>/collab?city=C   requests between agents, the money and builds that answered them (bench/collab.py)
+  GET  /api/runs/<id>/collab?city=C   requests between agents, the money and builds that answered them (bench/collab.py),
+                                      with the collaboration score per month as `score` (fleet/report.py collab_score)
   GET  /api/runs/<id>/collab?region=1 a region run's cities: mayors' deals and messages between cities
+                                      (`score`: each city's, asks and deals answered between them)
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -166,6 +168,26 @@ def trace_summary(rec: dict, calls: list[dict] | None = None) -> dict:
 
 _PROBLEMS: dict[str, tuple] = {}   # trajectories path -> ((path, size), run_problems result): recomputed as a live run grows
 _COLLAB: dict[tuple, tuple] = {}    # (frames path, city) -> ((path, size, city), run_collab result): likewise
+
+
+def collab_data(d: Path, city: str | None) -> dict:
+    """run_collab of a run folder (city "*": the region view) with its collaboration score as `score`
+    (fleet/report.py: collab_score, region_score from each city's), cached in _COLLAB until frames.jsonl grows."""
+    from .bench.collab import run_collab
+    from .fleet.report import collab_score, region_score
+    fr = d / "frames.jsonl"
+    key = (str(fr), fr.stat().st_size if fr.exists() else 0, city)
+    hit = _COLLAB.get((str(fr), city))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    c = run_collab(d, city)
+    try:
+        c["score"] = (region_score(c, {x: collab_data(d, x).get("score") or {} for x in c["cities"]}) if city == "*"
+                      else collab_score(c))
+    except Exception as e:          # the score is extra: never lose the Team tab over it
+        c["score"] = {"error": f"{type(e).__name__}: {e}"}
+    _COLLAB[(str(fr), city)] = (key, c)
+    return c
 
 
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
@@ -414,15 +436,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                                     else {"problems": [], "roles": {}, "total": {}, "hints": []})
                         return self._json(_PROBLEMS[str(traj)][1])
                     if parts[3] == "collab":        # who asked whom for what, and what came of it (Team tab)
-                        from .bench.collab import run_collab
                         city = (q.get("city") or [None])[0]
                         if (q.get("region") or ["0"])[0] not in ("", "0", "false"):
                             city = "*"              # the region view: the cities, their deals and messages
-                        fr = d / "frames.jsonl"
-                        key = (str(fr), fr.stat().st_size if fr.exists() else 0, city)
-                        if _COLLAB.get((str(fr), city), (None,))[0] != key:
-                            _COLLAB[(str(fr), city)] = (key, run_collab(d, city))
-                        return self._json(_COLLAB[(str(fr), city)][1])
+                        return self._json(collab_data(d, city))
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []

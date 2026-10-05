@@ -10,7 +10,8 @@ site something needed (idle: the department's hint), funds short of its cheapest
 the mayor), none ready but some blocked for lack of land or roads (no_land: one hint for planning), nothing needed
 (none); a negative city treasury; > 20% of turns ended on the step or token limit.
 With the run folder (`run_dir`, which the runner passes) the report also scores how the departments worked together,
-from frames.jsonl through bench/collab.py (`collaboration`: report only, never scored or shown to agents).
+from frames.jsonl through bench/collab.py (`collaboration`: report only, never scored or shown to agents); the viewer's
+Team tab shows it as of each month (`collab_score`, the collab endpoint's `score`).
 """
 from __future__ import annotations
 
@@ -590,6 +591,85 @@ def collaboration(c: dict) -> dict:
             "requests": len(threads), "open": len(threads) - len(closed), "window": window,
             "unanswered": [{"month": t["month"], "from": t["from"], "to": t["to"],
                             "text": cut(t["text"], UNANSWERED_CHARS)} for t in waiting[:UNANSWERED_SHOWN]]}
+
+
+def collab_as_of(c: dict, month: int) -> dict:
+    """collab()'s dict as a live run had it at frame `month` (a frame carries the turns of the month before it): the
+    events up to month - 1, the requests made by then, each answered (its status) once its response is in, else
+    unanswered once its window has passed (last_month = month), else open. collaboration() of it is the score the run
+    showed at that frame, and at the last frame it is the dict itself. One gap: a money request partly funded by then
+    and met later already counts as met."""
+    if month >= c["last_month"]:
+        return c
+    seen, win = month - 1, c["window"]
+
+    def status(t: dict) -> str:
+        r = t.get("response")
+        if r is not None and r["month"] <= seen:
+            return t["status"]
+        return "unanswered" if t["month"] + win <= month else "open"
+    return {**c, "last_month": month, "threads": [{**t, "status": status(t)} for t in c["threads"] if t["month"] <= seen],
+            "events": [e for e in c["events"] if e["month"] <= seen],
+            "handoffs": [h for h in c["handoffs"] if h["month_to"] <= seen]}
+
+
+def collab_score(c: dict) -> dict:
+    """The viewer's collaboration score (/api/runs/<id>/collab's `score`): collaboration() of the collab dict, plus
+    `series`, the score as of every frame month 0..last_month (collab_as_of), compact: `score` per month, per component
+    [score, counts...] (responsiveness [score, answered, n]; follow_through [score, n, met, partial, acted, replied,
+    unanswered]; handoffs [score, used, n]; money_aim [score, aimed, given, n]) and per department its responsiveness
+    as the one asked [score, answered, n] (n: requests to it answered or past their window)."""
+    out = {**collaboration(c), "min_cases": COLLAB_MIN, "follow_weight": FOLLOW_WEIGHT}
+    roles = list(out["roles"])
+    months = list(range(int(c["last_month"]) + 1))
+    ser = {"month": months, "score": [], "responsiveness": [], "follow_through": [], "handoffs": [], "money_aim": [],
+           "roles": {r: [] for r in roles}}
+    for m in months:
+        cm = collab_as_of(c, m)
+        co = collaboration(cm)
+        cp = co["components"]
+        ser["score"].append(co["score"])
+        ser["responsiveness"].append([cp["responsiveness"]["score"], cp["responsiveness"]["answered"],
+                                      cp["responsiveness"]["n"]])
+        ft = cp["follow_through"]
+        ser["follow_through"].append([ft["score"], ft["n"], *(ft["by_status"][s] for s in FOLLOW_WEIGHT)])
+        ser["handoffs"].append([cp["handoffs"]["score"], cp["handoffs"]["used"], cp["handoffs"]["n"]])
+        ma = cp["money_aim"]
+        ser["money_aim"].append([ma["score"], ma["aimed"], ma["given"], ma["n"]])
+        closed = Counter(t["to"] for t in cm["threads"] if t["status"] in FOLLOW_WEIGHT and t["from"] != t["to"]
+                         and t["from"] in c["roles"])
+        for r in roles:
+            x = co["roles"].get(r) or {}
+            ser["roles"][r].append([x.get("responsiveness"), x.get("answered_for", 0), closed[r]])
+    out["series"] = ser
+    return out
+
+
+def region_score(rc: dict, cities: dict[str, dict]) -> dict:
+    """The Region view's scores (/api/runs/<id>/collab?region=1's `score`): each city's collab_score (`cities`: city ->
+    its score dict) as its final score and per-month series, and between the cities, as of every frame month by
+    collab_as_of's rule: `asks`, the share of asks to another city answered (met, acted on or replied to) among those
+    answered or past their window [score, answered, n], and `deals`, the share of deal offers accepted among those
+    accepted, declined or left unanswered past the window (withdrawn ones left out) [score, accepted, n]; each n/a
+    under COLLAB_MIN cases."""
+    win, last = rc["window"], int(rc["last_month"])
+    months = list(range(last + 1))
+    asks, deals = [], []
+    for m in months:
+        th = collab_as_of({**rc, "events": [], "handoffs": []}, m)["threads"]
+        ask = [t for t in th if t["kind"] != "deal" and t["status"] != "open"]
+        offer = [t for t in th if t["kind"] == "deal" and t["status"] not in ("open", "withdrawn")]
+        ok = sum(t["status"] in ANSWERED for t in ask)
+        acc = sum(t["status"] == "met" for t in offer)
+        asks.append([_share(ok, len(ask), len(ask)), ok, len(ask)])
+        deals.append([_share(acc, len(offer), len(offer)), acc, len(offer)])
+    per = {c: {"score": s.get("score"), "requests": s.get("requests"),
+               "components": {k: v["score"] for k, v in (s.get("components") or {}).items()},
+               "series": (s.get("series") or {}).get("score", [])} for c, s in cities.items()}
+    return {"cities": per, "window": win, "min_cases": COLLAB_MIN,
+            "asks": dict(zip(("score", "answered", "n"), asks[-1])) if asks else None,
+            "deals": dict(zip(("score", "accepted", "n"), deals[-1])) if deals else None,
+            "series": {"month": months, "asks": asks, "deals": deals}}
 
 
 def run_collaboration(run_dir: str | Path | None, city: str | None = None) -> dict | None:

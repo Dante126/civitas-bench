@@ -19,7 +19,7 @@ export class CollabGraph {
   constructor(canvas, { colorOf, onPick, big = false } = {}) {
     this.cv = canvas; this.g = canvas.getContext("2d"); this.colorOf = colorOf || (() => "#ccc");
     this.onPick = onPick; this.big = big;
-    this.data = null; this.month = -1; this.funds = {}; this.filter = () => true;
+    this.data = null; this.month = -1; this.funds = {}; this.answers = {}; this.filter = () => true;
     this.parts = []; this.floats = []; this.flash = new Map(); this.pulse = new Map(); this.act = new Map();
     this.pending = new Map(); this.hover = null; this.mouse = null; this.selected = null; this.active = true;
     this._loop = this._loop.bind(this);
@@ -47,9 +47,10 @@ export class CollabGraph {
   }
 
   // month: the turn month on show (a frame's month - 1). animate: launch that month's events (and those since prev).
-  setMonth(month, { funds = {}, animate = false, budgetMs = 1600, filter } = {}) {
+  // answers: role -> {s, a, n}, its responsiveness to that month (score or null under 3 cases, answered, settled).
+  setMonth(month, { funds = {}, answers = {}, animate = false, budgetMs = 1600, filter } = {}) {
     if (filter) this.filter = filter;
-    this.funds = funds;
+    this.funds = funds; this.answers = answers;
     const prev = this.month;
     this.month = month;
     if (!this.data) return;
@@ -294,6 +295,9 @@ export class CollabGraph {
     this._label(r, x, y + rad + 13 * s, "#e9ecef", 11 * s, true);
     const f = r === "mayor" ? this.funds.__treasury : this.funds[r];
     if (f != null) this._label(fmtK(f), x, y + rad + 25 * s, "#9aa3ad", 9.5 * s, true);
+    const an = this.answers[r];                          // its responsiveness as the one asked
+    if (an) this._label(an.s != null ? `answers ${Math.round(an.s)}%` : `answers ${an.a} of ${an.n}`, x, y + rad + (f != null ? 37 : 25) * s,
+      an.s == null ? "#9aa3ad" : an.s >= 70 ? "#7fdcaa" : an.s >= 40 ? "#ffd98a" : "#ff9a90", 9.5 * s, true);
     g.globalAlpha = 1;
   }
 
@@ -311,9 +315,10 @@ export class CollabGraph {
   }
 
   _tip(h, [mx, my]) {
-    const st = (this.data.stats || {})[h.role] || {};
+    const st = (this.data.stats || {})[h.role] || {}, an = h.role && this.answers[h.role];
     const lines = h.role
       ? [h.role, `asked ${st.asked || 0} · answered ${st.answered || 0}`, `asked of it ${st.asked_of || 0} · it answered ${st.answered_by || 0}`,
+         ...(an ? [`answered ${an.a} of ${an.n} settled requests to it${an.s != null ? ` (${Math.round(an.s)}%)` : ""}`] : []),
          `money in ${fmtK(st.money_in || 0)}${st.money_out ? ` · out ${fmtK(st.money_out)}` : ""}`, `${st.builds || 0} builds · ${st.messages || 0} messages`]
       : this._edgeLines(h);
     const g = this.g, pad = 7;

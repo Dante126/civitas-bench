@@ -287,8 +287,10 @@ function renderDepts(f) {
     return `<div class="drow ${roleOn(r) ? "" : "off"}" data-role="${r}" style="--c:${roleColor(r)}" title="${esc(r)} (${esc(S.meta.agents[r])}): click to show only this department in the right panel">
       <span class="n">${r}</span><span class="t"><i style="width:${Math.max(0, Math.min(100, v)).toFixed(1)}%"></i></span>
       <span class="sc">${v.toFixed(1)}</span><span class="dd">${trend(v, p.scores[r] ?? 0)}</span></div>`;
-  }).join("");
-  $("scoreCards").querySelectorAll(".drow").forEach(el => el.onclick = () => {
+  }).join("") + teamworkRow();
+  const tw = $("scoreCards").querySelector(".teamrow");
+  if (tw) tw.onclick = () => { S.tab = "team"; store.set("tab", S.tab); renderTab(); };
+  $("scoreCards").querySelectorAll(".drow[data-role]").forEach(el => el.onclick = () => {
     const r = el.dataset.role;
     S.roleFilter = S.roleFilter.size === 1 && S.roleFilter.has(r) ? new Set() : new Set([r]);
     renderDepts(S.frames[S.idx]); renderTab(); updateBeams();
@@ -562,6 +564,72 @@ function renderEvents(f) {
   body.innerHTML = head + (ev.length ? ev.slice(0, 300).map(([m, e, w]) => `<div class="msgline"><span class="tag ${w ? "warn" : ""}">m${m}</span> ${esc(e)}</div>`).join("") : `<div class="emptytab">Nothing has happened to the city yet.</div>`);
 }
 
+// ---------------------------------------------------------------- team: the collaboration score
+// the collab response's `score` (fleet/report.py collab_score): the fleet report's score as the run stood at each frame
+// month, so the strip, the nodes' "answers" and the left dock follow the playhead
+const SC_COMPS = [["responsiveness", "answers"], ["follow_through", "follow-through"], ["handoffs", "hand-offs"], ["money_aim", "money aim"]];
+const SC_STATUS = { met: "funded", partial: "partly funded", acted: "acted on", replied: "replied", unanswered: "no answer" };
+const scoreOf = (d) => d && d.score && !d.score.error && d.score.series && d.score.series.month.length ? d.score : null;
+const scoreIdx = (sc, month) => Math.max(0, Math.min(sc.series.month.length - 1, month));   // series months run 0..last
+const scoreMonth = () => S.frames.length ? S.frames[S.idx].month : 0;
+const scoreTxt = (v) => v == null ? "n/a" : v.toFixed(1);
+function compTip(k, row, sc) {
+  const w = sc.window, na = row[0] == null ? `\nn/a: fewer than ${sc.min_cases} cases so far.` : "";
+  if (k === "responsiveness") return `Responsiveness: the share of requests between departments answered within ${w} months (funded, partly funded, acted on or replied to).\n${row[1]} of ${row[2]} requests answered.${na}`;
+  if (k === "follow_through") {
+    const keys = Object.keys(sc.follow_weight), wts = keys.map(s => `${SC_STATUS[s] || s} ${sc.follow_weight[s]}`).join(", ");
+    return `Follow-through: the requests weighted by how far they were met (${wts}).\n${row[1]} requests: ${keys.map((s, j) => `${row[2 + j]} ${SC_STATUS[s] || s}`).join(", ")}.${na}`;
+  }
+  if (k === "handoffs") return `Hand-offs: the share of planning's roads, freed lots and cleared land another department built on within ${w} months.\n${row[1]} of ${row[2]} built on.${na}`;
+  return `Money aim: the share of the mayor's top-up dollars that answered the department's own money request.\n${fmt$(row[1])} of ${fmt$(row[2])} in ${row[3]} top-ups.${na}`;
+}
+const SCORE_TIP = (sc) => `Teamwork: the mean of the four components with at least ${sc.min_cases} cases each, from the start of the run to this month. A request counts once it is answered or its ${sc.window}-month window has passed. Hover a component for its definition and counts.`;
+// the score over the run on an auto-scaled band: solid up to the month on show (a tick marks it), faint after it
+function teamSpark(vals, i, w = 120, h = 30) {
+  const v = vals.filter(x => x != null); if (v.length < 2) return `<svg class="tspark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"></svg>`;
+  let lo = Math.min(...v), hi = Math.max(...v); const pad = Math.max(0, 20 - (hi - lo)) / 2; lo = Math.max(0, lo - pad - 2); hi = Math.min(100, hi + pad + 2);
+  const n = Math.max(2, vals.length), X = (j) => (j / (n - 1) * w).toFixed(1), Y = (x) => (h - 3 - (x - lo) / Math.max(1e-6, hi - lo) * (h - 6)).toFixed(1);
+  const runs = (a, b) => { const out = []; let cur = []; for (let j = a; j <= b; j++) { if (vals[j] == null) { if (cur.length) out.push(cur); cur = []; } else cur.push(`${X(j)},${Y(vals[j])}`); } if (cur.length) out.push(cur); return out; };
+  const line = (pts, op) => pts.length > 1 ? `<polyline fill="none" stroke="#3ecf9e" stroke-opacity="${op}" stroke-width="1.6" stroke-linejoin="round" vector-effect="non-scaling-stroke" points="${pts.join(" ")}"/>` : "";
+  const dot = `<line x1="${X(i)}" x2="${X(i)}" y1="0" y2="${h}" stroke="rgba(255,255,255,.35)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+  return `<svg class="tspark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><title>${lo.toFixed(0)}-${hi.toFixed(0)}</title>${runs(i, vals.length - 1).map(p => line(p, 0.25)).join("")}${runs(0, i).map(p => line(p, 1)).join("")}${dot}</svg>`;
+}
+function scoreBar(label, s, tip) {
+  return `<div class="tsc ${s == null ? "na" : ""}" title="${esc(tip)}"><span>${label}</span><div class="tsv"><b>${s == null ? "n/a" : Math.round(s)}</b><i><u style="width:${Math.max(0, Math.min(100, s ?? 0))}%"></u></i></div></div>`;
+}
+function scoreStrip(d, month) {
+  const sc = scoreOf(d); if (!sc) return "";
+  const ser = sc.series, i = scoreIdx(sc, month), v = ser.score[i], settled = ser.responsiveness[i][2];
+  const comps = SC_COMPS.map(([k, label]) => scoreBar(label, ser[k][i][0], compTip(k, ser[k][i], sc))).join("");
+  return `<div class="tscore"><div class="tshead" title="${esc(SCORE_TIP(sc))}"><div class="tsmain"><span class="k">Teamwork</span><b class="${v == null ? "na" : ""}">${scoreTxt(v)}</b></div>
+    <span class="s">to month ${ser.month[i]}<br>${settled} request${settled === 1 ? "" : "s"} settled</span>${teamSpark(ser.score, i)}</div><div class="tscomps">${comps}</div></div>`;
+}
+// each department's responsiveness as the one asked, for the network's nodes
+function teamAnswers() {
+  const sc = scoreOf(S.collab), out = {}; if (!sc) return out;
+  const i = scoreIdx(sc, scoreMonth());
+  for (const [r, rows] of Object.entries(sc.series.roles || {})) { const [s, a, n] = rows[i] || []; if (n) out[r] = { s, a, n }; }
+  return out;
+}
+// the Region view: each city's teamwork, then the asks and deal offers answered between the cities
+function regionScoreStrip(month) {
+  const sc = S.rcollab && S.rcollab.score; if (!sc || sc.error || !sc.series) return "";
+  const i = Math.max(0, Math.min(sc.series.month.length - 1, month)), ask = sc.series.asks[i], deal = sc.series.deals[i], na = `\nn/a: fewer than ${sc.min_cases} cases so far.`;
+  const cities = Object.entries(sc.cities || {}).map(([c, x]) => { const v = x.series.length ? x.series[Math.min(i, x.series.length - 1)] : null;
+    return `<div class="tsmain tscity" title="${esc(c)}'s teamwork to this month: the mean of its responsiveness, follow-through, hand-offs and money aim (open its team for the parts)"><span class="k">${cityTag(c)}</span><b class="${v == null ? "na" : ""}">${scoreTxt(v)}</b></div>`; }).join("");
+  const comps = scoreBar("asks answered", ask[0], `Asks between cities answered within ${sc.window} months (a deal offered or accepted, or a reply from the other city).\n${ask[1]} of ${ask[2]} asks answered.${ask[0] == null ? na : ""}`)
+    + scoreBar("deals accepted", deal[0], `Deal offers accepted, of those accepted, declined or left unanswered past ${sc.window} months (withdrawn offers left out).\n${deal[1]} of ${deal[2]} offers accepted.${deal[0] == null ? na : ""}`);
+  return `<div class="tscore"><div class="tshead" title="Teamwork per city, as of this month">${cities}</div><div class="tscomps two">${comps}</div></div>`;
+}
+// the left dock's last department row: the team's score, a click opens the Team tab
+function teamworkRow() {
+  const sc = scoreOf(S.collab); if (!sc || !S.frames.length) return "";
+  const i = scoreIdx(sc, scoreMonth()), v = sc.series.score[i], p = sc.series.score[scoreIdx(sc, ago().month)];
+  return `<div class="drow teamrow" style="--c:var(--accent)" title="${esc(SCORE_TIP(sc))}\nClick to open the Team tab.">
+    <span class="n">Teamwork</span><span class="t"><i style="width:${Math.max(0, Math.min(100, v ?? 0)).toFixed(1)}%"></i></span>
+    <span class="sc">${scoreTxt(v)}</span><span class="dd">${v != null && p != null ? trend(v, p) : ""}</span></div>`;
+}
+
 // ---------------------------------------------------------------- team (collab.js)
 // the departments as a live network: requests, money and builds of each turn play out as the replay moves
 let teamGraph = null, teamBig = null, collabAt = 0;
@@ -592,6 +660,7 @@ async function loadCollab(force = false) {
   }
   if (S.runId !== id) return;
   S.collab = d; S.collabErr = null;
+  if (S.frames.length) renderDepts(S.frames[S.idx]);          // its Teamwork row
   for (const gph of [teamGraph, teamBig]) if (gph) gph.setData(d);
   S.anim = false; updateBeams();
   if (S.tab === "team") renderTeam(); updateTeamView();
@@ -600,7 +669,7 @@ const teamMonth = () => S.frames.length ? S.frames[S.idx].month - 1 : -1;     //
 function teamStep(gph) {
   const f = S.frames[S.idx], m = f.metrics || {};
   const act = (S.collab && S.collab.act_every) || 1;
-  gph.setMonth(teamMonth(), { funds: { ...(m.dept_funds || {}), __treasury: m.treasury }, animate: S.anim, filter: roleOn,
+  gph.setMonth(teamMonth(), { funds: { ...(m.dept_funds || {}), __treasury: m.treasury }, answers: teamAnswers(), animate: S.anim, filter: roleOn,
     budgetMs: S.playing ? Math.min(2600, +$("speed").value * act * 0.9) : 1600 });
 }
 // a thread's state as of the month on show
@@ -683,13 +752,14 @@ function renderTeam() {
   }
   if (!teamGraph || !document.getElementById("teamCanvas")) {
     if (teamGraph) teamGraph.destroy();
-    body.innerHTML = `<canvas id="teamCanvas" class="teamcanvas"></canvas>${TEAM_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
+    body.innerHTML = `<div id="teamScore"></div><canvas id="teamCanvas" class="teamcanvas"></canvas>${TEAM_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
     teamGraph = new CollabGraph($("teamCanvas"), { colorOf: roleColor, onPick: onTeamPick });
     teamGraph.setData(S.collab);
     S.anim = false;
   }
   teamStep(teamGraph);
   const em = teamMonth();
+  $("teamScore").innerHTML = scoreStrip(S.collab, scoreMonth());
   $("teamSum").innerHTML = teamSummary(em);
   $("teamList").innerHTML = handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
   bindThreads($("teamList")); bindHandoffs($("teamList")); bindRegionList($("teamList"));
@@ -723,7 +793,7 @@ function updateTeamView() {
   teamStep(teamBig);
   const em = teamMonth();
   $("teamMonth").textContent = `month ${S.frames[S.idx].month}`;
-  $("teamSide").innerHTML = teamSummary(em) + TEAM_LEGEND + handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
+  $("teamSide").innerHTML = scoreStrip(S.collab, scoreMonth()) + teamSummary(em) + TEAM_LEGEND + handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
   bindThreads($("teamSide")); bindHandoffs($("teamSide")); bindRegionList($("teamSide"));
   const un = $("teamSide").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamBig.selected = null; onTeamPick(null); };
 }
@@ -784,15 +854,16 @@ function regionTeamSummary(em) {
     <div><b>${active.length}</b><span>active deals</span></div><div><b>${fmt$(per)}</b><span>traded / month</span></div></div>`;
 }
 function cityTable(em) {
-  const d = S.rcollab;
+  const d = S.rcollab, sc = d.score && !d.score.error ? d.score.cities || {} : {};
+  const tw = (c) => { const x = sc[c]; if (!x || !x.series.length) return null; return x.series[Math.min(em + 1, x.series.length - 1)]; };
   const rows = d.cities.map(c => {
-    const t = cityTally(d, c, em), st = d.stats[c] || {};
+    const t = cityTally(d, c, em), st = d.stats[c] || {}, v = tw(c);
     return `<tr data-city="${esc(c)}" title="Open ${esc(c)}'s team"><td>${cityTag(c)}</td><td>${t.sent} / ${t.received}</td><td>${t.asks_out_ok}/${t.asks_out}</td>
       <td>${t.proposed} / ${t.accepted}${t.active ? ` <span class="muted">(${t.active} on)</span>` : ""}</td><td>${fmt$(t.sold)} / ${fmt$(t.bought)}</td>
-      <td>${st.requests ? Math.round(100 * st.answered / st.requests) + "%" : "—"}</td></tr>`;
+      <td title="requests answered inside the city, whole run: ${st.requests ? Math.round(100 * st.answered / st.requests) + "%" : "none"}">${sc[c] ? `<b>${scoreTxt(v)}</b>` : st.requests ? Math.round(100 * st.answered / st.requests) + "%" : "—"}</td></tr>`;
   }).join("");
   return `<table class="lb regionteam"><tr><th>city</th><th title="messages to / from other cities">msgs out/in</th><th title="its asks to other cities that were answered">asks met</th>
-    <th title="deals it proposed / offers to it it accepted">deals prop/acc</th><th title="paid to it / by it through deals">sold / bought</th><th title="requests answered inside the city, whole run">team</th></tr>${rows}</table>`;
+    <th title="deals it proposed / offers to it it accepted">deals prop/acc</th><th title="paid to it / by it through deals">sold / bought</th><th title="the city's teamwork score to this month (the Team tab's strip, per city)">teamwork</th></tr>${rows}</table>`;
 }
 function dealHTML(x, em, compact = false) {
   const st = dealState(x, em), paid = dealPaid(x, em), col = RES_C[x.resource] || "#ccc";
@@ -859,13 +930,14 @@ function renderRegionTeam(body) {
   }
   if (!teamRGraph || !document.getElementById("teamRCanvas")) {
     if (teamRGraph) teamRGraph.destroy();
-    body.innerHTML = `<canvas id="teamRCanvas" class="teamcanvas"></canvas>${REGION_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
+    body.innerHTML = `<div id="teamScore"></div><canvas id="teamRCanvas" class="teamcanvas"></canvas>${REGION_LEGEND}<div id="teamSum"></div><div id="teamList"></div>`;
     teamRGraph = new RegionGraph($("teamRCanvas"), { colorOf: roleColor, onPick: onRegionPick, onOpen: openCityTeam });
     teamRGraph.setData(S.rcollab, S.metaRaw.layout);
     S.anim = false;
   }
   regionStep(teamRGraph);
   const em = teamMonth();
+  $("teamScore").innerHTML = regionScoreStrip(scoreMonth());
   $("teamSum").innerHTML = regionTeamSummary(em);
   $("teamList").innerHTML = regionLists(em);
   bindRegionList($("teamList"));
@@ -876,7 +948,7 @@ function updateRegionView() {
   regionStep(teamBigR);
   const em = teamMonth();
   $("teamMonth").textContent = `region · month ${S.frames[S.idx].month}`;
-  $("teamSide").innerHTML = regionTeamSummary(em) + REGION_LEGEND + regionLists(em);
+  $("teamSide").innerHTML = regionScoreStrip(scoreMonth()) + regionTeamSummary(em) + REGION_LEGEND + regionLists(em);
   bindRegionList($("teamSide"));
 }
 // a city's Team view in a region run: its deals with the neighbours and its latest messages with other cities
