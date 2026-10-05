@@ -1589,6 +1589,13 @@ Hover a node or edge for its numbers, and click one to filter the thread list un
 
 The data comes from `GET /api/runs/<id>/collab` (`bench/collab.py`), built from `frames.jsonl` alone, so it works for scripted, LLM and fleet runs and for runs already stored. A thread's window is 2 × `act_every` months. On the v23 120-month seed-1 run, 325 threads: 169 met, 53 partial, 49 unanswered, 34 replied, 12 acted, 8 open.
 
+**Region runs** get a city / Region switch at the top of the Team tab. A city's view is its own team: a message to another city isn't one of its requests. Below the requests, a "With other cities" section lists the city's deals with its neighbours and its latest messages to other cities. The **Region** view draws the cities at their place in the region, sized by population, with the links they built drawn faintly underneath. Each mayor deal is an edge labelled with amount, resource and price (power yellow, water blue). An active deal is solid, with light flowing from seller to buyer and its payment travelling back as coins each month. An offer is dashed, and an ended deal stays faint for a year. As the replay steps, messages between cities fly as comets and an offer flies as a contract. An acceptance flashes the edge green and a cancellation flashes it red ✕. Below the graph:
+- each city's tally: messages out and in, asks answered, deals proposed and accepted, sold and bought, and how many of its team's requests were answered;
+- the deals, with their state at the playhead and what was paid;
+- the threads between cities, newest first. A deal offer is accepted, declined or withdrawn. Another ask is acted on when the other mayor offers or accepts a deal with the asker inside the window, and replied to when the other city writes back.
+
+Double-click a city, or click its row, to open its team. The data is `GET /api/runs/<id>/collab?region=1` (`bench/collab.py:region_collab`), built from each frame's `deals` snapshot, the deal actions in the turns and the council. `collab?city=C` adds that city's `deals`, `external` events and `external_threads`.
+
 **Problems tab** (viewer). `GET /api/runs/<id>/problems` (`bench/problems.py`) lists every failed or refused tool call and every turn that ended badly (step limit, no tool call, token budget, unreadable reply), each with what the agent did next:
 - **fixed:** a later call of the same tool worked in the same turn (the same arguments count too, after another action changed what failed, e.g. the dezone a road needed);
 - **escalated:** it gave up but messaged another role, e.g. asked the mayor for money;

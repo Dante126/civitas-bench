@@ -9,6 +9,7 @@ Endpoints
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
   GET  /api/runs/<id>/problems   every failed / refused call and bad turn end, how the agent handled it, per-role rates
   GET  /api/runs/<id>/collab?city=C   requests between agents, the money and builds that answered them (bench/collab.py)
+  GET  /api/runs/<id>/collab?region=1 a region run's cities: mayors' deals and messages between cities
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -415,6 +416,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                     if parts[3] == "collab":        # who asked whom for what, and what came of it (Team tab)
                         from .bench.collab import run_collab
                         city = (q.get("city") or [None])[0]
+                        if (q.get("region") or ["0"])[0] not in ("", "0", "false"):
+                            city = "*"              # the region view: the cities, their deals and messages
                         fr = d / "frames.jsonl"
                         key = (str(fr), fr.stat().st_size if fr.exists() else 0, city)
                         if _COLLAB.get((str(fr), city), (None,))[0] != key:
