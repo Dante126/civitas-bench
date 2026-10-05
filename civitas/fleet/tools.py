@@ -756,11 +756,12 @@ def _zone_beside(w, tiles: list[tuple[int, int]], spare=()) -> list[str]:
     return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
 
 
-def zone_fit(w, args: dict, funds: float) -> str:
+def zone_fit(w, args: dict, funds: float, ask: bool = True) -> str:
     """For a zone its department's funds can't pay (`args` as sent): the price per tile it was charged, as actions.zone
     charges it (zone_density: industry and mixed use at the high-density price; REZONE_COST per zoned tile changing
     density), how many new tiles `funds` buy, and the sub-rectangle of the requested area with the most tiles `funds`
-    pay for (then the most with road access, then the smallest); for R/C/O at high density, whether "low" zones it all.
+    pay for (then the most with road access, then the smallest); for R/C/O at high density, whether "low" zones it all;
+    then to ask the mayor for the rest, or with `ask` False (mayor_ask) to say so in the end_turn report instead.
     "" when the funds don't pay for one tile, or on any error. v19 (120 months, seeds 0-1): 43 zones failed on "costs
     $48 but the planning budget only has $46; ask the mayor for funds", 41 of them with money for some tiles, and
     planning asked the mayor instead of zoning less; industry zoned "low" was charged high density unseen. v23 (120
@@ -810,8 +811,11 @@ def zone_fit(w, args: dict, funds: float) -> str:
             if not short_of(funds, low):
                 out += f', or zone it all with density "low" for {money(low)}'
         full = zone_cost(len(tiles), len(rezone), density)
-        return out + (f"; then ask the mayor for {money(math.ceil(full - funds))} for the rest (send_message)"
-                      if full > funds else "")
+        rest = money(math.ceil(full - funds))
+        if full <= funds:
+            return out
+        return out + (f"; then ask the mayor for {rest} for the rest (send_message)" if ask   # mayor_ask: review
+                      else f"; the rest ({rest}) waits: say so in your end_turn report")
     except Exception:
         return ""
 
@@ -1640,7 +1644,7 @@ def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
 def ask_refusal(a: Ask) -> str:
     """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal)."""
     return (f"not sent: {a.why}, so a money ask now gets a no. Put what you need in your end_turn report instead "
-            "(the mayor reads it); to post this message anyway, call send_message again.")
+            "(the mayor reads it); to post this message anyway, send it to the mayor again.")
 
 
 # the mayor's actions whose results say where the money stands (ToolBox._money_note, appended by _act on success and
@@ -3750,7 +3754,7 @@ class ToolBox:
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
         if name == "zone" and message.startswith("costs $") and " budget only has " in message:
-            return zone_fit(w, args, w.dept_funds["planning"])
+            return zone_fit(w, args, w.dept_funds["planning"], mayor_ask(self.env, self.fleet, "planning").ok)
         if (name, message) in (("zone", "no empty land tiles in that area"), ("dezone", "no zoned tiles in that area")):
             try:
                 tiles = _rect(w, args)
@@ -3834,6 +3838,8 @@ class ToolBox:
             call = bus_line_call(bus_stops(lst))
             if (m := BUDGET_SHORT.search(message)) and (lack := float(m[1].replace(",", "")) -
                                                         float(m[2].replace(",", ""))) > 0:
+                if not mayor_ask(self.env, self.fleet, "transport").ok:   # the hold-back would refuse it: review
+                    return f" - {money(math.ceil(lack))} short; say so in your end_turn report. The line: {call}"
                 return f" - ask the mayor for {money(math.ceil(lack))} (send_message), then {call}"
             return f" - the suggested stops, all on one road network: {call}"
         except Exception:
@@ -4216,16 +4222,20 @@ class ToolBox:
         """Queue one council message per recipient (`to`: one address, or several separated by commas: recipients()),
         posted at the end of the turn, so per-role digests, the Team tab's threads and the mayor's Open requests see
         one message each. A department's money ask to the mayor it can't get now is held back once a turn
-        (_ask_refusal: the model only)."""
+        (_ask_refusal: the model only); sent to others too, only the mayor's copy is held back."""
         if not text.strip():
             raise ToolError("text is empty")
         from .region import message_targets
         names = recipients(to, message_targets(self.env, self.role))
-        if "mayor" in names and (refusal := self._ask_refusal(text)):
+        refusal = self._ask_refusal(text) if "mayor" in names else ""
+        if refusal and names == ["mayor"]:
             return {"ok": False, "refused": "ask", "error": refusal}
+        if refusal:                                   # the others still get it: review, "mayor,planning" lost both
+            names = [r for r in names if r != "mayor"]
         self.messages += [{"to": r, "text": text} for r in names]
         each = " (one message each)" if len(names) > 1 else ""
-        return {"ok": True, "message": f"message to {_and(names)}{each} will be posted at the end of your turn"}
+        msg = f"message to {_and(names)}{each} will be posted at the end of your turn"
+        return {"ok": True, "message": msg + (f"; not to the mayor: {refusal}" if refusal else "")}
 
     def _ask_refusal(self, text: str) -> str:
         """The model's department (max_steps given: ToolAgent) sending the mayor a money ask (collab.is_request and

@@ -28,8 +28,10 @@ ASK = re.compile(r"\$\s?\d|\bneed|\brequest|\bplease\b|\bcould you\b|\bcan you\b
 # what is_request strikes before reading ASK: a negated need ("no budget needed", "No immediate needs", "no need",
 # "not required", "nothing needed") and $0. The 120-month trinity runs and the region smoke 20261005 had 8 status
 # reports to the mayor counted as requests (transport's "below the 1,500 threshold ... No budget needed at this time
-# (current $0 matches target)", education's "No schools needed yet"); striking these turned no other message
-NO_ASK = re.compile(r"\b(?:no|not|nothing|don'?t|doesn'?t|do not|does not)\b(?:\s+[\w$,.]+){0,3}?\s+"
+# (current $0 matches target)", education's "No schools needed yet"); striking these turned no other message. The
+# negation stays in its clause (no comma, "and", "we" ...): review, "no clinic and need one" lost its ask
+NO_ASK = re.compile(r"\b(?:no|not|nothing|don'?t|doesn'?t|do not|does not)\b"
+                    r"(?:\s+(?!(?:and|but|or|so|yet|we|i|need)\b)[\w$]+){0,3}?\s+"     # within one clause: "no X and need Y" asks
                     r"(?:needs?|needed|required|requested|requests?)\b|\bno need\b|\$\s?0+(?:\.0+)?(?![\d,]|\.\d)", re.I)
 MONEY = re.compile(r"\$\s?\d|\bfund|\bbudget|\bmoney|\ballocat", re.I)
 LAND = re.compile(r"\broad|\blot\b|\blots\b|\bzone|\bdezone|\briverbank|\bland\b|\btile", re.I)
@@ -435,7 +437,7 @@ def _cross_messages(frames: list[dict], cities) -> list[dict]:
             ev.append({"month": int(m.get("month", 0)), "kind": "message", "from": m.get("sender"), "to": to,
                        "from_city": _city_of(m.get("sender")), "to_city": _city_of(to), "text": text[:TEXT_CHARS],
                        "amount": None if dm else _amount(text), "deal": int(dm[1]) if dm else None,
-                       "ask": not dm and bool(ASK.search(text) or "?" in text)})
+                       "ask": not dm and bool(ASK.search(NO_ASK.sub(" ", text)) or "?" in text)})   # as is_request
     return ev
 
 

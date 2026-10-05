@@ -252,3 +252,12 @@ def test_region_collab_endpoint(tmp_path):
         assert "region" not in c and len(c["deals"]) == 2 and c["roles"][0] == "mayor"
     finally:
         srv.shutdown()
+
+
+def test_a_negation_stays_in_its_clause():
+    """Review: "no clinic and need one" lost its only ask word to the negated-need strike."""
+    from civitas.bench.collab import is_request
+    assert is_request("mayor", "We have no clinic and need one near (12,4)")
+    assert is_request("planning", "Nothing built yet, we need land near 3,4")
+    assert not is_request("mayor", "Below 1,500 residents. No budget needed at this time (current $0 matches target)")
+    assert not is_request("mayor", "No schools needed yet")

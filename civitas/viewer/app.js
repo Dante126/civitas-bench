@@ -675,7 +675,7 @@ function teamStep(gph) {
 // a thread's state as of the month on show
 function threadState(t, em) {
   if (t.response && t.response.month <= em) return t.status;
-  return em - t.month > (S.collab.window || 6) ? "unanswered" : "waiting";
+  return em + 1 - t.month >= (S.collab.window || 6) ? "unanswered" : "waiting";   // as the score: report.collab_as_of
 }
 const ST_TEXT = { met: "funded", partial: "partly funded", acted: "acted on", replied: "replied", waiting: "waiting", unanswered: "no answer", open: "waiting" };
 function teamThreads(em) {
@@ -882,7 +882,7 @@ function dealHTML(x, em, compact = false) {
 const RST_TEXT = { met: "funded", partial: "partly", acted: "acted on", replied: "replied", waiting: "waiting", unanswered: "no answer", open: "waiting", declined: "declined", withdrawn: "withdrawn" };
 function regionThreadHTML(t, em, win) {
   const r = t.response, o = t.outcome, see = (x) => x && x.month <= em;
-  const st = see(r) ? t.status : em - t.month > win && t.kind !== "deal" ? "unanswered" : "waiting";
+  const st = see(r) ? t.status : em + 1 - t.month >= win ? "unanswered" : "waiting";   // offers too, as the score
   const label = t.kind === "deal" && st === "met" ? "accepted" : RST_TEXT[st] || st;
   const steps = [];
   if (see(r)) steps.push(`<div class="tstep">↳ <span class="jump" data-m="${r.month}">m${r.month}</span> ${cityTag(t.to_city)}: ${esc(r.text).slice(0, 110)}</div>`);

@@ -1988,6 +1988,18 @@ def test_department_briefings_say_whether_to_ask_the_mayor(monkeypatch):
         system_prompt("mayor", FleetAgentConfig(model="x"), 12)
 
 
+def test_a_held_back_ask_still_reaches_the_other_recipients(monkeypatch):
+    """Review: "mayor,planning" with an ask the mayor can't fund lost planning's copy too."""
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": POLICE_2ND, "education": SCHOOL_1ST})
+    env.world.treasury = 1000.0                                           # a hold
+    box = T.ToolBox(env, "police", max_steps=12)
+    res = box.call("send_message", {"to": "mayor,planning", "text": "Requesting $2,500 and a lot near (5,5)"})
+    assert res["ok"] and "; not to the mayor: not sent: " in res["message"]
+    assert box.messages == [{"to": "planning", "text": "Requesting $2,500 and a lot near (5,5)"}]
+
+
 def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatch):
     env = _env()
     _months_spent(env, {}, {}, {})
@@ -1998,8 +2010,8 @@ def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatc
     assert box.call("send_message", ask) == {"ok": False, "refused": "ask", "error": (
         "not sent: another police station ($2,500 short) waits: the mayor is in a hold (the treasury is at or under "
         "its reserve) and funds only first buildings, supply and planning's road, so a money ask now gets a no. Put "
-        "what you need in your end_turn report instead (the mayor reads it); to post this message anyway, call "
-        "send_message again.")}
+        "what you need in your end_turn report instead (the mayor reads it); to post this message anyway, send it to "
+        "the mayor again.")}
     assert box.messages == []
     assert box.call("send_message", ask)["ok"] and box.messages == [ask]           # once a turn: then it goes
     for to, text in (("planning", "need $500 for a lot"), ("mayor", "Station built, coverage 80%"),   # no money ask
@@ -2008,9 +2020,10 @@ def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatc
     assert T.ToolBox(env, "education", max_steps=12).call(              # a first building: it asks
         "send_message", {"to": "mayor", "text": "Need $2,500 for our first school"})["ok"]
     assert T.ToolBox(env, "police").call("send_message", ask)["ok"]        # the scripted fleet: never held
-    held = T.ToolBox(env, "transport", max_steps=12).call(                 # nothing ready: held, the whole call
-        "send_message", {"to": "mayor,planning", "text": "please allocate $1,000 for future upgrades"})
-    assert held["refused"] == "ask" and "nothing ready to buy, so a money ask now gets a no" in held["error"]
+    tbox = T.ToolBox(env, "transport", max_steps=12)                     # nothing ready: the mayor's copy held
+    held = tbox.call("send_message", {"to": "mayor,planning", "text": "please allocate $1,000 for future upgrades"})
+    assert held["ok"] and "not to the mayor: not sent: nothing ready to buy, so a money ask now gets a no" in \
+        held["message"] and [m["to"] for m in tbox.messages] == ["planning"]
 
 
 def test_one_send_message_answers_several_departments():
