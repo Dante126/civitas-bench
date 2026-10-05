@@ -1194,8 +1194,37 @@ next to its summary. They contain:
 - the scoreboard
 - the final plan and the months it changed
 - per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups, refused calls (repeats and guard refusals) and overrides (earned `confirm: true` repeats; fleet_report.md's `repeats (look-ups / refused / overrides)` column), spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
+- a collaboration score (see below)
 - the top failures, last reports and the lessons in memory
 - coaching hints
+
+**Collaboration score.** The report scores how the departments worked together, 0–100, from
+`frames.jsonl` through the Team tab's request matching (`bench/collab.py`). It is for the
+report only: it never enters `bench/scoring.py` and agents never see it. Only requests
+between two roles in the game count. A request still inside its window (2 × `act_every`
+months, the Team tab's "open") is left out. There are four components:
+
+- **responsiveness**: the share of requests that were met, partly met, acted on or replied
+  to within the window
+- **follow-through**: the same requests weighted by how far they were met: met 1, partial
+  0.6, acted on 0.5, replied 0.25, unanswered 0
+- **hand-offs**: the share of planning's roads, freed lots and cleared land that another
+  department built on within the window. Openings still inside their window count only once
+  used.
+- **money aim**: the share of the mayor's top-up dollars that answered that department's
+  money request (frames can't tell a top-up for a first building or supply)
+
+The score is the mean of the components that have at least 3 cases. A component with fewer
+is n/a, and so is the score when every component is. `fleet_report.json` has it under
+`collaboration`: the components with their counts, per-department rows and the three oldest
+unanswered requests. `fleet_report.md`'s Collaboration section shows the score, the components
+and a per-department table (asked, answered by others, asked of it, answered for others,
+responsiveness, follow-through, hand-offs), then lists the oldest unanswered requests. A region
+report has one per city; requests to another city are left out. On a finished run folder,
+`fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env.
+Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
+84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 55.4 (v17,
+seed 0), then 72.7 / 73.5 (v19) and 63.6 / 74.5 (v23, seeds 0 / 1).
 
 A hint fires on any of these:
 
@@ -1605,7 +1634,7 @@ Hitting the per-turn action cap doesn't count. The tab shows these rates for the
 - `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council). The viewer replays these.
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
-- `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, coaching hints (see [Agent fleets](#agent-fleets)); in a region, one section per city with fleet agents
+- `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, collaboration score, coaching hints (see [Agent fleets](#agent-fleets)); in a region, one section per city with fleet agents
 - `checkpoint.ckpt` / `playbooks.toml` / `PAUSED` (a supervised run between sessions): the game to resume, the playbooks to edit, the resume command (see Modes under [Agent fleets](#agent-fleets)). The checkpoint is a pickle signed with this installation's key (`~/.config/civitas/checkpoint.key`); resume refuses one whose signature is missing or doesn't match, so it only resumes on the machine and account that made it
 
 `python examples/export_sft.py runs/ --role planning --min-reward 0.001` turns the good

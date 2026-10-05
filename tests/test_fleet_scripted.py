@@ -91,7 +91,11 @@ def test_a_short_episode_runs_end_to_end(tmp_path, monkeypatch):
                for st in rep["roles"].values())
     assert rep["scoreboard"]["city"] == s["final_scores"]["city"] and rep["plan"]["versions"] >= 1
     assert "fleet:scripted" in (d / "fleet_report.md").read_text()
-    rebuilt, _ = fleet_report(env, s, rows_from_trajectories(d / "trajectories.jsonl"))
+    # the collaboration score, from frames.jsonl (report only): the scripted departments ask the mayor for money
+    co = rep["collaboration"]
+    assert co["requests"] > 0 and co["components"]["responsiveness"]["n"] > 0 and "## Collaboration" in (
+        d / "fleet_report.md").read_text()
+    rebuilt, _ = fleet_report(env, s, rows_from_trajectories(d / "trajectories.jsonl"), d)
     assert json.loads(json.dumps(rebuilt)) == rep
 
 

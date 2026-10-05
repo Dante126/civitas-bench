@@ -9,6 +9,8 @@ successful action spanning 6+ months (`_turn_kind`, from what the turn's briefin
 site something needed (idle: the department's hint), funds short of its cheapest such site (starved: one hint for
 the mayor), none ready but some blocked for lack of land or roads (no_land: one hint for planning), nothing needed
 (none); a negative city treasury; > 20% of turns ended on the step or token limit.
+With the run folder (`run_dir`, which the runner passes) the report also scores how the departments worked together,
+from frames.jsonl through bench/collab.py (`collaboration`: report only, never scored or shown to agents).
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
+from ..bench.collab import OPENERS, run_collab
 from ..sim import catalog as C
 from .fmt import REPORT_PREVIEW_CHARS, cut, money, pct
 from .memory import DEPARTMENTS, FleetState
@@ -66,6 +69,12 @@ BUDGET_LINE = re.compile(rf"- ({MONEY}) in department funds(?: \(plan target ({M
 PRICE_END = re.compile(rf"; ({MONEY})(?:/tile| road \+ ({MONEY}) zoning)?( - you have {MONEY})?$")
 SUPPLY_LINE = re.compile(rf"supply ({NUMBER}) / demand ({NUMBER}), coverage ([\d.]+)%")
 ASKED = re.compile(rf"\${NUMBER}")
+# The collaboration score (collaboration()): a request thread's status (bench/collab.py) -> how far it was met; "open"
+# threads (window not passed yet) are left out. A component with fewer than COLLAB_MIN cases is n/a
+FOLLOW_WEIGHT = {"met": 1.0, "partial": 0.6, "acted": 0.5, "replied": 0.25, "unanswered": 0.0}
+ANSWERED = ("met", "partial", "acted", "replied")
+COLLAB_MIN = 3
+UNANSWERED_SHOWN, UNANSWERED_CHARS = 3, 100
 
 
 def _tool_error(call: dict) -> str | None:
@@ -522,11 +531,81 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
     return hints
 
 
-def fleet_report(env, summary: dict, trajectories: list[dict]) -> tuple[dict, str]:
-    """(report, markdown) from the env after the run, the run summary and `turn_row`s of the fleet turns. For a region
-    (RegionEnv) one report with a section per city that had fleet turns (region_report)."""
+def _share(part: float, whole: float, n: int) -> float | None:
+    """100 x part / whole on 0-100 (1 decimal), None (n/a) with fewer than COLLAB_MIN cases."""
+    return round(100 * part / whole, 1) if n >= COLLAB_MIN and whole > 0 else None
+
+
+def collaboration(c: dict) -> dict:
+    """How the departments worked together, from bench/collab.py's collab() of a run (or one city of a region): four
+    components on 0-100, each n/a with fewer than COLLAB_MIN cases, and the score, their mean (n/a when all are).
+    Only requests between two roles of the game count, and "open" ones (window not passed) are left out.
+    - responsiveness: the share of requests answered in the window (met, partial, acted on or replied to);
+    - follow-through: the requests weighted by how far they were met (FOLLOW_WEIGHT: met 1, partial 0.6, acted 0.5,
+      replied 0.25, unanswered 0);
+    - hand-offs: the share of planning's roads, freed lots and cleared land (OPENERS) another department built on
+      within the window (collab's handoffs; openings whose window hasn't passed count only once used);
+    - money aim: the share of the mayor's top-up dollars that answered the department's money request in the window
+      before (part of its thread). Whether a top-up was for a first building or supply can't be told from frames, and
+      "went into a build within the window" was ~100% on every 120-month LLM run, so neither counts.
+    Per role: requests it sent (asked) and got answered, requests sent to it (asked_of) and it answered, its
+    responsiveness (as the one asked) and follow-through (as the one asking), hand-offs (planning: its openings used;
+    others: builds on land planning opened). `unanswered`: the UNANSWERED_SHOWN oldest unanswered requests."""
+    roles, window, last = list(c["roles"]), c["window"], c["last_month"]
+    threads = [t for t in c["threads"] if t["from"] in roles and t["to"] in roles and t["from"] != t["to"]]
+    closed = [t for t in threads if t["status"] in FOLLOW_WEIGHT]
+    answered = lambda ts: sum(t["status"] in ANSWERED for t in ts)
+    weight = lambda ts: sum(FOLLOW_WEIGHT[t["status"]] for t in ts)
+    events = c["events"]
+    used = {h["event_from"] for h in c["handoffs"]}
+    opens = [e for e in events if e["from"] == "planning" and e.get("type") in OPENERS and e.get("rect")
+             and (e["id"] in used or e["month"] + window <= last)]
+    n_used = sum(e["id"] in used for e in opens)
+    gifts = [e for e in events if e["kind"] == "money" and e["from"] == "mayor" and not e.get("take_back")
+             and e["to"] in roles and e["to"] != "mayor"]
+    given = sum(g["amount"] for g in gifts)
+    aimed = sum(g["amount"] for g in gifts if g.get("thread") is not None)
+    comps = {
+        "responsiveness": {"score": _share(answered(closed), len(closed), len(closed)), "n": len(closed),
+                           "answered": answered(closed)},
+        "follow_through": {"score": _share(weight(closed), len(closed), len(closed)), "n": len(closed),
+                           "by_status": {s: sum(t["status"] == s for t in closed) for s in FOLLOW_WEIGHT}},
+        "handoffs": {"score": _share(n_used, len(opens), len(opens)), "n": len(opens), "used": n_used},
+        "money_aim": {"score": _share(aimed, given, len(gifts)), "n": len(gifts), "aimed": round(aimed, 2),
+                      "given": round(given, 2)}}
+    vals = [v["score"] for v in comps.values() if v["score"] is not None]
+    per = {}
+    for r in roles:
+        sent, got = [t for t in threads if t["from"] == r], [t for t in threads if t["to"] == r]
+        hand = (n_used if r == "planning" else sum(h["to"] == r for h in c["handoffs"]))
+        if not (sent or got or hand):
+            continue
+        sent_c = [t for t in sent if t["status"] in FOLLOW_WEIGHT]
+        got_c = [t for t in got if t["status"] in FOLLOW_WEIGHT]
+        per[r] = {"asked": len(sent), "answered": answered(sent), "asked_of": len(got), "answered_for": answered(got),
+                  "responsiveness": _share(answered(got_c), len(got_c), len(got_c)),
+                  "follow_through": _share(weight(sent_c), len(sent_c), len(sent_c)), "handoffs": hand}
+    waiting = sorted((t for t in threads if t["status"] == "unanswered"), key=lambda t: t["month"])
+    return {"score": round(sum(vals) / len(vals), 1) if vals else None, "components": comps, "roles": per,
+            "requests": len(threads), "open": len(threads) - len(closed), "window": window,
+            "unanswered": [{"month": t["month"], "from": t["from"], "to": t["to"],
+                            "text": cut(t["text"], UNANSWERED_CHARS)} for t in waiting[:UNANSWERED_SHOWN]]}
+
+
+def run_collaboration(run_dir: str | Path | None, city: str | None = None) -> dict | None:
+    """collaboration() of a run folder's frames.jsonl (one city of a region with `city`); None without one. Works on
+    any run folder, with or without the env (the runner's report, or a finished run read afterwards)."""
+    if run_dir is None or not (Path(run_dir) / "frames.jsonl").exists():
+        return None
+    return collaboration(run_collab(run_dir, city))
+
+
+def fleet_report(env, summary: dict, trajectories: list[dict], run_dir: str | Path | None = None) -> tuple[dict, str]:
+    """(report, markdown) from the env after the run, the run summary and `turn_row`s of the fleet turns; with the run
+    folder also its collaboration score (run_collaboration; None without). For a region (RegionEnv) one report with a
+    section per city that had fleet turns (region_report)."""
     if hasattr(env, "envs"):
-        return region_report(env, summary, trajectories)
+        return region_report(env, summary, trajectories, run_dir)
     fleet = getattr(env, "fleet", None) or FleetState()
     months = summary.get("months_played", env.world.month)
     roles = {r: _role_stats(r, [x for x in trajectories if x["role"] == r], fleet)
@@ -543,6 +622,10 @@ def fleet_report(env, summary: dict, trajectories: list[dict]) -> tuple[dict, st
                     "versions": len(fleet.plan_versions), "changed": [v["month"] for v in fleet.plan_versions]},
            "roles": roles,
            "hints": _hints(roles, trajectories, fleet, env.world.history, months)}
+    try:
+        rep["collaboration"] = run_collaboration(run_dir, getattr(env, "city", None))
+    except Exception as e:                       # unreadable frames must not cost the run its report
+        rep["collaboration"] = {"score": None, "error": f"{type(e).__name__}: {e}"}
     return rep, markdown(rep)
 
 
@@ -556,16 +639,17 @@ def _city_summary(summary: dict, city: str, env) -> dict:
             "bankrupt": bool(env.world.bankrupt)}
 
 
-def region_report(region, summary: dict, trajectories: list[dict]) -> tuple[dict, str]:
+def region_report(region, summary: dict, trajectories: list[dict],
+                  run_dir: str | Path | None = None) -> tuple[dict, str]:
     """A region run's report: the region scoreboard, then for each city with fleet turns its own report (plan, roles,
-    hints) from its env's fleet state and its turns (`turn_row`s named "north.mayor" etc.). The top-level `hints` are
-    every city's, each with its `city`."""
+    hints, the city's collaboration score) from its env's fleet state and its turns (`turn_row`s named "north.mayor"
+    etc.). The top-level `hints` are every city's, each with its `city`."""
     cities = {}
     for c, env in region.envs.items():
         pre = c + "."
         rows = [{**r, "role": r["role"][len(pre):]} for r in trajectories if r["role"].startswith(pre)]
         if rows:
-            cities[c] = fleet_report(env, _city_summary(summary, c, env), rows)[0]
+            cities[c] = fleet_report(env, _city_summary(summary, c, env), rows, run_dir)[0]
     scores, fm = summary.get("final_scores") or {}, summary.get("final_metrics") or {}
     by_city = fm.get("by_city") or {}
     rep = {"run_id": summary.get("run_id"), "seed": summary.get("seed"), "signature": summary.get("signature"),
@@ -612,6 +696,44 @@ def markdown(rep: dict) -> str:
     return "\n".join([f"# Fleet report: {rep['run_id']}", "", _played(rep), "", *_body(rep)]) + "\n"
 
 
+def _score(v) -> str:
+    return "n/a" if v is None else f"{v:.1f}"
+
+
+def _collab_lines(co: dict | None) -> list[str]:
+    """The Collaboration section (collaboration()): score, components, per-department table, oldest unanswered."""
+    if co is None:
+        return ["n/a (no frames.jsonl to read)."]
+    if "error" in co:
+        return [f"n/a ({_cell(co['error'])})."]
+    cp, w = co["components"], co["window"]
+    st = cp["follow_through"]["by_status"]
+    L = [f"Score **{_score(co['score'])}** / 100: the mean of the components with at least {COLLAB_MIN} cases "
+         f"({co['requests']} requests between departments, {co['open']} still open; a request is answered within "
+         f"{w} months, 2 x act_every).", "",
+         "| component | score | from |", "|---|---:|---|",
+         f"| responsiveness | {_score(cp['responsiveness']['score'])} | {cp['responsiveness']['answered']} of "
+         f"{cp['responsiveness']['n']} requests met, partly met, acted on or replied to |",
+         f"| follow-through | {_score(cp['follow_through']['score'])} | " + ", ".join(
+             f"{st[s]} {s} x {FOLLOW_WEIGHT[s]:g}" for s in FOLLOW_WEIGHT) + " |",
+         f"| hand-offs | {_score(cp['handoffs']['score'])} | {cp['handoffs']['used']} of {cp['handoffs']['n']} "
+         f"planning roads / freed lots built on by another department |",
+         f"| money aim | {_score(cp['money_aim']['score'])} | {money(cp['money_aim']['aimed'])} of "
+         f"{money(cp['money_aim']['given'])} in {cp['money_aim']['n']} top-ups answered the department's request |"]
+    if co["roles"]:
+        L += ["", "| department | asked | answered by others | asked of it | answered for others | responsiveness "
+                  "| follow-through | hand-offs |", "|---|" + "---:|" * 7]
+        L += [f"| {r} | {x['asked']} | {x['answered']} | {x['asked_of']} | {x['answered_for']} "
+              f"| {_score(x['responsiveness'])} | {_score(x['follow_through'])} | {x['handoffs']} |"
+              for r, x in co["roles"].items()]
+        L += ["", "Hand-offs: planning's openings another department built on; for the others, their builds on land "
+                  "planning opened."]
+    if co["unanswered"]:
+        L += ["", "Longest unanswered:", ""]
+        L += [f"- month {u['month']}, {u['from']} -> {u['to']}: \"{_cell(u['text'])}\"" for u in co["unanswered"]]
+    return L
+
+
 def _body(rep: dict, h: str = "##") -> list[str]:
     """Everything after the title and the seed line, headings at level `h` (a region report's city sections: ###)."""
     sb, plan = rep["scoreboard"], rep["plan"]
@@ -642,7 +764,8 @@ def _body(rep: dict, h: str = "##") -> list[str]:
                  f"| {st['repeats']} / {st['refused']} / {st.get('overrides', 0)} | {money(st['spent'])} "
                  f"| {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
                  f"| {st['limit_turns']} | {st['length_stops']} | {st['api_errors']} |")
-    fails = [(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]
+    L += ["", f"{h} Collaboration", "", *_collab_lines(rep.get("collaboration"))]
+    fails =[(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]
     if fails:
         L += ["", f"{h} Top failures", ""]
         L += [f"- {r}: " + "; ".join(f"{g['count']}x \"{_cell(g['message'])}\"" for g in gs) for r, gs in fails]
