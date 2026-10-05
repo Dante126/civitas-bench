@@ -11,6 +11,7 @@ from __future__ import annotations
 import calendar
 import json
 import math
+from collections import Counter
 
 from ..agents.prompts import GAME_RULES
 from ..bench.scoring import ScoringConfig
@@ -24,6 +25,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     DeptMoney, Funding, SupplyBuild, bank_keep, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, \
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
+from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 from .tools import bus_seats, first_bus_line
 
@@ -109,7 +111,10 @@ BUDGET = {"mayor": "Stay solvent: upkeep is paid from the treasury every month a
                    "good; keep the reserve when you move money to departments (allocate_budget) or cut taxes.",
           "dept": "Stay within your budget: you can only spend your department's funds, which the mayor allocates."}
 TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budget; departments only see their "
-                 "slice. Read their reports and adjust the plan when the numbers move.",
+                 "slice. Read their reports and adjust the plan when the numbers move. Answer every request to you "
+                 "(your briefing's Open requests block) the turn you see it: a top-up, or one line by send_message to "
+                 "that department saying why not or when (the reserve, a first building elsewhere comes first, its "
+                 "funds already cover it).",
         "dept": "Follow your slice of the plan (budget target, priority, city goals). To get something from the "
                 "mayor or another department, ask with send_message."}
 
@@ -150,7 +155,9 @@ def _listed(items: list[str], more: str) -> list[str]:
     return [f"  - {x}" for x in items[-MAX_LINES:]] + ([f"  - (+{extra} earlier; {more})"] if extra > 0 else [])
 
 
-def _digest(env, fleet: FleetState, role: str) -> list[str]:
+def _digest(env, fleet: FleetState, role: str, moved: set = frozenset(), cap: int = MAX_MESSAGES) -> list[str]:
+    """The "Since your last turn" block, quoting the `cap` newest new messages. `moved`: (month, sender, text) of
+    messages to the role shown in another block instead (the mayor's Open requests), only counted here."""
     w = env.world
     d = fleet.digest(role, w.month, env.council, who=env._name(role))
     L = [f"## Since your last turn ({'month ' + str(d['since']) if d['since'] is not None else 'first turn'})"]
@@ -163,12 +170,16 @@ def _digest(env, fleet: FleetState, role: str) -> list[str]:
     for f in w.forecast():
         L.append(f"- forecast: {cut(f)}")
     msgs = [env._local(m) for m in d["messages"]]
-    L.append("- new council messages (newest last):" if msgs else "- no new council messages")
-    older = msgs[:-MAX_MESSAGES]
+    away = [m for m in msgs if m["to"] == role and (m["month"], m["sender"], m["text"]) in moved]
+    msgs = [m for m in msgs if m not in away]
+    L.append("- new council messages (newest last):" if msgs or away else "- no new council messages")
+    if away:
+        L.append(f"  - ({len(away)} request{'s' * (len(away) != 1)} to you: under Open requests to you below)")
+    older = msgs[:-cap]
     if older:
         L.append(f"  - ({len(older)} older{_older_reach(env, role, older)})")
     L.extend(f"  - m{m['month']} {m['sender']} -> {'you' if m['to'] == role else m['to']}: "
-             f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-MAX_MESSAGES:])
+             f"{cut(m['text'], MESSAGE_PREVIEW_CHARS)}" for m in msgs[-cap:])
     return L
 
 
@@ -476,7 +487,13 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
                  f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
                  f"({C.RECALL_MONTHS} = recall)")
-    L += [""] + _digest(env, fleet, "mayor")
+    f = funding_gaps(env, fleet)
+    reqs = open_requests(env, fleet)
+    asks = _requests(reqs, f, w.month)
+    # each department line of the Open requests block takes the place of a quoted message: the worst mix of
+    # test_briefings_stay_bounded_at_the_limits stays within its bound with requests from every department
+    cap = max(1, MAX_MESSAGES - max(0, len(asks) - 2))
+    L += [""] + _digest(env, fleet, "mayor", {(r.month, r.dept, r.text) for r in reqs}, cap)
     for off in w.offers:
         L.append(f"- OPEN OFFER #{off['id']}: large factory, {off['jobs']} jobs, {money(off['bonus'])} bonus, heavy "
                  f"pollution (accept_offer / decline_offer before month {off['expires']})")
@@ -484,7 +501,6 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     plan = bool(fleet.plan_versions)
     budgets = p["budgets"] if plan else {}
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
-    f = funding_gaps(env, fleet)
     clipped = any(len(" ".join(e["text"].split())) > MAYOR_REPORT_CHARS for e in latest.values())
     spent = min(len(w.history), SPEND_MONTHS)
     notes = (["most urgent first"] + [f"spent = last {months(spent)}"] * bool(spent)
@@ -501,7 +517,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     if any(m.kind == "blocked" for m in f.depts.values()):              # a line says "; blocked: ..."
         L.append(BLOCKED_NOTE)
     L += spend_lines(w, f)                     # the money to spend and the top-ups the needs lines ask, in order
-    L += [""]
+    L += asks + [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")
     else:
@@ -510,6 +526,31 @@ def _mayor(env, fleet: FleetState) -> list[str]:
         if p["notes"]:
             L.append(f"- notes: {cut(p['notes'], NOTES_CHARS)}")
     return L + [""] + _map(w, "mayor") + [""] + _memory(fleet, "mayor")
+
+
+def _requests(reqs: list[OpenRequest], f, now: int) -> list[str]:
+    """The mayor's Open requests block (open_requests; [] without any): one line per department, the longest waiting
+    first, at most REQUESTS_SHOWN (then "+N more"), its repeats merged: the months it asked, how long it has waited,
+    "last turn to answer" when the next turn falls outside the window, the latest amount asked, what its money says
+    (request_state: what to fund and whether the money covers it, or why it needs no top-up) and its latest request
+    quoted. The digest counts these messages only. 120-month LLM runs (trinity v19 / v23): the mayor answered 59-81%
+    of the requests sent to it (other departments ~100%), and replied to almost none of those it didn't fund."""
+    if not reqs:
+        return []
+    covered = fund_cover(f)
+    groups = request_groups(reqs)
+    L = ["", "## Open requests to you (answer each: a top-up, or send_message to it saying why not / when)"]
+    for d, rs in groups[:REQUESTS_SHOWN]:
+        n = Counter(r.month for r in rs)
+        asked = ", ".join(f"m{m}" + (f" x{k}" if k > 1 else "") for m, k in n.items())
+        last = "; last turn to answer" if any(r.last for r in rs) else ""
+        amount = next((r.amount for r in reversed(rs) if r.amount), None)
+        ask = f", asks {money(amount)}" if amount else ""
+        L.append(f"- {d}: {asked} (waiting {months(now - rs[0].month)}{last}){ask}; {request_state(f, d, covered)}: "
+                 f"\"{cut(rs[-1].text, REQUEST_CHARS)}\"")
+    if len(groups) > REQUESTS_SHOWN:
+        L.append(f"- +{len(groups) - REQUESTS_SHOWN} more: " + ", ".join(d for d, _ in groups[REQUESTS_SHOWN:]))
+    return L
 
 
 def _bus_first(bus, funds: float) -> str:

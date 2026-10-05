@@ -9,7 +9,8 @@ Matching, inside a window of 2 x act_every months after the request (turn order 
 - a request is a message to one role that asks for something ($, need, request, please, can you, ...); messages to
   "all" are broadcasts;
 - a money request (to the mayor, naming dollars or funds) is met by the mayor's top-ups to the sender reaching
-  MET_SHARE of the amount (any top-up when no amount is named), partial below that;
+  MET_SHARE of the amount (any top-up when no amount is named), partial below that, else replied to when the mayor
+  messages the sender back (a no, with why or when, is an answer);
 - another request is acted on when the recipient acts within NEAR tiles of a tile it names, replied to when the
   recipient messages the sender back;
 - else unanswered, or open while the window hasn't passed (a live run);
@@ -123,7 +124,7 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
             to, text = str(m.get("to") or "all"), str(m.get("text") or "")
             events.append({"month": int(m.get("month", 0)), "kind": "message", "from": m.get("sender"), "to": to,
                            "text": text[:TEXT_CHARS], "amount": _amount(text), "tiles": _tiles(text),
-                           "ask": to != "all" and bool(ASK.search(text))})
+                           "ask": is_request(to, text)})
         for t in turns:
             role, month = t.get("role"), int(t.get("month", f.get("month", 0)))
             for r in t.get("results") or []:
@@ -193,31 +194,55 @@ def handoffs(events: list[dict], key, window: int) -> list[dict]:
     return out
 
 
+def is_request(to: str, text: str) -> bool:
+    """A council message that asks something of one role (ASK words); messages to "all" are broadcasts."""
+    return str(to or "all") != "all" and bool(ASK.search(str(text or "")))
+
+
+def money_ask(req: dict) -> bool:
+    """A request to the mayor that names dollars or funds (MONEY)."""
+    return req["to"] == "mayor" and bool(MONEY.search(req["text"]))
+
+
+def answer(req: dict, later: list[dict]) -> tuple[str | None, list[dict]]:
+    """How a request ({"from", "to", "text", "amount", "tiles"}) was answered by `later`, the events after it inside
+    its window in turn order (messages {"kind": "message", "from", "to"}, top-ups {"kind": "money", "from", "to",
+    "amount"}, actions {"kind": "build" / "act", "from", "tile"}): ("met" / "partial", the top-ups) for a money ask
+    met by the mayor's top-ups to the sender, ("acted", [action]) for another request acted on within NEAR tiles of a
+    tile it names, ("replied", [message]) for a message from the one asked back to the asker (the first of acted /
+    replied for other requests), else (None, []). collab's threads and the mayor's Open requests block
+    (fleet/tools.py:open_requests) both decide by it."""
+    a, b = req["from"], req["to"]
+    reply = [e for e in later if e["kind"] == "message" and e["from"] == b and e["to"] == a]
+    if money_ask(req):
+        gifts = [e for e in later if e["kind"] == "money" and e["from"] == "mayor" and e["to"] == a]
+        if gifts:
+            want = req.get("amount")
+            return ("met" if not want or sum(e["amount"] for e in gifts) >= MET_SHARE * want else "partial"), gifts
+        return ("replied", reply[:1]) if reply else (None, [])
+    near = [e for e in later if e["from"] == b and e["kind"] in ("build", "act") and e.get("tile") and any(
+        abs(e["tile"][0] - x) <= NEAR and abs(e["tile"][1] - y) <= NEAR for x, y in req.get("tiles") or [])]
+    first = next((e for e in later if e in near[:1] + reply[:1]), None)
+    if first is None:
+        return None, []
+    return ("acted" if first in near else "replied"), [first]
+
+
 def _thread(req: dict, events: list[dict], key, window: int, last: int) -> dict:
     """One request's thread: its response and outcome (see the module doc)."""
     a, b, k0, end = req["from"], req["to"], key(req), req["month"] + window
     later = [e for e in events if key(e) > k0 and e["month"] <= end]
-    money_ask = b == "mayor" and bool(MONEY.search(req["text"]))
-    kind = "money" if money_ask else "land" if req.get("tiles") or LAND.search(req["text"]) else "other"
-    ids, response, status = [req["id"]], None, None
-    if money_ask:
-        gifts = [e for e in later if e["kind"] == "money" and e["from"] == "mayor" and e["to"] == a]
-        got = sum(e["amount"] for e in gifts)
-        if gifts:
-            want = req["amount"]
-            status = "met" if not want or got >= MET_SHARE * want else "partial"
-            response = {"month": gifts[0]["month"], "kind": "money", "amount": got, "text": gifts[0]["text"]}
-            ids += [e["id"] for e in gifts]
-    else:
-        near = [e for e in later if e["from"] == b and e["kind"] in ("build", "act") and e["tile"] and any(
-            abs(e["tile"][0] - x) <= NEAR and abs(e["tile"][1] - y) <= NEAR for x, y in req.get("tiles") or [])]
-        reply = [e for e in later if e["kind"] == "message" and e["from"] == b and e["to"] == a]
-        first = min(near[:1] + reply[:1], key=key, default=None)
-        if first is not None:
-            status = "acted" if first in near else "replied"
-            response = {"month": first["month"], "kind": first["kind"], "amount": first.get("amount"),
-                        "text": first["text"], "tile": first.get("tile")}
-            ids.append(first["id"])
+    kind = "money" if money_ask(req) else "land" if req.get("tiles") or LAND.search(req["text"]) else "other"
+    ids, response = [req["id"]], None
+    status, got = answer(req, later)
+    if status in ("met", "partial"):
+        response = {"month": got[0]["month"], "kind": "money", "amount": sum(e["amount"] for e in got),
+                    "text": got[0]["text"]}
+    elif status is not None:
+        first = got[0]
+        response = {"month": first["month"], "kind": first["kind"], "amount": first.get("amount"),
+                    "text": first["text"], "tile": first.get("tile")}
+    ids += [e["id"] for e in got]
     outcome = None
     if response is not None:
         built = next((e for e in later + [e for e in events if end < e["month"] <= response["month"] + window]
