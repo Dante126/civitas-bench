@@ -698,8 +698,9 @@ function teamSummary(em) {
   const answered = asks.filter(t => t.response && t.response.month <= em).length;
   const money = d.events.filter(e => e.kind === "money" && inQ(e.month) && !e.take_back).reduce((a, e) => a + e.amount, 0);
   const builds = d.events.filter(e => e.kind === "build" && inQ(e.month)).length;
-  return `<div class="teamsum"><div><b>${asks.length}</b><span>requests</span></div><div><b>${asks.length ? Math.round(100 * answered / asks.length) + "%" : "—"}</b><span>answered so far</span></div>
-    <div><b>${fmt$(money)}</b><span>money moved</span></div><div><b>${builds}</b><span>builds</span></div></div>`;
+  const per = act > 1 ? `last ${act} months` : "this month";     // this turn's tiles: the strip above covers the run
+  return `<div class="teamsum"><div><b>${asks.length}</b><span>requests, ${per}</span></div><div><b>${asks.length ? Math.round(100 * answered / asks.length) + "%" : "—"}</b><span>of them answered yet</span></div>
+    <div><b>${fmt$(money)}</b><span>moved, ${per}</span></div><div><b>${builds}</b><span>builds, ${per}</span></div></div>`;
 }
 const TEAM_LEGEND = `<div class="teamlegend"><span><i style="background:#fff;box-shadow:0 0 6px #fff"></i>request</span><span><i style="background:#8a93a0"></i>report</span>
   <span><i style="background:#ffd34d"></i>money</span><span><i style="border:2px solid #5fd38d;background:none"></i>build</span>
