@@ -94,6 +94,20 @@ def test_amounts_asked_for():
     assert _amount("we have $0 left") is None and _amount("no money talk") is None
 
 
+def test_a_status_report_that_needs_nothing_is_no_request():
+    """Region smoke 20261005 and the 120-month trinity runs: transport's "No budget needed at this time (current $0
+    matches target)" counted as a request to the mayor. A negated need and $0 aren't asks; any other ask word is."""
+    from civitas.bench.collab import is_request
+    assert not is_request("mayor", "Transport Department reporting: below the ~1,500 threshold. No congested roads "
+                                   "detected. No budget needed at this time (current $0 matches target).")
+    assert not is_request("mayor", "Police Department ready. No immediate needs.")
+    assert not is_request("mayor", "Education: no schools needed yet. Current budget: $0.")
+    assert not is_request("mayor", "Utilities: water at 66% of capacity, so no expansion is required.")
+    assert is_request("mayor", "No budget needed now; next quarter we need $1,500 for a bus line")
+    assert is_request("mayor", "Station built for $2,500") and is_request("mayor", "Holding $0, need $2,000")
+    assert is_request("mayor", "Please allocate $0.5k") and not is_request("all", "We need $2,000")
+
+
 def test_a_scripted_episode(tmp_path):
     from civitas.bench.runner import run_episode
     from civitas.config import load_config

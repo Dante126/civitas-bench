@@ -26,6 +26,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spare_funded, spend_lines, unclaimed_spots
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
+from .tools import Ask, mayor_ask
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 from .tools import bus_seats, first_bus_line
 
@@ -114,9 +115,11 @@ TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budg
                  "slice. Read their reports and adjust the plan when the numbers move. Answer every request to you "
                  "(your briefing's Open requests block) the turn you see it: a top-up, or one line by send_message to "
                  "that department saying why not or when (the reserve, a first building elsewhere comes first, its "
-                 "funds already cover it).",
-        "dept": "Follow your slice of the plan (budget target, priority, city goals). To get something from the "
-                "mayor or another department, ask with send_message."}
+                 "funds already cover it); one send_message can answer several departments (to: \"police,fire\").",
+        "dept": "Follow your slice of the plan (budget target, priority, city goals). Ask the mayor for money only "
+                "when your briefing's budget block says to (a first building, supply, planning's road, or another "
+                "building the mayor's money covers), for the amount it names; otherwise put what you need in your "
+                "end_turn report, which the mayor reads. Ask other departments with send_message."}
 
 
 def _value(key: str, v) -> str:
@@ -539,7 +542,8 @@ def _requests(reqs: list[OpenRequest], f, now: int) -> list[str]:
         return []
     covered = fund_cover(f)
     groups = request_groups(reqs)
-    L = ["", "## Open requests to you (answer each: a top-up, or send_message to it saying why not / when)"]
+    L = ["", "## Open requests to you (answer each: a top-up, or send_message on why not / when; one call answers "
+              "several)"]
     for d, rs in groups[:REQUESTS_SHOWN]:
         n = Counter(r.month for r in rs)
         asked = ", ".join(f"m{m}" + (f" x{k}" if k > 1 else "") for m, k in n.items())
@@ -553,14 +557,27 @@ def _requests(reqs: list[OpenRequest], f, now: int) -> list[str]:
     return L
 
 
-def _bus_first(bus, funds: float) -> str:
+def _bus_first(bus, funds: float, ask: Ask) -> str:
     """Transport's priority line while the city has no bus line and its first is ready (first_bus_line): the line
-    before any avenue, and what to ask the mayor for when short. The 120-month LLM runs listed bus stops ($1,500) and
-    congested roads ($30/tile) side by side; transport spent on avenues first and never afforded the line."""
-    lack = "" if not short_of(funds, bus.cost) else \
-        f"; you have {money(math.floor(funds))}: ask the mayor for {money(math.ceil(bus.cost - funds))} (send_message)"
+    before any avenue, and what to ask the mayor for when short (only when it would fund it: mayor_ask). The 120-month
+    LLM runs listed bus stops ($1,500) and congested roads ($30/tile) side by side; transport spent on avenues first
+    and never afforded the line."""
+    lack = "" if not short_of(funds, bus.cost) else f"; you have {money(math.floor(funds))}" + (
+        f": ask the mayor for {money(math.ceil(bus.cost - funds))} (send_message)" if ask.ok else "")
     return (f"- First bus line ({bus.text()}) before any avenue: create_bus_line through all the bus_stops stops "
             f"below; upgrade_road is refused while it would leave you short of it{lack}")
+
+
+def _ask_line(a: Ask) -> str:
+    """A department's Your budget line on asking the mayor for money (mayor_ask): "- ask the mayor for $2,500 for your
+    first police station (send_message, with a reason): the mayor funds first buildings, supply and planning's road
+    first", or "- no money ask to the mayor now: another police station ($2,500 short) waits: the mayor's money above
+    its reserve doesn't cover it after first buildings, supply and planning's road. Say what you need in your end_turn
+    report" (the "can't pay" line says it instead when it shows). Region smoke 20261005: 28 of 46 asks to the mayor
+    were for another building it couldn't cover or with nothing ready, and it spent its steps refusing them."""
+    if a.ok:
+        return f"- ask the mayor for {money(a.amount)} for {a.what} (send_message, with a reason): {a.why}"
+    return f"- no money ask to the mayor now: {a.why}. Say what you need in your end_turn report"
 
 
 def _bus_riders(w) -> str:
@@ -577,8 +594,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     dept = ROLES[role]["budget"]
     p = plan_slice(fleet, role)
     if not fleet.plan_versions:
-        L = ["## Your plan slice", "- No city plan yet: follow your mission and ask the mayor for a budget and "
-             "priorities (send_message)."]
+        L = ["## Your plan slice", "- No city plan yet: follow your mission (your budget block says whether to ask the "
+             "mayor for money)."]
         target = None
     else:
         target = p["budget"]
@@ -607,14 +624,20 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     wanted = {p: pr for p, pr in prices.items() if role != "utilities" or _wanted(w, p)}
     purposes, low = cheapest(wanted) or cheapest(wanted, supplementary=True) or ((), None)
     more = _supply_money(supplies, funds)[2]
+    # whether to ask the mayor for money (mayor_ask): for the needs line's top-up (utilities: its supply line's), or
+    # else say what is needed in the end_turn report; one line, the "can't pay" one when it shows
+    ask = mayor_ask(env, fleet, role)
     if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
         L.append("- You can't pay for any ready site" + (" (the supply above needs " + money(more) + " more)" if more
                                                          else f" (cheapest: {' or '.join(purposes)} {low.text()})")
-                 + ". Don't call build tools this turn: ask the mayor for "
-                 + (money(more) if more else "the amount") + " with a reason (send_message) unless you already "
-                 "did, then end_turn.")
+                 + ". Don't call build tools this turn: " + (
+                     f"ask the mayor for {money(more or ask.amount)} with a reason (send_message) unless you already "
+                     "did, then end_turn." if ask.ok else
+                     f"no money ask to the mayor ({ask.why}): say what you need in your end_turn report."))
+    else:
+        L.append(_ask_line(ask))
     if role == "transport" and (bus := first_bus_line(w, lists)):
-        L.append(_bus_first(bus, funds))
+        L.append(_bus_first(bus, funds, ask))
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     if role == "transport":
         L.append(_bus_riders(w))

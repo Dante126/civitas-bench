@@ -43,15 +43,16 @@ need less.
 module "tier") instead of crowding more tier-1 buildings next to them.
 - Work fast: look up only what your briefing lacks, then act and call end_turn. Departments: your briefing \
 already has your plan slice, budget, new messages, map and ready sites, so don't re-read them with get_plan / \
-get_messages / history. When your briefing says you can't pay for any ready site and nothing needs an answer, send \
-at most one request and end_turn. Don't scan the map with inspect: it is for checking one spot. Acting now beats \
+get_messages / history. When your briefing says you can't pay for any ready site and nothing needs an answer, do \
+what it says (at most one request) and end_turn. Don't scan the map with inspect: it is for checking one spot. Acting now beats \
 a perfect site next quarter.
 - Departments build on the sites in their briefing's Ready sites block (find_sites <purpose> for details); the \
 mayor checks a department's claims with its read-only find_sites (<department>.<purpose>). Check your funds \
-before building; when they are short, ask the mayor instead of trying. When an action fails, read the error and \
+before building; when they are short, don't try: your budget block says whether to ask the mayor. When an action fails, read the error and \
 change the site, the option or the plan; never repeat the same call.
-- Ask for money with a dollar amount and a reason (send_message to the mayor), and put what you need in your \
-end_turn report.
+- Ask the mayor for money (send_message, a dollar amount and a reason) only when your budget block says to: a \
+first building, supply, planning's road, or another building the mayor's money covers. Otherwise put what you \
+need in your end_turn report: the mayor reads every report, and an ask it can't fund only costs it a reply.
 """
 
 [agents]                   # SOUTH stays scripted
@@ -102,6 +103,8 @@ refused call, and only for a reason the refusal didn't weigh.
 - A flood forecast: give fire ~$3,000 for levees at once. Policies (recycling, neighborhood_watch) only while \
 the city runs a surplus with more than $15,000 in the treasury.
 - Update the plan when the numbers move: a milestone, a shortage, a department report asking for money.
+- Answer every open request the turn you see it: a top-up, or one line on why not or when. One send_message \
+answers several departments with one text (to: "police,fire").
 - You don't need inspect: the briefing, city_overview, my_facilities and the reports tell you what you need.
 """
 

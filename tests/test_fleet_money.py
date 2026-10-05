@@ -1927,3 +1927,112 @@ def test_the_tool_agent_s_mayor_gets_the_reminder():
     assert [c["tool"] for c in trace] == ["end_turn", "send_message", "end_turn"] and d.meta["ended"]
     assert trace[0]["result"]["refused"] == "open_requests"
     assert d.messages == [{"to": "police", "text": "Not yet: reserve"}]
+
+
+# --- Unit E: departments ask the mayor only for what it can fund now (tools.py: mayor_ask, ToolBox._ask_refusal;
+# briefing.py: _ask_line), and one send_message reaches several roles (tools.py: recipients)
+POLICE_2ND = FB(2500, (N("police station", 5, 1, "coverage 66%", upkeep=55),), 2500, ())
+SCHOOL_1ST = FB(2500, (N("elementary school", 5, 0, first=True, upkeep=45),), 2500, ())
+
+
+def test_mayor_ask_by_kind(monkeypatch):
+    """Region smoke 20261005: 28 of 46 asks to the mayor were for another building it couldn't cover or with nothing
+    ready. First/supply and growth always ask (the needs line's top-up); another only when the money covers it."""
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": POLICE_2ND, "education": SCHOOL_1ST, "fire": FB(None, (), 2500, ("a fire station",))},
+            road=FB(315, (ROAD,), 315, ()))
+    fleet = FleetState.of(env)
+    env.world.treasury, env.world.dept_funds["education"] = 30000.0, 1000
+    assert T.mayor_ask(env, fleet, "education") == T.Ask(
+        True, 1500, "your first elementary school", "the mayor funds first buildings, supply and planning's road first")
+    assert T.mayor_ask(env, fleet, "planning")[:3] == (True, 315, "a road into open land and zoning it")
+    assert T.mayor_ask(env, fleet, "police") == T.Ask(True, 2500, "another police station",
+                                                      "the mayor's money above its reserve covers it now")
+    env.world.treasury = 6000.0                       # $3,000 above the reserve: the school and road, then no station
+    a = T.mayor_ask(env, fleet, "police")
+    assert not a.ok and a.amount == 0 and a.why == (
+        "another police station ($2,500 short) waits: the mayor's money above its reserve doesn't cover it after first "
+        "buildings, supply and planning's road")
+    env.world.treasury = 1000.0                       # a hold: the first school still asks
+    assert T.mayor_ask(env, fleet, "police").why.endswith(": the mayor is in a hold (the treasury is at or under its "
+                                                          "reserve) and funds only first buildings, supply and "
+                                                          "planning's road")
+    assert T.mayor_ask(env, fleet, "education").ok
+    assert T.mayor_ask(env, fleet, "transport") == T.Ask(False, 0, "", "nothing ready to buy")
+    assert T.mayor_ask(env, fleet, "fire").why == ("a fire station is blocked for lack of land: ask planning for a "
+                                                   "lot, not the mayor for money")
+    env.world.dept_funds["transport"] = 9000
+    assert T.mayor_ask(env, fleet, "transport").why == "you hold $8,000 more than you need now"
+    env.world.dept_funds["planning"] = 900
+    assert T.mayor_ask(env, fleet, "planning").why == "your funds cover your road"
+
+
+def test_department_briefings_say_whether_to_ask_the_mayor(monkeypatch):
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": POLICE_2ND, "education": SCHOOL_1ST})
+    env.world.treasury = 1000.0                                           # a hold
+    budget = lambda d: _block(briefing(env, d, mark=False), "## Your budget")
+    assert budget("education")[1] == ("- ask the mayor for $2,500 for your first elementary school (send_message, with "
+                                      "a reason): the mayor funds first buildings, supply and planning's road first")
+    assert budget("police")[1] == (
+        "- no money ask to the mayor now: another police station ($2,500 short) waits: the mayor is in a hold (the "
+        "treasury is at or under its reserve) and funds only first buildings, supply and planning's road. Say what you "
+        "need in your end_turn report")
+    assert budget("transport")[1] == ("- no money ask to the mayor now: nothing ready to buy. Say what you need in "
+                                      "your end_turn report")
+    dept = system_prompt("police", FleetAgentConfig(model="x"), 12)
+    assert "Ask the mayor for money only when your briefing's budget block says to (a first building, supply, " in dept
+    assert "one send_message can answer several departments (to: \"police,fire\")" in \
+        system_prompt("mayor", FleetAgentConfig(model="x"), 12)
+
+
+def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatch):
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": POLICE_2ND, "education": SCHOOL_1ST})
+    env.world.treasury = 1000.0                                           # a hold
+    ask = {"to": "mayor", "text": "Requesting $2,500 for another police station"}
+    box = T.ToolBox(env, "police", max_steps=12)
+    assert box.call("send_message", ask) == {"ok": False, "refused": "ask", "error": (
+        "not sent: another police station ($2,500 short) waits: the mayor is in a hold (the treasury is at or under "
+        "its reserve) and funds only first buildings, supply and planning's road, so a money ask now gets a no. Put "
+        "what you need in your end_turn report instead (the mayor reads it); to post this message anyway, call "
+        "send_message again.")}
+    assert box.messages == []
+    assert box.call("send_message", ask)["ok"] and box.messages == [ask]           # once a turn: then it goes
+    for to, text in (("planning", "need $500 for a lot"), ("mayor", "Station built, coverage 80%"),   # no money ask
+                     ("mayor", "please free a lot near (3,4)")):
+        assert T.ToolBox(env, "police", max_steps=12).call("send_message", {"to": to, "text": text})["ok"], text
+    assert T.ToolBox(env, "education", max_steps=12).call(              # a first building: it asks
+        "send_message", {"to": "mayor", "text": "Need $2,500 for our first school"})["ok"]
+    assert T.ToolBox(env, "police").call("send_message", ask)["ok"]        # the scripted fleet: never held
+    held = T.ToolBox(env, "transport", max_steps=12).call(                 # nothing ready: held, the whole call
+        "send_message", {"to": "mayor,planning", "text": "please allocate $1,000 for future upgrades"})
+    assert held["refused"] == "ask" and "nothing ready to buy, so a money ask now gets a no" in held["error"]
+
+
+def test_one_send_message_answers_several_departments():
+    """The south mayor spent all 20 steps of month 9 on one refusal per department. A comma list (or a JSON list)
+    queues one council message per role, so the digests, collab threads and the Open requests block see each."""
+    env = _env(act_every=3)
+    _asked(env)
+    fleet = FleetState.of(env)
+    box = _mayor(env, treasury=30000)
+    res = box.call("send_message", {"to": "transport, Police,police", "text": "Not this quarter: the reserve first"})
+    assert res == {"ok": True, "message": "message to transport and police (one message each) will be posted at the "
+                                          "end of your turn"}
+    assert box.call("send_message", {"to": ["health"], "text": "Not this quarter: the reserve first"})["ok"]  # a list
+    assert [m["to"] for m in box.messages] == ["transport", "police", "health"]
+    assert T.open_requests(env, fleet, box.messages) == []
+    assert box.call("send_message", {"to": "health", "text": "Not this quarter: the reserve first"})["ok"]  # no cache
+    bad = box.call("send_message", {"to": "police,mayor", "text": "x"})
+    assert not bad["ok"] and bad["error"].startswith("argument 'to' must be one of planning, utilities, ")
+    assert box.call("send_message", {"to": "all,police", "text": "x"})["error"].startswith("'all' already reaches")
+    env.apply("mayor", Decision(executed=box.executed, messages=box.messages))
+    assert [(m["sender"], m["to"]) for m in env.council.posted_in(3)] == [
+        ("mayor", "transport"), ("mayor", "police"), ("mayor", "health"), ("mayor", "health")]
+    assert "## Open requests to you" not in briefing(env, "mayor", mark=False)
+    assert "one send_message can answer several (to: \"police,fire\")" in T.requests_reminder(
+        [T.OpenRequest(0, "police", "x", None, False)])

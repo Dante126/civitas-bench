@@ -27,7 +27,7 @@ from ..core.actions import connector_feeder
 from ..core.observation import _connector_sites
 from ..sim import catalog as C
 from .fmt import money, num
-from .tools import Tool, ToolError
+from .tools import Tool, ToolError, to_schema
 
 _REGIONS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()     # city env -> its RegionEnv
 MAX_DEALS = 4            # deals listed in a briefing's Region block (region_overview has them all)
@@ -300,9 +300,10 @@ def region_tools(box) -> list[Tool]:
              "flows of goods, commuters and tourists, and your city's deals.", lambda: overview(region, city)),
         Tool("send_message", "Post on the council board (delivered at the end of your turn): to a role of your city "
              f"(\"mayor\"), a whole team (\"{others[0]}\"; \"{city}\" is yours), one agent of another city "
-             f"(\"{others[0]}.mayor\"), or \"all\" (every city).", box.send_message,
-             {"to": {"type": "string", "enum": message_targets(box.env, box.role)}, "text": {"type": "string"}},
-             ("to", "text")),
+             f"(\"{others[0]}.mayor\"), or \"all\" (every city). Several in one call (to: \"police,fire\") each get "
+             "their own message.", box.send_message,
+             {"to": to_schema(message_targets(box.env, box.role)), "text": {"type": "string"}}, ("to", "text"),
+             lists=("to",)),
     ]
     if box.role == "mayor":
         deal = {"type": "integer", "description": "the deal number (#1 is 1)"}

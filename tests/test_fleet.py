@@ -3070,7 +3070,7 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
     assert station.endswith("; $2,500 - you have $1,000") and jail.endswith("; $4,000 - you have $1,000"), police
     assert _block(police, "## Your budget")[1] == (
         "- You can't pay for any ready site (cheapest: station $2,500). Don't call build tools this turn: ask the "
-        "mayor for the amount with a reason (send_message) unless you already did, then end_turn.")
+        "mayor for $1,500 with a reason (send_message) unless you already did, then end_turn.")   # the needs line's
     assert "(cheapest: station $2,500)" in briefing(env, "fire", mark=False)       # never the $1,500 shelter
     assert "(cheapest: clinic or landfill $2,000)" in briefing(env, "health", mark=False)     # a tie names both
     planning = briefing(env, "planning", mark=False)  # only its road priced, and never on the budget line
@@ -3083,11 +3083,11 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
     police = briefing(env, "police", mark=False)
     station, jail = _ready_sites(police)[:2]
     assert re.search(r", need [\d,]+; \$2,500$", station) and jail.endswith("; $4,000 - you have $3,000"), police
-    assert len(_block(police, "## Your budget")) == 1
+    assert len(_block(police, "## Your budget")) == 2 and "can't pay" not in police     # the funds and ask lines
     for funds in (2500, 2500 - 1e-10):                 # exactly the cost, or short by float dust (_spend lets it pass)
         w.dept_funds["police"] = funds
         police = briefing(env, "police", mark=False)
-        assert len(_block(police, "## Your budget")) == 1 and _ready_sites(police)[0].endswith("; $2,500"), police
+        assert "can't pay" not in police and _ready_sites(police)[0].endswith("; $2,500"), police
     w.dept_funds["police"] = 2499.6                    # short: funds shown rounded down, never "$2,500"
     police = briefing(env, "police", mark=False)
     assert _block(police, "## Your budget")[0].startswith("- $2,499 in department funds"), police
@@ -3114,11 +3114,14 @@ def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
     budget = lambda: _block(briefing(env, "education", mark=False), "## Your budget")
     needs = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- education:"))
     w.dept_funds["education"] = 2500                   # the school is affordable: no advice
-    assert len(budget()) == 1 and needs() == "- education: funds $2,500, spent $0; funds cover its next build"
+    assert budget()[1:] == ["- no money ask to the mayor now: funds cover your next build. Say what you need in "
+                            "your end_turn report"]
+    assert needs() == "- education: funds $2,500, spent $0; funds cover its next build"
     assert ready()["library"].endswith("same list as school; $1,500") and ready()["school"].endswith("; $2,500")
     w.dept_funds["education"] = 2000                   # a library is affordable (no budget line), the school isn't
-    assert len(budget()) == 1 and needs().startswith("- education: funds $2,000, spent $0; needs $2,500 for its "
-                                                     "first elementary school (")
+    assert budget()[1].startswith("- ask the mayor for $500 for your first elementary school (send_message, with a "
+                                  "reason): the mayor funds first buildings") and len(budget()) == 2
+    assert needs().startswith("- education: funds $2,000, spent $0; needs $2,500 for its first elementary school (")
     assert ready()["library"].endswith("; $1,500") and ready()["school"].endswith("; $2,500 - you have $2,000")
     w.dept_funds["education"] = 1000                   # short of both: the library's line says so too
     assert budget()[1].startswith("- You can't pay for any ready site (cheapest: school $2,500).")
@@ -3154,7 +3157,7 @@ def test_shelter_and_cemetery_are_never_named_as_the_first_build(grown_env):
     for dept, cheap, dear in (("fire", "shelter", "station"), ("health", "cemetery", "landfill")):
         text = briefing(env, dept, mark=False)
         ready = {ln.split(":")[0][2:]: ln for ln in _ready_sites(text)}
-        assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text, dept
+        assert "can't pay" not in text, dept
         assert ready[cheap].endswith("; $1,500") and "- you have $1,500" in ready[dear], ready
     w.dept_funds.update(fire=2000, health=2000)        # the landfill and clinic affordable: health needs nothing
     assert line("health") == "- health: funds $2,000, spent $0; funds cover its builds" and \
@@ -3309,7 +3312,8 @@ def test_no_bus_stops_before_1500_residents():
     w.dept_funds["transport"] = 0
     text = briefing(env, "transport", mark=False)
     assert _ready_sites(text)[0] == f"- bus_stops: none - {SITE_NOTES['bus_stops'][0]}", _ready_sites(text)
-    assert len(_block(text, "## Your budget")) == 1 and "can't pay" not in text
+    assert _block(text, "## Your budget")[1:] == ["- no money ask to the mayor now: nothing ready to buy. Say what you "
+                                                  "need in your end_turn report"] and "can't pay" not in text
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
     assert res["sites"] == [] and res["note"] == SITE_NOTES["bus_stops"][1]
     _no_spending(env)
@@ -3335,9 +3339,10 @@ def test_transport_is_priced_by_its_bus_lines_past_5000(open_env):
                               if ln.startswith("- transport:"))
     w.dept_funds["transport"] = 3000
     text = briefing(env, "transport", mark=False)
-    budget = _block(text, "## Your budget")          # the funds line, then the first bus line's priority line
-    assert len(budget) == 2 and budget[1].startswith("- First bus line ($1,500) before any avenue") and \
+    budget = _block(text, "## Your budget")          # the funds and ask lines, then the first bus line's priority line
+    assert len(budget) == 3 and budget[2].startswith("- First bus line ($1,500) before any avenue") and \
         "can't pay" not in text, text
+    assert budget[1].startswith("- no money ask to the mayor now: you hold $1,500 more than you need now")
     assert fleet_line() == "- transport: funds $3,000, spent $0; idle $1,500 (keeps $1,500)"     # one bus line, not
     # a harbour
     w.dept_funds["transport"] = 0
@@ -3583,7 +3588,8 @@ def test_department_briefing_builds_one_observation(monkeypatch):
     for role in DEPTS:
         calls.clear()
         briefing(env, role, mark=False)
-        assert calls == [True] * (1 + n * (role == "planning")), (role, calls)
+        # and one for its ask line (mayor_ask: its own DeptMoney; every department's only for another building)
+        assert calls == [True] * (2 + n * (role == "planning")), (role, calls)
     fleet = FleetState.of(env)
     for funds in (0, 50000):
         env.world.dept_funds.update({d: funds for d in DEPTS})
@@ -4650,7 +4656,7 @@ def test_tool_agent_caps_parallel_calls_and_skips_calls_after_end_turn():
 
 def test_tool_agent_messages_ids_and_truncation():
     a, env = _agent(reply=lambda m: [_call("inspect", {"x": 20, "y": 20, "radius": 4}, None),
-                                     _call("send_message", {"to": "mayor", "text": "need funds"}, "")]
+                                     _call("send_message", {"to": "mayor", "text": "need a road east"}, "")]
                     if len(m) == 2 else [_call("end_turn", {"report": "r"}, "x9")])
     d = a.act(env.observe("police"))
     asst = [m for m in d.meta["messages"] if m["role"] == "assistant"]
@@ -4660,7 +4666,7 @@ def test_tool_agent_messages_ids_and_truncation():
     assert ids == [m["tool_call_id"] for m in d.meta["messages"] if m["role"] == "tool"]
     assert all(len(m["content"]) <= 4000 and ": " not in m["content"][:20]
                for m in d.meta["messages"] if m["role"] == "tool")
-    assert d.messages == [{"to": "mayor", "text": "need funds"}]
+    assert d.messages == [{"to": "mayor", "text": "need a road east"}]
     assert d.meta["finish_reason"] == "end_turn" and d.meta["reasoning"] == "[step 0] secret\n\n[step 1] secret"
     assert d.meta["usage"] == {"prompt_tokens": 10, "completion_tokens": 20}
     env.apply("police", d)

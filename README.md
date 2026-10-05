@@ -622,20 +622,37 @@ tasks and money, and to let people coach it.
     messages on one line and quotes one fewer other message per department line, so the
     briefing stays within its bound. The system prompt asks the mayor to answer each request
     the turn it sees it: a top-up, or one line by `send_message` to that department saying
-    why not or when. A model mayor's first `end_turn` with requests still open is refused
+    why not or when. One `send_message` answers several departments: `to` takes several
+    roles separated by commas (`"police,fire"`, or a JSON list), and each gets its own
+    council message, so digests, the Team tab's threads and this block see one each. A model mayor's first `end_turn` with requests still open is refused
     once (`refused: "open_requests"`, naming them) while at least 2 tool calls are left, and
     the next `end_turn` ends the turn. The scripted fleet gets no reminder. In the 120-month
     trinity runs (v19, v23) the mayor answered 59–81% of the requests sent to it, against
     about 100% for every other department. In v23 seed 0, 102 money requests went
     unanswered. The mayor's digest showed 94 of them, and in every case it funded someone
     else in the window (first/supply in a hold for 66 of them). 80 of them asked for
-    another building, and it replied to few.
+    another building, and it replied to few. In the region smoke that added the block (both
+    cities on trinity, 12 months) the mayor answered 93–94% of the requests, but most
+    answers were a no (follow-through 25 / 29): of 46 requests to it, 9 were for a first
+    building or supply, 9 for planning's road, 15 for another building the money above the
+    reserve didn't cover and 13 came with nothing ready to buy (transport's "below 1,500
+    residents" notes among them), and the south mayor spent all 20 steps of month 9 on
+    refusals. Departments now ask only for what the mayor can fund (below).
 
     The plan comes last.
 
-  A department's briefing covers its plan slice, its budget
-  (when its funds buy none of its ready sites, a line names the cheapest, all of them on a
-  tie, and tells it to ask the mayor and end the turn instead of calling build tools), its
+  A department's briefing covers its plan slice, its budget (with one line on asking the
+  mayor for money, `fleet/tools.py:mayor_ask`: `- ask the mayor for $2,500 for your first
+  police station (send_message, with a reason): ...` when its kind is first/supply or growth,
+  for its needs line's top-up, or another building the mayor's money covers now
+  (`fund_cover`); otherwise `- no money ask to the mayor now: another police station ($2,500
+  short) waits: the mayor is in a hold ... Say what you need in your end_turn report`, or
+  why it needs none: nothing ready to buy, idle money, blocked for lack of land (ask
+  planning); when its funds buy none of its ready sites, a line names the cheapest, all of
+  them on a tie, and tells it to ask the mayor for that top-up, or to report instead, and
+  end the turn instead of calling build tools; a model department's `send_message` to the
+  mayor that asks for money it can't get now is held back once a turn, `refused: "ask"`,
+  and the next one is posted; the scripted fleet is never held), its
   key metrics, a "since your last turn" digest (failed actions, events, and the newest
   council messages addressed to it or to `all`, quoted with sender and month), a Ready
   sites block (one line per `find_sites` purpose: the count and best site with the price
@@ -934,7 +951,7 @@ tasks and money, and to let people coach it.
 | tools | |
 |---|---|
 | look-ups (no side effects) | `city_overview` (headline numbers, a 3-month trend, `operations_3_months`, the treasury change split as in the Finances block, and `costs_last_month` by kind), `map_overview` (the whole map as ASCII with rulers and a legend, downsampled on maps too big for one tool result, plus the facts of the briefing's Map block; when the map and the facts together don't fit, as from about month 66 of a long game, the road lines go first, the longest kept while they fit, then the facts give way to a pointer to the Map block), `inspect(x, y, radius)` (tiles within 4: zones and levels, buildings and tiers, roads, river, power / water / pollution), `find_sites(purpose, near_x, near_y)` (ranked sites for the role, e.g. `zone_R`, `road_extension`, `pump`, `clinic`, `bus_stops`, `levee`, `library` (the school list); sites on roads cut off from the highway are dropped, and the pump and sewage lists then top up from free riverbank lots beside the connected roads; the mayor's read-only version takes `<department>.<purpose>`, e.g. `utilities.sewage`, to check which sites a department has), `my_facilities` (the role's buildings with load, capacity, tier and the upgrades on offer; for the mayor, funding levels, policies and imports), `unlocks`, `get_plan`, `get_messages`, `history(kind, months)` |
-| turn control | `send_message(to, text)`, `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing) with the treasury, gives `to_spend`, `to_fund` (department, kind, amount, upkeep per month, in the briefing's order) and `first_buildings` (first/supply departments at a $0 target, utilities' supply included), and its `next` is the briefing's to-spend and to-fund lines; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 after a deficit on rounded dollars, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
+| turn control | `send_message(to, text)` (`to`: a role, `all`, or several roles separated by commas, one message each), `update_memory(commitments, open_tasks, lessons)`, `update_plan(goals, budgets, priorities, notes)` (mayor only; the result names any idle money to take back first, lists the departments below their budget target that would use a top-up (as in the briefing) with the treasury, gives `to_spend`, `to_fund` (department, kind, amount, upkeep per month, in the briefing's order) and `first_buildings` (first/supply departments at a $0 target, utilities' supply included), and its `next` is the briefing's to-spend and to-fund lines; the reserve rule in `fleet/tools.py:reserve`, $3,000 or 3 months of expenses, 6 after a deficit on rounded dollars, mirrors the fleet configs' mayor playbook), `end_turn(report)` |
 | actions | one tool per action of the role (see [Roles and actions](#roles-and-actions)). The JSON schemas come from `actions.action_docs()`, and the actions run through `apply_action`, so validation, costs and milestone locks are the same as for every other agent |
 
 **Three memory layers.** Nothing else carries over between turns.
@@ -1106,7 +1123,7 @@ air links; utilities' has the river and what the deals do to supply. Every role 
 `region_overview`, the mayor gets `offer_deal`, `accept_deal` and `cancel_deal` (run as
 the region runs any mayor's deals, and counted in the action cap), and `send_message`
 takes a role of the city (`"mayor"`), a team (`"south"`), another city's agent
-(`"south.mayor"`) or `"all"`. The fleet report has the region scoreboard and one section
+(`"south.mayor"`) or `"all"`, or several of them separated by commas. The fleet report has the region scoreboard and one section
 per city with fleet agents. `configs/fleet_region_smoke.toml` runs the `fleet_smoke.toml`
 fleet in the north city against the scripted baseline in the south.
 
@@ -1248,10 +1265,14 @@ report has one per city; requests to another city are left out. On a finished ru
 `fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env. The
 viewer shows it too, at the playhead (Team tab, below).
 Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
-84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 55.4 (v17,
-seed 0), then 73.1 / 75.2 (v19) and 64.9 / 76.1 (v23, seeds 0 / 1). Before the mayor's replies
+84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 58.5 (v17,
+seed 0), then 73.3 / 75.2 (v19) and 65.0 / 76.1 (v23, seeds 0 / 1). Before the mayor's replies
 to money requests counted, v19 scored 72.7 / 73.5 and v23 63.6 / 74.5. The scripted mayor
-never replies, so its score didn't move.
+never replies, so its score didn't move. A status report that says it needs nothing is no
+request (`collab.NO_ASK`: a negated need such as "No budget needed at this time" and $0 are
+struck before the ask words are read): that took 1 to 2 transport and education reports out
+of each of those runs (v19 seed 0 was 73.1, v23 seed 0 64.9; v17's 55.4 had gone stale
+already) and left the scripted fleet's score as it was.
 
 A hint fires on any of these:
 

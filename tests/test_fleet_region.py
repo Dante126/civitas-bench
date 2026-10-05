@@ -18,7 +18,7 @@ from civitas.fleet.fmt import money
 from civitas.fleet.memory import FleetState
 from civitas.fleet.region import MAX_DEALS, connector_prices, link, message_targets, region_lines, region_of
 from civitas.fleet.report import fleet_report, rows_from_trajectories
-from civitas.fleet.tools import ToolBox
+from civitas.fleet.tools import ToolBox, to_schema
 from civitas.sim import catalog as C
 
 TITLES = {spec["title"]: r for r, spec in ROLES.items()}
@@ -274,11 +274,27 @@ def test_message_addresses_in_a_region():
                                             "education", "all", "north", "south",
                                             *(f"south.{r}" for r in TURN_ORDER)]
     box = ToolBox(n, "police")
-    assert box.tools["send_message"].properties["to"]["enum"] == message_targets(n, "police")
+    assert box.tools["send_message"].properties["to"] == to_schema(message_targets(n, "police"))
     assert not box.call("send_message", {"to": "north.police", "text": "x"})["ok"]          # own name: not a target
     single = ToolBox(CivitasEnv(GameConfig(seed=0, months=3)), "police")
-    assert single.tools["send_message"].properties["to"]["enum"] == [r for r in TURN_ORDER if r != "police"] + ["all"]
+    assert single.tools["send_message"].properties["to"] == to_schema([r for r in TURN_ORDER if r != "police"] + ["all"])
     assert "region_overview" not in single.tools and "offer_deal" not in ToolBox(single.env, "mayor").tools
+
+
+def test_one_message_to_several_addresses_in_a_region():
+    """send_message's comma list in a region: own roles, another city's team and agent, each its own council message
+    under its council name (RegionEnv.apply prefixes the own city's roles)."""
+    region, n, s = _linked()
+    box = ToolBox(n, "mayor")
+    res = box.call("send_message", {"to": "police, fire,south,south.mayor", "text": "Noted: next quarter"})
+    assert res["ok"] and res["message"] == ("message to police, fire, south and south.mayor (one message each) will be "
+                                            "posted at the end of your turn")
+    region.apply("north.mayor", Decision(executed=box.executed, messages=box.messages))
+    assert [(m["sender"], m["to"]) for m in region.council.posted_in(0)] == [
+        ("north.mayor", "north.police"), ("north.mayor", "north.fire"), ("north.mayor", "south"),
+        ("north.mayor", "south.mayor")]
+    assert "Noted" in region.council.visible_to("south.planning", 0)[0]["text"]          # the south team's copy
+    assert not box.call("send_message", {"to": "police,west", "text": "x"})["ok"]        # every name must be a target
 
 
 # ------------------------------------------------------------ deals

@@ -18,7 +18,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..bench.collab import TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request
+from ..bench.collab import MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
                             WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
                             zone_density, zone_price, zone_tiles)
@@ -308,6 +308,7 @@ class Tool:
     required: tuple = ()
     strict: bool = True           # reject unknown arguments (action tools pass them to the handler)
     newest_last: bool = False     # trimming keeps the tail of long lists (logs, messages)
+    lists: tuple = ()             # string arguments that also take a JSON list, joined with commas (send_message's to)
     trim_hint: str = ""           # how to ask for less when a result is trimmed
 
     def schema(self) -> dict:
@@ -398,6 +399,28 @@ def _coerce(name: str, v, spec: dict):
     if "enum" in spec and v not in spec["enum"]:
         raise ToolError(f"argument '{name}' must be one of {', '.join(map(str, spec['enum']))}; got {v!r}")
     return v
+
+
+def to_schema(targets: list[str]) -> dict:
+    """send_message's `to`: a string naming one address or several separated by commas (a JSON list is joined:
+    Tool.lists). An enum would refuse the several."""
+    return {"type": "string", "description": f"one of {', '.join(targets)}; or several roles separated by commas "
+                                             "(\"police,fire\"), each getting its own message"}
+
+
+def recipients(to: str, targets: list[str]) -> list[str]:
+    """The addresses `to` names (send_message): one, or several separated by commas, each one of `targets` (case
+    aside), repeats dropped; "all" only alone. ToolError otherwise."""
+    lower = {t.lower(): t for t in targets}
+    names = list(dict.fromkeys(p.strip() for p in str(to).split(",") if p.strip()))
+    bad = [n for n in names if n.lower() not in lower]
+    if not names or bad:
+        raise ToolError(f"argument 'to' must be one of {', '.join(targets)}, or several of them separated by commas; "
+                        f"got {to!r}")
+    names = list(dict.fromkeys(lower[n.lower()] for n in names))
+    if "all" in names and len(names) > 1:
+        raise ToolError("'all' already reaches every role: send to 'all' alone, or list the roles")
+    return names
 
 
 def _items_schema(example: list) -> dict:
@@ -1557,8 +1580,67 @@ def requests_reminder(reqs: list[OpenRequest]) -> str:
     n = len(reqs)
     return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Answer each department "
             "now: allocate_budget, or send_message to it with one line on why not or when (the reserve, a first "
-            "building elsewhere first, its funds already cover it). Then call end_turn again: it ends the turn "
-            "whatever is still open.")
+            "building elsewhere first, its funds already cover it); one send_message can answer several (to: "
+            "\"police,fire\"). Then call end_turn again: it ends the turn whatever is still open.")
+
+
+# ------------------------------------------------------------------ departments' money asks to the mayor
+# Region smoke 20261005 (trinity in both cities, 12 months, act_every 3): 46 requests to the mayor, 45 naming money.
+# By the department's line on that month's Departments block: 9 for a first building or supply, 9 for planning's road,
+# 15 for another building the money above the reserve didn't cover (a second police / fire station, a clinic, a
+# school), 13 with nothing ready to buy (transport's "below 1,500 residents" notes, "funds for future stations", a
+# library). The mayor answered 93% of them, mostly with a no (follow-through 25 / 29), and the south mayor spent all
+# 20 steps of month 9 on refusals. A department's briefing says whether to ask (briefing._ask_line), and the model's
+# send_message holds back once a turn a money ask the mayor can't fund now (ToolBox._ask_refusal).
+class Ask(NamedTuple):
+    """Whether a department should ask the mayor for money now (mayor_ask), and what to say."""
+    ok: bool          # first/supply or growth with a top-up, or another building the mayor's money covers now
+    amount: int       # DeptMoney.top_up when ok, else 0
+    what: str         # what the top-up buys, in the department's words: "your first police station"
+    why: str          # ok: why the mayor funds it; else why it won't now
+
+
+def _yours(text: str) -> str:
+    """A Departments-block phrase in the department's own words: "its first school" -> "your first school"."""
+    return re.sub(r"\bits\b", "your", text)
+
+
+def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
+    """What `dept` can ask the mayor for now, by its DeptMoney.kind: the top-up its needs line names when it is
+    first/supply or growth (the mayor funds those first, from the treasury above $3,000), or another building that
+    fund_cover covers (the money above the reserve after them; never in a hold); else no ask, and why: another building
+    that waits ("in a hold" / "doesn't cover it"), idle money, a first building blocked for lack of land (ask
+    planning), or its DeptMoney.state ("funds cover your builds", "nothing ready to buy", "supply has room", "only a
+    library ready ($1,500)"; planning's "your funds cover your road" / "no road is ready"). The department's own
+    DeptMoney decides (one observation, ~0.5 ms; its kind is funding_gaps' but for unclaimed first buildings, which
+    read as their state); the whole funding_gaps (~7 ms) only for another building, whose cover needs every top-up."""
+    m = DeptMoney(env, dept)
+    k, what = m.kind, _yours(m.what)
+    if k in NEED_KINDS[:2]:
+        return Ask(True, m.top_up, what, "the mayor funds first buildings, supply and planning's road first")
+    if k == "another":
+        f = funding_gaps(env, fleet)
+        if dept in fund_cover(f):
+            return Ask(True, m.top_up, what, "the mayor's money above its reserve covers it now")
+        why = ("the mayor is in a hold (the treasury is at or under its reserve) and funds only first buildings, "
+               "supply and planning's road" if f.hold else "the mayor's money above its reserve doesn't cover it "
+               "after first buildings, supply and planning's road")
+        return Ask(False, 0, what, f"{what} ({money(m.top_up)} short) waits: {why}")
+    if k == "idle":
+        return Ask(False, 0, "", f"you hold {money(m.idle)} more than you need now")
+    if k == "blocked":
+        return Ask(False, 0, "", f"{' or '.join(m.blocked)} is blocked for lack of land: ask planning for a lot, not "
+                                 "the mayor for money")
+    if dept == "planning":
+        return Ask(False, 0, "", "your funds cover your road" if m.build is not None and m.build.cost is not None
+                   else "no road is ready")
+    return Ask(False, 0, "", _yours(m.state) or "nothing ready to buy")
+
+
+def ask_refusal(a: Ask) -> str:
+    """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal)."""
+    return (f"not sent: {a.why}, so a money ask now gets a no. Put what you need in your end_turn report instead "
+            "(the mayor reads it); to post this message anyway, call send_message again.")
 
 
 # the mayor's actions whose results say where the money stands (ToolBox._money_note, appended by _act on success and
@@ -2918,6 +3000,7 @@ class ToolBox:
         self.branch_dezone = branch_dezone                # planning's branch road dezones its empty lots (_branch_clear)
         self.max_steps = max_steps                        # the turn's tool-call limit (ToolAgent only): the mayor's
         self.reminded = False                             # end_turn reminder of open requests, once a turn (end_turn)
+        self.held_ask = False                             # a department's money ask held back, once a turn
         self.fleet = FleetState.of(env)
         self.ended = False
         self.report = ""
@@ -3101,6 +3184,8 @@ class ToolBox:
                     raise ToolError(f"{tool.name} has no argument {k!r}; valid arguments: {valid}")
                 out[k] = v
                 continue
+            if k in tool.lists and isinstance(v, list):
+                v = ",".join(str(x) for x in v)
             out[k] = _coerce(k, v, tool.properties[k])
         missing = [k for k in tool.required if k not in out]
         if missing:
@@ -4107,8 +4192,9 @@ class ToolBox:
         cap = f"at most {LIMITS['list_items']} items of {LIMITS['item_chars']} chars"
         tools = [
             Tool("send_message", "Post on the council board (delivered at the end of your turn): to a role, or "
-                 "'all'.", self.send_message, {"to": {"type": "string", "enum": [*others, "all"]},
-                                               "text": {"type": "string"}}, ("to", "text")),
+                 "'all'. Several roles in one call (to: \"police,fire\") each get their own message.",
+                 self.send_message, {"to": to_schema([*others, "all"]), "text": {"type": "string"}}, ("to", "text"),
+                 lists=("to",)),
             Tool("update_memory", f"Save your notes for later turns. Each list you give replaces the old one ({cap}); "
                  "lists you leave out are kept.", self.update_memory,
                  {"commitments": strings, "open_tasks": strings, "lessons": strings}),
@@ -4127,10 +4213,32 @@ class ToolBox:
         return tools
 
     def send_message(self, to: str, text: str) -> dict:
+        """Queue one council message per recipient (`to`: one address, or several separated by commas: recipients()),
+        posted at the end of the turn, so per-role digests, the Team tab's threads and the mayor's Open requests see
+        one message each. A department's money ask to the mayor it can't get now is held back once a turn
+        (_ask_refusal: the model only)."""
         if not text.strip():
             raise ToolError("text is empty")
-        self.messages.append({"to": to, "text": text})
-        return {"ok": True, "message": f"message to {to} will be posted at the end of your turn"}
+        from .region import message_targets
+        names = recipients(to, message_targets(self.env, self.role))
+        if "mayor" in names and (refusal := self._ask_refusal(text)):
+            return {"ok": False, "refused": "ask", "error": refusal}
+        self.messages += [{"to": r, "text": text} for r in names]
+        each = " (one message each)" if len(names) > 1 else ""
+        return {"ok": True, "message": f"message to {_and(names)}{each} will be posted at the end of your turn"}
+
+    def _ask_refusal(self, text: str) -> str:
+        """The model's department (max_steps given: ToolAgent) sending the mayor a money ask (collab.is_request and
+        MONEY) it can't get now (mayor_ask: not first/supply, growth or another building the money covers): the
+        refusal, once a turn (the next send_message posts it); "" otherwise. The scripted fleet never sees it."""
+        if (self.role == "mayor" or self.max_steps is None or self.held_ask or not is_request("mayor", text)
+                or not MONEY.search(text)):
+            return ""
+        a = mayor_ask(self.env, self.fleet, self.role)
+        if a.ok:
+            return ""
+        self.held_ask = True
+        return ask_refusal(a)
 
     def update_memory(self, **fields) -> dict:
         try:

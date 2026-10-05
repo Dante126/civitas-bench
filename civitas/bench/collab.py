@@ -7,7 +7,8 @@ health asks the mayor for $2,000 for a landfill, the mayor funds it, health buil
 
 Matching, inside a window of 2 x act_every months after the request (turn order breaks ties within a month):
 - a request is a message to one role that asks for something ($, need, request, please, can you, ...); messages to
-  "all" are broadcasts;
+  "all" are broadcasts, and a status report that says it needs nothing ("No budget needed at this time (current $0
+  matches target)") is no request: negated needs and $0 don't count as asks (NO_ASK);
 - a money request (to the mayor, naming dollars or funds) is met by the mayor's top-ups to the sender reaching
   MET_SHARE of the amount (any top-up when no amount is named), partial below that, else replied to when the mayor
   messages the sender back (a no, with why or when, is an answer);
@@ -24,6 +25,12 @@ from pathlib import Path
 
 ASK = re.compile(r"\$\s?\d|\bneed|\brequest|\bplease\b|\bcould you\b|\bcan you\b|\bask|\brequir|\bfund|\bfree (up )?a",
                  re.I)
+# what is_request strikes before reading ASK: a negated need ("no budget needed", "No immediate needs", "no need",
+# "not required", "nothing needed") and $0. The 120-month trinity runs and the region smoke 20261005 had 8 status
+# reports to the mayor counted as requests (transport's "below the 1,500 threshold ... No budget needed at this time
+# (current $0 matches target)", education's "No schools needed yet"); striking these turned no other message
+NO_ASK = re.compile(r"\b(?:no|not|nothing|don'?t|doesn'?t|do not|does not)\b(?:\s+[\w$,.]+){0,3}?\s+"
+                    r"(?:needs?|needed|required|requested|requests?)\b|\bno need\b|\$\s?0+(?:\.0+)?(?![\d,]|\.\d)", re.I)
 MONEY = re.compile(r"\$\s?\d|\bfund|\bbudget|\bmoney|\ballocat", re.I)
 LAND = re.compile(r"\broad|\blot\b|\blots\b|\bzone|\bdezone|\briverbank|\bland\b|\btile", re.I)
 AMOUNT = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k\b)?", re.I)
@@ -195,8 +202,9 @@ def handoffs(events: list[dict], key, window: int) -> list[dict]:
 
 
 def is_request(to: str, text: str) -> bool:
-    """A council message that asks something of one role (ASK words); messages to "all" are broadcasts."""
-    return str(to or "all") != "all" and bool(ASK.search(str(text or "")))
+    """A council message that asks something of one role (ASK words, read once negated needs and $0 are struck out:
+    NO_ASK); messages to "all" are broadcasts."""
+    return str(to or "all") != "all" and bool(ASK.search(NO_ASK.sub(" ", str(text or ""))))
 
 
 def money_ask(req: dict) -> bool:
