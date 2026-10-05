@@ -1758,3 +1758,172 @@ def test_after_a_loan_a_top_up_under_the_reserve_can_t_be_confirmed(monkeypatch)
     box = _mayor(env, treasury=3107)                                   # a new turn, no loan: earned confirm
     assert box.call("allocate_budget", health)["refused"] == "reserve"
     assert box.call("allocate_budget", {**health, "confirm": True})["override"] == "reserve"
+
+
+# --- Unit D: requests to the mayor (tools.py: open_requests, request_state, ToolBox.end_turn's reminder; briefing.py:
+# the Open requests block; bench/collab.py: answer, shared with the collaboration score)
+import json  # noqa: E402
+
+from civitas.bench.collab import collab  # noqa: E402
+from civitas.core.decision import Decision  # noqa: E402
+from civitas.fleet.agent import ToolAgent  # noqa: E402
+
+ASKS = [("police", "Requesting $2,500 for our first police station"),
+        ("health", "Mayor, I need $2,000 for a landfill"),
+        ("transport", "Transport reporting: nothing to build yet, please allocate budget"),
+        ("fire", "Fire station built, all good"),                     # no ask: not a request
+        ("education", "need a school")]                                # to all: a broadcast
+
+
+def _asked(env):
+    """act_every 3: the mayor's month-0 turn (marked), then the departments' messages, then months to month 3."""
+    briefing(env, "mayor")
+    for d, text in ASKS:
+        env.council.post(0, d, text, "all" if d == "education" else "mayor")
+    for _ in range(3):
+        env.end_month()
+
+
+def test_open_requests_until_a_top_up_or_a_reply():
+    """v23 seed 0: the mayor answered 59% of the requests sent to it. A request stays open until a top-up to the
+    department (any share of what it asked: met or partial) or a message back to it, inside 2 x act_every months."""
+    env = _env(act_every=3)
+    _asked(env)
+    fleet = FleetState.of(env)
+    reqs = T.open_requests(env, fleet)
+    assert [(r.month, r.dept, r.amount, r.last) for r in reqs] == [(0, "transport", None, False),
+                                                                  (0, "police", 2500, False),
+                                                                  (0, "health", 2000, False)]
+    box = _mayor(env, treasury=30000)
+    assert box.call("allocate_budget", {"department": "police", "amount": 2500})["ok"]
+    assert box.call("send_message", {"to": "health", "text": "Not this quarter: the reserve comes first"})["ok"]
+    assert box.call("send_message", {"to": "all", "text": "Budget review next quarter"})["ok"]   # no reply to anyone
+    assert [r.dept for r in T.open_requests(env, fleet, box.messages)] == ["transport"]
+    env2 = _env(act_every=3)
+    _asked(env2)
+    assert _mayor(env2).call("allocate_budget", {"department": "health", "amount": 500})["ok"]     # partial
+    assert "health" not in [r.dept for r in T.open_requests(env2, FleetState.of(env2))]
+    # month 6 is the last turn to answer a month-0 request; at month 7 it no longer counts
+    for _ in range(3):
+        env.end_month()
+    assert [(r.dept, r.last) for r in T.open_requests(env, fleet)] == [   # the top-up is in the log; the month-3
+        ("transport", True), ("health", True)]                             # reply was never posted
+    env.end_month()
+    assert T.open_requests(env, fleet) == []
+
+
+def test_open_requests_agree_with_the_collaboration_score():
+    """The same requests and the mayor's month-3 answers as frames: collab's threads say what open_requests says
+    (a money ask with only a reply back is "replied", no longer unanswered)."""
+    env = _env(act_every=3)
+    _asked(env)
+    box = _mayor(env, treasury=30000)
+    box.call("allocate_budget", {"department": "police", "amount": 2500})
+    box.call("send_message", {"to": "health", "text": "Not this quarter: the reserve comes first"})
+    still = {r.dept for r in T.open_requests(env, FleetState.of(env), box.messages)}
+    msg = lambda m, s, to, text: {"month": m, "sender": s, "to": to, "text": text}
+    frames = [{"month": 1, "council": [msg(0, d, "all" if d == "education" else "mayor", t) for d, t in ASKS],
+               "turns": []},
+              {"month": 4, "council": [msg(3, "mayor", "health", "Not this quarter: the reserve comes first")],
+               "turns": [{"month": 3, "role": "mayor", "results": list(box.executed)}]},
+              {"month": 7, "council": [], "turns": []}]
+    th = {t["from"]: t["status"] for t in collab(frames, list(env.roles), act_every=3)["threads"]}
+    assert th == {"police": "met", "health": "replied", "transport": "unanswered"}
+    assert still == {d for d, s in th.items() if s == "unanswered"}
+
+
+def test_the_mayor_s_briefing_lists_open_requests(monkeypatch):
+    _builds(monkeypatch, {"police": FB(2500, (N("police station", 5, 0, first=True, upkeep=55),), 2500, ())})
+    env = _env(act_every=3)
+    _asked(env)
+    text = briefing(env, "mayor", mark=False)
+    assert "  - (3 requests to you: under Open requests to you below)\n" in text
+    assert "Requesting $2,500" not in text.split("## Open requests")[0]          # quoted once, in the block
+    assert "- m0 education -> all: need a school" in text and "Fire station built" in text   # the others stay
+    lines = _block(text, "## Open requests to you")
+    assert lines[0].startswith("- transport: m0 (waiting 3 months); no top-up needed (")
+    assert lines[1].startswith("- police: m0 (waiting 3 months), asks $2,500; to fund $2,500 (first/supply), ")
+    assert lines[1].endswith(': "Requesting $2,500 for our first police station"')
+    assert lines[2].startswith("- health: m0 (waiting 3 months), asks $2,000; ") and len(lines) == 3
+    assert text.index("- to fund: ") < text.index("## Open requests to you") < text.index("## City plan")
+    # repeats from one department merge; past REQUESTS_SHOWN departments the rest are named
+    env.council.post(3, "health", "Again: need $2,000 for the landfill please", "mayor")
+    for d in ("utilities", "planning"):
+        env.council.post(3, d, f"{d} needs $900, please", "mayor")
+    env.end_month()
+    lines = _mayor_block(env, "## Open requests to you")
+    assert lines[2].startswith("- health: m0, m3 (waiting 4 months), asks $2,000; ")
+    assert lines[2].endswith(': "Again: need $2,000 for the landfill please"')
+    assert len(lines) == T.REQUESTS_SHOWN + 1 and lines[-1] == "- +1 more: utilities"   # planning first in turn order
+    # every one answered: no block
+    box = _mayor(env, treasury=30000)
+    for d in ("transport", "police", "health", "utilities", "planning"):
+        box.call("send_message", {"to": d, "text": "Noted: not this month, the reserve first"})
+    env.apply("mayor", Decision(executed=box.executed, messages=box.messages))
+    assert "## Open requests to you" not in briefing(env, "mayor", mark=False)
+
+
+def test_request_state_says_what_the_mayor_can_answer(monkeypatch):
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"police": FB(2500, (N("police station", 5, 1, "coverage 66%", upkeep=55),), 2500, ()),
+                          "education": FB(2500, (N("elementary school", 5, 0, first=True, upkeep=45),), 2500, ())})
+    env.world.treasury = 1000.0                                           # a hold, nothing above $3,000
+    f = funding_gaps(env, FleetState.of(env))
+    cov = T.fund_cover(f)
+    assert T.request_state(f, "police", cov) == "to fund $2,500 (another), not covered (hold)"
+    assert T.request_state(f, "fire", cov) == "no top-up needed (nothing ready to buy)"
+    env.world.treasury = 30000.0
+    f = funding_gaps(env, FleetState.of(env))
+    assert T.request_state(f, "education", T.fund_cover(f)) == "to fund $2,500 (first/supply), covered"
+    env.world.dept_funds["fire"] = 9000
+    f = funding_gaps(env, FleetState.of(env))
+    assert T.request_state(f, "fire", T.fund_cover(f)).startswith("no top-up needed (holds $")
+
+
+def test_end_turn_reminds_the_model_s_mayor_once():
+    env = _env(act_every=3)
+    _asked(env)
+    assert T.ToolBox(env, "mayor").call("end_turn", {"report": "done"})["ok"]          # scripted fleet: no reminder
+    box = T.ToolBox(env, "mayor", max_steps=12)
+    res = box.call("end_turn", {"report": "done"})
+    assert res["ok"] is False and res["refused"] == "open_requests" and not box.ended
+    assert res["error"].startswith("not ended: 3 requests to you still open: transport (since m0), police (asks "
+                                   "$2,500, since m0), health (asks $2,000, since m0). Answer each department now")
+    assert box.call("end_turn", {"report": "done"})["ok"] and box.ended              # once a turn
+    box = T.ToolBox(env, "mayor", max_steps=12)                       # all answered: it ends at once
+    box.call("allocate_budget", {"department": "police", "amount": 2500})
+    for d in ("transport", "health"):
+        box.call("send_message", {"to": d, "text": "Not this quarter"})
+    assert box.call("end_turn", {"report": "done"})["ok"] and box.ended
+    box = T.ToolBox(env, "mayor", max_steps=2)                        # no call left for a reply: no reminder
+    box.call("city_overview")
+    assert box.call("end_turn", {"report": "done"})["ok"]
+    assert T.ToolBox(env, "police", max_steps=12).call("end_turn", {"report": "done"})["ok"]   # the mayor only
+
+
+def test_the_tool_agent_s_mayor_gets_the_reminder():
+    class Fake:
+        n = 0
+
+        def chat(self, model, messages, **kw):
+            self.n += 1
+            seq = [("end_turn", {"report": "done"}), ("send_message", {"to": "police", "text": "Not yet: reserve"}),
+                   ("end_turn", {"report": "done"})]
+            name, args = seq[min(self.n, len(seq)) - 1]
+            return {"content": "", "tool_calls": [{"id": f"c{self.n}", "type": "function",
+                                                   "function": {"name": name, "arguments": json.dumps(args)}}],
+                    "finish_reason": "tool_calls", "usage": {}, "latency_s": 0.0}
+
+    env = _env(act_every=3)
+    briefing(env, "mayor")
+    env.council.post(0, "police", "Requesting $2,500 for a station", "mayor")
+    env.end_month()
+    a = ToolAgent("mayor", cfg=FleetAgentConfig(model="fake"))
+    a.client = Fake()
+    a.bind(env)
+    d = a.act(env.observe("mayor"))
+    trace = d.meta["tool_trace"]
+    assert [c["tool"] for c in trace] == ["end_turn", "send_message", "end_turn"] and d.meta["ended"]
+    assert trace[0]["result"]["refused"] == "open_requests"
+    assert d.messages == [{"to": "police", "text": "Not yet: reserve"}]

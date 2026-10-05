@@ -55,6 +55,21 @@ def test_money_requests_met_partial_unanswered_and_open():
     assert {t["from"]: t["status"] for t in d["threads"]}["education"] == "unanswered"
 
 
+def test_a_money_request_the_mayor_replies_to_is_answered():
+    """A no with why or when is an answer: a money ask with no top-up but a message back from the mayor is replied
+    to (the mayor's Open requests block decides the same way, through collab.answer); a top-up still wins."""
+    frames = [frame(1, [msg(0, "police", "mayor", "Requesting $2,500 for a station"),
+                        msg(0, "fire", "mayor", "Need $2,500 for a station")]),
+              frame(4, [msg(3, "mayor", "police", "Not this quarter: the reserve comes first"),
+                        msg(3, "mayor", "fire", "Next quarter")],
+                    [turn(3, "mayor", res("allocate_budget", department="fire", amount=2500))]),
+              frame(13)]
+    th = {t["from"]: t for t in collab(frames, ROLES, act_every=3)["threads"]}
+    assert th["police"]["status"] == "replied" and th["police"]["kind"] == "money"
+    assert th["police"]["response"]["text"] == "Not this quarter: the reserve comes first"
+    assert th["fire"]["status"] == "met"
+
+
 def test_land_requests_acted_and_replies():
     frames = [
         frame(1, [msg(0, "utilities", "planning", "Please free a riverbank lot near (33,23) for the pump"),

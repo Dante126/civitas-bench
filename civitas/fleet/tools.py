@@ -18,6 +18,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
+from ..bench.collab import TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
                             WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
                             zone_density, zone_price, zone_tiles)
@@ -1452,6 +1453,114 @@ def still_to_fund(f: Funding, n: int = FUNDED_SHOWN) -> str:
     return ", ".join(items[:n]) + (f", +{len(items) - n} more" if len(items) > n else "")
 
 
+# ------------------------------------------------------------------ requests to the mayor
+# The 120-month LLM runs (trinity v19 / v23): the mayor answered 59-81% of the requests sent to it, every other
+# department ~100%. In v23 seed 0, 102 money asks went unanswered: the mayor saw 94 of them in its digest, gave money
+# to someone else in the window every time (first/supply in a hold, 66 of them), and 80 asked for "another" building;
+# it replied to few. The briefing's Open requests block and the end_turn reminder name what is still open.
+REQUESTS_SHOWN = 4           # departments on the mayor's Open requests block before "+N more"
+REQUEST_CHARS = 75           # the latest request of each department quoted there
+REMIND_MIN_LEFT = 2          # tool calls left after the end_turn for its open-requests reminder (a reply, end_turn)
+
+
+class OpenRequest(NamedTuple):
+    """A department's request to the mayor with no answer yet (bench/collab.py:answer: no top-up to it, no message
+    back) inside its window of 2 x act_every months, where the collaboration score still counts one."""
+    month: int
+    dept: str
+    text: str
+    amount: float | None    # the dollars it asks for (collab's _amount), None when it names none
+    last: bool              # the mayor's next turn falls outside the window: this is its last turn to answer
+
+
+def open_requests(env, fleet: FleetState, pending=()) -> list[OpenRequest]:
+    """The departments' requests to the mayor still open, oldest first, decided as the collaboration score decides
+    them (collab.answer) from the council board (messages the mayor can see from the window's start), the mayor's
+    successful allocate_budget calls in the fleet log, and `pending`: this turn's send_message calls (ToolBox.messages,
+    posted at the end of the turn). Requests are council messages to the mayor from a department of this city that ask
+    something (collab.is_request); later events are ordered by month, turn order, messages before actions, as in
+    collab."""
+    w = env.world
+    act = max(1, int(env.cfg.act_every))
+    window = 2 * act
+    since = w.month - window
+    order = {r.split(".")[-1]: i for i, r in enumerate(env.roles)}
+    msgs = [env._local(m) for m in env.council.visible_to(env._name("mayor"), since_month=since)]
+    events = [{"month": m["month"], "kind": "message", "from": m["sender"], "to": m["to"], "text": m["text"]}
+              for m in msgs]
+    events += [{"month": w.month, "kind": "message", "from": "mayor", "to": m.get("to"), "text": m.get("text", "")}
+               for m in pending]
+    for e in fleet.log:
+        a = e.get("action") or {}
+        if (e["kind"] != "action" or e["role"] != "mayor" or not e.get("ok") or e["month"] < since
+                or a.get("type") != "allocate_budget"):
+            continue
+        try:
+            amount = float(a.get("amount", 0))
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            events.append({"month": e["month"], "kind": "money", "from": "mayor", "to": a.get("department"),
+                           "amount": amount, "text": e.get("message", "")})
+    key = lambda e: (e["month"], order.get(e["from"], len(order)), 0 if e["kind"] == "message" else 1)
+    events.sort(key=key)
+    nxt = (w.month // act + 1) * act               # the mayor's next turn (env.acts_this_month)
+    out = []
+    for i, e in enumerate(events):
+        if (e["kind"] != "message" or e["to"] != "mayor" or e["from"] not in DEPARTMENTS
+                or not is_request(e["to"], e["text"]) or e["month"] + window < w.month):
+            continue
+        # as collab's events: the text cut to TEXT_CHARS, the amount and tiles from all of it
+        req = {**e, "text": e["text"][:TEXT_CHARS], "amount": asked_amount(e["text"]), "tiles": text_tiles(e["text"])}
+        later = [x for x in events[i + 1:] if key(x) > key(e) and x["month"] <= e["month"] + window]
+        if answer(req, later)[0] is None:
+            out.append(OpenRequest(e["month"], e["from"], e["text"], req["amount"], nxt > e["month"] + window))
+    return out
+
+
+def request_groups(reqs: list[OpenRequest]) -> list[tuple[str, list[OpenRequest]]]:
+    """Open requests by department (repeats merged), the longest-waiting department first."""
+    groups: dict[str, list[OpenRequest]] = {}
+    for r in sorted(reqs, key=lambda r: r.month):
+        groups.setdefault(r.dept, []).append(r)
+    return list(groups.items())
+
+
+def request_state(f: Funding, dept: str, covered: list[str]) -> str:
+    """What the mayor can tell a department that asked, from funding_gaps (its Departments line names the building):
+    "to fund $2,500 (another), not covered (hold)" ("not covered now" outside a hold) / "..., covered" (fund_cover:
+    the money covers it after the items before it), or why it needs no top-up: "no top-up needed (nothing ready to
+    buy)" (DeptMoney.state), "(holds $1,508 idle)", "(blocked for lack of land)", planning's "(funds cover its road)"
+    / "(no road ready)"."""
+    m = f.depts.get(dept)
+    if m is None:
+        return "not in the game"
+    k = m.kind
+    if k in NEED_KINDS:
+        cover = "covered" if dept in covered else "not covered" + (" (hold)" if f.hold else " now")
+        return f"to fund {money(m.top_up)} ({k}), {cover}"
+    if k == "idle":
+        why = f"holds {money(m.idle)} idle"
+    elif k == "blocked":
+        why = "blocked for lack of land"
+    elif dept == "planning":
+        why = "funds cover its road" if m.build is not None and m.build.cost is not None else "no road ready"
+    else:
+        why = m.state or "nothing ready to buy"
+    return f"no top-up needed ({why})"
+
+
+def requests_reminder(reqs: list[OpenRequest]) -> str:
+    """The end_turn refusal while requests are open (ToolBox.end_turn): the departments, what they ask, since when."""
+    names = [f"{d} ({f'asks {money(a)}, ' if (a := next((r.amount for r in reversed(rs) if r.amount), None)) else ''}"
+             f"since m{rs[0].month})" for d, rs in request_groups(reqs)]
+    n = len(reqs)
+    return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Answer each department "
+            "now: allocate_budget, or send_message to it with one line on why not or when (the reserve, a first "
+            "building elsewhere first, its funds already cover it). Then call end_turn again: it ends the turn "
+            "whatever is still open.")
+
+
 # the mayor's actions whose results say where the money stands (ToolBox._money_note, appended by _act on success and
 # on a core failure, not _explain's fix), in the model's message only
 MONEY_ACTIONS = ("allocate_budget", "take_loan", "repay_loan")
@@ -2801,12 +2910,14 @@ class Took(NamedTuple):
 
 
 class ToolBox:
-    def __init__(self, env, role: str, branch_dezone: bool = False):
+    def __init__(self, env, role: str, branch_dezone: bool = False, max_steps: int | None = None):
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
         self.env, self.role = env, role
         self.world = env.world
         self.branch_dezone = branch_dezone                # planning's branch road dezones its empty lots (_branch_clear)
+        self.max_steps = max_steps                        # the turn's tool-call limit (ToolAgent only): the mayor's
+        self.reminded = False                             # end_turn reminder of open requests, once a turn (end_turn)
         self.fleet = FleetState.of(env)
         self.ended = False
         self.report = ""
@@ -4057,6 +4168,15 @@ class ToolBox:
         return out
 
     def end_turn(self, report: str) -> dict:
+        """End the turn with the report. The model's mayor (max_steps given: ToolAgent) is first refused once a turn
+        ("refused": "open_requests") while departments' requests to it are still open after this turn's top-ups and
+        messages (open_requests), unless fewer than REMIND_MIN_LEFT calls would be left; the next end_turn ends it."""
+        if self.role == "mayor" and self.max_steps is not None and not self.reminded \
+                and self.max_steps - self.n_calls >= REMIND_MIN_LEFT:
+            self.reminded = True
+            reqs = open_requests(self.env, self.fleet, self.messages)
+            if reqs:
+                return {"ok": False, "refused": "open_requests", "error": requests_reminder(reqs)}
         report = report.strip()[:REPORT_MAX_CHARS]
         self.ended, self.report = True, report
         self.fleet.reports[self.role] = report

@@ -607,6 +607,29 @@ tasks and money, and to let people coach it.
     - In smoke v13–v19, education's month-0 target was $0 in 15 of 15 plans. First
       buildings at a $0 target were funded 16 of 36 times, against 36 of 40 with a target,
       and utilities got $113k of its $135k top-ups beyond what its needs line asked.
+  - **Open requests.** Under those two lines, `## Open requests to you` lists the
+    departments' requests to the mayor that are still open: a council message to the mayor
+    that asks for something, with no top-up to that department and no message back to it
+    since, inside its window of 2 × `act_every` months. That is the collaboration score's own
+    rule (`bench/collab.py:answer`, used by both). There is one line per department, the
+    longest waiting first, at most 4 (then `+N more`), with repeats merged: `- police: m6 x2
+    (waiting 3 months), asks $2,500; to fund $1,006 (first/supply), covered: "Requesting
+    $2,500 to build the first police station..."`. Each line gives what the department's
+    money needs: the top-up and whether the money covers it (`not covered (hold)` when it
+    doesn't), or why it needs none (`no top-up needed (nothing ready to buy)`, `(holds $1,508
+    idle)`, `(blocked for lack of land)`). It adds `last turn to answer` when the next turn
+    falls outside the window, and quotes the latest request. The digest counts those
+    messages on one line and quotes one fewer other message per department line, so the
+    briefing stays within its bound. The system prompt asks the mayor to answer each request
+    the turn it sees it: a top-up, or one line by `send_message` to that department saying
+    why not or when. A model mayor's first `end_turn` with requests still open is refused
+    once (`refused: "open_requests"`, naming them) while at least 2 tool calls are left, and
+    the next `end_turn` ends the turn. The scripted fleet gets no reminder. In the 120-month
+    trinity runs (v19, v23) the mayor answered 59–81% of the requests sent to it, against
+    about 100% for every other department. In v23 seed 0, 102 money requests went
+    unanswered. The mayor's digest showed 94 of them, and in every case it funded someone
+    else in the window (first/supply in a hold for 66 of them). 80 of them asked for
+    another building, and it replied to few.
 
     The plan comes last.
 
@@ -1205,7 +1228,8 @@ between two roles in the game count. A request still inside its window (2 × `ac
 months, the Team tab's "open") is left out. There are four components:
 
 - **responsiveness**: the share of requests that were met, partly met, acted on or replied
-  to within the window
+  to within the window. A money request to the mayor with no top-up counts as replied to
+  when the mayor messages the sender back, since a no with a reason is still an answer.
 - **follow-through**: the same requests weighted by how far they were met: met 1, partial
   0.6, acted on 0.5, replied 0.25, unanswered 0
 - **hand-offs**: the share of planning's roads, freed lots and cleared land that another
@@ -1225,7 +1249,9 @@ report has one per city; requests to another city are left out. On a finished ru
 viewer shows it too, at the playhead (Team tab, below).
 Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
 84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 55.4 (v17,
-seed 0), then 72.7 / 73.5 (v19) and 63.6 / 74.5 (v23, seeds 0 / 1).
+seed 0), then 73.1 / 75.2 (v19) and 64.9 / 76.1 (v23, seeds 0 / 1). Before the mayor's replies
+to money requests counted, v19 scored 72.7 / 73.5 and v23 63.6 / 74.5. The scripted mayor
+never replies, so its score didn't move.
 
 A hint fires on any of these:
 
@@ -1619,7 +1645,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 
 Hover a node or edge for its numbers, and click one to filter the thread list under the graph. Each thread is a request, its response (money, a reply, or an action near the tiles it named) and its outcome (the requester's next build). Click a thread's month to jump there, or its 📍 to fly to the building. ⤢ Expand opens the same view full-screen.
 
-The data comes from `GET /api/runs/<id>/collab` (`bench/collab.py`), built from `frames.jsonl` alone, so it works for scripted, LLM and fleet runs and for runs already stored. A thread's window is 2 × `act_every` months. On the v23 120-month seed-1 run, 325 threads: 169 met, 53 partial, 49 unanswered, 34 replied, 12 acted, 8 open.
+The data comes from `GET /api/runs/<id>/collab` (`bench/collab.py`), built from `frames.jsonl` alone, so it works for scripted, LLM and fleet runs and for runs already stored. A thread's window is 2 × `act_every` months. On the v23 120-month seed-1 run, 325 threads: 159 met, 63 partial, 50 replied, 33 unanswered, 12 acted, 8 open. A money request to the mayor is met or partly met by its top-ups to the sender, else replied to when the mayor writes back.
 
 **Region runs** get a city / Region switch at the top of the Team tab. A city's view is its own team: a message to another city isn't one of its requests. Below the requests, a "With other cities" section lists the city's deals with its neighbours and its latest messages to other cities. The **Region** view draws the cities at their place in the region, sized by population, with the links they built drawn faintly underneath. Each mayor deal is an edge labelled with amount, resource and price (power yellow, water blue). An active deal is solid, with light flowing from seller to buyer and its payment travelling back as coins each month. An offer is dashed, and an ended deal stays faint for a year. As the replay steps, messages between cities fly as comets and an offer flies as a contract. An acceptance flashes the edge green and a cancellation flashes it red ✕. Below the graph:
 - each city's tally: messages out and in, asks answered, deals proposed and accepted, sold and bought, and its teamwork score at the playhead;

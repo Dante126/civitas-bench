@@ -4363,7 +4363,21 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         mp.setattr(T, "first_build", lambda env, dept: seven.get(dept) or real(env, dept))
         w.dept_funds.update(transport=0)
         money_at_the_limits(3500.0)
+        sizes.clear()
+        mayor = check("seven needs + money, hold, no requests")
+        # and two requests to the mayor from every department, as long as they get: the Open requests block takes the
+        # place of the quoted messages
+        for d in DEPTS:
+            for k in range(2):
+                env.council.post(w.month - 1, d, f"REQ-{d} {k}: we need $12,345 for a station " + "z" * 500, "mayor")
         mayor = check("seven needs + money, hold")
+        asks = mayor[mayor.index("## Open requests to you"):].split("\n\n")[0].splitlines()
+        assert len(asks) == 1 + T.REQUESTS_SHOWN + 1 and asks[-1].startswith("- +3 more: "), asks
+        assert all(", asks $12.3k; to fund $" in ln for ln in asks[1:-1]), asks
+        assert sum("), not covered (hold): \"REQ-" in ln for ln in asks) == 3, asks       # planning's $1 is covered
+        assert "  - (14 requests to you: under Open requests to you below)\n" in mayor
+        assert mayor.count("msg ") == 1 and "REQ-" not in mayor.split("## Open requests")[0]   # one press message
+        assert sizes["seven needs + money, hold"] <= sizes["seven needs + money, hold, no requests"] + 150, sizes
         assert mayor.count("; needs $") == 7 and mayor.count("its first ") == 3, mayor
         # utilities short of all three supplies (v20 fixes: a building per short supply, bought together), the labels
         # as long as they get (review): alternating heads, and past 10,000 residents an advanced treatment where no
@@ -4400,7 +4414,8 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     assert "\n- blocked for lack of land: utilities (" in briefing(env, "planning", mark=False)
     # the plan's budget was 7,650 (7,624 at "seven needs + money, hold"); utilities' line naming a building per short
     # supply (v20 fixes) took the worst mix to 7,661, its longest labels to 7,666, and a supply's building waiting for
-    # a lot (review) to 7,683, under the bound
+    # a lot (review) to 7,683, under the bound; with two requests from every department (the Open requests block in
+    # place of four quoted messages) 7,673
     assert max(sizes.values()) < 7690, sizes
     assert max(sizes, key=sizes.get) == "seven needs, two supplies and a wait + money, hold", sizes
 
