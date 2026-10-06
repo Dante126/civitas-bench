@@ -178,17 +178,18 @@ def settle_fleet(agents: dict, warm: dict | None = None) -> None:
     as plain scripted agents, outside the fleet tools) counts as having taken the warm-up's last turn, so its first
     briefing's digest covers the months since then rather than every event and council message of the warm-up; a
     fleet mayor finds the plan the scripted fleet would have written (goals, notes, priorities, the warm-up mayor's
-    working balances as budgets) instead of none; and a fleet agent taking over from the scripted fleet finds no
-    "lessons" in its memory: the scripted fleet writes there the last failure of each kind (fleet/scripted.py: _memory),
-    e.g. "build_park: no empty land tiles there", which the late smoke's planning read as a lesson at month 96."""
-    from ..fleet.memory import DEPARTMENTS
+    working balances as budgets) instead of none; and a fleet agent taking over from the scripted fleet finds its
+    memory empty: the scripted fleet writes there the last failure of each kind as "lessons" and this turn's requests
+    as "open_tasks" (fleet/scripted.py: _memory), e.g. "build_park: no empty land tiles there", which the late smoke's
+    planning read as a lesson at month 96, and "asked mayor: ...", requests the new agent never sent."""
+    from ..fleet.memory import DEPARTMENTS, MEMORY_FIELDS
     from ..fleet.scripted import GOALS, PLAN_NOTES, PRIORITIES, ScriptedFleetAgent
     for role, a in agents.items():
         env = getattr(a, "env", None)
         fleet = getattr(env, "fleet", None)
         before = (warm or {}).get(role)
         if a.kind == "fleet" and fleet is not None and isinstance(before, ScriptedFleetAgent) and before is not a:
-            fleet.memory.get(a.role, {})["lessons"] = []
+            fleet.memory[a.role] = {k: [] for k in MEMORY_FIELDS}
         if a.kind != "fleet" or fleet is None or a.role in fleet.last_turn_month or not env.world.month:
             continue
         k = max(1, env.cfg.act_every)

@@ -915,7 +915,9 @@ tasks and money, and to let people coach it.
   capped for lack of parks (the 2x2 block that raises the most developed homes, shops and
   offices, off the roadside lots), the zone type with the largest demand and fewer than
   10 tiles waiting on the strip its Ready line shows (sized to the funds left, sparing
-  funded lots), then a road into open land:
+  funded lots; a locked type is skipped, one whose strip has no usable tile gives way to
+  the next), then a road into open land; short of the builds' total it asks the mayor for
+  the difference only when it may ask (the mayor's needs line still prices only its road):
   `- Next: 2 park tiles by 20 homes (parks 14 of 16; R demand capped at +0.25 until 16)
   ($300): build_park {...}; then zone 10 tiles R high density (...) ($80): zone {...};
   then a road into open land (...) ($300): build_road {...}`. Its zone lines carry their
@@ -929,8 +931,9 @@ tasks and money, and to let people coach it.
   waits for, a road blocked by a building names a detour (`around it: build_road {...},
   then build_road {...} ($80)`; s1 v23 sent `build_road` through the same water pump 16
   times), and a zone leaving under $100 says what the rest pays for. At a warm-up
-  hand-over the scripted fleet's failure echoes leave the agents' memory "lessons" (the
-  late smoke's planning read "build_park: no empty land tiles there" as a lesson). None of
+  hand-over the memory the scripted fleet wrote is emptied (the late smoke's planning read
+  "build_park: no empty land tiles there" as a lesson, and its "asked mayor: ..." open tasks
+  were requests the new agent never sent). None of
   this changes what an action does: the scripted fleet plays turn for turn as before.
   The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too

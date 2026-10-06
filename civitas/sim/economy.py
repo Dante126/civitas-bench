@@ -93,6 +93,18 @@ class EconomyMixin:
                        "R_high": clamp(d_r + 0.1 * min(1.0, pop / 2000.0) - 0.15 * wealthy, caps["R"]),
                        "C": clamp(d_c, caps["C"]), "I": clamp(d_i), "O": clamp(d_o, caps["C"])}
 
+    def leisure_tiles(self) -> int:
+        """Park tiles plus 6 per plaza, stadium and monument: what the parks demand cap counts (fleet planning reads
+        it too)."""
+        landmarks = sum(self.n_buildings(st) for st in (C.PLAZA, C.STADIUM, C.MONUMENT))
+        return int((self.struct == C.PARK).sum()) + 6 * landmarks
+
+    def parks_capped(self) -> bool:
+        """R demand is capped for lack of parks: CAP_POP_PARKS residents or more and under one leisure tile per
+        RESIDENTS_PER_PARK of them."""
+        pop = self.stats.get("population", 0.0)
+        return pop >= C.CAP_POP_PARKS and self.leisure_tiles() < pop / C.RESIDENTS_PER_PARK
+
     def demand_caps(self) -> dict[str, float]:
         """SimCity 4 style caps: big cities need regional links (a train station) and parks."""
         pop = self.stats.get("population", 0.0)
@@ -100,8 +112,7 @@ class EconomyMixin:
         linked = bool(self.facilities(C.TRAIN)) or bool(self.facilities(C.HARBOUR))
         if pop >= C.CAP_POP_CONNECTION and not linked:
             caps["R"] = caps["C"] = C.CAP_LEVEL
-        leisure = int((self.struct == C.PARK).sum()) + 6 * sum(self.n_buildings(st) for st in (C.PLAZA, C.STADIUM, C.MONUMENT))
-        if pop >= C.CAP_POP_PARKS and leisure < pop / C.RESIDENTS_PER_PARK:
+        if self.parks_capped():
             caps["R"] = min(caps["R"], C.CAP_LEVEL)
         self.stats["demand_caps"] = {k: v for k, v in caps.items() if v < 1.0}
         return caps

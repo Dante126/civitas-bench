@@ -1535,8 +1535,8 @@ def open_requests(env, fleet: FleetState, pending=(), to: str = "mayor") -> list
     msgs = [env._local(m) for m in env.council.visible_to(env._name(to), since_month=since)]
     events = [{"month": m["month"], "kind": "message", "from": m["sender"], "to": m["to"], "text": m["text"]}
               for m in msgs]
-    events += [{"month": w.month, "kind": "message", "from": to, "to": r, "text": m.get("text", "")}
-               for m in pending for r in str(m.get("to", "")).split(",")]
+    events += [{"month": w.month, "kind": "message", "from": to, "to": m.get("to"), "text": m.get("text", "")}
+               for m in pending]
     for e in fleet.log:
         a = e.get("action") or {}
         if to != "mayor" and e["kind"] == "action" and e["role"] == to and e.get("ok") and e["month"] >= since:
@@ -3111,6 +3111,12 @@ def zone_line(purpose: str, sites: list[dict], strips: dict[str, dict], site: Ca
     return (text + f" ({ZONE_RULE})" if len(purpose) + len(text) + len(ZONE_RULE) <= 88 else text), own
 
 
+def strip_cost(purpose: str, strip: dict) -> float:
+    """A zone strip (a zone_<letter> site) at low density, industry and mixed use at the high-density price, as zone
+    charges them: planning's Ready sites zone lines."""
+    return strip["tiles"] * zone_price(zone_density(purpose[-1], "low"))
+
+
 def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = frozenset(),
                 prices: dict[str, Price] | None = None, funds: float | None = None) -> list[str]:
     """The Ready sites lines: per purpose the count and best site, or the short reason. A best site already shown
@@ -3172,7 +3178,7 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
             cost = None
             if own is not None:
                 shown[_where(own)] = purpose
-                cost = own["tiles"] * zone_price(zone_density(purpose[-1], "low"))     # planning: its strip's price
+                cost = strip_cost(purpose, own)                                      # planning: its strip's price
             lines.append(head + text + (price(purpose) if cost is None or role != "planning" or prices is None else
                                         f"; {money(cost)}" + (f" - you have {money(math.floor(funds))}"
                                                               if funds is not None and short_of(funds, cost) else "")))
@@ -3238,6 +3244,7 @@ class ToolBox:
         self._failed: dict[tuple, tuple[int, str]] = {}   # action key -> (call, error) since the last success
         self._invalid: dict[tuple, tuple[int, str]] = {}  # bad call key -> (call, error) since the last success
         self._funded: dict | None = None                  # _funded_sites() since the last successful action
+        self._depts: dict | None = None                   # dept_lists() since the last successful action (_bank_hint)
         self._refused: set[tuple] = set()                 # EARNED_CONFIRM calls refused this turn (_money_key), each
                                                           # until confirm: true overrides it once
         self.start_treasury = self.world.treasury         # at the turn's start: the loan guard (_loan_refusal)
@@ -3457,7 +3464,7 @@ class ToolBox:
         before, debt = w.struct.copy(), w.debt
         res = apply_action(w, self.role, {**args, "type": name}).to_dict()
         if res["ok"]:
-            self._funded = None
+            self._funded = self._depts = None
             self.took.append(Took(self.n_calls, name, dict(args), self._taken(name, args, before)))
             if name == "repay_loan":
                 self.repaid += debt - w.debt
@@ -4058,7 +4065,9 @@ class ToolBox:
             return ""
         try:
             from .planning import dezone_hint                 # planning imports this module
-            return dezone_hint(self.world, dept_lists(self.env))
+            if self._depts is None:
+                self._depts = dept_lists(self.env)
+            return dezone_hint(self.world, self._depts)
         except Exception:
             return ""
 

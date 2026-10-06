@@ -33,8 +33,9 @@ from ..sim import catalog as C
 from ..sim.grid import box_sum
 from .fmt import money
 from .tools import (AWAY_FROM_HOMES, BUILT_NAMES, DIRECTIONS, MAX_SITES, SiteList, Spot, _connected_roads, _empty_land,
-                    _riverbank_by_roads, _touching, _wanted, _where, edge_site, land_blocked, land_fix, road_cost,
-                    scarce_bank, short_of, site_price, zone_fit_rect, zone_line, zoning_cost)
+                    _riverbank_by_roads, _touching, _wanted, _where, claim_spots, dept_lists, edge_site, funded_sites,
+                    land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded, zone_fit_rect,
+                    zone_line, zoning_cost)
 
 PARK_RADIUS = 4            # World._compute_environment: park tiles within box_sum(.., 4) raise land value,
 PARK_STEP, PARK_MAX = 0.08, 0.3   # by 8 points each, at most 30 (4 park tiles in range)
@@ -57,24 +58,21 @@ def call(action: str, args: dict) -> str:
     return f"{action} {json.dumps(args, separators=(',', ':'))}"
 
 
-def leisure(w) -> int:
-    """Park tiles plus 6 per plaza, stadium and monument, as World.demand_caps counts them."""
-    return int((w.struct == C.PARK).sum()) + 6 * sum(w.n_buildings(s) for s in (C.PLAZA, C.STADIUM, C.MONUMENT))
-
-
 class Parks(NamedTuple):
-    have: int               # leisure()
+    have: int               # World.leisure_tiles()
     by_pop: int             # what the R demand cap asks for: one per RESIDENTS_PER_PARK residents
     want: int               # that, or one per HOMES_PER_PARK developed homes if more
-    capped: bool            # R demand capped for lack of parks now (World.demand_caps)
+    capped: bool            # R demand capped for lack of parks now (World.parks_capped, as demand_caps decides)
     soon: bool              # within CAP_NEAR of the population where the cap starts, short of by_pop
 
 
 def parks(w) -> Parks:
-    pop = w.metrics()["population"]
+    """The park tiles against the population, by the World's own cap helpers (leisure_tiles, parks_capped) on the
+    population the simulation reads (stats)."""
+    pop = w.stats.get("population", 0.0)
     homes = int((np.isin(w.struct, C.HOMES) & (w.level > 0)).sum())
-    have, by_pop = leisure(w), math.ceil(pop / C.RESIDENTS_PER_PARK)
-    capped = pop >= C.CAP_POP_PARKS and have < pop / C.RESIDENTS_PER_PARK
+    have, by_pop = w.leisure_tiles(), math.ceil(pop / C.RESIDENTS_PER_PARK)
+    capped = w.parks_capped()
     at_cap = max(by_pop, math.ceil(C.CAP_POP_PARKS / C.RESIDENTS_PER_PARK))
     soon = not capped and pop >= CAP_NEAR * C.CAP_POP_PARKS and have < at_cap
     return Parks(have, by_pop, max(by_pop, homes // HOMES_PER_PARK), capped, soon)
@@ -135,12 +133,10 @@ def park_site(w, funds: float | None = None, avoid=frozenset()) -> ParkSite | No
     return ParkSite(x1, y1, x2, y2, (x2 - x1 + 1) * (y2 - y1 + 1), reach)
 
 
-def parks_line(w, funds: float, avoid=frozenset()) -> list[str]:
-    """Planning's Ready sites line on parks: the park tiles against what the population asks for, the R demand cap
-    while it holds (or is near), and the best park block (park_site) with its price and call; [] while there is
-    no developed home, shop or office for a park to raise."""
-    p = parks(w)
-    site = park_site(w, funds, avoid)
+def parks_line(p: Parks, site: ParkSite | None) -> list[str]:
+    """Planning's Ready sites line on parks: the park tiles against what the population asks for (`p`), the R demand
+    cap while it holds (or is near), and the best park block (`site`: the view's, the Next line's too) with its price
+    and call; [] while there is no developed home, shop or office for a park to raise."""
     if site is None:
         return []
     cap = (f": R demand capped at +{C.CAP_LEVEL:g} until {p.by_pop}" if p.capped else
@@ -157,7 +153,7 @@ def cap_line(w) -> list[str]:
     caps = w.stats.get("demand_caps") or {}
     if not caps:
         return []
-    p, pop = parks(w), w.metrics()["population"]
+    p, pop = parks(w), w.stats.get("population", 0.0)
     linked = bool(w.facilities(C.TRAIN)) or bool(w.facilities(C.HARBOUR))
     why = ([f"parks {p.have} of {p.by_pop} tiles (yours: build_park)"] if p.capped else []) + (
         ["no train station or harbour (transport's)"] if pop >= C.CAP_POP_CONNECTION and not linked else [])
@@ -264,37 +260,39 @@ def bank_item(w, depts: dict, lists: dict | None = None) -> Item | None:
 
 
 def dezone_hint(w, depts: dict) -> str:
-    """For a failed dezone: the riverbank lot utilities waits for, when it waits for one (bank_item's dezone)."""
-    item = bank_item(w, depts)
-    return f"; the riverbank lot utilities waits for: {item.call}" if item and item.call.startswith("dezone") else ""
+    """For a failed dezone: the zoned riverbank lot utilities waits for (bank_item's dezone), when it waits for one."""
+    wanted = bank_purposes(w, depts)
+    xy = bank_lot(w, wanted[0]) if wanted else None
+    return "" if xy is None else f"; the riverbank lot utilities waits for: " + call(
+        "dezone", {"x1": xy[0], "y1": xy[1], "x2": xy[0], "y2": xy[1]})
 
 
 # ------------------------------------------------------------------ requests to planning
-def request_fix(env, dept: str, depts: dict, claims: dict, roads: list, lists: dict, text: str = "") -> str:
+def request_fix(w, dept: str, v: "View", text: str = "") -> str:
     """What planning can do for a department asking it for land, for its Open requests block: utilities' riverbank lot
     (bank_item's call); a first building blocked for lack of land (land_blocked): a lot at the town edge for one that
     must stay away from homes (edge_site), else what it needs (land_fix); a funded building whose lot is free
     (claim_spots): say where; else to reply where it can build or why not. Of several blocked buildings, the one the
     request (`text`) names. The late smokes (seeds 0-1, the region): utilities' bank
-    lots, police's jail and health's landfill and cemetery sites away from homes went unanswered every time."""
-    w = env.world
+    lots, police's jail and health's landfill and cemetery sites away from homes went unanswered every time. All from
+    the view (planning_view), computed once a briefing."""
     if dept == "mayor":
         return "your Next line has the calls: tell it what you did, or why not"
-    if dept == "utilities" and (item := bank_item(w, depts, lists)) is not None:
-        return f"{item.call} ({money(item.cost) if item.cost else 'free'})"
-    blocked = land_blocked(env, depts)
+    if dept == "utilities" and v.bank is not None:
+        return f"{v.bank.call} ({money(v.bank.cost) if v.bank.cost else 'free'})"
+    blocked = v.blocked
     if dept in blocked:
         named = lambda q: (site_price(w, dept, q).building if site_price(w, dept, q) else q.replace("_", " "))
         p = next((q for q in blocked[dept] if named(q).split()[-1] in text.lower()), blocked[dept][0])
         name = named(p)
         if p in AWAY_FROM_HOMES:
-            site = edge_site(w, roads)
+            site = edge_site(w, v.roads)
             return (f"its {name} needs a lot away from homes: leave ({site['x2']},{site['y2']}) free, the far end of "
                     f"road_extension {_where(site)}" if site else
                     f"its {name} needs a lot away from homes: extend a road into open land at the town edge and leave "
                     "its far end free")
         return f"its {name} needs {land_fix(w, dept, p) or 'a free roadside lot'}: leave or free (dezone) one"
-    spot = next((sp for k, sp in claims.items() if k[0] == dept), None)
+    spot = next((sp for k, sp in v.claims.items() if k[0] == dept), None)
     if spot is not None:
         return f"its {spot.building} lot ({spot.xy[0]},{spot.xy[1]}) is free: tell it, and zone around it"
     return "send_message where it can build (its Ready sites) or why not"
@@ -312,11 +310,6 @@ def strips_shown(lists: dict[str, SiteList]) -> dict[str, dict]:
     return strips
 
 
-def strip_cost(purpose: str, strip: dict) -> float:
-    """A zone strip at low density (industry and mixed use at the high-density price, as zone charges them)."""
-    return strip["tiles"] * zone_price(zone_density(purpose[-1], "low"))
-
-
 def _density(w, letter: str) -> str:
     if letter in ("I", "M") or not w.unlocked("high_density"):
         return "low"
@@ -325,40 +318,44 @@ def _density(w, letter: str) -> str:
     return "high"
 
 
-def zone_item(w, city: dict, strips: dict[str, dict], funds: float, avoid=frozenset()) -> tuple[Item | None, list[str]]:
+def zone_item(w, city: dict, lists: dict[str, SiteList], funds: float,
+              avoid=frozenset()) -> tuple[Item | None, list[str]]:
     """The zone type with the largest positive demand and fewer than WAITING_MAX zoned tiles waiting, on the strip its
-    Ready sites line shows, sized to `funds` (zone_fit_rect, sparing `avoid`); and the types with demand but no strip
-    (a road into open land opens one). (None, ...) when no type qualifies."""
+    Ready sites line shows (strips_shown), sized to `funds` (zone_fit_rect, sparing `avoid`); a type whose strip has
+    no tile left outside `avoid` gives way to the next. And the types with demand but no usable strip (a road into
+    open land opens one); a locked type (offices, mixed use before their milestone) is neither. (None, ...) when no
+    type qualifies."""
     zoned, dev = city.get("zoned_tiles") or {}, city.get("developed_tiles") or {}
+    strips = strips_shown(lists)
     blocked, cands = [], []
     for letter in ZONE_LETTERS:
         d = w.demand.get(letter, 0.0)
         waiting = zoned.get(letter, 0) - dev.get(letter, 0)
-        if d <= 0 or waiting >= WAITING_MAX:
+        lst = lists.get(f"zone_{letter}")
+        if d <= 0 or waiting >= WAITING_MAX or lst is None or (lst.short or "").startswith("locked"):
             continue
         if f"zone_{letter}" not in strips:
             blocked.append(letter)
             continue
         cands.append((d, -ZONE_LETTERS.index(letter), letter, waiting))
-    if not cands:
-        return None, blocked
-    d, _, letter, waiting = max(cands)
-    strip = strips[f"zone_{letter}"]
-    density = _density(w, letter)
-    args = {"zone": letter, "density": density, "x1": strip["x1"], "y1": strip["y1"], "x2": strip["x2"],
-            "y2": strip["y2"]}
-    price = zone_price(zone_density(letter, density))
-    fit = zone_fit_rect(w, args, funds if not short_of(funds, price) else math.inf, avoid)   # broke: the whole strip
-    if fit is None:
-        return None, blocked
-    (x1, y1, x2, y2), n, cost = fit
-    args.update(x1=x1, y1=y1, x2=x2, y2=y2)
-    if letter in ("I", "M"):
-        args.pop("density")
-    dens = "" if letter in ("I", "M") else f" {density} density"
-    return Item(f"zone {n} tiles {letter}{dens} (demand {d:+.2f}, {waiting} zoned tile{'s' * (waiting != 1)} "
-                f"waiting)", cost,
-                call("zone", args)), blocked
+    for d, _, letter, waiting in sorted(cands, reverse=True):
+        strip = strips[f"zone_{letter}"]
+        density = _density(w, letter)
+        args = {"zone": letter, "density": density, "x1": strip["x1"], "y1": strip["y1"], "x2": strip["x2"],
+                "y2": strip["y2"]}
+        price = zone_price(zone_density(letter, density))
+        fit = zone_fit_rect(w, args, funds if not short_of(funds, price) else math.inf, avoid)  # broke: whole strip
+        if fit is None:                                # every tile of it spared for others: no usable strip
+            blocked.append(letter)
+            continue
+        (x1, y1, x2, y2), n, cost = fit
+        args.update(x1=x1, y1=y1, x2=x2, y2=y2)
+        if letter in ("I", "M"):
+            args.pop("density")
+        dens = "" if letter in ("I", "M") else f" {density} density"
+        return Item(f"zone {n} tiles {letter}{dens} (demand {d:+.2f}, {waiting} zoned tile{'s' * (waiting != 1)} "
+                    f"waiting)", cost, call("zone", args)), sorted(blocked, key=ZONE_LETTERS.index)
+    return None, sorted(blocked, key=ZONE_LETTERS.index)
 
 
 def road_item(lists: dict[str, SiteList], why: str) -> Item | None:
@@ -375,13 +372,12 @@ def road_item(lists: dict[str, SiteList], why: str) -> Item | None:
 
 
 # ------------------------------------------------------------------ the Next line
-def away_item(env, depts: dict, lists: dict) -> Item | None:
+def away_item(w, blocked: dict[str, list[str]], lists: dict) -> Item | None:
     """A road into open land whose far end is away from homes (edge_site) while a first building that must stay away
     from homes is blocked for lack of land (land_blocked: police's jail, health's landfill or cemetery): build it and
     leave that end free. The late smokes: police asked for a jail site and health for landfill and cemetery sites at
-    the town edge; planning answered none."""
-    w = env.world
-    found = [(d, p) for d, ps in land_blocked(env, depts).items() for p in ps if p in AWAY_FROM_HOMES]
+    the town edge; planning answered none. `blocked`: land_blocked."""
+    found = [(d, p) for d, ps in blocked.items() for p in ps if p in AWAY_FROM_HOMES]
     roads = (lists.get("road_extension") or SiteList([], None, None)).sites
     site = edge_site(w, roads) if found else None
     if site is None:
@@ -395,27 +391,56 @@ def away_item(env, depts: dict, lists: dict) -> Item | None:
                           f"{site['y2']}) free")
 
 
-def planning_next(env, city: dict, lists: dict[str, SiteList], depts: dict, spots: list[Spot], funds: float,
-                  ask) -> str:
+class View(NamedTuple):
+    """What planning's briefing computes once (planning_view) and its Next line, Ready sites and Open requests blocks
+    share: one observation per priced department and what follows from it."""
+    depts: dict             # dept_lists
+    funded: dict            # funded_sites
+    claims: dict            # claim_spots: each funded building's own lot
+    lists: dict             # planning's site lists with its zone strips sparing those lots (spare_funded)
+    roads: list             # its road_extension sites
+    blocked: dict           # land_blocked: first buildings blocked for lack of land
+    avoid: set              # the claimed lots and scarce riverbank lots: zone and park calls spare them
+    bank: Item | None       # bank_item
+    away: Item | None       # away_item (None when bank_item is a road already)
+    parks: Parks
+    park: ParkSite | None   # park_site, sized to the funds bank / away leave: the parks line and the Next line's
+
+    @property
+    def spots(self) -> list:
+        return list(self.claims.values())
+
+
+def planning_view(env, lists: dict[str, SiteList], funds: float) -> View:
+    w = env.world
+    depts = dept_lists(env)
+    funded = funded_sites(w, depts)
+    claims = claim_spots(funded)
+    spared = spare_funded(lists, list(claims.values()))
+    roads = lists["road_extension"].sites if "road_extension" in lists else []
+    blocked = land_blocked(env, depts)
+    avoid = {t for sp in claims.values() for t in sp.tiles} | scarce_bank(w)
+    bank = bank_item(w, depts, spared)
+    away = None if bank is not None and bank.road else away_item(w, blocked, spared)
+    left = funds - sum(i.cost for i in (bank, away) if i is not None)
+    return View(depts, funded, claims, spared, roads, blocked, avoid, bank, away, parks(w), park_site(w, left, avoid))
+
+
+def planning_next(env, city: dict, v: View, funds: float, ask) -> str:
     """Planning's Next line, every turn: up to NEXT_ITEMS builds that raise its score most now, in this order, each
     priced with its exact call: the riverbank lot utilities' blocked pump or outlet waits for (bank_item); a road
-    leaving a lot away from homes for a blocked jail, landfill or cemetery (away_item); parks while
-    R demand is capped for lack of them, or soon will be (park_site); the zone type demand asks for most (zone_item, on
-    its Ready sites strip, sized to the funds left); parks while under one per HOMES_PER_PARK homes; a road into open
-    land (road_item) when a type with demand has no strip left, nothing else is to build, or the funds left cover it.
-    When the first is short of the funds, what to ask (mayor_ask's `ask`, for planning's road) or to say so in the
-    end_turn report. `spots`: claim_spots' lots of funded departments, which the zone and park calls spare (scarce
-    riverbank lots too). Each later item is sized and priced with what the earlier ones leave."""
+    leaving a lot away from homes for a blocked jail, landfill or cemetery (away_item); parks while R demand is capped
+    for lack of them, or soon will be (the view's park, the parks line's); the zone type demand asks for most
+    (zone_item, on its Ready sites strip, sized to the funds left); parks while under one per HOMES_PER_PARK homes; a
+    road into open land (road_item) when a type with demand has no usable strip, nothing else is to build, or the
+    funds left cover it. Each later item is sized and priced with what the earlier ones leave. When the items shown
+    cost more than the funds together: the difference to ask the mayor for when mayor_ask (`ask`) says planning may
+    ask now, else to say so in the end_turn report. The mayor's needs line prices only planning's road and zoning all
+    it opens (road_build), so the two amounts can differ: making it follow the Next line would change funding_gaps,
+    which the money guards read on the scripted fleet's turns too."""
     w = env.world
-    avoid = {t for sp in spots for t in sp.tiles} | scarce_bank(w)
-    items: list[Item] = []
-    if (bank := bank_item(w, depts, lists)) is not None:
-        items.append(bank)
-    if not any(i.road for i in items) and (away := away_item(env, depts, lists)) is not None:
-        items.append(away)
-    p = parks(w)
-    left = funds - sum(i.cost for i in items)
-    park = park_site(w, left, avoid)
+    items = [i for i in (v.bank, v.away) if i is not None]
+    p, park = v.parks, v.park
     park_item = None if park is None else Item(
         f"{park.tiles} park tile{'s' * (park.tiles > 1)} by {park.homes} homes (parks {p.have} of {p.want}"
         + (f"; R demand capped at +{C.CAP_LEVEL:g} until {p.by_pop}" if p.capped else "") + ")",
@@ -423,13 +448,13 @@ def planning_next(env, city: dict, lists: dict[str, SiteList], depts: dict, spot
     if park_item and (p.capped or p.soon):
         items.append(park_item)
     left = funds - sum(i.cost for i in items)
-    zone, blocked = zone_item(w, city, strips_shown(lists), left, avoid)
+    zone, blocked = zone_item(w, city, v.lists, left, v.avoid)
     if zone is not None:
         items.append(zone)
     if park_item and not (p.capped or p.soon) and p.have < p.want:
         items.append(park_item)
     if any(w.demand.get(k, 0.0) > 0 for k in ZONE_LETTERS) and not any(i.road for i in items):
-        road = road_item(lists, f"no free strip for {'/'.join(blocked)}" if blocked else "more land to zone")
+        road = road_item(v.lists, f"no free strip for {'/'.join(blocked)}" if blocked else "more land to zone")
         if road is not None and (blocked or not items or not short_of(funds - sum(i.cost for i in items), road.cost)):
             items.append(road)
     if not items:
@@ -439,10 +464,10 @@ def planning_next(env, city: dict, lists: dict[str, SiteList], depts: dict, spot
     shown = items[:NEXT_ITEMS]
     text = lambda i: f"{i.text} ({money(i.cost) if i.cost else 'free'}): {i.call}"
     line = "- Next: " + text(shown[0]) + "".join(f"; then {text(i)}" for i in shown[1:])
-    first = shown[0]
-    if short_of(funds, first.cost):
+    if short_of(funds, total := sum(i.cost for i in shown)):
+        lack = math.ceil(total - funds)
         line += f"; you have {money(math.floor(funds))}" + (
-            f": ask the mayor for {money(ask.amount)} (send_message)" if ask.ok and ask.amount else
+            f": ask the mayor for {money(lack)} for these (send_message)" if ask.ok else
             ": say what you need in your end_turn report")
     return line
 
