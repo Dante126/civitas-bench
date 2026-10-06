@@ -99,6 +99,35 @@ def test_a_short_episode_runs_end_to_end(tmp_path, monkeypatch):
     assert json.loads(json.dumps(rebuilt)) == rep
 
 
+def test_frames_record_the_needs_the_mayor_saw(tmp_path, monkeypatch):
+    """Each frame of a month the agents act in carries `needs` (FleetState.needs): every department's kind and top-up
+    as the mayor's briefing computed them that month (its Departments block), so the report's money aim reads the
+    needs record; other months and a line-up without fleet agents have none."""
+    from civitas.fleet import briefing
+    from civitas.fleet.tools import KINDS
+    seen, real = {}, briefing.funding_gaps
+
+    def spy(env, fleet):
+        f = real(env, fleet)
+        ups = {i.dept: i.amount for i in f.to_fund}
+        seen.setdefault(env.world.month, {d: [m.kind, ups.get(d, 0)] for d, m in f.depts.items()})
+        return f
+    monkeypatch.setattr(briefing, "funding_gaps", spy)
+    s, env, d, traj = _run(tmp_path, monkeypatch, _cfg(7))
+    frames = [json.loads(x) for x in (d / "frames.jsonl").read_text().splitlines()]
+    needs = {f["month"]: f["needs"] for f in frames if "needs" in f}
+    assert list(needs) == [0, 3, 6] == list(seen)
+    for m, n in needs.items():
+        assert list(n) == list(TURN_ORDER[1:]) and all(k in KINDS and up >= 0 and cov in (0, 1)
+                                                       for k, up, cov in n.values())
+        assert {dept: v[:2] for dept, v in n.items()} == seen[m]
+    assert json.loads((d / "fleet_report.json").read_text())["collaboration"]["components"]["money_aim"][
+        "basis"] == "needs"
+    base = apply_cli_overrides(load_config("configs/baseline.toml"), sets=["game.months=4"])
+    d = _run(tmp_path / "base", monkeypatch, base)[2]
+    assert not any("needs" in json.loads(x) for x in (d / "frames.jsonl").read_text().splitlines())
+
+
 def test_every_action_goes_through_the_toolbox(tmp_path, monkeypatch):
     def direct(*a, **k):
         raise AssertionError("env.apply ran an action itself")

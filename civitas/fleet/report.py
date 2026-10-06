@@ -75,6 +75,10 @@ ASKED = re.compile(rf"\${NUMBER}")
 FOLLOW_WEIGHT = {"met": 1.0, "partial": 0.6, "acted": 0.5, "replied": 0.25, "unanswered": 0.0}
 ANSWERED = ("met", "partial", "acted", "replied")
 COLLAB_MIN = 3
+# money aim with a needs record (frames' `needs`, FleetState.needs): a top-up went where it was needed when its
+# department's kind that month was one of AIM_KINDS, or "another" building the to-fund line's cover clause named
+# (fund_cover), up to what its needs line lacked (top_up); or when it answered the department's money request
+AIM_KINDS = ("first/supply", "growth")
 UNANSWERED_SHOWN, UNANSWERED_CHARS = 3, 100
 
 
@@ -546,9 +550,13 @@ def collaboration(c: dict) -> dict:
       replied 0.25, unanswered 0);
     - hand-offs: the share of planning's roads, freed lots and cleared land (OPENERS) another department built on
       within the window (collab's handoffs; openings whose window hasn't passed count only once used);
-    - money aim: the share of the mayor's top-up dollars that answered the department's money request in the window
-      before (part of its thread). Whether a top-up was for a first building or supply can't be told from frames, and
-      "went into a build within the window" was ~100% on every 120-month LLM run, so neither counts.
+    - money aim: the share of the mayor's top-up dollars (take-backs left out) that went where they were needed
+      (_money_aim): with the frames' needs record (fleet runs since it was added), to a department's first building or
+      supply, planning's road, or another building the to-fund line's money covered, up to what its needs line lacked
+      that month, or in answer to its money request; without the record (older runs; `basis` "messages") only the
+      dollars that answered the department's money request in the window before (part of its thread). Departments
+      ask only for what the mayor can fund and the mayor funds first buildings unasked, so the message rule alone read
+      43 / 37 on the 120-month region run of 2026-10-05 against 69 for the scripted fleet.
     Per role: requests it sent (asked) and got answered, requests sent to it (asked_of) and it answered, its
     responsiveness (as the one asked) and follow-through (as the one asking), hand-offs (planning: its openings used;
     others: builds on land planning opened). `unanswered`: the UNANSWERED_SHOWN oldest unanswered requests."""
@@ -565,7 +573,7 @@ def collaboration(c: dict) -> dict:
     gifts = [e for e in events if e["kind"] == "money" and e["from"] == "mayor" and not e.get("take_back")
              and e["to"] in roles and e["to"] != "mayor"]
     given = sum(g["amount"] for g in gifts)
-    aimed = sum(g["amount"] for g in gifts if g.get("thread") is not None)
+    aimed, by_need, by_ask = _money_aim(gifts)
     comps = {
         "responsiveness": {"score": _share(answered(closed), len(closed), len(closed)), "n": len(closed),
                            "answered": answered(closed)},
@@ -573,7 +581,9 @@ def collaboration(c: dict) -> dict:
                            "by_status": {s: sum(t["status"] == s for t in closed) for s in FOLLOW_WEIGHT}},
         "handoffs": {"score": _share(n_used, len(opens), len(opens)), "n": len(opens), "used": n_used},
         "money_aim": {"score": _share(aimed, given, len(gifts)), "n": len(gifts), "aimed": round(aimed, 2),
-                      "given": round(given, 2)}}
+                      "given": round(given, 2), "basis": "needs" if c.get("needs_from") is not None
+                      and c["needs_from"] <= last else "messages",
+                      "needed": round(by_need, 2), "asked": round(by_ask, 2)}}
     vals = [v["score"] for v in comps.values() if v["score"] is not None]
     per = {}
     for r in roles:
@@ -591,6 +601,27 @@ def collaboration(c: dict) -> dict:
             "requests": len(threads), "open": len(threads) - len(closed), "window": window,
             "unanswered": [{"month": t["month"], "from": t["from"], "to": t["to"],
                             "text": cut(t["text"], UNANSWERED_CHARS)} for t in waiting[:UNANSWERED_SHOWN]]}
+
+
+def _money_aim(gifts: list[dict]) -> tuple[float, float, float]:
+    """(aimed, by need, by request) dollars of the mayor's top-ups `gifts` (collab events, in turn order): a top-up
+    that answered its department's money request (part of its thread) counts in full; else, when it carries its
+    department's needs record that month (`need`: [kind, top_up, covered]) and the kind is one of AIM_KINDS or a
+    covered "another", it counts up to what the needs line still lacked (top_up less that month's earlier top-ups to
+    the department). A top-up without a record (an older run, a month the record is missing) counts only by the
+    request."""
+    left: dict[tuple, float] = {}               # (month, dept) -> what its needs line still lacks
+    aimed = by_need = by_ask = 0.0
+    for g in gifts:
+        need, amt, key = g.get("need"), g["amount"], (g["month"], g["to"])
+        room = left.get(key, need[1] if need else 0)
+        if g.get("thread") is not None:
+            aimed, by_ask = aimed + amt, by_ask + amt
+        elif need and (need[0] in AIM_KINDS or need[0] == "another" and need[2]):
+            part = min(amt, room)
+            aimed, by_need = aimed + part, by_need + part
+        left[key] = max(0.0, room - amt)
+    return aimed, by_need, by_ask
 
 
 def collab_as_of(c: dict, month: int) -> dict:
@@ -798,8 +829,7 @@ def _collab_lines(co: dict | None) -> list[str]:
              f"{st[s]} {s} x {FOLLOW_WEIGHT[s]:g}" for s in FOLLOW_WEIGHT) + " |",
          f"| hand-offs | {_score(cp['handoffs']['score'])} | {cp['handoffs']['used']} of {cp['handoffs']['n']} "
          f"planning roads / freed lots built on by another department |",
-         f"| money aim | {_score(cp['money_aim']['score'])} | {money(cp['money_aim']['aimed'])} of "
-         f"{money(cp['money_aim']['given'])} in {cp['money_aim']['n']} top-ups answered the department's request |"]
+         f"| money aim | {_score(cp['money_aim']['score'])} | {_aim_text(cp['money_aim'])} |"]
     if co["roles"]:
         L += ["", "| department | asked | answered by others | asked of it | answered for others | responsiveness "
                   "| follow-through | hand-offs |", "|---|" + "---:|" * 7]
@@ -812,6 +842,15 @@ def _collab_lines(co: dict | None) -> list[str]:
         L += ["", "Longest unanswered:", ""]
         L += [f"- month {u['month']}, {u['from']} -> {u['to']}: \"{_cell(u['text'])}\"" for u in co["unanswered"]]
     return L
+
+
+def _aim_text(ma: dict) -> str:
+    """The money aim row's "from" cell: what the aimed dollars went to, by its basis (collaboration())."""
+    head = f"{money(ma['aimed'])} of {money(ma['given'])} in {ma['n']} top-ups"
+    if ma.get("basis") != "needs":
+        return f"{head} answered the department's request (message-based: this run has no needs record)"
+    return (f"{head} went to a first building, supply, planning's road or another building the money covered "
+            f"({money(ma['needed'])}), or answered the department's request ({money(ma['asked'])})")
 
 
 def _body(rep: dict, h: str = "##") -> list[str]:

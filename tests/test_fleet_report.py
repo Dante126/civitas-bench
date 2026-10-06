@@ -2,7 +2,7 @@
 import json
 
 from civitas.bench.collab import collab
-from civitas.fleet.report import _collab_lines, collaboration, run_collaboration
+from civitas.fleet.report import _collab_lines, collab_as_of, collaboration, run_collaboration
 
 ROLES = ["mayor", "planning", "utilities", "transport", "police", "fire", "health", "education"]
 
@@ -51,7 +51,8 @@ def test_score_components_and_rows():
     assert cp["follow_through"]["score"] == 52.5                                       # (1 + 0.6 + 0.5 + 0) / 4
     assert cp["follow_through"]["by_status"] == {"met": 1, "partial": 1, "acted": 1, "replied": 0, "unanswered": 1}
     assert cp["handoffs"] == {"score": 33.3, "n": 3, "used": 1}                       # 1 of planning's 3 roads
-    assert cp["money_aim"] == {"score": 85.7, "n": 3, "aimed": 3000.0, "given": 3500.0}   # transport's $500 unasked
+    assert cp["money_aim"] == {"score": 85.7, "n": 3, "aimed": 3000.0, "given": 3500.0,   # transport's $500 unasked
+                               "basis": "messages", "needed": 0.0, "asked": 3000.0}        # no needs record
     assert co["score"] == 61.6                                                         # (75 + 52.5 + 33.3 + 85.7) / 4
     r = co["roles"]
     assert r["mayor"] == {"asked": 0, "answered": 0, "asked_of": 3, "answered_for": 2, "responsiveness": 66.7,
@@ -89,6 +90,83 @@ def test_requests_outside_the_game_do_not_count():
     frames = [frame(1, [msg(0, "health", "south.mayor", "Please send $2,000"), msg(0, "health", "health", "need $5")]),
               frame(9)]
     assert collaboration(collab(frames, ROLES))["requests"] == 0
+
+
+NEEDS = {"planning": ["growth", 300, 1], "utilities": ["nothing", 0, 0], "transport": ["idle", 0, 0],
+         "police": ["first/supply", 2500, 1], "fire": ["another", 2500, 1], "health": ["another", 2000, 0],
+         "education": ["nothing", 0, 0]}
+
+
+def _need_frames(needs=NEEDS):
+    """act_every 1. Education asks the mayor for $1,000 in month 0. Frame 1 carries the needs the mayor saw in month 1
+    (FleetState.needs); its top-ups that month (in frame 2): police $2,000 then $1,000 for a first station short
+    $2,500, planning $300 for its road, fire $2,500 for another station the money covers, health $2,000 for another
+    clinic it doesn't, transport $500 with idle money and education the $1,000 it asked for with nothing to build.
+    Month 3 has no record: police's $1,000 then counts only by a request (it made none)."""
+    gifts = [("police", 2000), ("police", 1000), ("planning", 300), ("fire", 2500), ("health", 2000),
+             ("transport", 500), ("education", 1000)]
+    f1 = {**frame(1, [msg(0, "education", "mayor", "need $1,000 for a school")]),
+          **({"needs": needs} if needs else {})}
+    return [frame(0), f1,
+            frame(2, [], [turn(1, "mayor", *(res("allocate_budget", department=d, amount=a) for d, a in gifts),
+                               res("allocate_budget", department="police", amount=-400))]),     # a take-back: left out
+            frame(3), frame(4, [], [turn(3, "mayor", res("allocate_budget", department="police", amount=1000))]),
+            frame(9)]
+
+
+def test_money_aim_reads_the_needs_record():
+    """With a needs record a top-up is aimed when it went to a first building / supply, growth or another building the
+    money covered, up to what the needs line lacked that month, or answered the department's request; else not."""
+    c = collab(_need_frames(), ROLES, act_every=1)
+    assert c["needs_from"] == 1 and collaboration(collab_as_of(c, 0))["components"]["money_aim"]["basis"] == "messages"
+    police = [e for e in c["events"] if e["kind"] == "money" and "police" in (e["to"], e["from"]) and e["month"] == 1]
+    assert police[0]["need"] == ["first/supply", 2500, 1] and "need" not in police[-1]       # the take-back
+    ma = collaboration(c)["components"]["money_aim"]
+    # police 2,000 + 500 of its 1,000 (short 2,500), planning 300, fire 2,500 (covered), education 1,000 (asked);
+    # health's uncovered 2,000, transport's idle 500 and month 3's unrecorded 1,000 miss
+    assert ma == {"score": round(100 * 6300 / 10300, 1), "n": 8, "aimed": 6300.0, "given": 10300.0, "basis": "needs",
+                  "needed": 5300.0, "asked": 1000.0}
+    md = "\n".join(_collab_lines(collaboration(c)))
+    assert ("| money aim | 61.2 | $6,300 of $10.3k in 8 top-ups went to a first building, supply, planning's road or "
+            "another building the money covered ($5,300), or answered the department's request ($1,000) |") in md
+
+
+def test_money_aim_without_a_needs_record_is_message_based():
+    """A run from before the record (no `needs` in its frames) keeps the message rule, and the report says so."""
+    co = collaboration(collab(_need_frames(needs=None), ROLES, act_every=1))
+    ma = co["components"]["money_aim"]
+    assert collab(_need_frames(needs=None), ROLES, act_every=1)["needs_from"] is None
+    assert ma == {"score": round(100 * 1000 / 10300, 1), "n": 8, "aimed": 1000.0, "given": 10300.0,
+                  "basis": "messages", "needed": 0.0, "asked": 1000.0}
+    assert "answered the department's request (message-based: this run has no needs record) |" in \
+        "\n".join(_collab_lines(co))
+
+
+def test_money_aim_reads_a_region_citys_needs():
+    """A region frame nests each city's needs under `cities`; collab(city=...) reads that city's."""
+    frames = [{"month": 0, "region": True, "council": [], "turns": [],
+               "cities": {"north": {"needs": NEEDS}, "south": {"needs": {"police": ["idle", 0, 0]}}}},
+              {"month": 1, "region": True, "council": [], "turns": [],
+               "cities": {c: {"turns": [turn(0, "mayor", res("allocate_budget", department="police", amount=2500))]}
+                          for c in ("north", "south")}}]
+    aim = {c: collaboration(collab(frames, ROLES, act_every=1, city=c, external=False))["components"]["money_aim"]
+           for c in ("north", "south")}
+    assert aim["north"]["needed"] == 2500.0 and aim["south"]["needed"] == 0.0
+    assert aim["north"]["basis"] == aim["south"]["basis"] == "needs"
+
+
+def test_a_region_frame_nests_each_fleet_citys_needs():
+    """A region frame carries `needs` in the frame of each city with a fleet state (CivitasEnv.frame), not at the top."""
+    from civitas.config import game_config, load_config, scoring_config
+    from civitas.core.env import make_env
+    from civitas.fleet.memory import FleetState
+    cfg = load_config("configs/region.toml")
+    game = game_config(cfg, 0)
+    env = make_env(game, scoring_config(cfg, game))
+    FleetState.of(env.envs["north"])
+    f = env.frame()
+    assert "needs" not in f and "needs" not in f["cities"]["south"]
+    assert set(f["cities"]["north"]["needs"]) == set(ROLES[1:])
 
 
 def test_run_collaboration_reads_a_run_folder(tmp_path):

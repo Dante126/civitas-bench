@@ -16,6 +16,10 @@ Matching, inside a window of 2 x act_every months after the request (turn order 
   recipient messages the sender back;
 - else unanswered, or open while the window hasn't passed (a live run);
 - the outcome is the requester's first build after the response, inside the window.
+
+With fleet agents each frame of a month the agents act in also carries `needs` (FleetState.needs): what each
+department's money was for as the mayor's Departments block showed it that month. A top-up then carries its
+department's record as `need` ([kind, top_up, covered]), which the report's money aim reads (fleet/report.py).
 """
 from __future__ import annotations
 
@@ -119,16 +123,29 @@ def _local(frame: dict, city: str | None) -> tuple[list, list]:
     return council, turns
 
 
+def _needs(frame: dict, city: str | None) -> dict | None:
+    """The frame's `needs` record (FleetState.needs: {dept: [kind, top_up, covered]}, what the mayor's Departments
+    block showed at the start of the frame's month), one city's in a region frame; None without (no fleet, a month the
+    agents don't act, a run from before the record)."""
+    if city is not None and "cities" in frame:
+        frame = (frame["cities"] or {}).get(city) or {}
+    n = frame.get("needs")
+    return n if isinstance(n, dict) and n else None
+
+
 def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str | None = None,
            external: bool = True) -> dict:
     """The events, threads and per-role stats of a run's frames (see the module doc). For one city of a region run
     (external=True) also that city's deals and its messages with other cities (city_external)."""
     order = {r: i for i, r in enumerate(roles)}
     events: list[dict] = []
+    needs: dict[int, dict] = {}
     last = 0
     for f in frames:
         last = max(last, int(f.get("month", 0)))
         council, turns = _local(f, city)
+        if n := _needs(f, city):
+            needs[int(f.get("month", 0))] = n
         for m in council:
             to, text = str(m.get("to") or "all"), str(m.get("text") or "")
             events.append({"month": int(m.get("month", 0)), "kind": "message", "from": m.get("sender"), "to": to,
@@ -151,6 +168,8 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
                         events.append({"month": month, "kind": "money", "from": role if amt > 0 else dept,
                                        "to": dept if amt > 0 else role, "amount": abs(amt), "text": r.get("message", ""),
                                        "tile": None, "take_back": amt < 0})
+                        if amt > 0 and month in needs and dept in needs[month]:
+                            events[-1]["need"] = needs[month][dept]
                     continue
                 tile = action_tile(a)
                 if typ.startswith(BUILDS) or typ in ("zone", "dezone", "bulldoze", "demolish"):
@@ -171,6 +190,7 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
             if events[eid]["thread"] is None:
                 events[eid]["thread"] = i
     out = {"roles": roles, "act_every": act_every, "last_month": last, "window": window,
+           "needs_from": min(needs, default=None),      # the first month with a needs record (None: no record)
            "events": [{k: v for k, v in e.items() if k != "tiles" or v} for e in events],
            "threads": threads, "handoffs": handoffs(events, key, window), "stats": _stats(roles, events, threads)}
     if city is not None and external and any("cities" in f for f in frames):

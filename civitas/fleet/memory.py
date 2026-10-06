@@ -126,6 +126,24 @@ class FleetState:
         for text in w.last_events:
             self.record(w.month - 1, "city", "event", text=text)
 
+    def needs(self, env) -> dict | None:
+        """The department needs the mayor's Departments block shows this month (tools.funding_gaps), for the frame's
+        `needs` key (CivitasEnv.frame): {dept: [kind, top_up, covered]} per department in the game, kind one of
+        tools.KINDS, top_up what its needs line lacks (0 without one), covered 1 when the to-fund line's cover clause
+        (fund_cover) names it. A frame of month M is written before month M's turns, so it is what the mayor sees
+        that month (the mayor acts first). Only in months the agents act (act_every) and with a mayor in the game;
+        None otherwise or on any error (a frame must never end a run). Read-only: report-only (the collaboration
+        score's money aim), never shown to agents. About 5-10 ms a call."""
+        if "mayor" not in env.roles or not env.acts_this_month("mayor"):
+            return None
+        from .tools import fund_cover, funding_gaps      # tools imports this module
+        try:
+            f = funding_gaps(env, self)
+            ups, cover = {i.dept: i.amount for i in f.to_fund}, set(fund_cover(f))
+            return {d: [m.kind, ups.get(d, 0), int(d in cover)] for d, m in f.depts.items()}
+        except Exception:
+            return None
+
     def history(self, kind: str | None = None, months: int | None = 3, role=None,
                 now: int | None = None) -> list[dict]:
         """Log entries from months `> now - months` (`now` defaults to the newest logged month), newest last,

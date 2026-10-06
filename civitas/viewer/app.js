@@ -581,7 +581,12 @@ function compTip(k, row, sc) {
     return `Follow-through: the requests weighted by how far they were met (${wts}).\n${row[1]} requests: ${keys.map((s, j) => `${row[2 + j]} ${SC_STATUS[s] || s}`).join(", ")}.${na}`;
   }
   if (k === "handoffs") return `Hand-offs: the share of planning's roads, freed lots and cleared land another department built on within ${w} months.\n${row[1]} of ${row[2]} built on.${na}`;
-  return `Money aim: the share of the mayor's top-up dollars that answered the department's own money request.\n${fmt$(row[1])} of ${fmt$(row[2])} in ${row[3]} top-ups.${na}`;
+  // fleet/report.py collaboration(): needs-based when the frames record what the mayor's Departments block showed
+  const ma = (sc.components || {}).money_aim || {};
+  const def = ma.basis === "needs"
+    ? "the share of the mayor's top-up dollars that went where they were needed: a department's first building or supply, planning's road, or another building the money covered (up to what it lacked that month), or an answer to its money request."
+    : "the share of the mayor's top-up dollars that answered the department's own money request (message-based: this run has no needs record).";
+  return `Money aim: ${def}\n${fmt$(row[1])} of ${fmt$(row[2])} in ${row[3]} top-ups.${na}`;
 }
 const SCORE_TIP = (sc) => `Teamwork: the mean of the four components with at least ${sc.min_cases} cases each, from the start of the run to this month. A request counts once it is answered or its ${sc.window}-month window has passed. Hover a component for its definition and counts.`;
 // the score over the run on an auto-scaled band: solid up to the month on show (a tick marks it), faint after it

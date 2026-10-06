@@ -1252,8 +1252,19 @@ months, the Team tab's "open") is left out. There are four components:
 - **hand-offs**: the share of planning's roads, freed lots and cleared land that another
   department built on within the window. Openings still inside their window count only once
   used.
-- **money aim**: the share of the mayor's top-up dollars that answered that department's
-  money request (frames can't tell a top-up for a first building or supply)
+- **money aim**: the share of the mayor's top-up dollars that went where they were needed.
+  A top-up counts when it went to a department's first building or supply, planning's road,
+  or another building the money covered (the kinds of the mayor's Departments block and the
+  to-fund line's cover clause), up to what the department lacked that month, or when it
+  answered the department's money request. Take-backs are left out. The needs come from
+  `frames.jsonl`: with fleet agents, each frame of a month the agents act in carries
+  `needs`, `{department: [kind, top_up, covered]}` as the mayor's briefing computed them
+  that month (`FleetState.needs`, from `funding_gaps()`; per city in a region frame; report
+  only, agents never see it). A run without that record (scripted line-ups, runs from before
+  it) keeps the old rule, the dollars that answered a money request, and the report says
+  "message-based: this run has no needs record". Since departments ask only for what the
+  mayor can fund and the mayor funds first buildings unasked, the message rule alone read 43
+  / 37 on the 120-month region run of 2026-10-05.
 
 The score is the mean of the components that have at least 3 cases. A component with fewer
 is n/a, and so is the score when every component is. `fleet_report.json` has it under
@@ -1264,9 +1275,13 @@ responsiveness, follow-through, hand-offs), then lists the oldest unanswered req
 report has one per city; requests to another city are left out. On a finished run folder,
 `fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env. The
 viewer shows it too, at the playhead (Team tab, below).
-Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
-84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 57.2 (v17,
-seed 0), then 74.0 / 76.6 (v19) and 64.8 / 77.0 (v23, seeds 0 / 1). A reply is no request of
+Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 70.5 ± 2.0 (seed 0: 68.0; responsiveness
+84, follow-through 59, hand-offs 48, money aim 81.5). With the message-based money aim it was
+67.2 ± 1.7 (seed 0 64.9, money aim 69). The stored LLM runs below have no needs record and
+keep the message rule; rebuilt offline from the mayors' to-fund lines, the 2026-10-05 region
+run's money aim would read 92 / 89 (teamwork 74.5 / 73.6) and v23's 99.9 / 100.
+On the 120-month trinity runs: 57.2 (v17, seed 0), then 74.0 / 76.6 (v19) and 64.8 / 77.0
+(v23, seeds 0 / 1). A reply is no request of
 its own (`collab.replies`): a message answering, within the window, a request from its
 recipient, or a mayor's message with a money decision ("approved", "unable to fund",
 `collab.DECISION`, which also covers answers to end_turn reports); a money ask back to the mayor
@@ -1625,6 +1640,8 @@ the first long run with the mayor's Open requests block, departments asking only
   Region block every turn. The Region view has still not shown real data.
 - **Weak spots:** south health 50.6, south police 54.8, transport 63–66 in both cities. Money aim (33–43) is low
   partly by construction: departments now ask only when the mayor can fund it, so many top-ups answer no message.
+  Money aim now reads the needs the mayor saw (frames' `needs`); this run predates that record and keeps the
+  message rule, and rebuilt offline from its mayors' to-fund lines it would read 92 / 89.
 
 **v20** (2026-09-29, main at c2947f0, adding the mayor money picture from
 `docs/plans/2026-09-29-mayor-money.md`: a Finances split, a need-ordered Departments block with
@@ -1689,7 +1706,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 
 **Hand-off beams** (toolbar ⇢, key <kbd>B</kbd>, on by default) draw the land planning handed over on the city itself, in both the pixel and the 3D view. A hand-off is another department's build within 2 tiles of an earlier planning road, dezone or clearance, inside the window. When one happens, planning's road or lot glows, a light arcs from it to the new building, and the building bursts with "road → school". The hand-offs of the last window stay as arcs while you scrub, and the Team tab lists them (📍 flies there). The v23 seed-1 run has 72, most of them a road and then a school, power plant, pump or police station.
 
-**Teamwork score.** A strip at the top of the tab shows the collaboration score (the fleet report's "Collaboration score", see [Agent fleets](#agent-fleets)) as the run stood at the playhead: the overall score, the four components as small bars (n/a greyed out under 3 cases; hover one for its definition and counts, e.g. "95 of 165 requests answered") and a sparkline over the months. A request counts once it is answered or its window has passed, so the score at month m is the one a live run showed then (one gap: a money request partly funded by then and met later counts as met). Each node reads its department's responsiveness as the one asked ("answers 59%", or "answers 2 of 2" under 3 cases), the left panel's Departments list ends with a Teamwork row (click it for the Team tab), and in the Region view a strip gives each city's score and, between the cities, the asks answered and deal offers accepted, with each city's score in the city table. The collab response carries it as `score` (`fleet/report.py:collab_score`: the report's numbers plus `series`, one entry per frame month; `region_score` for `?region=1`).
+**Teamwork score.** A strip at the top of the tab shows the collaboration score (the fleet report's "Collaboration score", see [Agent fleets](#agent-fleets)) as the run stood at the playhead: the overall score, the four components as small bars (n/a greyed out under 3 cases; hover one for its definition and counts, e.g. "95 of 165 requests answered"; money aim's says whether it is needs-based or message-based) and a sparkline over the months. A request counts once it is answered or its window has passed, so the score at month m is the one a live run showed then (one gap: a money request partly funded by then and met later counts as met). Each node reads its department's responsiveness as the one asked ("answers 59%", or "answers 2 of 2" under 3 cases), the left panel's Departments list ends with a Teamwork row (click it for the Team tab), and in the Region view a strip gives each city's score and, between the cities, the asks answered and deal offers accepted, with each city's score in the city table. The collab response carries it as `score` (`fleet/report.py:collab_score`: the report's numbers plus `series`, one entry per frame month; `region_score` for `?region=1`).
 
 Hover a node or edge for its numbers, and click one to filter the thread list under the graph. Each thread is a request, its response (money, a reply, or an action near the tiles it named) and its outcome (the requester's next build). Click a thread's month to jump there, or its 📍 to fly to the building. ⤢ Expand opens the same view full-screen.
 
@@ -1715,7 +1732,7 @@ Hitting the per-turn action cap doesn't count. The tab shows these rates for the
 ### Output files (`runs/<run_id>/`)
 
 - `meta.json`: config, agents, map size, natural resources
-- `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council). The viewer replays these.
+- `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council; with fleet agents also `needs` in the months they act, read by the collaboration score's money aim). The viewer replays these.
 - `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
 - `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, collaboration score, coaching hints (see [Agent fleets](#agent-fleets)); in a region, one section per city with fleet agents

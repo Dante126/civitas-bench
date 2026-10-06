@@ -195,7 +195,7 @@ class CivitasEnv:
     def frame(self, turns: list[dict] | None = None, scores: dict | None = None) -> dict:
         w = self.world
         q = lambda a: "".join(str(int(v)) for v in np.clip(a * 9.999, 0, 9).astype(int).ravel())
-        return {
+        f = {
             "month": w.month,
             "tiles": w.tiles_string(),
             "levels": "".join(str(int(v)) for v in w.frame_levels().ravel()),
@@ -223,6 +223,12 @@ class CivitasEnv:
             "council": [m for m in self.council.posted_in(w.month - 1)
                         if not self.city or m["sender"].startswith(self.city + ".")] if w.month else [],
         }
+        # with fleet agents, the department needs the mayor sees this month (FleetState.needs; report-only: the
+        # collaboration score's money aim). A region frame nests it per city
+        needs = self.fleet.needs(self) if self.fleet is not None else None
+        if needs:
+            f["needs"] = needs
+        return f
 
     def meta(self) -> dict:
         """Static facts about the map for the viewer."""
