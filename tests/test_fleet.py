@@ -1246,14 +1246,19 @@ def test_update_plan_lists_the_departments_below_their_target():
     assert res["ok"] and "below_target" not in res                                  # no targets yet
     res = mayor.call("update_plan", {"budgets": {"planning": 9000, "utilities": 7000, "fire": 2500, "police": 0}})
     assert res["ok"] and res["message"].startswith("plan v2 saved")
-    assert res["below_target"] == {"utilities": {"funds": 2000, "target": 7000, "gap": 5000},
-                                   "fire": {"funds": 0, "target": 2500, "gap": 2500}}      # planning is funded
+    # planning is funded; fire has nothing ready on a fresh map: no gap, its target flagged (nothing_to_fund)
+    assert res["below_target"] == {"utilities": {"funds": 2000, "target": 7000, "gap": 5000}}
+    assert res["nothing_to_fund"] == {"fire": "target $2,500 above its $0 funds, but nothing ready to buy: no top-up "
+                                              "buys anything now"}
     assert res["treasury"] == 30000
     assert res["next"].startswith("to spend: $27k above the $3,000 reserve; ")    # needs-based: test_fleet_money
+    assert res["next"].endswith("; nothing to fund now: fire (nothing ready to buy)")
     assert mayor.call("allocate_budget", {"department": "utilities", "amount": 5000})["ok"]
-    res = mayor.call("update_plan", {"priorities": {"fire": "stations by homes"}})
-    assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
-    assert res["treasury"] == 25000
+    res = mayor.call("update_plan", {"priorities": {"fire": "stations by homes", "police": "patrols"}})
+    assert "below_target" not in res and res["nothing_to_fund"] == {
+        "fire": "target $2,500 above its $0 funds and priority \"stations by homes\", but nothing ready to buy: no "
+                "top-up buys anything now",
+        "police": "priority \"patrols\", but nothing ready to buy: no top-up buys anything now"}
 
 
 def test_update_plan_says_what_there_is_to_spend():
@@ -1579,8 +1584,8 @@ def test_update_plan_says_to_take_idle_money_back():
     res = mayor.call("update_plan", {"budgets": {"planning": 9000}})
     assert res["idle"] == {"planning": 6834, "transport": 1000} and "below_target" not in res
     assert res["to_spend"] == 34834 and res["next"].startswith(note)
-    res = mayor.call("update_plan", {"budgets": {"fire": 2500}})
-    assert res["below_target"] == {"fire": {"funds": 0, "target": 2500, "gap": 2500}}
+    res = mayor.call("update_plan", {"budgets": {"fire": 2500}})       # nothing ready for fire: no gap, flagged
+    assert "below_target" not in res and list(res["nothing_to_fund"]) == ["fire"]
     assert res["next"].startswith(note)
 
 
@@ -3114,8 +3119,9 @@ def test_a_library_never_counts_as_the_cheapest_ready_site(grown_env):
     budget = lambda: _block(briefing(env, "education", mark=False), "## Your budget")
     needs = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- education:"))
     w.dept_funds["education"] = 2500                   # the school is affordable: no advice
-    assert budget()[1:] == ["- no money ask to the mayor now: funds cover your next build. Say what you need in "
-                            "your end_turn report"]
+    assert budget()[1:] == ["- no money ask to the mayor now: funds cover your next build. This turn: build your first "
+                            "elementary school ($2,500): your funds cover it; say what you need in your end_turn "
+                            "report"]
     assert needs() == "- education: funds $2,500, spent $0; funds cover its next build"
     assert ready()["library"].endswith("same list as school; $1,500") and ready()["school"].endswith("; $2,500")
     w.dept_funds["education"] = 2000                   # a library is affordable (no budget line), the school isn't
@@ -3312,8 +3318,9 @@ def test_no_bus_stops_before_1500_residents():
     w.dept_funds["transport"] = 0
     text = briefing(env, "transport", mark=False)
     assert _ready_sites(text)[0] == f"- bus_stops: none - {SITE_NOTES['bus_stops'][0]}", _ready_sites(text)
-    assert _block(text, "## Your budget")[1:] == ["- no money ask to the mayor now: nothing ready to buy. Say what you "
-                                                  "need in your end_turn report"] and "can't pay" not in text
+    assert _block(text, "## Your budget")[1:] == ["- no money ask to the mayor now: nothing ready to buy. Ask when a "
+                                                  "site is ready for you. This turn: nothing is ready to build; say "
+                                                  "what you need in your end_turn report"] and "can't pay" not in text
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
     assert res["sites"] == [] and res["note"] == SITE_NOTES["bus_stops"][1]
     _no_spending(env)
@@ -3630,16 +3637,17 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
         env.end_month()
     _fill_roadside(env.world)                          # every roadside tile taken; pump and outlet have room
     block = _ready_sites(briefing(env, "planning", mark=False))
-    line = (head + "police (police station), fire (fire station), health (clinic, landfill: away from homes), "
-            "education (elementary school)" + tail)    # the cheapest first buildings, all on a tie; water has room
-    assert len(line) == 202
+    # the cheapest first buildings, all on a tie; water has room, power (81 of 111, +62 a quarter) won't in 3 months
+    line = (head + "utilities (wind turbine), police (police station), fire (fire station), health (clinic, landfill: "
+            "away from homes), education (elementary school)" + tail)
+    assert len(line) == 228
     assert block[-4] == line and block[-2].startswith("- high density: locked")          # before the high density
     assert block[-3] == ("- away from homes (health's landfill): leave a lot free by (40,19), the far end of "
                          "road_extension (25,19)-(40,19), with no homes within 4 tiles")      # a dead end's extension
     import civitas.fleet.briefing as B
     B.BLOCKED_LINE_CHARS, keep = 150, B.BLOCKED_LINE_CHARS
     try:                                               # too long: the departments alone
-        assert land(env) == [head + "police, fire, health, education" + tail]
+        assert land(env) == [head + "utilities, police, fire, health, education" + tail]
     finally:
         B.BLOCKED_LINE_CHARS = keep
     assert not any(ln.startswith("- blocked") for ln in _ready_sites(briefing(env, "police", mark=False)))
@@ -4078,7 +4086,7 @@ def test_mayor_briefing_marks_departments_below_their_target():
     # a building per short supply (v20 fixes; the pump and outlet wait for a road to the river)
     assert lines["utilities"] == ("- utilities: funds $2,000 < target $7,000; needs $6,200 for its first coal plant "
                                   "and water tower ($110/month); sewage outlet waits for a road to the river")
-    assert lines["fire"] == "- fire: funds $0 < target $2,500; nothing ready to buy"
+    assert lines["fire"] == "- fire: funds $0, target $2,500 (unusable now); nothing ready to buy"   # no gap: no "<"
     assert lines["police"] == "- police: funds $0; nothing ready to buy"
     to_fund = lambda: next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- to fund:"))
     assert to_fund() == ("- to fund: first/supply: utilities $4,200, health $2,000 ($6,200, upkeep +$140/month): "
@@ -4099,7 +4107,7 @@ def test_mayor_briefing_marks_departments_below_their_target():
     w.dept_funds.update(fire=401)                                   # $99 short: under the $100 floor
     assert _dept_lines(env)["fire"].startswith("- fire: funds $401, target $500")
     w.dept_funds.update(fire=399)
-    assert _dept_lines(env)["fire"].startswith("- fire: funds $399 < target $500")
+    assert _dept_lines(env)["fire"].startswith("- fire: funds $399, target $500 (unusable now)")  # $101: nothing ready
     assert "below target" not in briefing(env, "mayor", mark=False)
 
 
