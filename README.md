@@ -1216,6 +1216,16 @@ transport 92.1 -> 91.3), then ended its turns in 1 step once the Next line said 
 ("jammed roads are avenues already"). Teamwork 84.8 (money aim 100); 2 asks held back, 1 bus_line
 refusal, and 3 failed actions in 32 turns.
 
+Seed 1 (`runs/20261006-154117_fleet_smoke_late_s1_803`): city 61.3 -> 65.0 (+3.7), population
+4,596 -> 6,472 (+1,876), against the scripted fleet's +6.2 / +1,532: more growth, a smaller score
+gain. Teamwork only 44.1: departments' land requests to planning (riverbank sites, a jail, landfill
+and cemetery sites away from homes) went unanswered. The region late smoke
+(`fleet_region_late.toml`, seed 0, `runs/20261006-154117_fleet_region_late_s0_804`, 64 fleet turns,
+29 minutes): city 66.5 -> 70.6 (+4.1), population 12,084 -> 17,984 (+5,900); teamwork north 91.7,
+south 55.7. It made the first deal offer by an LLM mayor: south, short of water, was shown the
+right call (`"sell": false`, buy 20 from north) but left `sell` out, the default made it an offer
+to sell, and north rightly let it expire. `offer_deal` now requires `sell` (64d9ef2).
+
 **Config.**
 
 ```toml
