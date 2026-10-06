@@ -28,7 +28,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, shift
-from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, money, months, pct, signed
+from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -171,7 +171,7 @@ RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no ro
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 # utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
 # and, for the one-tile riverbank ones, their _bank_needed name: blocked or funded, one counts only while the city lacks
-# it or demand reaches BANK_BUSY x that supply (_wanted)
+# it or demand reaches BANK_BUSY x that supply now or within AHEAD_MONTHS (_wanted, _busy)
 SUPPLY_OF = {"pump": ("water", "pump"), "sewage": ("sewage", "sewage outlet"), "near_homes": ("water", None),
              "coal_or_gas": ("power", None), "wind": ("power", None)}
 # utilities' supplies, most urgent first: a lot develops to level 1 only with power, to 2 with water, to 3 with sewage
@@ -188,6 +188,9 @@ SUPPLIES = ("power", "water", "sewage")
 SUPPLY_MARGIN = 1.5
 SUPPLY_GROWTH = {"power": 60, "water": 50, "sewage": 50}
 BANK_BUSY = 0.9
+# ... now or within this many months at its growth over the last as many months (demand_ahead): a quarter, the next
+# turn at act_every 3, so utilities builds (and asks) ahead of a supply that will run short before then
+AHEAD_MONTHS = 3
 JAIL_BUSY = 0.8              # a first jail is needed once inmates pass this share of the cells (_cells_busy)
 RIVER_PURPOSES = RIVERBANK_PURPOSES | {"harbour", "levee"}    # purposes that belong on the river
 SCARCE_BANK = 2              # at most this many free riverbank lots by the roads: other purposes leave them alone
@@ -1318,6 +1321,8 @@ class Funding(NamedTuple):
     to_fund: list[FundItem] = []            # the departments of NEED_KINDS with a top-up, in `order`
     firsts_at_zero: tuple[str, ...] = ()    # the first/supply departments (in order) whose plan target is 0 or unset
     months_left: int | None = None          # months left in the game (None: not known): the hold's "close that"
+    unusable: dict[str, str] = {}           # {dept: wait_why}: a plan target above its funds (target_above) with
+                                            # nothing to buy now (buys_nothing); no gap, flagged on its line
 
     @property
     def spendable(self) -> float:
@@ -1353,24 +1358,27 @@ def funding_gaps(env, fleet: FleetState) -> Funding:
     w, budgets = env.world, fleet.plan["budgets"]
     depts = {d: DeptMoney(env, d) for d in DEPARTMENTS if d in env.roles}
     idle = {d: m.idle for d, m in depts.items() if m.idle}
-    gaps = {}
-    for d, m in depts.items():
-        target = budgets.get(d)
-        if (target is not None and d not in idle and target - m.funds >= max(GAP_MIN, GAP_SHARE * target)
-                and m.wants_more):
-            gaps[d] = {"funds": round(m.funds), "target": round(target), "gap": round(target - m.funds)}
     unclaimed = unclaimed_firsts(depts)
     for d, m in depts.items():
         m.unclaimed = unclaimed.get(d, ())
     turn = list(depts)
     kinds = {d: m.kind for d, m in depts.items()}
+    gaps, unusable = {}, {}
+    for d, m in depts.items():
+        if d in idle or not target_above(budgets.get(d), m.funds):
+            continue
+        if buys_nothing(m):                     # nothing to buy now: no gap, the target flagged (unusable)
+            unusable[d] = wait_why(m)
+        elif m.wants_more:
+            target = budgets[d]
+            gaps[d] = {"funds": round(m.funds), "target": round(target), "gap": round(target - m.funds)}
     order = tuple(sorted(depts, key=lambda d: (KIND_RANK[kinds[d]], turn.index(d))))
     to_fund = [FundItem(d, kinds[d], m.top_up, m.upkeep, m.what) for d in order
                if kinds[d] in NEED_KINDS and (m := depts[d]).top_up > 0]
     zero = tuple(d for d in order if kinds[d] == KINDS[0] and not budgets.get(d))
     keep = reserve(w)
     return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep, idle, depts, unclaimed, order,
-                   to_fund, zero, env.cfg.months - w.month)
+                   to_fund, zero, env.cfg.months - w.month, unusable)
 
 
 def _to_spend_line(w, f: Funding, cf: CashFlow) -> str:
@@ -1487,6 +1495,7 @@ def still_to_fund(f: Funding, n: int = FUNDED_SHOWN) -> str:
 # it replied to few. The briefing's Open requests block and the end_turn reminder name what is still open.
 REQUESTS_SHOWN = 4           # departments on the mayor's Open requests block before "+N more"
 REQUEST_CHARS = 75           # the latest request of each department quoted there
+PRIORITY_CHARS = 40          # a priority quoted in update_plan's nothing_to_fund flags
 REMIND_MIN_LEFT = 2          # tool calls left after the end_turn for its open-requests reminder (a reply, end_turn)
 
 
@@ -1567,15 +1576,48 @@ def request_state(f: Funding, dept: str, covered: list[str]) -> str:
     if k in NEED_KINDS:
         cover = "covered" if dept in covered else "not covered" + (" (hold)" if f.hold else " now")
         return f"to fund {money(m.top_up)} ({k}), {cover}"
-    if k == "idle":
-        why = f"holds {money(m.idle)} idle"
-    elif k == "blocked":
-        why = "blocked for lack of land"
-    elif dept == "planning":
-        why = "funds cover its road" if m.build is not None and m.build.cost is not None else "no road ready"
-    else:
-        why = m.state or "nothing ready to buy"
-    return f"no top-up needed ({why})"
+    return f"no top-up needed ({wait_why(m)})"
+
+
+def buys_nothing(m: DeptMoney) -> bool:
+    """A department with nothing to buy now (kind "nothing": supply has room, nothing ready, only a supplementary
+    building, funds covering its builds), so a plan target above its funds is no gap but unusable (Funding.unusable,
+    update_plan's nothing_to_fund). Not planning, whose spending goes past its priced road (zoning, parks), nor a
+    blocked department, which keeps money for its first building until planning frees a lot. Region run 20261005: the
+    mayor kept utilities at a $3,000-7,000 target with supply room ("funds $0 < target $7,000; supply has room"), and
+    utilities asked against "supply has room" 28 times."""
+    return m.kind == "nothing" and m.dept != "planning"
+
+
+def nothing_to_fund(f: Funding, budgets: dict, priorities: dict | None = None) -> dict[str, str]:
+    """update_plan's flags on targets and priorities that point a department at money it can't use now: each
+    department with a target above its funds and nothing to buy (Funding.unusable), or given a priority in this
+    update (`priorities`) while it has nothing to buy (buys_nothing): "target $3,000 above its $0 funds and priority
+    \"expand water capacity\", but supply has room: no top-up buys anything now". Region run 20261005: utilities read
+    a $3,000-7,000 target and "expand water capacity" beside "supply has room" and asked 28 times against it."""
+    out = {}
+    for d, m in f.depts.items():
+        pri = (priorities or {}).get(d) if isinstance(priorities, dict) else None
+        given = bool(isinstance(pri, str) and pri.strip()) and buys_nothing(m)
+        if d not in f.unusable and not given:
+            continue
+        parts = ([f"target {money(budgets[d])} above its {money(math.floor(m.funds))} funds"] if d in f.unusable
+                 else []) + ([f"priority \"{cut(pri, PRIORITY_CHARS)}\""] if given else [])
+        out[d] = f"{' and '.join(parts)}, but {wait_why(m)}: no top-up buys anything now"
+    return out
+
+
+def wait_why(m: DeptMoney) -> str:
+    """Why a department with no needs line needs no top-up, in the mayor's words: "holds $1,508 idle", "blocked for
+    lack of land", planning's "funds cover its road" / "no road ready", else its DeptMoney.state ("supply has room",
+    "nothing ready to buy", ...). request_state and Funding.unusable read it."""
+    if m.kind == "idle":
+        return f"holds {money(m.idle)} idle"
+    if m.kind == "blocked":
+        return "blocked for lack of land"
+    if m.dept == "planning":
+        return "funds cover its road" if m.build is not None and m.build.cost is not None else "no road ready"
+    return m.state or "nothing ready to buy"
 
 
 def requests_reminder(reqs: list[OpenRequest]) -> str:
@@ -1603,11 +1645,21 @@ class Ask(NamedTuple):
     amount: int       # DeptMoney.top_up when ok, else 0
     what: str         # what the top-up buys, in the department's words: "your first police station"
     why: str          # ok: why the mayor funds it; else why it won't now
+    # the rest only when not ok (_not_now):
+    plan: str = ""    # its plan target above its funds (target_above): a ceiling, not money to ask for
+    when: str = ""    # what would make an ask valid ("a supply will be 90% used within 3 months at its growth ...")
+    instead: str = "" # what to do this turn ("build another police station ($2,500): your funds cover it")
 
 
 def _yours(text: str) -> str:
     """A Departments-block phrase in the department's own words: "its first school" -> "your first school"."""
     return re.sub(r"\bits\b", "your", text)
+
+
+def target_above(target: float | None, funds: float) -> bool:
+    """A plan target above the funds by at least the gap rule (max(GAP_MIN, GAP_SHARE x target)): funding_gaps' "<"
+    marker and its unusable targets, and mayor_ask's plan note."""
+    return bool(target) and target - funds >= max(GAP_MIN, GAP_SHARE * target)
 
 
 def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
@@ -1616,9 +1668,10 @@ def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
     fund_cover covers (the money above the reserve after them; never in a hold); else no ask, and why: another building
     that waits ("in a hold" / "doesn't cover it"), idle money, a first building blocked for lack of land (ask
     planning), or its DeptMoney.state ("funds cover your builds", "nothing ready to buy", "supply has room", "only a
-    library ready ($1,500)"; planning's "your funds cover your road" / "no road is ready"). The department's own
-    DeptMoney decides (one observation, ~0.5 ms; its kind is funding_gaps' but for unclaimed first buildings, which
-    read as their state); the whole funding_gaps (~7 ms) only for another building, whose cover needs every top-up."""
+    library ready ($1,500)"; planning's "your funds cover your road" / "no road is ready"), with _not_now's plan note,
+    when to ask and what to do instead. The department's own DeptMoney decides (one observation, ~0.5 ms; its kind is
+    funding_gaps' but for unclaimed first buildings, which read as their state); the whole funding_gaps (~7 ms) only
+    for another building, whose cover needs every top-up."""
     m = DeptMoney(env, dept)
     k, what = m.kind, _yours(m.what)
     if k in NEED_KINDS[:2]:
@@ -1630,22 +1683,61 @@ def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
         why = ("the mayor is in a hold (the treasury is at or under its reserve) and funds only first buildings, "
                "supply and planning's road" if f.hold else "the mayor's money above its reserve doesn't cover it "
                "after first buildings, supply and planning's road")
-        return Ask(False, 0, what, f"{what} ({money(m.top_up)} short) waits: {why}")
+        return _not_now(env, fleet, m, f"{what} ({money(m.top_up)} short) waits: {why}", what)
     if k == "idle":
-        return Ask(False, 0, "", f"you hold {money(m.idle)} more than you need now")
+        return _not_now(env, fleet, m, f"you hold {money(m.idle)} more than you need now")
     if k == "blocked":
-        return Ask(False, 0, "", f"{' or '.join(m.blocked)} is blocked for lack of land: ask planning for a lot, not "
-                                 "the mayor for money")
+        return _not_now(env, fleet, m, f"{' or '.join(m.blocked)} is blocked for lack of land: ask planning for a lot, "
+                                       "not the mayor for money")
     if dept == "planning":
-        return Ask(False, 0, "", "your funds cover your road" if m.build is not None and m.build.cost is not None
-                   else "no road is ready")
-    return Ask(False, 0, "", _yours(m.state) or "nothing ready to buy")
+        return _not_now(env, fleet, m, "your funds cover your road" if m.build is not None
+                        and m.build.cost is not None else "no road is ready")
+    return _not_now(env, fleet, m, _yours(m.state) or "nothing ready to buy")
+
+
+def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> Ask:
+    """A no-ask, with the rest the department reads on its Your budget line and in send_message's hold-back: its plan
+    target as a ceiling when above its funds (target_above), when an ask would be valid (supply room: once a supply
+    will be BANK_BUSY used within AHEAD_MONTHS at its growth, the tightest named; nothing ready: once a site is) and
+    what to do this turn instead (its next build when its funds cover it, no supply to build, a lot from planning,
+    else only what its funds pay for). Region run 20261005 (trinity in both cities, 120 months): 125 money asks held
+    back, every one under a budget line saying not to ask; in 51 the plan target was above the funds, and utilities
+    read "budget target: $7,000" and "priority: expand water capacity" beside "supply has room" (28 held back)."""
+    w, dept, b = env.world, m.dept, m.build
+    target = fleet.plan["budgets"].get(dept)
+    plan = (f"your {money(target)} plan target is the mayor's ceiling for you, not money to ask for"
+            if target_above(target, m.funds) else "")
+    room = b is not None and b.room and m.kind == "nothing"
+    unready = m.kind == "nothing" and m.state == "nothing ready to buy" and dept != "planning"
+    when = ""
+    if room:
+        sup = w.metrics()
+        tight = max((s for s in SUPPLIES if sup[f"{s}_supply"] > 0),
+                    key=lambda s: demand_ahead(w, s) / sup[f"{s}_supply"], default=None)
+        when = (f"a supply will be {pct(100 * BANK_BUSY)} used within {months(AHEAD_MONTHS)} at its growth"
+                + (f" (now {supply_ahead(w, tight)})" if tight else ""))
+    elif unready:
+        when = "a site is ready for you"
+    if b is not None and b.cost is not None and b.named and not short_of(m.funds, b.cost):
+        instead = f"build {_yours(b.what)} ({money(b.cost)}): your funds cover it"
+    elif room:
+        instead = "no supply needs building yet"
+    elif unready:
+        instead = "nothing is ready to build"
+    elif m.kind == "blocked":
+        instead = "ask planning for a lot"
+    else:
+        instead = "build only what your funds pay for"
+    return Ask(False, 0, what, why, plan, when, instead)
 
 
 def ask_refusal(a: Ask) -> str:
-    """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal)."""
-    return (f"not sent: {a.why}, so a money ask now gets a no. Put what you need in your end_turn report instead "
-            "(the mayor reads it); to post this message anyway, send it to the mayor again.")
+    """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal): why, the plan note,
+    when to ask and what to do this turn instead (_not_now)."""
+    return (f"not sent: {a.why}, so a money ask now gets a no" + (f"; {a.plan}" if a.plan else "") + ". "
+            + (f"Ask when {a.when}. " if a.when else "")
+            + f"Instead this turn: {a.instead}; put what you need in your end_turn report (the mayor reads it). To post "
+            "this message anyway, send it to the mayor again.")
 
 
 # the mayor's actions whose results say where the money stands (ToolBox._money_note, appended by _act on success and
@@ -2388,7 +2480,8 @@ def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]
 
 
 def _wanted(w, purpose: str) -> bool:
-    """False for a utilities purpose (SUPPLY_OF) while its supply has room: demand under BANK_BUSY of it, and for a
+    """False for a utilities purpose (SUPPLY_OF) while its supply has room: demand under BANK_BUSY of it now and in
+    AHEAD_MONTHS at its growth (_busy), and for a
     pump or outlet the city has one (a fresh map, supply 0, wants them all); True for other purposes. Smoke v14 seed 1,
     months 6 and 9: pump and outlet built, water 370-490 and sewage 250 against demand of 99-116, the bank lots beside
     the roads taken, and planning read "blocked for lack of land: utilities (pump, sewage) ... dezone a roadside lot for
@@ -2406,9 +2499,33 @@ def _wanted(w, purpose: str) -> bool:
 
 
 def _busy(w, supply: str) -> bool:
-    """Demand is at least BANK_BUSY of the `supply` ("power", "water", "sewage")."""
-    m = w.metrics()
-    return m[f"{supply}_demand"] >= BANK_BUSY * m[f"{supply}_supply"]
+    """Demand is at least BANK_BUSY of the `supply` ("power", "water", "sewage") now or within AHEAD_MONTHS at its
+    growth (demand_ahead)."""
+    return demand_ahead(w, supply) >= BANK_BUSY * w.metrics()[f"{supply}_supply"]
+
+
+def demand_ahead(w, supply: str) -> float:
+    """The `supply`'s demand AHEAD_MONTHS from now at its growth over the last AHEAD_MONTHS months of history (fewer
+    early on, scaled to AHEAD_MONTHS; no growth when it fell or before two months are recorded): demand now plus that
+    growth. Region run 20261005 (trinity in both cities, 120 months, act_every 3): 28 money asks were held back on
+    "supply has room", 16 of them right after utilities built; 5 of those supplies reached 99%+ used before its next
+    turn, and all 5 had demand plus the last quarter's growth at 90% or more of the supply (13 of the 28 did)."""
+    now = w.metrics()[f"{supply}_demand"]
+    h, key = w.history, f"{supply}_demand"
+    span = min(AHEAD_MONTHS, len(h) - 1)
+    if span <= 0:
+        return now
+    return now + max(0.0, (h[-1][key] - h[-1 - span][key]) * AHEAD_MONTHS / span)
+
+
+def supply_ahead(w, supply: str) -> str:
+    """The share of the `supply` used now and in AHEAD_MONTHS at its growth (demand_ahead), for utilities' no-ask line:
+    "water 84% used, 88% in 3 months"; "" without supply."""
+    have = w.metrics()[f"{supply}_supply"]
+    if have <= 0:
+        return ""
+    now, ahead = w.metrics()[f"{supply}_demand"], demand_ahead(w, supply)
+    return f"{supply} {pct(100 * now / have)} used, {pct(100 * ahead / have)} in {months(AHEAD_MONTHS)}"
 
 
 def supply_need(w, supply: str) -> float:
@@ -2464,21 +2581,27 @@ class SupplyBuild(NamedTuple):
                                     # roads (blocked_firsts), which utilities keeps money for
     imported: float = 0.0       # the part of `have` bought in (service imports): supply_need leaves it out
     blocked_fix: str = ""       # what `blocked` needs beyond a roadside lot (land_fix: "a road to the river")
+    ahead: float | None = None  # demand in AHEAD_MONTHS at its growth (demand_ahead); None: as `demand`
 
     @property
     def status(self) -> str:
         """The supply against demand, imports in (as the City block shows them): short of demand "power 25% covered",
         else the share used, as build_status says it ("power 98% used"; imports filling a gap read "100% used": at
-        capacity, where "100% covered" read as nothing to do)."""
+        capacity, where "100% covered" read as nothing to do), and when it is wanted only for its growth (under
+        BANK_BUSY used now, at it within AHEAD_MONTHS: _busy) that share then: "water 84% used, 92% in 3 months"."""
         if self.demand <= 0:
             return f"no {self.supply} demand yet"
         if self.have < self.demand:
             return f"{self.supply} {pct(100 * self.have / self.demand)} covered"
-        return f"{self.supply} {pct(100 * self.demand / self.have)} used"
+        used = f"{self.supply} {pct(100 * self.demand / self.have)} used"
+        if self.ahead is not None and self.demand < BANK_BUSY * self.have <= self.ahead:
+            return used + f", {pct(100 * self.ahead / self.have)} in {months(AHEAD_MONTHS)}"
+        return used
 
 
 def short_supplies(w, lists: dict[str, SiteList]) -> list[SupplyBuild]:
-    """Each supply with a utilities purpose it wants (_wanted: demand at BANK_BUSY of its supply, or a pump or outlet
+    """Each supply with a utilities purpose it wants (_wanted: demand at BANK_BUSY of its supply now or within
+    AHEAD_MONTHS, or a pump or outlet
     the city lacks), in SUPPLIES order, with the building to name for it: of its ready purposes (ready_prices), each at
     its first site no earlier pick took, pick_supply's for supply_need. Supplies whose ready purposes all need the
     riverbank pick first (an outlet can go nowhere else: with one free bank lot it gets the lot and water a tower),
@@ -2512,7 +2635,8 @@ def short_supplies(w, lists: dict[str, SiteList]) -> list[SupplyBuild]:
     m = w.metrics()
     out = []
     for s in (s for s in SUPPLIES if s in short):
-        base = SupplyBuild(s, m[f"{s}_supply"], m[f"{s}_demand"], need[s], imported=m["service_imports"].get(s, 0.0))
+        base = SupplyBuild(s, m[f"{s}_supply"], m[f"{s}_demand"], need[s], imported=m["service_imports"].get(s, 0.0),
+                           ahead=demand_ahead(w, s))
         if (pick := picks[s]) is not None:
             p, pr, output, site = pick
             out.append(base._replace(purpose=p, price=pr, output=output, site=site,
@@ -4283,6 +4407,9 @@ class ToolBox:
         if f.firsts_at_zero:
             out["first_buildings"] = list(f.firsts_at_zero)
             nxt.append(f"first/supply at a $0 target: {', '.join(f.firsts_at_zero)}")
+        if flags := nothing_to_fund(f, self.fleet.plan["budgets"], fields.get("priorities")):
+            out["nothing_to_fund"] = flags
+            nxt.append("nothing to fund now: " + ", ".join(f"{d} ({wait_why(f.depts[d])})" for d in flags))
         out["next"] = "; ".join(nxt)
         return out
 

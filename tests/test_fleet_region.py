@@ -211,7 +211,7 @@ def test_each_city_keeps_its_own_fleet_state():
     assert s.fleet.memory["police"]["lessons"] == ["south lesson"] and n.fleet.memory["police"]["lessons"] == []
     # each mayor manages its own city's departments and money
     n.world.dept_funds["police"] = 1234
-    assert "- police: funds $1,234 < target $2,500" in briefing(n, "mayor", mark=False)
+    assert "- police: funds $1,234, target $2,500" in briefing(n, "mayor", mark=False)     # nothing ready yet
     assert "$1,234" not in briefing(s, "mayor", mark=False)
     r = ToolBox(s, "mayor").call("allocate_budget", {"department": "fire", "amount": 1000})
     assert r["ok"] and s.world.dept_funds["fire"] == 1000 and n.world.dept_funds["fire"] == 0

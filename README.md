@@ -444,11 +444,15 @@ tasks and money, and to let people coach it.
 - **A turn is a tool loop.** The agent starts from a short briefing and then calls tools.
   The mayor's briefing covers the city, the finances (below) and the departments, most
   urgent first. Each department's line gives its funds, its target (`funds $0 < target
-  $2,500` when it still needs funding) and what it spent over the last 3 months. Then comes
+  $2,500` when it still needs funding; `target $7,000 (unusable now)` when it has nothing to
+  buy, so a top-up would sit idle: no `<` and not in `update_plan`'s `below_target`, which
+  lists it, with any priority given it in that call, under `nothing_to_fund`; not planning,
+  nor a department blocked for lack of land) and what it spent over the last 3 months. Then comes
   one note on its money: what its needs line buys (below), what is blocked, its idle money,
   or what its money does without a needs line: `funds cover its builds` (every priced
   purpose), `funds cover its next build`, `supply has room` (utilities sites are ready but
-  no supply is short), `only a library ready ($1,500)` (only supplementary sites), or
+  no supply is short, nor will be 90% used within 3 months at its growth over the last 3),
+  `only a library ready ($1,500)` (only supplementary sites), or
   `nothing ready to buy`. Last is its latest report, cut at 170 characters. Two lines close
   the block: the money there is to spend and what to fund with it.
   - **Finances.** The treasury's change since the trend month is split into what the city
@@ -646,9 +650,14 @@ tasks and money, and to let people coach it.
   police station (send_message, with a reason): ...` when its kind is first/supply or growth,
   for its needs line's top-up, or another building the mayor's money covers now
   (`fund_cover`); otherwise `- no money ask to the mayor now: another police station ($2,500
-  short) waits: the mayor is in a hold ... Say what you need in your end_turn report`, or
-  why it needs none: nothing ready to buy, idle money, blocked for lack of land (ask
-  planning); when its funds buy none of its ready sites, a line names the cheapest, all of
+  short) waits: the mayor is in a hold ... This turn: build only what your funds pay for; say
+  what you need in your end_turn report`, or why it needs none: nothing ready to buy, idle
+  money, blocked for lack of land (ask planning), supply has room; a no-ask also says, when
+  the plan target is above the funds, that the target is the mayor's ceiling, not money to
+  ask for, when an ask would be valid (`Ask when a supply will be 90% used within 3 months
+  at its growth (now water 60% used, 64% in 3 months)`, or when a site is ready) and what
+  to do this turn instead (build the next building its funds cover, `no supply needs
+  building yet`, ask planning for a lot), as the hold-back below does; when its funds buy none of its ready sites, a line names the cheapest, all of
   them on a tie, and tells it to ask the mayor for that top-up, or to report instead, and
   end the turn instead of calling build tools; a model department's `send_message` to the
   mayor that asks for money it can't get now is held back once a turn, `refused: "ask"`,
@@ -668,7 +677,9 @@ tasks and money, and to let people coach it.
   line builds there: `- wind: 6 sites, best (34,23), wind 1.39 (not (33,23): riverbank
   kept for sewage)`, `- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for
   sewage)`, `- sewage: 1 site, best (33,23) (riverbank: kept for sewage)`. While a supply
-  is short or at least 90% used its budget block adds each such supply in the words of
+  is short or at least 90% used, now or within 3 months at its growth over the last 3
+  (`tools.py:demand_ahead`, `AHEAD_MONTHS`; then `water 84% used, 92% in 3 months`), its
+  budget block adds each such supply in the words of
   the mayor's needs line and what its funds pay for, most urgent first, with the
   buildings its needs line names: `- supply needed now: power 25% covered (supply 1.80,
   demand 7, 1.80 imported), sewage 0% covered (supply 0, demand 7): your $4,400 pays for
@@ -1620,7 +1631,16 @@ the first long run with the mayor's Open requests block, departments asking only
   responsiveness once open ones are left out), against 59% on v23. 98 of 492 `send_message` calls went to several
   departments, and none failed on a recipient name.
 - **Departments' unfundable money asks:** 125 were held back once (`refused: "ask"`). Utilities' reasoning shows a
-  conflict: its plan target ($3,000) against "no money ask to the mayor now: supply has room".
+  conflict: its plan target ($3,000) against "no money ask to the mayor now: supply has room". By department:
+  utilities 39, health 27, education 19, police 16, fire 14, transport 10; by reason: another building the mayor's
+  money didn't cover 41 (in a hold 31 more), supply has room 28, blocked for lack of land 13, funds already covering
+  the next build 12 (asks made right after building it). Every one came under a budget line saying not to ask; in 51
+  the plan target was above the funds. 12 were sent again (6 topped up at the mayor's next turn). Of the 28 "supply
+  has room" asks, 5 supplies reached 99%+ used before utilities' next turn, all 5 with demand plus the last quarter's
+  growth at 90% of the supply. Since then a supply counts as wanted at 90% used now or within 3 months at its growth,
+  a target above the funds of a department with nothing to buy reads `(unusable now)` on the mayor's side
+  (`update_plan`'s `nothing_to_fund`), and the no-ask line and the hold-back call the target a ceiling, say when to ask
+  and what to do this turn instead.
 - **No deals and no messages between the cities** in 120 months, although both mayors had the deal tools and the
   Region block every turn. The Region view has still not shown real data.
 - **Weak spots:** south health 50.6, south police 54.8, transport 63–66 in both cities. Money aim (33–43) is low

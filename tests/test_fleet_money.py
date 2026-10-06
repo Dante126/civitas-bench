@@ -427,7 +427,8 @@ def test_mayor_departments_most_urgent_first(monkeypatch):
     w.dept_funds.update(police=2500, fire=2500, health=0)
     lines = {ln.split(":")[0][2:]: ln for ln in _mayor_block(env, "## Departments") if ": funds " in ln}
     assert lines["planning"] == "- planning: funds $0, spent $0"
-    assert lines["police"] == "- police: funds $2,500 < target $5,000, spent $0; funds cover its builds"
+    # its target above funds that cover its builds: no gap, flagged (Funding.unusable)
+    assert lines["police"] == "- police: funds $2,500, target $5,000 (unusable now), spent $0; funds cover its builds"
     assert lines["fire"] == "- fire: funds $2,500, spent $0; funds cover its next build"    # levees: no dearest price
     assert lines["health"] == "- health: funds $0, spent $1,000; nothing ready to buy"
     assert BLOCKED_NOTE not in _mayor_block(env, "## Departments")
@@ -808,7 +809,9 @@ def test_update_plan_reports_what_to_fund(monkeypatch):
     w.treasury = 30000
     _builds(monkeypatch, {})
     res = mayor.call("update_plan", {"notes": "nothing ready"})
-    assert res["to_fund"] == [] and res["next"] == "to spend: $27k above the $3,000 reserve; to fund: nothing ready"
+    assert res["to_fund"] == [] and res["next"] == (
+        "to spend: $27k above the $3,000 reserve; to fund: nothing ready; nothing to fund now: police (nothing ready to "
+        "buy), education (nothing ready to buy)")       # targets above their funds with nothing to buy
 
 
 def test_city_overview_splits_the_treasury_change():
@@ -1959,7 +1962,8 @@ def test_mayor_ask_by_kind(monkeypatch):
                                                           "reserve) and funds only first buildings, supply and "
                                                           "planning's road")
     assert T.mayor_ask(env, fleet, "education").ok
-    assert T.mayor_ask(env, fleet, "transport") == T.Ask(False, 0, "", "nothing ready to buy")
+    assert T.mayor_ask(env, fleet, "transport") == T.Ask(False, 0, "", "nothing ready to buy", "",
+                                                         "a site is ready for you", "nothing is ready to build")
     assert T.mayor_ask(env, fleet, "fire").why == ("a fire station is blocked for lack of land: ask planning for a "
                                                    "lot, not the mayor for money")
     env.world.dept_funds["transport"] = 9000
@@ -1978,10 +1982,11 @@ def test_department_briefings_say_whether_to_ask_the_mayor(monkeypatch):
                                       "a reason): the mayor funds first buildings, supply and planning's road first")
     assert budget("police")[1] == (
         "- no money ask to the mayor now: another police station ($2,500 short) waits: the mayor is in a hold (the "
-        "treasury is at or under its reserve) and funds only first buildings, supply and planning's road. Say what you "
-        "need in your end_turn report")
-    assert budget("transport")[1] == ("- no money ask to the mayor now: nothing ready to buy. Say what you need in "
-                                      "your end_turn report")
+        "treasury is at or under its reserve) and funds only first buildings, supply and planning's road. This turn: "
+        "build only what your funds pay for; say what you need in your end_turn report")
+    assert budget("transport")[1] == ("- no money ask to the mayor now: nothing ready to buy. Ask when a site is ready "
+                                      "for you. This turn: nothing is ready to build; say what you need in your "
+                                      "end_turn report")
     dept = system_prompt("police", FleetAgentConfig(model="x"), 12)
     assert "Ask the mayor for money only when your briefing's budget block says to (a first building, supply, " in dept
     assert "one send_message can answer several departments (to: \"police,fire\")" in \
@@ -2009,9 +2014,9 @@ def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatc
     box = T.ToolBox(env, "police", max_steps=12)
     assert box.call("send_message", ask) == {"ok": False, "refused": "ask", "error": (
         "not sent: another police station ($2,500 short) waits: the mayor is in a hold (the treasury is at or under "
-        "its reserve) and funds only first buildings, supply and planning's road, so a money ask now gets a no. Put "
-        "what you need in your end_turn report instead (the mayor reads it); to post this message anyway, send it to "
-        "the mayor again.")}
+        "its reserve) and funds only first buildings, supply and planning's road, so a money ask now gets a no. "
+        "Instead this turn: build only what your funds pay for; put what you need in your end_turn report (the mayor "
+        "reads it). To post this message anyway, send it to the mayor again.")}
     assert box.messages == []
     assert box.call("send_message", ask)["ok"] and box.messages == [ask]           # once a turn: then it goes
     for to, text in (("planning", "need $500 for a lot"), ("mayor", "Station built, coverage 80%"),   # no money ask
@@ -2024,6 +2029,105 @@ def test_send_message_holds_back_a_money_ask_the_mayor_cant_fund_once(monkeypatc
     held = tbox.call("send_message", {"to": "mayor,planning", "text": "please allocate $1,000 for future upgrades"})
     assert held["ok"] and "not to the mayor: not sent: nothing ready to buy, so a money ask now gets a no" in \
         held["message"] and [m["to"] for m in tbox.messages] == ["planning"]
+
+
+ROOM = FB(None, (), 0.0, (), room=True)           # utilities: ready sites left out, their supply has room
+
+
+def _supplies(monkeypatch, env, **sd) -> dict:
+    """Pin the live metrics' supply and demand (power=(250, 100), ...); the history keeps the real months."""
+    m = dict(env.world.metrics())
+    for s, (have, want) in sd.items():
+        m[f"{s}_supply"], m[f"{s}_demand"] = float(have), float(want)
+    monkeypatch.setattr(env.world, "metrics", lambda: m)
+    return m
+
+
+def test_a_supply_is_wanted_ahead_of_its_growth(monkeypatch):
+    """Region run 20261005: 28 asks held back on "supply has room"; 5 of those supplies reached 99%+ before
+    utilities' next turn, all 5 with demand plus the last quarter's growth at 90% of the supply (_busy, demand_ahead)."""
+    env = _env(act_every=3)
+    _months_spent(env, {}, {}, {}, {}, {})
+    w = env.world
+    _supplies(monkeypatch, env, power=(250, 180))
+    for h, d in zip(w.history[-4:], (120, 140, 160, 180)):
+        h["power_demand"] = d
+    assert T.demand_ahead(w, "power") == 240                        # +60 over the last 3 months
+    assert T._busy(w, "power") and T._wanted(w, "coal_or_gas")      # 240 >= 90% of 250, though 72% used now
+    assert T.supply_ahead(w, "power") == "power 72% used, 96% in 3 months"
+    for h in w.history:
+        h["power_demand"] = 180                                     # flat: as before, under 90% has room
+    assert T.demand_ahead(w, "power") == 180 and not T._busy(w, "power") and not T._wanted(w, "coal_or_gas")
+    w.history[-4]["power_demand"] = 220                             # falling: no growth counted
+    assert T.demand_ahead(w, "power") == 180
+    w.history[:] = w.history[-2:]                                   # one month of growth, scaled to 3
+    w.history[-2]["power_demand"] = 170
+    assert T.demand_ahead(w, "power") == 210
+    w.history[:] = w.history[-1:]                                   # one month recorded: demand now
+    assert T.demand_ahead(w, "power") == 180
+    b = T.SupplyBuild("power", 250, 180, 0, ahead=240)              # wanted for its growth: says when
+    assert b.status == "power 72% used, 96% in 3 months"
+    assert b._replace(demand=230).status == "power 92% used"        # busy now: as before
+    assert b._replace(ahead=None).status == "power 72% used"
+
+
+def test_a_target_with_nothing_to_buy_is_flagged_not_a_gap(monkeypatch):
+    """Region run 20261005: the Departments block read "utilities: funds $0 < target $7,000; supply has room", its
+    briefing "budget target: $7,000" beside "supply has room", and utilities asked 28 times against it. A target above
+    the funds of a department with nothing to buy (kind "nothing", not planning) is no gap but flagged; a blocked one
+    keeps its gap (money for its first building once planning frees a lot)."""
+    env = _env()
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"utilities": ROOM, "fire": FB(None, (), 2500, ("a fire station",))},
+            road=FB(315, (ROAD,), 315, ()))
+    w = env.world
+    w.treasury, w.dept_funds["planning"] = 30000.0, 900                # planning's funds cover its road
+    mayor = ToolBox(env, "mayor")
+    res = mayor.call("update_plan", {"budgets": {"utilities": 7000, "fire": 2500, "planning": 9000},
+                                     "priorities": {"utilities": "expand water capacity", "police": "patrols",
+                                                    "fire": "a station by the homes"}})
+    f = funding_gaps(env, FleetState.of(env))
+    assert f.unusable == {"utilities": "supply has room"} and set(f.gaps) == {"fire", "planning"}
+    assert "utilities" not in res["below_target"] and res["nothing_to_fund"] == {
+        "utilities": "target $7,000 above its $0 funds and priority \"expand water capacity\", but supply has room: no "
+                     "top-up buys anything now",
+        "police": "priority \"patrols\", but nothing ready to buy: no top-up buys anything now"}   # fire: blocked
+    assert res["next"].endswith("; nothing to fund now: utilities (supply has room), police (nothing ready to buy)")
+    lines = {ln.split(":")[0][2:]: ln for ln in _mayor_block(env, "## Departments") if ": funds " in ln}
+    assert lines["utilities"] == "- utilities: funds $0, target $7,000 (unusable now), spent $0; supply has room"
+    assert lines["fire"] == "- fire: funds $0 < target $2,500, spent $0; blocked: a fire station"
+    assert lines["planning"] == "- planning: funds $900 < target $9,000, spent $0"
+    w.dept_funds["utilities"] = 6400                                   # within 10% of the target: nothing flagged
+    assert "utilities" not in funding_gaps(env, FleetState.of(env)).unusable
+
+
+def test_a_no_ask_reconciles_the_plan_and_says_what_to_do_instead(monkeypatch):
+    """Region run 20261005: 125 money asks held back, every one under a budget line saying not to ask, 51 with the
+    plan target above the funds; 12 went again. The no-ask line and the hold-back say the target is a ceiling, when an
+    ask would be valid and what to do this turn instead."""
+    env = _env(act_every=3)
+    _months_spent(env, {}, {}, {})
+    _builds(monkeypatch, {"utilities": ROOM, "police": POLICE_2ND})
+    _supplies(monkeypatch, env, power=(250, 100), water=(250, 150), sewage=(250, 120))
+    fleet = FleetState.of(env)
+    fleet.update_plan(env.world.month, budgets={"utilities": 7000}, priorities={"utilities": "expand water capacity"})
+    a = T.mayor_ask(env, fleet, "utilities")
+    plan = "your $7,000 plan target is the mayor's ceiling for you, not money to ask for"
+    when = "a supply will be 90% used within 3 months at its growth (now water 60% used, 60% in 3 months)"
+    assert a == T.Ask(False, 0, "", "supply has room", plan, when, "no supply needs building yet")
+    budget = _block(briefing(env, "utilities", mark=False), "## Your budget")      # (its supply line: no pump yet)
+    assert budget[-1] == f"- no money ask to the mayor now: supply has room; {plan}. Ask when {when}. This turn: no " \
+                        "supply needs building yet; say what you need in your end_turn report"
+    box = T.ToolBox(env, "utilities", max_steps=12)
+    assert box.call("send_message", {"to": "mayor", "text": "Requesting $3,000 to expand water capacity"})["error"] == (
+        f"not sent: supply has room, so a money ask now gets a no; {plan}. Ask when {when}. Instead this turn: no "
+        "supply needs building yet; put what you need in your end_turn report (the mayor reads it). To post this "
+        "message anyway, send it to the mayor again.")
+    fleet.update_plan(env.world.month, budgets={"utilities": 0})       # no target above the funds: no plan note
+    assert T.mayor_ask(env, fleet, "utilities").plan == ""
+    env.world.dept_funds["police"] = 3000                              # its funds cover another station: build it
+    a = T.mayor_ask(env, fleet, "police")
+    assert (a.ok, a.when, a.instead) == (False, "", "build another police station ($2,500): your funds cover it")
 
 
 def test_one_send_message_answers_several_departments():

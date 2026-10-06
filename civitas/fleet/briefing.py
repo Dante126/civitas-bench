@@ -116,7 +116,8 @@ TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budg
                  "(your briefing's Open requests block) the turn you see it: a top-up, or one line by send_message to "
                  "that department saying why not or when (the reserve, a first building elsewhere comes first, its "
                  "funds already cover it); one send_message can answer several departments (to: \"police,fire\").",
-        "dept": "Follow your slice of the plan (budget target, priority, city goals). Ask the mayor for money only "
+        "dept": "Follow your slice of the plan (budget target, priority, city goals); the budget target is the "
+                "mayor's ceiling for you, not money to ask for. Ask the mayor for money only "
                 "when your briefing's budget block says to (a first building, supply, planning's road, or another "
                 "building the mayor's money covers), for the amount it names; otherwise put what you need in your "
                 "end_turn report, which the mayor reads. Ask other departments with send_message."}
@@ -258,8 +259,9 @@ def _supply_money(builds: list[SupplyBuild], funds: float) -> tuple[list[str], l
 
 
 def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
-    """Utilities' line under its funds while a supply is wanted (short_supplies: demand at 90% of it or more, or a
-    pump or outlet the city lacks), most urgent first (a lot develops at all only with power, to level 2 with water,
+    """Utilities' line under its funds while a supply is wanted (short_supplies: demand at 90% of it or more now or
+    within 3 months at its growth, "water 84% used, 92% in 3 months", or a pump or outlet the city lacks), most urgent
+    first (a lot develops at all only with power, to level 2 with water,
     to 3 with sewage), each as the mayor's needs line says it (_supply_state), and what its funds pay for, greedy in
     that order with the building its needs line names for each (the mayor's line asks the same), then what the rest
     needs: "- supply needed now: power 25% covered (supply 1.80, demand 7, 1.80 imported), sewage 0% covered (supply
@@ -368,7 +370,10 @@ def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
     do), else what its money does (DeptMoney.state: "; funds cover its builds", "; funds cover its next build",
     "; supply has room", "; only a library ready ($1,500)", "; nothing ready to buy"; planning none). Smoke
     v9-v12: nothing showed what a department spent, and planning, spending about $1,000 a quarter, read "funds $7,834 <
-    target $9,000" and was topped up. v19 seed 1, month 6: take-backs left planning under what it keeps, unseen."""
+    target $9,000" and was topped up. v19 seed 1, month 6: take-backs left planning under what it keeps, unseen. A
+    target above the funds of a department with nothing to buy (Funding.unusable) reads "target $7,000 (unusable
+    now)", the suffix saying why ("; supply has room", "; nothing ready to buy"): region run 20261005,
+    "funds $0 < target $7,000; supply has room" kept utilities asking for money it couldn't use."""
     kind = m.kind
     suffix = (f"; idle {money(m.idle)} (keeps {money(m.keep)})" if kind == "idle" else
               _needs(m) if kind in NEED_KINDS else
@@ -376,6 +381,7 @@ def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
               f"; {m.state}" if m.state else "")
     return (f"- {d}: funds {money(math.floor(m.funds))}"
             + (f"{' <' if d in f.gaps else ','} target {money(budgets[d])}" if d in budgets else "")
+            + (" (unusable now)" if d in f.unusable and d in budgets else "")
             + (f", spent {money(m.spent)}" if m.months else "") + suffix)
 
 
@@ -574,10 +580,17 @@ def _ask_line(a: Ask) -> str:
     first", or "- no money ask to the mayor now: another police station ($2,500 short) waits: the mayor's money above
     its reserve doesn't cover it after first buildings, supply and planning's road. Say what you need in your end_turn
     report" (the "can't pay" line says it instead when it shows). Region smoke 20261005: 28 of 46 asks to the mayor
-    were for another building it couldn't cover or with nothing ready, and it spent its steps refusing them."""
+    were for another building it couldn't cover or with nothing ready, and it spent its steps refusing them. A no-ask
+    adds mayor_ask's plan note, when to ask and what to do this turn (_not_now): "- no money ask to the mayor now:
+    supply has room; your $7,000 plan target is the mayor's ceiling for you, not money to ask for. Ask when a supply
+    will be 90% used within 3 months at its growth (now water 51% used, 55% in 3 months). This turn: no supply needs
+    building yet; say what you need in your end_turn report". Region run 20261005: 125 asks held back, each under a
+    bare no-ask line; in 51 the plan target was above the funds."""
     if a.ok:
         return f"- ask the mayor for {money(a.amount)} for {a.what} (send_message, with a reason): {a.why}"
-    return f"- no money ask to the mayor now: {a.why}. Say what you need in your end_turn report"
+    return (f"- no money ask to the mayor now: {a.why}" + (f"; {a.plan}" if a.plan else "") + "."
+            + (f" Ask when {a.when}." if a.when else "")
+            + (f" This turn: {a.instead}; say" if a.instead else " Say") + " what you need in your end_turn report")
 
 
 def _bus_riders(w) -> str:
@@ -633,7 +646,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                  + ". Don't call build tools this turn: " + (
                      f"ask the mayor for {money(more or ask.amount)} with a reason (send_message) unless you already "
                      "did, then end_turn." if ask.ok else
-                     f"no money ask to the mayor ({ask.why}): say what you need in your end_turn report."))
+                     f"no money ask to the mayor ({ask.why}" + (f"; {ask.plan}" if ask.plan else "") + ")"
+                     + (f"; ask when {ask.when}" if ask.when else "") + ": say what you need in your end_turn report."))
     else:
         L.append(_ask_line(ask))
     if role == "transport" and (bus := first_bus_line(w, lists)):
