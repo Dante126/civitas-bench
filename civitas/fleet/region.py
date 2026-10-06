@@ -12,19 +12,23 @@ What the region adds:
   river, the links and (mayor) the deals;
 - a Region block in the mayor's, transport's and utilities' briefings (`region_lines`): the other cities (population,
   surplus and shortfall, unemployed and open jobs, links, last month's flows), connector sites, the river and the
-  deals;
+  deals; the mayor's also has its deal opportunities (`RegionEnv.deal_opportunities`: it or a neighbour at its power /
+  water limit while the other has spare, with the exact offer_deal call), its spare otherwise, and for each deal
+  whether an offer to it is worth accepting, when an active one ends and whether to cancel it (`RegionEnv.deal_check`);
 - tools (`region_tools`): `region_overview` for every role, the mayor's deal actions (`offer_deal`, `accept_deal`,
   `cancel_deal`, run through the region as it runs any mayor's deals), and `send_message` addressed to the city's
   own roles, a whole team ("south"), another city's agent ("south.mayor") or "all" (`message_targets`).
 """
 from __future__ import annotations
 
+import json
 import math
 import weakref
 from functools import partial
 
 from ..core.actions import connector_feeder
 from ..core.observation import _connector_sites
+from ..core.region import DEAL_BUSY, DEAL_MIN, RegionEnv, opportunity_text
 from ..sim import catalog as C
 from .fmt import money, num
 from .tools import Tool, ToolError, to_schema
@@ -90,7 +94,8 @@ def _deals(region, city: str) -> list[dict]:
 
 def overview(region, city: str) -> dict:
     """The region_overview result: the other cities (RegionEnv._region_view), the river, this city's links,
-    connectors and connector sites, last month's flows and its open deals."""
+    connectors and connector sites, last month's flows, its open deals, its power / water as a deal sees them
+    (RegionEnv.supply_state) and its deal opportunities with their offer_deal arguments."""
     view = region._region_view(city)
     w = region.envs[city].world
     return {"ok": True, "city": city, "cities": view["cities"], "my_specialisations": view["my_specialisations"],
@@ -99,7 +104,10 @@ def overview(region, city: str) -> dict:
             "flows_last_month": [dict(f) for f in region.flows if city in (f["a"], f["b"])],
             "connectors": [dict(c) for c in w.connectors],
             "connector_sites": connector_prices(w),
-            "deals": _deals(region, city)}
+            "deals": _deals(region, city),
+            "supply": region.supply_state(city),
+            "deal_opportunities": [{**o, "offer_deal": region.offer_args(o, city)}
+                                   for o in region.deal_opportunities(city)]}
 
 
 # ---------------------------------------------------------------- prompts
@@ -130,7 +138,12 @@ def region_rules(region, city: str, role: str) -> str:
         L.append("- Deals: offer_deal offers another mayor power or water capacity (sell: true) or asks to buy it "
                  "(sell: false) at a price per unit per month; it runs once that mayor calls accept_deal, and either "
                  "side can cancel_deal. Bought capacity adds to your supply, sold capacity comes off it; the money "
-                 "moves every month.")
+                 "moves every month. No link is needed. A city short of power or water imports at most "
+                 f"{round(100 * C.IMPORT_SHARE_MAX)}% of its demand at ${C.IMPORT_PRICE['power']:g} (power) / "
+                 f"${C.IMPORT_PRICE['water']:g} (water) a unit a month, and while it imports no new lot connects, so "
+                 "it stops growing; spare power earns only "
+                 f"${C.POWER_SELL_PRICE:g} a unit and spare water nothing. A deal between those prices pays both "
+                 "sides: your Region block names one when it fits.")
     L.append("- region_overview shows the other cities, the links, last month's flows"
              + (", connector sites" if role == "transport" else "") + (" and the deals" if role == "mayor" else "")
              + (" (your briefing's Region block has the summary)." if role in REGION_BLOCK else "."))
@@ -169,10 +182,19 @@ def _city_line(region, city: str, v: dict, prices: dict | None) -> str:
     return line
 
 
-def _deal_line(d: dict, mayor: bool = True) -> str:
-    """One deal: for the mayor what it pays or earns and what to do; for utilities what it does to supply."""
+def _use(s: dict, resource: str) -> str:
+    """'power at 97% of your own supply' (supply_state)."""
+    return (f"{resource} at {s['use_pct']}% of your own supply" if s["use_pct"] is not None else
+            f"no {resource} supply of your own")
+
+
+def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
+    """One deal: for the mayor what it pays or earns and what to do (with `check`, RegionEnv.deal_check: whether an
+    offer to it is worth taking, the last month of an active one, and whether to end it); for utilities what it does
+    to supply."""
     sell = d["you_are"] == "selling"
     n = d["months_left"]
+    call = lambda name: f'{name} {{"deal": {d["id"]}}}'
     if mayor:
         what = (f"you {'sell' if sell else 'buy'} {num(d['amount'])} {d['resource']} {'to' if sell else 'from'} "
                 f"{d['partner']} at ${d['price']:g}/unit/month ({'+' if sell else '-'}"
@@ -181,11 +203,35 @@ def _deal_line(d: dict, mayor: bool = True) -> str:
         what = (f"the city {'sells' if sell else 'buys'} {num(d['amount'])} {d['resource']} {'to' if sell else 'from'} "
                 f"{d['partner']} ({'-' if sell else '+'}{num(d['amount'])} {d['resource']} supply)")
     if d["status"] == "active":
-        return f"- deal #{d['id']} active: {what}, {n} month{'s' * (n != 1)} left"
+        line = f"- deal #{d['id']} active: {what}, {n} month{'s' * (n != 1)} left"
+        if check:
+            line += f" (through month {check['ends']})"
+            if check.get("cancel"):
+                s = check["s"]
+                line += (f"; you need it back ({_use(s, d['resource'])}): {call('cancel_deal')}" if sell else
+                         f"; you have room without it: {call('cancel_deal')} saves "
+                         f"{money(d['amount'] * d['price'])}/month")
+        return line
     if not mayor:
         return f"- deal #{d['id']} offered by {d['proposed_by']}: {what} for {n} months, if the mayors agree"
     if d["proposed_by"] == d["partner"]:
-        return f"- deal #{d['id']} offered by {d['partner']}: {what} for {n} months: accept_deal to take it"
+        line = f"- deal #{d['id']} offered by {d['partner']}: {what} for {n} months"
+        if not check:
+            return line + ": accept_deal to take it"
+        s = check["s"]
+        if sell:
+            why = (f"you have {num(RegionEnv.spare(s))} spare" if check["worth"] else
+                   f"you have only {num(RegionEnv.spare(s))} spare" if d["price"] >= s["floor"] else
+                   f"below the ${s['floor']:g}/unit your spare earns now")
+        elif s["need"] <= 0:
+            why = f"you have room ({_use(s, d['resource'])})"
+        elif d["price"] >= s["import_price"]:
+            why = f"dearer than imports (${s['import_price']:g}/unit)"
+        else:
+            why = f"{_use(s, d['resource'])}, imports cost ${s['import_price']:g}/unit" + (
+                "" if check["worth"] else f", but you need only {num(math.ceil(s['need']))}")
+        return line + f"; {why}: " + (f"{call('accept_deal')} takes it" if check["worth"] else
+                                      f"not worth it, leave it or {call('cancel_deal')}")
     return f"- deal #{d['id']} offered by you: {what} for {n} months, waiting for {d['partner']}.mayor to accept"
 
 
@@ -193,8 +239,30 @@ def _deal_lines(region, city: str, note: str, mayor: bool = True) -> list[str]:
     deals = _deals(region, city)
     if not deals:
         return [f"- deals: none{note}"]
-    L = [_deal_line(d, mayor) for d in deals[:MAX_DEALS]]
+    states = {c: region.supply_state(c) for c in region.cities} if mayor else None
+    L = [_deal_line(d, mayor, region.deal_check(d, city, states) if mayor else None) for d in deals[:MAX_DEALS]]
     return L + ([f"- (+{len(deals) - MAX_DEALS} more deals: region_overview)"] if len(deals) > MAX_DEALS else [])
+
+
+def _opportunity_lines(region, city: str) -> list[str]:
+    """The mayor's deal opportunities (RegionEnv.deal_opportunities), each with its offer_deal call; else, with spare
+    beyond DEAL_BUSY of its own supply, one line saying so."""
+    states = {c: region.supply_state(c) for c in region.cities}
+    L = []
+    opps = region.deal_opportunities(city, states)
+    for o in opps:
+        why, what = opportunity_text(o, city)
+        L.append(f"- deal opportunity: {why}: offer_deal {json.dumps(region.offer_args(o, city))} {what} "
+                 "(no link needed)")
+    told = {o["resource"] for o in opps} | {d["resource"] for d in region.deals if d["status"] == "offered"
+                                            and city in (d["seller"], d["buyer"])}
+    spare = {r: RegionEnv.spare(s) for r, s in states[city].items() if r not in told}
+    spare = {r: v for r, v in spare.items() if v >= DEAL_MIN}
+    if spare and region.deal_months():
+        L.append("- spare: " + ", ".join(f"{r} {num(round(v))}" for r, v in spare.items())
+                 + f" beyond {round(100 * DEAL_BUSY)}% use; no neighbour is short of "
+                 + ("it" if len(spare) == 1 else "either") + " now (a deal opportunity shows here when one is)")
+    return L
 
 
 def _river_line(region, city: str) -> list[str]:
@@ -226,6 +294,7 @@ def region_lines(env, role: str) -> list[str]:
         L.append("- your specialisations: " + (", ".join(f"{k} {v:g}" for k, v in spec.items()) or "none yet"))
         L += _river_line(region, city)
         L += _deal_lines(region, city, ": offer_deal sells or buys power / water capacity with another mayor")
+        L += _opportunity_lines(region, city)
     elif role == "transport":
         view = {v["city"]: v for v in region._region_view(city)["cities"]}
         for c, cs in connector_prices(w).items():
@@ -297,7 +366,8 @@ def region_tools(box) -> list[Tool]:
     tools = [
         Tool("region_overview", "The other cities of the region (population, specialisations, surplus and shortfall, "
              "unemployed and open jobs, links), the river, your links, connectors and connector sites, last month's "
-             "flows of goods, commuters and tourists, and your city's deals.", lambda: overview(region, city)),
+             "flows of goods, commuters and tourists, your city's deals, its power / water against its own supply and "
+             "its deal opportunities.", lambda: overview(region, city)),
         Tool("send_message", "Post on the council board (delivered at the end of your turn): to a role of your city "
              f"(\"mayor\"), a whole team (\"{others[0]}\"; \"{city}\" is yours), one agent of another city "
              f"(\"{others[0]}.mayor\"), or \"all\" (every city). Several in one call (to: \"police,fire\") each get "

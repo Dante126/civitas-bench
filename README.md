@@ -157,7 +157,8 @@ population ≈ 7.3k; `configs/fleet_scripted.toml` plays them through the fleet 
 scores exactly that (see [Agent fleets](#agent-fleets), "Scripted fleet").
 The scripted agents leave obvious room: they never use districts, mixed use, historic
 listings or soil clean-up, rarely use policies or funding levels, build services by simple
-coverage rules, hoard money late in the game and never make neighbour deals.
+coverage rules and hoard money late in the game. In a region the scripted mayors make the
+neighbour deals their observation names (see [Region mode](#region-mode-cities-that-trade-and-specialise)).
 
 Useful switches in `[game]` (or `--set game.X=...`):
 
@@ -427,8 +428,36 @@ in every city, `[agents."south.planning"]` sets one city.
   money), tourism, trade (freight), education. Complementary cities gain the most from links.
 - **Diplomacy.** All teams share one council board (address `"south"`, `"north.mayor"` or
   `"all"`) and mayors can agree power/water deals (`offer_deal`, `accept_deal`, `cancel_deal`).
+- **Power and water deals.** A deal moves a fixed amount of capacity from the seller's
+  supply to the buyer's every month, for a price per unit, until its term ends or either
+  mayor cancels it; no link is needed. A city short of power or water imports at most 25%
+  of its demand at $1.50 / $0.80 a unit a month (+1% per 1,000 residents), and while it
+  imports no empty lot connects, so it stops growing. Spare power earns $0.25 a unit
+  (sold to the outside region) and spare water nothing. A deal priced between the two
+  pays both sides. Once the buyer has room again it only moves money from one city to the
+  other. Each mayor's observation (`RegionEnv.deal_opportunities`) names a deal
+  opportunity when one city is at 90% or more of its own supply (imports left out) while
+  another has spare beyond 90%. It gives the amount that brings the buyer back to 90%
+  (at most the seller's spare), a price halfway between the seller's floor and the buyer's
+  import price, a term of two mayor turns and the exact `offer_deal` call. An offer to the
+  city says whether it is worth taking, and an active deal says when it ends and whether
+  to cancel it (`RegionEnv.deal_check`). The scripted mayors follow these lines: they
+  accept fair offers, cancel the others and offer each opportunity.
 
-Each city is scored on its own; the region score is their average. Fleet agents play region
+Each city is scored on its own; the region score is their average.
+
+| scripted, 120 months | city | population | deals run / offered |
+|---|---:|---:|---:|
+| `region.toml` seeds 0–2, before deals | 75.96 ± 1.56 | 27,175 | 0 / 0 |
+| `region.toml` seeds 0–2, with deals | 77.19 ± 1.28 | 29,159 | 20 / 24 |
+| `region.toml` seeds 0–7, before deals | 76.26 ± 1.15 | 27,507 | 0 / 0 |
+| `region.toml` seeds 0–7, with deals | 76.76 ± 1.05 | 28,434 | 18 / 22 |
+| `region_trio.toml` seeds 0–2, before deals | 76.13 ± 0.78 | 40,755 | 0 / 0 |
+| `region_trio.toml` seeds 0–2, with deals | 77.10 ± 1.00 | 42,004 | 51 / 67 |
+
+The deals are small money: $650–2,200 paid per two-city game, with most deals running
+1–2 months before the buyer's own plant gives it room. The gain is within seed noise
+(7 of 8 seeds up, seed 7 down 2.3). Single-city play is unchanged. Fleet agents play region
 roles too (see [Agent fleets](#agent-fleets), "Regions").
 
 ### Agent fleets
@@ -1117,7 +1146,13 @@ other cities and where they lie, the council's addresses, the river, links and, 
 mayor, deals). The mayor's briefing gains a Region block: per other city its population,
 specialisations, surplus and shortfall, unemployed and open jobs, links, what a connector
 would cost transport and last month's goods, commuters and tourists between the two, then
-the river's pollution and up to 4 deals with what to do about them. Transport's block has
+the river's pollution and up to 4 deals with what to do about them (an offer to the city
+with whether it is worth taking and the `accept_deal` call; an active deal with its last
+month and, when the city should end it, the `cancel_deal` call). Below those come its deal
+opportunities, at most one per resource, each with why, the exact `offer_deal` call and
+what it pays or earns a month; without one, its spare beyond 90% of its own supply. The
+system prompt's Deals rule gives the import and resale prices that make a deal pay.
+Transport's block has
 each neighbour's best connector site priced as `build_connector` charges it, and boat and
 air links; utilities' has the river and what the deals do to supply. Every role gets
 `region_overview`, the mayor gets `offer_deal`, `accept_deal` and `cancel_deal` (run as
@@ -1622,7 +1657,12 @@ the first long run with the mayor's Open requests block, departments asking only
 - **Departments' unfundable money asks:** 125 were held back once (`refused: "ask"`). Utilities' reasoning shows a
   conflict: its plan target ($3,000) against "no money ask to the mayor now: supply has room".
 - **No deals and no messages between the cities** in 120 months, although both mayors had the deal tools and the
-  Region block every turn. The Region view has still not shown real data.
+  Region block every turn. The Region view has still not shown real data. Why: each city imported power or water in
+  about 20 of the 120 months (43 city-months, $5.1k of imports in all), and the other city had spare in 29 of those.
+  But the City block's supply line counts imports, so it read "power 1,081 / 1,081" and the mayors concluded they
+  weren't short. Nothing told either mayor that the other was short, what price would pay, or that no link is
+  needed (the north mayor twice thought a connector was), and the 8-action cap went to allocations. Since then the Region block names
+  each deal opportunity with its `offer_deal` call (see [Region mode](#region-mode-cities-that-trade-and-specialise)).
 - **Weak spots:** south health 50.6, south police 54.8, transport 63–66 in both cities. Money aim (33–43) is low
   partly by construction: departments now ask only when the mayor can fund it, so many top-ups answer no message.
 

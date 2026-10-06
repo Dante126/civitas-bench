@@ -121,7 +121,26 @@ class ScriptedMayor(Agent):
             msgs.append({"to": "all", "text": "Budgets allocated. Planning: grow housing and jobs near the highway. "
                                               "Utilities: power and water first. Services: build once people move in. "
                                               "Ask me if you run short."})
-        return Decision(actions=acts[: obs.get("max_actions", 8)], messages=msgs, thinking="; ".join(why))
+        deals = _deal_actions(obs) if "region" in obs else []      # region mode only; beside the action cap
+        if deals:
+            why.append(", ".join(f"{a['type']} {a.get('deal') or a['resource']}" for a in deals))
+        return Decision(actions=acts[: obs.get("max_actions", 8)] + deals, messages=msgs, thinking="; ".join(why))
+
+
+def _deal_actions(obs: dict) -> list[dict]:
+    """A region mayor's power / water deals (RegionEnv.observe's region block): accept an offer to the city that is
+    worth it (it buys cheaper than its imports while at its limit, or sells no more than its spare at its floor or
+    above) and cancel one that isn't, cancel an active deal it no longer wants (it sells and has reached its own limit,
+    or buys and has room without it), and offer each deal opportunity as named. Deal actions run through the region,
+    outside the city's action cap."""
+    reg, city = obs["region"], obs.get("city_name")
+    acts = []
+    for d in reg.get("deals", []):
+        if d["status"] == "offered" and d["proposed_by"] != city:
+            acts.append({"type": "accept_deal" if d.get("worth") else "cancel_deal", "deal": d["id"]})
+        elif d["status"] == "active" and d.get("cancel"):
+            acts.append({"type": "cancel_deal", "deal": d["id"]})
+    return acts + [{"type": "offer_deal", **o["offer"]} for o in reg.get("deal_opportunities", [])]
 
 
 def _requested_amounts(council: list[dict], since: int) -> dict[str, float]:
