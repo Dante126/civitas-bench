@@ -1605,6 +1605,27 @@ parallel; the Mac slept overnight, so wall times don't count):
   than asking"; they now say to zone the part that fits and ask for the rest.
 - **Utilities:** power and water coverage stayed at 96–100% all game on both seeds; v19 dipped to 77–89% power.
 
+**120-month region run on main at 615bff3** (2026-10-05, `configs/fleet_region_both_120.toml`: `fleet_region_smoke.toml`
+with the fleet in both cities and `months = 120`; 640 fleet turns, 38.3M prompt tokens, 4.4 hours, seed 0). It is
+the first long run with the mayor's Open requests block, departments asking only for what the mayor can fund, and
+`send_message` to several departments at once.
+
+| | north | south | region | scripted, same map and cadence |
+|---|---|---|---|---|
+| city score at month 120 | **79.3** | 73.6 | **76.4** (average over the run 61.6) | 67.3 (`region.toml`, `act_every = 3`) |
+| population | 18,860 | 17,828 | **36,688** | 13,148 |
+| teamwork (collaboration score) | 62.2 | 60.5 | | |
+
+- **The mayors answered every request:** 78 of 82 and 74 of 75 requests to them got a top-up or a reply (100%
+  responsiveness once open ones are left out), against 59% on v23. 98 of 492 `send_message` calls went to several
+  departments, and none failed on a recipient name.
+- **Departments' unfundable money asks:** 125 were held back once (`refused: "ask"`). Utilities' reasoning shows a
+  conflict: its plan target ($3,000) against "no money ask to the mayor now: supply has room".
+- **No deals and no messages between the cities** in 120 months, although both mayors had the deal tools and the
+  Region block every turn. The Region view has still not shown real data.
+- **Weak spots:** south health 50.6, south police 54.8, transport 63–66 in both cities. Money aim (33–43) is low
+  partly by construction: departments now ask only when the mayor can fund it, so many top-ups answer no message.
+
 **v20** (2026-09-29, main at c2947f0, adding the mayor money picture from
 `docs/plans/2026-09-29-mayor-money.md`: a Finances split, a need-ordered Departments block with
 upkeep, "to spend" / "to fund" lines, earned confirm, the loan guard and money result notes)
