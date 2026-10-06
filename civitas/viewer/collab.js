@@ -448,6 +448,7 @@ export class BeamLayer {
 const CITY_C = ["#4fc3f7", "#ff8a65", "#c5a3ff", "#7bd88f", "#f06292", "#ffd54f"];
 export const RES_C = { power: "#ffd34d", water: "#5ab8ff" };
 const ENDED_SHOWN = 12;                 // months an ended deal stays on the graph
+const LABELS_PER_PAIR = 3;              // deal labels stacked on one edge; the rest read "+N more"
 const DONE = ["met", "partial", "acted", "replied"];
 export const cityColor = (cities, c) => { const i = (cities || []).indexOf(c); return CITY_C[(i < 0 ? 0 : i) % CITY_C.length]; };
 // a deal's state in month m: null before its offer, "offered", "active" or "ended"
@@ -577,7 +578,20 @@ export class RegionGraph {
       if (!byPair.has(key)) byPair.set(key, []);
       byPair.get(key).push({ d, st, p: pair[0], q: pair[1] });
     }
-    for (const list of byPair.values()) list.forEach((x, i) => { x.k = (i - (list.length - 1) / 2) * 0.2; x.lt = Math.max(0.25, Math.min(0.75, 0.5 + (i - (list.length - 1) / 2) * 0.24)); out.push(x); });
+    // labels: live deals first (at most LABELS_PER_PAIR, the rest "+N more"), an ended one only while nothing is live
+    // between the two cities: many short deals stacked unreadable labels on one edge
+    const rank = (x) => x.st === "ended" ? 2 : x.st === "active" ? 0 : 1;
+    for (const list of byPair.values()) {
+      list.sort((a, b) => rank(a) - rank(b) || (b.d.ended ?? b.d.offered ?? 0) - (a.d.ended ?? a.d.offered ?? 0));
+      const live = list.filter(x => x.st !== "ended").length;
+      const labelled = list.filter((x, i) => i < LABELS_PER_PAIR && (x.st !== "ended" || (!live && i === 0)));
+      const more = list.filter(x => x.st !== "ended").length - labelled.filter(x => x.st !== "ended").length;
+      // live deals fan out; every ended one shares a single faint line (eleven short deals made a spray of arcs)
+      const slots = live + (list.length > live ? 1 : 0);
+      list.forEach((x, i) => { x.k = (Math.min(i, live) - (slots - 1) / 2) * 0.2; out.push(x); });
+      labelled.forEach((x, i) => { x.label = true; x.lt = Math.max(0.25, Math.min(0.75, 0.5 + (i - (labelled.length - 1) / 2) * 0.24)); });
+      if (more > 0) labelled[labelled.length - 1].more = more;
+    }
     return out;
   }
   _launch(prev, month, budget) {
@@ -720,11 +734,13 @@ export class RegionGraph {
       this._path(x.p, x.q, x.k); g.stroke();
     }
     g.restore();
+    if (!x.label) return;
     // the label on the edge (several deals between two cities stack theirs along it): what, how much, at what price,
     // and where it stands
     const [mx, my] = this._at(x.p, x.q, x.k, x.lt), left = d.months - dealPaid(d, this.month);
     const main = `${Math.round(d.amount)} ${d.resource} · $${d.price}`;
-    const sub = x.st === "active" ? `#${d.id} ${d.seller}→${d.buyer} · ${left} mo left` : x.st === "offered" ? `#${d.id} offer from ${d.proposer}` : `#${d.id} ${dealEnd(d)}`;
+    const sub = (x.st === "active" ? `#${d.id} ${d.seller}→${d.buyer} · ${left} mo left` : x.st === "offered" ? `#${d.id} offer from ${d.proposer}` : `#${d.id} ${dealEnd(d)}`)
+      + (x.more ? ` · +${x.more} more` : "");
     g.globalAlpha = (x.st === "ended" ? 0.6 * (1 - age) + 0.2 : 1) * (on ? 1 : 0.35);
     this._label(main, mx, my - 2 * s, x.st === "ended" ? "#9aa3ad" : col, 10.5 * s, true);
     this._label(sub, mx, my + 10 * s, "#9aa3ad", 9 * s, true);
