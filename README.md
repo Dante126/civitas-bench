@@ -1876,7 +1876,19 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **Team.**
 - **Issues:** *Agent mistakes* (the Problems analysis) or *City events* (disasters, milestones, offers, and what residents complain about).
 - **Money.**
-- **⋯:** Charts, Region, All messages (the full council log) and Runs.
+- **⋯:** Charts, Region, All messages (the full council log), Runs and **Compare runs**.
+
+**Compare view** (viewer: ⋯ → Compare runs, the Runs tab's checkboxes and **Compare (n)**, or `C`). Up to 8 runs side by
+side, e.g. the fleet's long runs, a region run, a late smoke and the scripted fleet. A table with the runs as columns
+(best value per row in green): kind (LLM fleet, scripted fleet, scripted, LLM; region, late with its warm-up), model,
+months played, the final and average city score (and after a warm-up the average since, and the score and population
+change since hand-over), population, each department's final score, the Teamwork score with its four components as bars
+and its requests, and from `fleet_report.json` the fleet calls per turn (failed, refused, repeats, tool errors) and
+overrides. Above it, overlaid line charts of the city score, population and Teamwork per month, each run's scripted
+warm-up shaded and its line faded there. A region run's own column holds the region's city score and population and its
+departments' and Teamwork's mean over its cities; "Cities of region runs" adds a column (and a dashed line) per city.
+The picked runs stay picked (localStorage); click a run's name to open it. Backend: `GET /api/compare?runs=a,b,c`
+(`bench/compare.py:run_compare`, cached per run until its files change).
 
 **Team tab** (viewer). The departments as a live network (`viewer/collab.js`): the mayor in the centre, the departments on a ring, each node sized by its funds with an arc for its open requests. Edges glow with the last 12 months of messages and money. As the replay steps, each turn's events play out:
 - requests fly as comets with the amount asked, and reports as small pulses;

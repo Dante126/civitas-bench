@@ -4,6 +4,7 @@ import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } fr
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
 import { CollabGraph, BeamLayer, RegionGraph, cityColor, dealState, dealPaid, dealEnd, cityTally, RES_C } from "./collab.js";
+import { RUN_COLORS, COMPARE_MAX, columns, tableHTML, chartsHTML, legendHTML, drawCharts } from "./compare.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -486,8 +487,9 @@ function renderTab() {
     $("tabTools").innerHTML = "";
     renderRegion();
   } else if (S.tab === "runs") {
-    $("tabTools").innerHTML = `<button class="btn" id="rRefresh">↻ Refresh</button><button class="btn primary" id="rNew">＋ New run</button>`;
+    $("tabTools").innerHTML = `<button class="btn" id="rRefresh">↻ Refresh</button><button class="btn" id="rCompare" title="The ticked runs side by side">Compare (${S.cmp.ids.length})</button><button class="btn primary" id="rNew">＋ New run</button>`;
     $("rRefresh").onclick = () => { refreshRuns().then(renderTab); };
+    $("rCompare").onclick = openCompare;
     $("rNew").onclick = openLaunch;
     renderRunsTab();
   }
@@ -1329,15 +1331,83 @@ async function renderRunsTab() {
       ${board.map(r => `<tr title="${esc(r.signature + (r.fleet_version ? `\nfleet_version ${r.fleet_version}` : ""))}"><td class="ellipsis" style="max-width:130px">${esc(boardLabel(r))}</td><td>${r.n}</td>
       <td><b>${r.city.mean.toFixed(1)}</b><span class="muted">±${r.city.std.toFixed(1)}</span></td><td>${Math.round(r.population.mean).toLocaleString()}</td>
       ${Object.keys(r.roles).map(k => `<td>${r.roles[k].mean.toFixed(0)}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}
-    <h4 style="margin-top:14px">All runs</h4>
-    ${S.runs.map(r => `<div class="runrow" data-run="${esc(r.run_id)}"><span class="ellipsis"><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
+    <h4 style="margin-top:14px">All runs <span class="muted small" style="text-transform:none;letter-spacing:0">· tick runs to compare them</span></h4>
+    ${S.runs.map(r => `<div class="runrow" data-run="${esc(r.run_id)}"><span class="ellipsis"><label class="cmpbox" title="Pick for the Compare view"><input type="checkbox" data-cmp="${esc(r.run_id)}" ${S.cmp.ids.includes(r.run_id) ? "checked" : ""}></label><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
       <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b> ` : ""}<span class="pill ${r.status}">${r.status}</span></span><span class="sig">${esc(r.signature || "")}</span></div>`).join("")}`;
-  body.querySelectorAll(".runrow").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop) openRun(el.dataset.run); });
+  body.querySelectorAll(".runrow").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop && !e.target.closest(".cmpbox")) openRun(el.dataset.run); });
+  body.querySelectorAll("[data-cmp]").forEach(b => b.onchange = () => {
+    if (b.checked) b.checked = cmpAdd(b.dataset.cmp); else cmpRemove(b.dataset.cmp);
+    if ($("rCompare")) $("rCompare").textContent = `Compare (${S.cmp.ids.length})`;
+  });
   body.querySelectorAll("[data-stop]").forEach(b => b.onclick = async (e) => {
     e.stopPropagation();
     try { await api("/api/stop", { run_id: b.dataset.stop }); toast("Run stopped."); } catch (err) { toast(esc(err.message), true); }
     await refreshRuns(); renderRunsTab();
   });
+}
+
+// ================================================================ compare view (compare.js, /api/compare)
+// the picked runs and their colour slots are remembered; a run keeps its colour while it stays picked
+S.cmp = { ids: store.get("cmpRuns", []), slots: store.get("cmpSlots", {}), split: store.get("cmpSplit", false), data: {} };
+if (!Array.isArray(S.cmp.ids)) S.cmp.ids = [];
+S.cmp.ids = S.cmp.ids.filter(x => typeof x === "string").slice(0, COMPARE_MAX);
+if (!S.cmp.slots || typeof S.cmp.slots !== "object") S.cmp.slots = {};
+const cmpSave = () => { store.set("cmpRuns", S.cmp.ids); store.set("cmpSlots", S.cmp.slots); };
+const cmpColor = (id) => RUN_COLORS[S.cmp.slots[id] ?? 0] || RUN_COLORS[0];
+function freeSlot(except) { const used = new Set(S.cmp.ids.filter(x => x !== except).map(x => S.cmp.slots[x])); return RUN_COLORS.findIndex((_, i) => !used.has(i)); }
+S.cmp.ids.forEach(id => { if (S.cmp.slots[id] == null || S.cmp.ids.some(x => x !== id && S.cmp.slots[x] === S.cmp.slots[id])) S.cmp.slots[id] = freeSlot(id); });
+function cmpAdd(id) {
+  if (!id || S.cmp.ids.includes(id)) return true;
+  if (S.cmp.ids.length >= COMPARE_MAX) { toast(`Compare up to ${COMPARE_MAX} runs at a time: remove one first.`, true); return false; }
+  S.cmp.slots[id] = freeSlot(id);
+  S.cmp.ids.push(id); cmpSave(); return true;
+}
+function cmpRemove(id) { S.cmp.ids = S.cmp.ids.filter(x => x !== id); delete S.cmp.slots[id]; cmpSave(); }
+function openCompare() {
+  if (!S.cmp.ids.length && S.runId) cmpAdd(S.runId);
+  S.cmp.data = {};                                   // fresh numbers for live runs (the server caches the rest)
+  $("compareModal").hidden = false;
+  renderCompare(); loadCompareRuns();
+}
+async function loadCompareRuns() {
+  const want = S.cmp.ids.filter(id => !S.cmp.data[id]);
+  if (!want.length) return;
+  want.forEach(id => S.cmp.data[id] = { loading: true });
+  try {
+    const d = await api(`/api/compare?runs=${want.map(encodeURIComponent).join(",")}`);
+    for (const r of d.runs) S.cmp.data[r.run_id] = r;
+    for (const id of d.missing) { delete S.cmp.data[id]; cmpRemove(id); }
+    if (d.missing.length) toast(`Not found, left out of the comparison: ${d.missing.map(esc).join(", ")}`, true);
+  } catch (e) { want.forEach(id => S.cmp.data[id] = { error: e.message }); }
+  if (!$("compareModal").hidden) renderCompare();
+}
+function renderCompare() {
+  const ids = S.cmp.ids, runs = ids.map(id => S.cmp.data[id]).filter(r => r && r.run_id);
+  $("cmpCount").textContent = ids.length ? `${ids.length} run${ids.length === 1 ? "" : "s"}` : "";
+  const others = (S.runs || []).filter(r => !ids.includes(r.run_id));
+  const anyRegion = runs.some(r => r.region);
+  $("cmpTools").innerHTML = `<select id="cmpAdd" aria-label="Add a run"><option value="">＋ Add a run…</option>${others.map(r =>
+      `<option value="${esc(r.run_id)}">${esc(r.name)} · seed ${r.seed ?? "?"} · ${r.scores ? `city ${r.scores.city.toFixed(1)} · ` : ""}${esc(r.run_id)}</option>`).join("")}</select>
+    ${S.runId && !ids.includes(S.runId) ? `<button class="btn" id="cmpAddOpen">＋ The open run</button>` : ""}
+    ${anyRegion ? `<label class="cmp-split" title="A region run as one column (region values), or one more column per city"><input type="checkbox" id="cmpSplit" ${S.cmp.split ? "checked" : ""}> Cities of region runs</label>` : ""}
+    <div class="grow"></div>${ids.length ? `<button class="btn" id="cmpClear">Clear</button>` : ""}`;
+  $("cmpAdd").onchange = (e) => { if (e.target.value && cmpAdd(e.target.value)) { renderCompare(); loadCompareRuns(); } };
+  if ($("cmpAddOpen")) $("cmpAddOpen").onclick = () => { if (cmpAdd(S.runId)) { renderCompare(); loadCompareRuns(); } };
+  if ($("cmpSplit")) $("cmpSplit").onchange = (e) => { S.cmp.split = e.target.checked; store.set("cmpSplit", S.cmp.split); renderCompare(); };
+  if ($("cmpClear")) $("cmpClear").onclick = () => { S.cmp.ids = []; S.cmp.slots = {}; cmpSave(); renderCompare(); };
+  const body = $("cmpBody");
+  if (!ids.length) { body.innerHTML = `<div class="emptytab">Pick runs to compare: add them above, or tick them in the Runs tab.</div>`; return; }
+  const waiting = ids.filter(id => !S.cmp.data[id] || S.cmp.data[id].loading).length;
+  const errs = ids.filter(id => S.cmp.data[id] && S.cmp.data[id].error);
+  const cols = columns(runs, { split: S.cmp.split, colorOf: cmpColor });
+  body.innerHTML = (waiting ? `<div class="small muted">Loading ${waiting} run${waiting === 1 ? "" : "s"}…</div>` : "") +
+    (errs.length ? `<div class="small bad">Could not load ${errs.map(esc).join(", ")}: ${esc(S.cmp.data[errs[0]].error)}</div>` : "") +
+    (cols.length ? `${legendHTML(cols)}<div class="cmp-charts">${chartsHTML()}</div>
+      <div class="cmp-scroll">${tableHTML(cols, { current: S.runId, roleColor })}</div>
+      <div class="small muted cmp-foot">Best value per row in green. A region run's own column holds the region's city score and population, and its departments' and Teamwork's mean over its cities. Click a run's name to open it.</div>` : "");
+  body.querySelectorAll("[data-open]").forEach(b => b.onclick = () => { $("compareModal").hidden = true; openRun(b.dataset.open); });
+  body.querySelectorAll("[data-x]").forEach(b => b.onclick = () => { cmpRemove(b.dataset.x); renderCompare(); if (S.tab === "runs") renderRunsTab(); });
+  if (cols.length) drawCharts(body, cols);
 }
 
 // ================================================================ charts
@@ -1658,6 +1728,7 @@ document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.targ
 $("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
 document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); $("moreMenu").hidden = true; renderTab(); });
 $("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("moreMenu").hidden; };
+$("compareBtn").onclick = () => { $("moreMenu").hidden = true; openCompare(); };
 document.addEventListener("click", (e) => { if (!e.target.closest(".tabmore")) $("moreMenu").hidden = true; });
 buildLayerMenu();
 $("layerBtn").onclick = (e) => { e.stopPropagation(); $("layerMenu").hidden = !$("layerMenu").hidden; };
@@ -1696,13 +1767,13 @@ document.addEventListener("keydown", (e) => {
     "0": () => scene.resetView(), t: () => scene.topView(), o: () => $("vRotate").click(), n: () => $("vNight").click(), g: () => $("vQuality").click(),
     p: () => $("vShot").click(), f: () => $("vFull").click(), l: () => { $("follow").checked = !$("follow").checked; $("follow").onchange({ target: $("follow") }); },
     "[": () => $("vLeft").click(), "]": () => $("vRight").click(), r: () => $("runBtn").click(), "?": () => ($("helpModal").hidden = false),
-    v: () => $("layerBtn").click(), x: () => $("vMode").click(), b: () => $("vBeams").click(),
+    v: () => $("layerBtn").click(), x: () => $("vMode").click(), b: () => $("vBeams").click(), c: () => openCompare(),
   };
   OVERLAYS.slice(0, 9).forEach((o, k) => { map[String(k + 1)] = () => setOverlay(o.id); });
   const fn = map[k] || map[k.toLowerCase()];
   if (fn) { e.preventDefault(); fn(); }
 });
-window.addEventListener("resize", () => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); if (S.tab === "money") renderMoneyTab(); });
+window.addEventListener("resize", () => { drawTrackMarks(); if (!$("compareModal").hidden) renderCompare(); if (S.tab === "charts") renderCharts(); if (S.tab === "money") renderMoneyTab(); });
 
 // ================================================================ boot
 (async function boot() {

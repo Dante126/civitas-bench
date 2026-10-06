@@ -190,6 +190,30 @@ def collab_data(d: Path, city: str | None) -> dict:
     return c
 
 
+_COMPARE: dict[str, tuple] = {}    # run folder -> ((size, mtime) of its files, run_compare result): a live run recomputes
+COMPARE_MAX = 12                    # runs per /api/compare request
+
+
+def compare_data(d: Path) -> dict:
+    """run_compare of a run folder (the Compare view), Teamwork from collab_data, cached in _COMPARE until frames.jsonl,
+    summary.json or fleet_report.json change."""
+    from .bench.compare import run_compare
+
+    def stamp(f: Path):
+        try:
+            st = f.stat()
+            return st.st_size, st.st_mtime_ns
+        except OSError:
+            return None
+    key = tuple(stamp(d / f) for f in ("frames.jsonl", "summary.json", "fleet_report.json", "meta.json"))
+    hit = _COMPARE.get(str(d))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    c = run_compare(d, collab_data)
+    _COMPARE[str(d)] = (key, c)
+    return c
+
+
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
     """The run's folder, only when it sits directly in `runs_dir` once resolved (no "..", ".", "a/b", links out)."""
     d = (runs_dir / run_id).resolve()
@@ -450,6 +474,16 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                     frames.append(json.loads(line))
                         return self._json({"since": since, "frames": frames, "status": self._status(d),
                                            "finished": (d / "summary.json").exists()})
+                if parts[1:] == ["compare"]:        # runs side by side (Compare view): ?runs=a,b,c
+                    ids = [x for x in ",".join(q.get("runs", [])).split(",") if x][:COMPARE_MAX]
+                    out, missing = [], []
+                    for rid in dict.fromkeys(ids):
+                        d = self._run_dir(rid)
+                        if d is None or not (d / "meta.json").exists():
+                            missing.append(rid)
+                            continue
+                        out.append({**compare_data(d), "status": self._status(d)})
+                    return self._json({"runs": out, "missing": missing})
                 if parts[1:] == ["leaderboard"]:
                     from .bench.runner import leaderboard
                     return self._json(leaderboard(runs_dir))

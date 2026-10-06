@@ -58,6 +58,7 @@
           <button data-tab="region" id="regionTab" hidden>Region</button>
           <button data-tab="council">All messages</button>
           <button data-tab="runs">Runs</button>
+          <button id="compareBtn" title="Several runs side by side: scores, population, Teamwork">Compare runs</button>
         </div>
       </div>
     </nav>
@@ -154,7 +155,7 @@
           <p><kbd>Home</kbd><kbd>End</kbd> first/last · <kbd>L</kbd> follow live run</p></div>
         <div><h4>View</h4>
           <p><kbd>V</kbd> layer menu · <kbd>1</kbd>–<kbd>9</kbd> layers · <kbd>B</kbd> hand-off beams · <kbd>N</kbd> night · <kbd>G</kbd> quality · <kbd>P</kbd> screenshot · <kbd>F</kbd> fullscreen</p>
-          <p><kbd>[</kbd><kbd>]</kbd> panels · <kbd>R</kbd> runs · <kbd>Esc</kbd> close</p></div>
+          <p><kbd>[</kbd><kbd>]</kbd> panels · <kbd>R</kbd> runs · <kbd>C</kbd> compare runs · <kbd>Esc</kbd> close</p></div>
         <div><h4>Inspect</h4>
           <p>Click a tile to see its stats, history, and which agent built it.</p>
           <p>Click an action in the Agents tab to fly to where it happened. Expand <i>Model reasoning</i> to read an LLM's full thinking, or <i>Tool calls</i> to follow a fleet turn call by call.</p>
@@ -172,6 +173,13 @@
     <div class="modal-card glass team-card">
       <div class="modal-head"><h3>Team view <span id="teamMonth" class="muted small"></span></h3><button class="btn icon" data-close>✕</button></div>
       <div class="team-body"><canvas id="teamBig" class="teamcanvas big"></canvas><canvas id="teamBigR" class="teamcanvas big" style="display:none"></canvas><div id="teamSide" class="teamside"></div></div>
+    </div>
+  </div>
+  <div id="compareModal" class="modal" hidden>
+    <div class="modal-card glass compare-card">
+      <div class="modal-head"><h3>Compare runs <span id="cmpCount" class="muted small"></span></h3><button class="btn icon" data-close>✕</button></div>
+      <div id="cmpTools" class="cmp-tools"></div>
+      <div id="cmpBody" class="cmp-body"></div>
     </div>
   </div>
   <div id="toasts"></div>
