@@ -609,7 +609,9 @@ class RegionEnv:
                 if not (0 < amount <= DEAL_AMOUNT_MAX and 0 <= price <= DEAL_PRICE_MAX and 1 <= months <= DEAL_MONTHS_MAX):
                     return res(False, f"amount 1-{DEAL_AMOUNT_MAX} units, price $0-{DEAL_PRICE_MAX} per unit per month, "
                                       f"months 1-{DEAL_MONTHS_MAX}")
-                sell = bool(a.get("sell", True))
+                if not isinstance(a.get("sell"), bool):     # no default: the late region smoke's south mayor, short
+                    return res(False, "sell must be true (you sell the capacity) or false (you buy it)")   # of water,
+                sell = a["sell"]                            # left out "sell": false and offered to sell instead
                 expires = self.month + self.offer_window() - 1
                 deal = {"id": len(self.deals) + 1, "seller": city if sell else to, "buyer": to if sell else city,
                         "resource": resource, "amount": amount, "price": price, "months_left": months,
@@ -619,7 +621,9 @@ class RegionEnv:
                                   f"DEAL #{deal['id']} proposed: {deal['seller']} sells {amount:.0f} {resource} to "
                                   f"{deal['buyer']} at ${price}/unit/month for {months} months (open until month "
                                   f"{expires})", to)
-                return res(True, f"proposed deal #{deal['id']}; the {to} mayor must accept it by month {expires}")
+                way = f"you sell {amount:.0f} {resource} to {to}" if sell else f"you buy {amount:.0f} {resource} from {to}"
+                return res(True, f"proposed deal #{deal['id']} ({way} at ${price}/unit/month for {months} months); the "
+                                 f"{to} mayor must accept it by month {expires}")
             deal = self.deal(int(a.get("deal", -1)))
             if deal is None:
                 return res(False, f"no deal #{a.get('deal')}")

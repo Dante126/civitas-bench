@@ -412,14 +412,14 @@ def region_tools(box) -> list[Tool]:
     if box.role == "mayor":
         deal = {"type": "integer", "description": "the deal number (#1 is 1)"}
         tools += [
-            Tool("offer_deal", "Offer another city's mayor a power or water deal: sell (sell: true, the default) or buy "
-                 f"(sell: false) `amount` units of capacity (1-{DEAL_AMOUNT_MAX}) at `price` dollars per unit per month "
+            Tool("offer_deal", "Offer another city's mayor a power or water deal: sell (sell: true) or buy "
+                 f"(sell: false; always give it) `amount` units of capacity (1-{DEAL_AMOUNT_MAX}) at `price` dollars per unit per month "
                  f"(0-{DEAL_PRICE_MAX}) for `months` (1-{DEAL_MONTHS_MAX}, default 24). It runs once that mayor calls "
                  f"accept_deal within {region.offer_window()} months (then the offer expires); the offer is posted on "
                  "the council.", partial(_deal, box, region, "offer_deal"),
                  {"to": {"type": "string", "enum": others}, "resource": {"type": "string", "enum": list(RESOURCES)},
                   "amount": {"type": "number"}, "price": {"type": "number"}, "months": {"type": "integer"},
-                  "sell": {"type": "boolean"}}, ("to", "resource", "amount", "price")),
+                  "sell": {"type": "boolean"}}, ("to", "resource", "amount", "price", "sell")),
             Tool("accept_deal", "Accept a deal another city's mayor offered your city.",
                  partial(_deal, box, region, "accept_deal"), {"deal": deal}, ("deal",)),
             Tool("cancel_deal", "End one of your city's deals (offered or active).",

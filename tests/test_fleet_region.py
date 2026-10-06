@@ -71,7 +71,7 @@ def _script(city: str, role: str, messages: list[dict]) -> list[dict]:
         seq = [[_call("update_plan", {"budgets": {"utilities": 3000}, "goals": [f"power {city}"]})],
                [_call("allocate_budget", {"department": "utilities", "amount": 3000})],
                [_call("send_message", {"to": f"{other}.mayor", "text": f"hello {other}, want power?"}),
-                _call("offer_deal", {"to": other, "resource": "power", "amount": 20, "price": 0.5, "months": 6})],
+                _call("offer_deal", {"to": other, "resource": "power", "amount": 20, "price": 0.5, "months": 6, "sell": True})],
                [_call("end_turn", {"report": "plan set, deal offered"})]]
         return seq[step] if step < len(seq) else []
     if role == "utilities":
@@ -307,14 +307,17 @@ def test_one_message_to_several_addresses_in_a_region():
 def test_mayors_make_deals_with_their_tools():
     region, n, s = _linked()
     nb, sb = ToolBox(n, "mayor"), ToolBox(s, "mayor")
-    offer = {"to": "south", "resource": "power", "amount": 50, "price": 1, "months": 3}
+    offer = {"to": "south", "resource": "power", "amount": 50, "price": 1, "months": 3, "sell": True}
     r = nb.call("offer_deal", offer)
-    assert r == {"ok": True, "message": "proposed deal #1; the south mayor must accept it by month 1", "cost": 0.0,
+    assert r == {"ok": True, "message": "proposed deal #1 (you sell 50 power to south at $1.0/unit/month for 3 months); "
+                 "the south mayor must accept it by month 1", "cost": 0.0,
                  "budget_left": n.world.treasury}
     assert region.council.messages[-1].sender == "north.mayor" and region.council.messages[-1].to == "south"
     assert not nb.call("accept_deal", {"deal": 1})["ok"]                          # not its own offer
     assert nb.call("accept_deal", {"deal": 1})["refused"] == "repeat"
     assert "must be one of" in nb.call("offer_deal", {**offer, "resource": "gold"})["error"]
+    no_way = {k: v for k, v in offer.items() if k != "sell"}     # no default: a dropped "sell": false sold instead
+    assert "sell" in nb.call("offer_deal", no_way)["error"]
     assert "the police role cannot use 'offer_deal'" in ToolBox(n, "police").call("offer_deal", offer)["error"]
     assert ("- deal #1 offered by north: you buy 50 power from north at $1/unit/month (-$50/month) for 3 months (open "
             "until month 1); no power supply of your own, imports cost $1.5/unit, but you need only 7: not worth it, "
@@ -346,7 +349,7 @@ def test_deals_count_towards_the_action_cap():
     region, n, s = _linked()
     n.cfg.max_actions_per_turn = 1
     box = ToolBox(n, "mayor")
-    assert box.call("offer_deal", {"to": "south", "resource": "water", "amount": 10, "price": 0.2})["ok"]
+    assert box.call("offer_deal", {"to": "south", "resource": "water", "amount": 10, "price": 0.2, "sell": True})["ok"]
     assert "action limit" in box.call("cancel_deal", {"deal": 1})["error"]
 
 
@@ -434,7 +437,7 @@ def test_a_deal_opportunity_when_one_city_is_short_and_the_other_has_spare():
 
 def test_offers_to_a_city_say_whether_they_are_worth_taking():
     region, n, s = _short_north()
-    offer = lambda box, **kw: box.call("offer_deal", {"to": "north", "resource": "power", "months": 3, **kw})
+    offer = lambda box, **kw: box.call("offer_deal", {"to": "north", "resource": "power", "months": 3, "sell": True, **kw})
     sb = ToolBox(s, "mayor")
     assert offer(sb, amount=160, price=2.0)["ok"] and offer(sb, amount=1000, price=0.5, months=4)["ok"]
     lines = [x for x in region_lines(n, "mayor") if x.startswith("- deal #")]
@@ -492,7 +495,8 @@ def test_two_sellers_cannot_both_cover_one_need():
     assert region.deal_opportunities("east") == [] and \
         not any(x.startswith("- deal opportunity") for x in region_lines(e, "mayor"))
     # offered anyway, each offer alone is worth taking; the first accepted, the second is covered
-    assert eb.call("offer_deal", {"to": "north", "resource": "power", "amount": 160, "price": 0.88, "months": 3})["ok"]
+    assert eb.call("offer_deal", {"to": "north", "resource": "power", "amount": 160, "price": 0.88, "months": 3,
+                                   "sell": True})["ok"]
     assert [region.deal_check(d, "north")["worth"] for d in region.deals] == [True, True]
     obs = region.observe("north.mayor")
     assert _deal_actions(obs) == [{"type": "accept_deal", "deal": 1}, {"type": "cancel_deal", "deal": 2}]
@@ -521,7 +525,7 @@ def test_a_deal_the_buyer_cannot_afford_is_not_worth_it():
     line = next(x for x in region_lines(n, "mayor") if x.startswith("- deal opportunity"))
     assert "for 3 months, as much as you can afford (no link needed)" in line
     assert ToolBox(s, "mayor").call("offer_deal", {"to": "north", "resource": "power", "amount": 160, "price": 0.88,
-                                                   "months": 3})["ok"]
+                                                   "months": 3, "sell": True})["ok"]
     check = region.deal_check(region.deals[0], "north")
     assert (check["worth"], check["reason"]) == (False, "afford") and check["budget"] == 30
     assert check["net"] == pytest.approx(160 * 0.88 - st["imported"] * 1.5)

@@ -49,7 +49,8 @@ def test_neighbour_deal_moves_capacity_and_money():
     env = _env()
     r = env.apply("north.mayor", Decision(actions=[{"type": "offer_deal", "resource": "power", "amount": 50,
                                                      "price": 1.0, "months": 3, "sell": True}]))
-    assert r[-1]["ok"] and r[-1]["message"] == "proposed deal #1; the south mayor must accept it by month 1"
+    assert r[-1]["ok"] and r[-1]["message"] == ("proposed deal #1 (you sell 50 power to south at $1.0/unit/month for 3 "
+                                                  "months); the south mayor must accept it by month 1")
     # north has no plant yet: the deal would sell capacity it doesn't have
     no = env.apply("south.mayor", Decision(actions=[{"type": "accept_deal", "deal": 1}]))[-1]
     assert not no["ok"] and no["message"].startswith("north no longer has any power to sell: its own supply 0")
