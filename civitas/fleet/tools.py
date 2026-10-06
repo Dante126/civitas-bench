@@ -19,7 +19,8 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..bench.collab import MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request, replies
+from ..bench.collab import BUILDS, MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, action_tile, \
+    answer, is_request, replies
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
                             WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
                             zone_density, zone_price, zone_tiles)
@@ -49,6 +50,7 @@ OWN_NAMED = 2                # this turn's own build_road calls named when a roa
 BLOCKERS_NAMED = 3           # tiles named per kind when a road is blocked
 DEZONES_NAMED = 2            # dezone rects suggested for the lots in its way
 ZONES_BESIDE = 2             # zone rects suggested beside a rectangle with no empty land
+ZONE_LEFT_SHOWN = 100        # a planning zone leaving less than this says what the rest pays for (_zone_left)
 CONTENT_KINDS = 5            # kinds of tile named when a failed zone / dezone says what the rectangle holds
 RIVER_BANDS = 3              # row bands the Map block describes the river in
 ROAD_LINE_MIN = 3            # the Map block's road lines: straight runs of connected road at least this long,
@@ -765,11 +767,49 @@ def _zone_beside(w, tiles: list[tuple[int, int]], spare=()) -> list[str]:
     return [r for _, r in sorted(sides, key=lambda s: s[0])[:ZONES_BESIDE]]
 
 
+def zone_fit_rect(w, args: dict, funds: float,
+                  avoid=frozenset()) -> tuple[tuple[int, int, int, int], int, float] | None:
+    """The sub-rectangle of a zone's area (`args` as sent) with the most tiles `funds` pay for, as actions.zone charges
+    them (then the most with road access, then the smallest), covering none of the `avoid` tiles: ((x1, y1, x2, y2),
+    tiles, cost); None when the funds don't pay for one tile. zone_fit names it; planning's Next line sizes its zone
+    call with it (avoiding the lots funded departments and utilities are about to build on)."""
+    letter = str(args.get("zone", "")).upper()[:1]
+    density = zone_density(letter, str(args.get("density", "low")).lower())
+    rect = _rect(w, args)
+    (xa, ya), (xb, yb) = rect[0], rect[-1]
+    tiles, rezone = zone_tiles(w, letter, density, rect)
+    grids = [np.zeros((yb - ya + 1, xb - xa + 1), int) for _ in range(4)]    # new, re-zoned, road access, avoid
+    for x, y in tiles:
+        grids[0][y - ya, x - xa] = 1
+        grids[2][y - ya, x - xa] = int(bool(w.access[y, x]))
+    for x, y in rezone:
+        grids[1][y - ya, x - xa] = 1
+    for x, y in avoid:
+        if xa <= x <= xb and ya <= y <= yb:
+            grids[3][y - ya, x - xa] = 1
+    sums = [np.pad(g.cumsum(0).cumsum(1), ((1, 0), (1, 0))).tolist() for g in grids]
+    box = lambda t, a, b, c, d: t[d + 1][c + 1] - t[b][c + 1] - t[d + 1][a] + t[b][a]
+    H, W = grids[0].shape
+    best = None
+    for y1 in range(H):
+        for y2 in range(y1, H):
+            for x1 in range(W):
+                for x2 in range(x1, W):
+                    n, r, a, bad = (box(t, x1, y1, x2, y2) for t in sums)
+                    cost = zone_cost(n, r, density)
+                    if n + r == 0 or bad or short_of(funds, cost):
+                        continue
+                    key = (n + r, a, -(x2 - x1 + 1) * (y2 - y1 + 1))
+                    if best is None or key > best[0]:
+                        best = (key, (x1 + xa, y1 + ya, x2 + xa, y2 + ya), n + r, cost)
+    return None if best is None else best[1:]
+
+
 def zone_fit(w, args: dict, funds: float, ask: bool = True) -> str:
     """For a zone its department's funds can't pay (`args` as sent): the price per tile it was charged, as actions.zone
     charges it (zone_density: industry and mixed use at the high-density price; REZONE_COST per zoned tile changing
     density), how many new tiles `funds` buy, and the sub-rectangle of the requested area with the most tiles `funds`
-    pay for (then the most with road access, then the smallest); for R/C/O at high density, whether "low" zones it all;
+    pay for (zone_fit_rect); for R/C/O at high density, whether "low" zones it all;
     then to ask the mayor for the rest, or with `ask` False (mayor_ask) to say so in the end_turn report instead.
     "" when the funds don't pay for one tile, or on any error. v19 (120 months, seeds 0-1): 43 zones failed on "costs
     $48 but the planning budget only has $46; ask the mayor for funds", 41 of them with money for some tiles, and
@@ -780,36 +820,15 @@ def zone_fit(w, args: dict, funds: float, ask: bool = True) -> str:
         letter = str(args.get("zone", "")).upper()[:1]
         density = zone_density(letter, str(args.get("density", "low")).lower())
         rect = _rect(w, args)
-        (xa, ya), (xb, yb) = rect[0], rect[-1]
         tiles, rezone = zone_tiles(w, letter, density, rect)
         price = zone_price(density)
-        grids = [np.zeros((yb - ya + 1, xb - xa + 1), int) for _ in range(3)]    # new tiles, re-zoned, road access
-        for x, y in tiles:
-            grids[0][y - ya, x - xa] = 1
-            grids[2][y - ya, x - xa] = int(bool(w.access[y, x]))
-        for x, y in rezone:
-            grids[1][y - ya, x - xa] = 1
-        sums = [np.pad(g.cumsum(0).cumsum(1), ((1, 0), (1, 0))).tolist() for g in grids]
-        box = lambda t, a, b, c, d: t[d + 1][c + 1] - t[b][c + 1] - t[d + 1][a] + t[b][a]
-        H, W = grids[0].shape
-        best = None
-        for y1 in range(H):
-            for y2 in range(y1, H):
-                for x1 in range(W):
-                    for x2 in range(x1, W):
-                        n, r, a = (box(t, x1, y1, x2, y2) for t in sums)
-                        cost = zone_cost(n, r, density)
-                        if n + r == 0 or short_of(funds, cost):
-                            continue
-                        key = (n + r, a, -(x2 - x1 + 1) * (y2 - y1 + 1))
-                        if best is None or key > best[0]:
-                            best = (key, (x1 + xa, y1 + ya, x2 + xa, y2 + ya), n + r, cost)
+        best = zone_fit_rect(w, args, funds)
         if best is None:
             return ""
         why = (" (industry and mixed use are always charged the high-density price)" if letter in NO_DENSITY
                else f" ({density} density)")
         buys = int((funds + 1e-9) // price)
-        (x1, y1, x2, y2), n, cost = best[1:]
+        (x1, y1, x2, y2), n, cost = best
         out = (f" - zone {letter} costs {money(price)}/tile{why}"
                + (f", {money(REZONE_COST)} per zoned tile changing density" if rezone else "")
                + f"; {money(math.floor(funds + 1e-9))} pays for {buys} new tile{'s' * (buys != 1)}: zone "
@@ -1489,8 +1508,9 @@ REMIND_MIN_LEFT = 2          # tool calls left after the end_turn for its open-r
 
 
 class OpenRequest(NamedTuple):
-    """A department's request to the mayor with no answer yet (bench/collab.py:answer: no top-up to it, no message
-    back) inside its window of 2 x act_every months, where the collaboration score still counts one."""
+    """A department's request to the mayor (or to planning: open_requests' `to`) with no answer yet
+    (bench/collab.py:answer: no top-up to it, no action near the tiles it names, no message back) inside its window of
+    2 x act_every months, where the collaboration score still counts one."""
     month: int
     dept: str
     text: str
@@ -1498,25 +1518,33 @@ class OpenRequest(NamedTuple):
     last: bool              # the mayor's next turn falls outside the window: this is its last turn to answer
 
 
-def open_requests(env, fleet: FleetState, pending=()) -> list[OpenRequest]:
-    """The departments' requests to the mayor still open, oldest first, decided as the collaboration score decides
-    them (collab.answer) from the council board (messages the mayor can see from the window's start), the mayor's
-    successful allocate_budget calls in the fleet log, and `pending`: this turn's send_message calls (ToolBox.messages,
-    posted at the end of the turn). Requests are council messages to the mayor from a department of this city that ask
-    something (collab.is_request); later events are ordered by month, turn order, messages before actions, as in
-    collab."""
+def open_requests(env, fleet: FleetState, pending=(), to: str = "mayor") -> list[OpenRequest]:
+    """The requests to `to` (the mayor, or planning) still open, oldest first, decided as the collaboration score
+    decides them (collab.answer) from the council board (messages `to` can see from the window's start), its
+    successful actions in the fleet log (the mayor's allocate_budget top-ups; planning's builds, zones, dezones and
+    bulldozes, which answer a request naming a tile near them), and `pending`: this turn's send_message calls
+    (ToolBox.messages, posted at the end of the turn). Requests are council messages to `to` from a department of this
+    city (for planning, the mayor too) that ask something (collab.is_request); later events are ordered by month, turn
+    order, messages before actions, as in collab. Region run 20261005 and the 120-month runs: 176 requests went to
+    planning (98 from utilities, for riverbank lots), 85 unanswered; in the late smokes it answered none."""
     w = env.world
     act = max(1, int(env.cfg.act_every))
     window = 2 * act
     since = w.month - window
     order = {r.split(".")[-1]: i for i, r in enumerate(env.roles)}
-    msgs = [env._local(m) for m in env.council.visible_to(env._name("mayor"), since_month=since)]
+    msgs = [env._local(m) for m in env.council.visible_to(env._name(to), since_month=since)]
     events = [{"month": m["month"], "kind": "message", "from": m["sender"], "to": m["to"], "text": m["text"]}
               for m in msgs]
-    events += [{"month": w.month, "kind": "message", "from": "mayor", "to": m.get("to"), "text": m.get("text", "")}
-               for m in pending]
+    events += [{"month": w.month, "kind": "message", "from": to, "to": r, "text": m.get("text", "")}
+               for m in pending for r in str(m.get("to", "")).split(",")]
     for e in fleet.log:
         a = e.get("action") or {}
+        if to != "mayor" and e["kind"] == "action" and e["role"] == to and e.get("ok") and e["month"] >= since:
+            typ = str(a.get("type", ""))
+            if typ.startswith(BUILDS) or typ in ("zone", "dezone", "bulldoze", "demolish"):
+                events.append({"month": e["month"], "kind": "build" if typ.startswith(BUILDS) else "act",
+                               "from": to, "to": to, "text": e.get("message", ""), "tile": action_tile(a)})
+            continue
         if (e["kind"] != "action" or e["role"] != "mayor" or not e.get("ok") or e["month"] < since
                 or a.get("type") != "allocate_budget"):
             continue
@@ -1529,11 +1557,12 @@ def open_requests(env, fleet: FleetState, pending=()) -> list[OpenRequest]:
                            "amount": amount, "text": e.get("message", "")})
     key = lambda e: (e["month"], order.get(e["from"], len(order)), 0 if e["kind"] == "message" else 1)
     events.sort(key=key)
-    nxt = (w.month // act + 1) * act               # the mayor's next turn (env.acts_this_month)
-    rep = replies(events, window)                  # a department's answer to the mayor's own request: no request
+    nxt = (w.month // act + 1) * act               # `to`'s next turn (env.acts_this_month)
+    rep = replies(events, window)                  # an answer to `to`'s own request: no request
+    askers = set(DEPARTMENTS) - {to} if to == "mayor" else ({"mayor", *DEPARTMENTS} - {to})
     out = []
     for i, e in enumerate(events):
-        if (e["kind"] != "message" or e["to"] != "mayor" or e["from"] not in DEPARTMENTS or i in rep
+        if (e["kind"] != "message" or e["to"] != to or e["from"] not in askers or i in rep
                 or not is_request(e["to"], e["text"]) or e["month"] + window < w.month):
             continue
         # as collab's events: the text cut to TEXT_CHARS, the amount and tiles from all of it
@@ -1607,6 +1636,16 @@ def wait_why(m: DeptMoney) -> str:
     if m.dept == "planning":
         return "funds cover its road" if m.build is not None and m.build.cost is not None else "no road ready"
     return m.state or "nothing ready to buy"
+
+
+def planning_reminder(reqs: list[OpenRequest]) -> str:
+    """Planning's end_turn refusal while requests to it are open (ToolBox.end_turn): who asks, since when."""
+    names = [f"{d} (since m{rs[0].month})" for d, rs in request_groups(reqs)]
+    n = len(reqs)
+    return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Answer each now: do what "
+            "it asks at the spot it names (your Open requests block names the call), or send_message to it with one "
+            "line on where it can build or why not; one send_message can answer several (to: \"police,health\"). "
+            "Then call end_turn again: it ends the turn whatever is still open.")
 
 
 def requests_reminder(reqs: list[OpenRequest]) -> str:
@@ -1708,7 +1747,9 @@ def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> 
                 + (f" (now {supply_ahead(w, tight)})" if tight else ""))
     elif unready:
         when = "a site is ready for you"
-    if b is not None and b.cost is not None and b.named and not short_of(m.funds, b.cost):
+    if dept == "planning":                # its Next line: parks, zones, a lot for utilities, then the road
+        instead = "the builds your briefing's Next line names"
+    elif b is not None and b.cost is not None and b.named and not short_of(m.funds, b.cost):
         instead = f"build {_yours(b.what)} ({money(b.cost)}): your funds cover it"
     elif room:
         instead = "no supply needs building yet"
@@ -3128,9 +3169,13 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
         if purpose.startswith("zone_") and "x2" in sites[0]:     # one zone type per strip (zone_line)
             text, own = zone_line(purpose, sites, strips, site)
+            cost = None
             if own is not None:
                 shown[_where(own)] = purpose
-            lines.append(head + text + price(purpose))
+                cost = own["tiles"] * zone_price(zone_density(purpose[-1], "low"))     # planning: its strip's price
+            lines.append(head + text + (price(purpose) if cost is None or role != "planning" or prices is None else
+                                        f"; {money(cost)}" + (f" - you have {money(math.floor(funds))}"
+                                                              if funds is not None and short_of(funds, cost) else "")))
             continue
         if path in paths:
             lines.append(head + f"same list as {paths[path]}" + price(purpose))
@@ -3432,6 +3477,7 @@ class ToolBox:
             note += self._funded_warning(funded, bank=bool(note)) if funded is not None else ""
             prior = note or (res["message"] if "WARNING" in res["message"] else "")   # the game's no-access warning
             note += self._branch_warning(ways, before, prior) if ways is not None else ""
+            note += self._zone_left() if name == "zone" and self.role == "planning" else ""   # when nearly spent
         else:
             note = self._explain(name, args, res["message"])
         out = {"ok": res["ok"], "message": cleared + res["message"] + note, "cost": res["cost"],
@@ -3941,7 +3987,8 @@ class ToolBox:
             if mine and (strip := self._next_strip(args)):
                 mine += f"; {strip}"
             return (f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
-                    + (f"; zone beside it instead: {' or '.join(beside)}" if beside else ""))
+                    + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
+                    + (self._bank_hint() if name == "dezone" else ""))
         if name != "build_road":
             if name == "create_bus_line":          # the suggested stops as one call (the LLM runs: lines of 1-2 stops)
                 return self._stops_hint(message)
@@ -3976,7 +4023,11 @@ class ToolBox:
         built = list(firsts.values())
         ls, bs = "s" * (len(lots) > 1), "s" * (len(built) > 1)
         tiles = lambda pts: _some([f"({x},{y})" for x, y in pts], BLOCKERS_NAMED)
-        tail = f"; route around the building{bs} (the Map block has the road extent)"
+        around = ""
+        if built and self.role == "planning":
+            from .planning import detour_hint                 # planning imports this module
+            around = detour_hint(w, line)
+        tail = f"; route around the building{bs}" + (around or " (the Map block has the road extent)")
         if built and (hint := self._branch_hint()):
             tail += f"; {hint}"
         if not lots:
@@ -3998,6 +4049,29 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _bank_hint(self) -> str:
+        """For planning's failed dezone: the riverbank lot utilities waits for, when it waits for one (planning's
+        dezone_hint); "" otherwise or on any error. v23 seed 0: 22 dezones failed on road, river, empty land and a
+        coal plant while planning hunted for the bank lot utilities asked for, in 36 of its 40 turns."""
+        if self.role != "planning":
+            return ""
+        try:
+            from .planning import dezone_hint                 # planning imports this module
+            return dezone_hint(self.world, dept_lists(self.env))
+        except Exception:
+            return ""
+
+    def _zone_left(self) -> str:
+        """After planning's successful zone that leaves it under ZONE_LEFT_SHOWN: what its funds left pay for, at each
+        zone price (model only). 131 of the 134 zones that failed on money in the 120-month runs came after the turn's
+        earlier actions had spent it (57 with under $50 left)."""
+        left = self.world.dept_funds["planning"]
+        low, high = zone_price("low"), zone_price("high")
+        if left >= ZONE_LEFT_SHOWN:
+            return ""
+        return (f" ({money(math.floor(left + 1e-9))} left: {int((left + 1e-9) // low)} more tiles at low density, "
+                f"{int((left + 1e-9) // high)} at high density or for I and M)")
 
     def _stops_hint(self, message: str) -> str:
         """For a failed create_bus_line: the suggested stops as one call (bus_line_call), after asking the mayor for
@@ -4464,15 +4538,17 @@ class ToolBox:
         return out
 
     def end_turn(self, report: str) -> dict:
-        """End the turn with the report. The model's mayor (max_steps given: ToolAgent) is first refused once a turn
-        ("refused": "open_requests") while departments' requests to it are still open after this turn's top-ups and
-        messages (open_requests), unless fewer than REMIND_MIN_LEFT calls would be left; the next end_turn ends it."""
-        if self.role == "mayor" and self.max_steps is not None and not self.reminded \
+        """End the turn with the report. The model's mayor and planning (max_steps given: ToolAgent) are first refused
+        once a turn ("refused": "open_requests") while requests to them are still open after this turn's top-ups,
+        actions and messages (open_requests), unless fewer than REMIND_MIN_LEFT calls would be left; the next end_turn
+        ends it."""
+        if self.role in ("mayor", "planning") and self.max_steps is not None and not self.reminded \
                 and self.max_steps - self.n_calls >= REMIND_MIN_LEFT:
             self.reminded = True
-            reqs = open_requests(self.env, self.fleet, self.messages)
+            reqs = open_requests(self.env, self.fleet, self.messages, to=self.role)
             if reqs:
-                return {"ok": False, "refused": "open_requests", "error": requests_reminder(reqs)}
+                return {"ok": False, "refused": "open_requests",
+                        "error": (requests_reminder if self.role == "mayor" else planning_reminder)(reqs)}
         report = report.strip()[:REPORT_MAX_CHARS]
         self.ended, self.report = True, report
         self.fleet.reports[self.role] = report
