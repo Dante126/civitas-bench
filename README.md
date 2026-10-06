@@ -1265,8 +1265,14 @@ report has one per city; requests to another city are left out. On a finished ru
 `fleet.report.run_collaboration(run_dir[, city])` computes the same score without the env. The
 viewer shows it too, at the playhead (Team tab, below).
 Scripted fleet (`fleet_scripted.toml`), seeds 0–4: 67.2 ± 1.7 (seed 0: 64.9; responsiveness
-84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 58.5 (v17,
-seed 0), then 73.3 / 75.2 (v19) and 65.0 / 76.1 (v23, seeds 0 / 1). Before the mayor's replies
+84, follow-through 59, hand-offs 48, money aim 69). On the 120-month trinity runs: 57.2 (v17,
+seed 0), then 74.0 / 76.6 (v19) and 64.8 / 77.0 (v23, seeds 0 / 1). A reply is no request of
+its own (`collab.replies`): a message answering, within the window, a request from its
+recipient, or a mayor's message with a money decision ("approved", "unable to fund",
+`collab.DECISION`, which also covers answers to end_turn reports); a money ask back to the mayor
+still counts. Without that, the 120-month region run of 2026-10-05 counted 32 of the north
+mayor's 60 replies as unanswered requests, and the more the mayor replied the lower the score
+went (v19 was 73.3 / 75.2 and v23 65.0 / 76.1 before it). Before the mayor's replies
 to money requests counted, v19 scored 72.7 / 73.5 and v23 63.6 / 74.5. The scripted mayor
 never replies, so its score didn't move. A status report that says it needs nothing is no
 request (`collab.NO_ASK`: a negated need such as "No budget needed at this time" and $0 are

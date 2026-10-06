@@ -261,3 +261,15 @@ def test_a_negation_stays_in_its_clause():
     assert is_request("planning", "Nothing built yet, we need land near 3,4")
     assert not is_request("mayor", "Below 1,500 residents. No budget needed at this time (current $0 matches target)")
     assert not is_request("mayor", "No schools needed yet")
+
+
+def test_replies_are_not_requests_of_their_own():
+    """A mayor's answer ("Approved ...", "unable to fund ...") is no request; a money ask back to the mayor still is."""
+    from civitas.bench.collab import replies
+    ev = [{"kind": "message", "month": 3, "from": "police", "to": "mayor", "text": "Need $2,500 for our first station"},
+          {"kind": "message", "month": 3, "from": "mayor", "to": "police", "text": "Please hold on, next quarter"},
+          {"kind": "message", "month": 6, "from": "mayor", "to": "health", "text": "I'm unable to fund a clinic now"},
+          {"kind": "message", "month": 6, "from": "mayor", "to": "planning", "text": "Please build a road at (3,4)"},
+          {"kind": "message", "month": 6, "from": "planning", "to": "mayor", "text": "Need $300 to build it"},
+          {"kind": "message", "month": 9, "from": "planning", "to": "mayor", "text": "Could you check the plan?"}]
+    assert replies(ev, 6) == {1, 2, 5}

@@ -162,6 +162,8 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
     for i, e in enumerate(events):
         e["id"], e["thread"] = i, None
     window = 2 * max(1, int(act_every))
+    for i in replies(events, window):
+        events[i]["ask"], events[i]["reply"] = False, True
     threads = [_thread(e, events, key, window, last) for e in events if e["kind"] == "message" and e["ask"]]
     for i, th in enumerate(threads):
         th["id"] = i
@@ -207,6 +209,35 @@ def is_request(to: str, text: str) -> bool:
     """A council message that asks something of one role (ASK words, read once negated needs and $0 are struck out:
     NO_ASK); messages to "all" are broadcasts."""
     return str(to or "all") != "all" and bool(ASK.search(NO_ASK.sub(" ", str(text or ""))))
+
+
+# a money decision in a mayor's message: an answer to a department (often to its end_turn report, which is no council
+# message) rather than a request of its own; the same run's mayors sent 20 such per city, all counted unanswered
+DECISION = re.compile(r"\b(?:unable|cannot|can'?t|not able|approved|funded|transferred|allocated|granted|denied|"
+                      r"declined|reclaim\w*)\b", re.I)
+
+
+def replies(events: list[dict], window: int) -> set[int]:
+    """Indices of the messages in `events` (in turn order) that answer a request: from A to B within `window` months
+    after a message from B to A that is_request. They are replies, not requests of their own, whatever their words:
+    the 120-month region run (20261005) counted 32 of the north mayor's 60 "requests" unanswered, every one a reply
+    ("Approved $2,000 for the landfill", "I'm unable to fund ... this turn") that the department never answered back.
+    A mayor's message with a money decision (DECISION) is one too, also when what it answers was an end_turn report."""
+    asked: dict[tuple, int] = {}                     # (from, to) -> month of the latest request
+    out = set()
+    for i, e in enumerate(events):
+        if e.get("kind") != "message":
+            continue
+        a, b, text = e.get("from"), str(e.get("to") or "all"), str(e.get("text") or "")
+        m = asked.get((b, a))
+        if a == "mayor" and DECISION.search(text):
+            out.add(i)
+        elif m is not None and int(e["month"]) - m <= window and not (b == "mayor" and _amount(text) and
+                                                                   MONEY.search(text)):
+            out.add(i)                               # but "need $2,500 to build it" back to the mayor asks
+        elif is_request(b, text):
+            asked[(a, b)] = int(e["month"])
+    return out
 
 
 def money_ask(req: dict) -> bool:

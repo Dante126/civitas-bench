@@ -18,7 +18,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from ..bench.collab import MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request
+from ..bench.collab import MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, answer, is_request, replies
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
                             WATER_LINES, _kind_name, _line, _point, _rect, action_docs, apply_action, zone_cost,
                             zone_density, zone_price, zone_tiles)
@@ -1532,9 +1532,10 @@ def open_requests(env, fleet: FleetState, pending=()) -> list[OpenRequest]:
     key = lambda e: (e["month"], order.get(e["from"], len(order)), 0 if e["kind"] == "message" else 1)
     events.sort(key=key)
     nxt = (w.month // act + 1) * act               # the mayor's next turn (env.acts_this_month)
+    rep = replies(events, window)                  # a department's answer to the mayor's own request: no request
     out = []
     for i, e in enumerate(events):
-        if (e["kind"] != "message" or e["to"] != "mayor" or e["from"] not in DEPARTMENTS
+        if (e["kind"] != "message" or e["to"] != "mayor" or e["from"] not in DEPARTMENTS or i in rep
                 or not is_request(e["to"], e["text"]) or e["month"] + window < w.month):
             continue
         # as collab's events: the text cut to TEXT_CHARS, the amount and tiles from all of it
