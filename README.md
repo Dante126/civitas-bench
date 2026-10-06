@@ -144,7 +144,7 @@ civitas bench -c configs/eval_planning.toml --seeds 0-4 --agent planning=llm:arc
 # the fleet reference: the scripted baselines played through the fleet tools on the fleet's settings (free)
 civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5
 
-# a late-game smoke: scripted agents play months 0-59, the configured fleet months 60-71 (see "Late-game smokes")
+# a late-game smoke: scripted agents play months 0-95, the configured fleet months 96-107 (see "Late-game smokes")
 civitas run -c configs/fleet_smoke_late.toml
 civitas run -c configs/fleet_smoke.toml --set game.months=72 --warmup 60      # the same, from any config
 civitas prompt -c configs/fleet_smoke_late.toml --role transport               # its first briefing after the warm-up
@@ -1158,7 +1158,9 @@ on `run`, `bench` and `prompt`) plays months 0–59 with scripted agents and the
 game to the configured agents. `game.months` stays the whole game, so 60 warm-up months and 12
 fleet months are `months = 72`; a warm-up as long as the game is refused.
 `configs/fleet_smoke_late.toml` is fleet_smoke's fleet that way, and
-`configs/fleet_region_late.toml` is fleet_region_both_120's: both cities from month 60.
+`configs/fleet_region_late.toml` is fleet_region_both_120's: both cities, each from month 96
+(`months = 108`, `warmup_months = 96`: at month 60 the seed-0 city had only 2,724 residents,
+transit at 17% and no shortage, so a 60-month warm-up still tested the middle game).
 
 - **Who plays the warm-up.** Every fleet agent becomes the scripted fleet (`model =
   "scripted"`, its playbooks kept, the scripted fleet's own 20 steps). So the plan, the
@@ -1185,7 +1187,8 @@ fleet months are `months = 72`; a warm-up as long as the game is refused.
   average city score, and the warm-up's own agent stats. `agent_stats` count only the
   configured agents' turns. The run's last line prints the same. The scripted fleet playing
   on (`--set fleet.model=scripted`, seed 0) is the yardstick for a fleet's 12 months:
-  `after the warm-up (months 60-71): city 55.8 -> 62.3 (+6.5), population 2,724 -> 4,436 (+1,712)`.
+  `after the warm-up (months 96-107): city 66.8 -> 67.9 (+1.1), population 6,036 -> 6,304 (+268)`
+  (from month 60 in a 72-month game: 55.8 -> 62.3, 2,724 -> 4,436).
 - **Reports.** The fleet report, the Problems tab, the Team tab and the collaboration score
   cover the months after the warm-up only (`run_collab` reads `warmup_months` as `since`).
   The report's header names the warm-up and the score change. In a region, `deals` keeps the
@@ -1197,11 +1200,13 @@ fleet months are `months = 72`; a warm-up as long as the game is refused.
   `session_months = 6` the first pause is at month N + 6, and resume works as usual.
   `civitas bench --warmup N` passes it to every seed.
 
-On seed 0, fleet_smoke_late's fleet starts at month 60 with 2,724 residents and a city score of
-55.8. Transit is at 17% on one bus line (230 of 1,500 seats), no road is congested, and the
+On seed 0 a 60-month warm-up (`--set game.months=72 --warmup 60`) starts the fleet with 2,724
+residents and a city score of 55.8. Transit is at 17% on one bus line (230 of 1,500 seats), no road is congested, and the
 5,000-resident milestone (rail, harbour, hospital, university) is still ahead. The mayor
 has $10.2k, $11.8k to spend, and four buildings to fund: education's first high school, plus
-another police station, fire station and clinic.
+another police station, fire station and clinic. From month 96 (the configs) it has 6,036
+residents and a score of 66.8; transit is still 17-20% on seeds 0-1 (the scripted transport keeps
+it up), and seed 0 has a jammed stretch for an avenue.
 
 **Config.**
 

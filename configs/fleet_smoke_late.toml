@@ -1,13 +1,13 @@
 # Late-game fleet check: the fleet of configs/fleet_smoke.toml (identical [fleet] / [agents] blocks; tests/test_fleet.py
-# checks) takes over a grown city. The first 60 months are a warm-up played by the scripted fleet (each fleet agent with
-# model = "scripted": no model calls, ~3 s), then the trinity fleet plays months 60-71 (4 turns per role, 32 turns in
+# checks) takes over a grown city. The first 96 months are a warm-up played by the scripted fleet (each fleet agent with
+# model = "scripted": no model calls, ~3 s), then the trinity fleet plays months 96-107 (4 turns per role, 32 turns in
 # all): second bus lines, tier upgrades, a dropping transit share. `civitas prompt -c configs/fleet_smoke_late.toml
 # --role transport` prints the first briefing after the warm-up. Key: ARCEE_API_KEY in ./.env.
 name = "fleet_smoke_late"
 
 [game]
-months = 72                # the whole game: the warm-up and the fleet's months
-warmup_months = 60         # months 0-59 played by scripted agents; the configured agents from month 60
+months = 108               # the whole game: the warm-up and the fleet's months
+warmup_months = 96         # months 0-95 played by scripted agents; the configured agents from month 96
 act_every = 3              # the city runs monthly; agents plan by the quarter
 max_actions_per_turn = 8   # successful actions per turn; look-ups are free
 

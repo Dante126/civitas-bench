@@ -1,13 +1,13 @@
 # Late-game fleet check in a region: configs/fleet_region_both_120.toml (the fleet of configs/fleet_smoke.toml in both
 # cities; identical [fleet] / [agents] blocks, tests/test_fleet_region.py checks) for 72 months, of which months 0-59
 # are a warm-up played by the scripted baselines (plain scripted agents in a region: the scripted fleet plays single
-# cities only; their deals, links and council carry over), then the trinity fleet plays months 60-71 in both cities
+# cities only; their deals, links and council carry over), then the trinity fleet plays months 96-107 in both cities
 # (64 fleet turns). Key: ARCEE_API_KEY in ./.env.
 name = "fleet_region_late"
 
 [game]
-months = 72                # the whole game: the warm-up and the fleet's months
-warmup_months = 60         # months 0-59 played by scripted agents; the configured agents from month 60
+months = 108               # the whole game: the warm-up and the fleet's months
+warmup_months = 96         # months 0-95 played by scripted agents; the configured agents from month 96
 act_every = 3              # the cities run monthly; agents plan by the quarter
 max_actions_per_turn = 8   # successful actions per turn; look-ups are free
 region = true

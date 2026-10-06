@@ -20,7 +20,7 @@ civitas run -c configs/smoke.toml --serve            # short LLM run + web viewe
 civitas bench -c configs/baseline.toml --seeds 0-4 --workers 5
 civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5   # scripted baselines through the fleet tools
 civitas resume <run_id> [-c edited.toml]             # next session of a paused supervised fleet run
-civitas run -c configs/fleet_smoke_late.toml          # late-game smoke: scripted months 0-59, the fleet 60-71
+civitas run -c configs/fleet_smoke_late.toml          # late-game smoke: scripted months 0-95, the fleet 96-107
 civitas run -c configs/fleet_smoke.toml --set game.months=72 --warmup 60   # the same warm-up from any config
 civitas prompt -c configs/fleet_smoke_late.toml --role transport   # first briefing after the warm-up (~3 s, no model)
 civitas serve                                        # 3D viewer / run launcher only

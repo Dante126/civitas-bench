@@ -109,7 +109,7 @@ def test_the_late_configs_keep_the_smoke_fleets():
     assert late["fleet"] == smoke["fleet"] and late["agents"] == smoke["agents"]
     assert late["providers"] == smoke["providers"] and late["scoring"] == smoke["scoring"]
     g = game_config(late)
-    assert (g.months, g.warmup_months, g.act_every) == (72, 60, 3) and warmup_months(late) == 60
+    assert (g.months, g.warmup_months, g.act_every) == (108, 96, 3) and warmup_months(late) == 96
     both, rlate = (load_config(str(ROOT / f"configs/{n}.toml")) for n in ("fleet_region_both_120", "fleet_region_late"))
     assert rlate["fleet"] == both["fleet"] and rlate["agents"] == both["agents"]
     g = game_config(rlate)
