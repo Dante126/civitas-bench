@@ -195,8 +195,8 @@ def rows_from_trajectories(path: str | Path) -> list[dict]:
         for line in f:
             if line.strip():
                 rec = json.loads(line)
-                if str(rec.get("agent", "")).startswith("fleet:"):
-                    rows.append(turn_row(rec))
+                if str(rec.get("agent", "")).startswith("fleet:") and not rec.get("warmup"):
+                    rows.append(turn_row(rec))        # a warm-up's scripted turns aren't the fleet's
     return rows
 
 
@@ -720,6 +720,9 @@ def fleet_report(env, summary: dict, trajectories: list[dict], run_dir: str | Pa
         return region_report(env, summary, trajectories, run_dir)
     fleet = getattr(env, "fleet", None) or FleetState()
     months = summary.get("months_played", env.world.month)
+    warm = summary.get("warmup") or {}
+    # after a warm-up the hints read only the configured agents' months (history entry m = the state after m - 1)
+    history = [m for m in env.world.history if m["month"] > warm.get("months", 0)]
     roles = {r: _role_stats(r, [x for x in trajectories if x["role"] == r], fleet)
              for r in env.roles if any(x["role"] == r for x in trajectories)}
     scores = summary.get("final_scores") or {}
@@ -733,7 +736,8 @@ def fleet_report(env, summary: dict, trajectories: list[dict], run_dir: str | Pa
            "plan": {**{k: plan.get(k) for k in ("goals", "budgets", "priorities", "notes", "month")},
                     "versions": len(fleet.plan_versions), "changed": [v["month"] for v in fleet.plan_versions]},
            "roles": roles,
-           "hints": _hints(roles, trajectories, fleet, env.world.history, months)}
+           "hints": _hints(roles, trajectories, fleet, history, months),
+           **({"warmup": warm} if warm else {})}
     try:
         rep["collaboration"] = run_collaboration(run_dir, getattr(env, "city", None))
     except Exception as e:                       # unreadable frames must not cost the run its report
@@ -774,14 +778,15 @@ def region_report(region, summary: dict, trajectories: list[dict],
                                          "population": by_city.get(c, {}).get("population"),
                                          "treasury": by_city.get(c, {}).get("treasury")} for c in region.cities}},
            "cities": cities,
-           "hints": [{**h, "city": c} for c, r in cities.items() for h in r["hints"]]}
+           "hints": [{**h, "city": c} for c, r in cities.items() for h in r["hints"]],
+           **({"warmup": summary["warmup"]} if summary.get("warmup") else {})}
     return rep, region_markdown(rep)
 
 
 def region_markdown(rep: dict) -> str:
     sb = rep["scoreboard"]
     avg = f" (average {sb['avg_city']:.1f})" if sb.get("avg_city") is not None else ""
-    L = [f"# Fleet report: {rep['run_id']}", "", _played(rep), "",
+    L = [f"# Fleet report: {rep['run_id']}", "", _played(rep), "", *_warm_lines(rep),
          f"Region of {len(rep['region'])} cities ({', '.join(rep['region'])}); fleet agents in "
          f"{', '.join(rep['cities']) or 'none'}.", "", "## Region scoreboard", "",
          f"Region score **{sb['city'] or 0:.1f}**{avg}, population {sb['population'] or 0:,}, treasury "
@@ -804,8 +809,23 @@ def _played(rep: dict) -> str:
             + (" (ended early)" if conf and played < conf else "") + f". Agents: `{rep['signature']}`")
 
 
+def _warm_lines(rep: dict) -> list[str]:
+    """After a warm-up (summary["warmup"]): who played it, what the report covers, and what the months after it added."""
+    w = rep.get("warmup") or {}
+    if not w:
+        return []
+    n = w["months"]
+    head = f"Warm-up: months 0-{n - 1} played by `{w['signature']}`"
+    if not w.get("handed_over"):
+        return [head + "; the game ended before the configured agents took over.", ""]
+    h, e, c = w["at_handover"], w["at_end"], w["change"]
+    return [f"{head}. Roles, hints and collaboration below cover months {n}-{e['month'] - 1} only. "
+            f"City score {_score(h['city'])} at hand-over (month {n}), {_score(e['city'])} at the end "
+            f"({c['city']:+.1f}); population {h['population']:,} -> {e['population']:,} ({c['population']:+,}).", ""]
+
+
 def markdown(rep: dict) -> str:
-    return "\n".join([f"# Fleet report: {rep['run_id']}", "", _played(rep), "", *_body(rep)]) + "\n"
+    return "\n".join([f"# Fleet report: {rep['run_id']}", "", _played(rep), "", *_warm_lines(rep), *_body(rep)]) + "\n"
 
 
 def _score(v) -> str:

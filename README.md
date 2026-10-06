@@ -144,6 +144,11 @@ civitas bench -c configs/eval_planning.toml --seeds 0-4 --agent planning=llm:arc
 # the fleet reference: the scripted baselines played through the fleet tools on the fleet's settings (free)
 civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5
 
+# a late-game smoke: scripted agents play months 0-59, the configured fleet months 60-71 (see "Late-game smokes")
+civitas run -c configs/fleet_smoke_late.toml
+civitas run -c configs/fleet_smoke.toml --set game.months=72 --warmup 60      # the same, from any config
+civitas prompt -c configs/fleet_smoke_late.toml --role transport               # its first briefing after the warm-up
+
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
 
@@ -170,6 +175,7 @@ Useful switches in `[game]` (or `--set game.X=...`):
 | `roles = [...]` | which roles play, in turn order |
 | `seasons = true` | winter heating and snow, summer cooling and fires, seasonal tourism |
 | `region = true`, `cities = [...]` | 2–6 cities, each with its own team (see below) |
+| `warmup_months = N` | scripted agents play months 0 to N−1, the configured agents the rest (`--warmup N`; see "Late-game smokes" under [Agent fleets](#agent-fleets)) |
 | `team_weight` | reward = w·Δcity + (1−w)·Δrole − penalty·invalid actions |
 | `balance` | override any constant, e.g. `"CATALOG.coal.cost" = 3000`, `"SERVICES.clinic.radius" = 9` or `"TIERS.pump.2.water" = 800` |
 
@@ -1146,6 +1152,57 @@ $EDITOR runs/<run_id>/playbooks.toml        # after each pause
 civitas resume <run_id>                     # or: civitas resume <run_id> -c edited.toml
 ```
 
+**Late-game smokes.** A 12-month smoke from month 0 only ever tests the opening. A warm-up
+lets the fleet start from a grown city instead: `[game] warmup_months = 60` (or `--warmup 60`
+on `run`, `bench` and `prompt`) plays months 0–59 with scripted agents and then hands the same
+game to the configured agents. `game.months` stays the whole game, so 60 warm-up months and 12
+fleet months are `months = 72`; a warm-up as long as the game is refused.
+`configs/fleet_smoke_late.toml` is fleet_smoke's fleet that way, and
+`configs/fleet_region_late.toml` is fleet_region_both_120's: both cities from month 60.
+
+- **Who plays the warm-up.** Every fleet agent becomes the scripted fleet (`model =
+  "scripted"`, its playbooks kept, the scripted fleet's own 20 steps). So the plan, the
+  department memory and the history log the fleet inherits were written through the fleet
+  tools, and the game up to month N is exactly configs/fleet_scripted.toml's with the same
+  `[game]` (`tests/test_warmup.py` compares the frames). `llm` and `remote` agents play the
+  warm-up as scripted agents. Scripted, noop and random agents play through as configured.
+  In a region (the scripted fleet plays single cities only) the warm-up uses plain scripted
+  agents, with their deals and links. At the hand-over each fleet mayor gets the plan the
+  scripted fleet would have written: its goals, and the warm-up mayor's working balances as
+  budgets. Each fleet agent also counts as having taken the warm-up's last turn, so its first
+  digest starts there.
+- **Hand-over.** The configured agents are built and bound when the run starts. They take
+  over at the first acting month at or after N, keeping the env, council, scores and fleet
+  state. Turn order and `act_every` go on unchanged.
+- **Logs.** `frames.jsonl` covers the whole game, and the viewer shades the warm-up on the
+  timeline ("scripted warm-up"). `trajectories.jsonl` holds every turn, the warm-up's marked
+  `"warmup": true`; the Agents tab tags them "(warm-up)". `meta.json` records `warmup_months`
+  and the warm-up line-up (`warmup`). The signature ends in `warmup:N` (before the mode), so
+  leaderboards keep warm-up runs apart.
+- **Scores.** The final score is still that of the whole game (scoring is a function of the
+  metrics history). `summary.json` adds `warmup`: the city score and population at the
+  hand-over and at the end, the change (what the configured agents' months added), their
+  average city score, and the warm-up's own agent stats. `agent_stats` count only the
+  configured agents' turns. The run's last line prints the same. The scripted fleet playing
+  on (`--set fleet.model=scripted`, seed 0) is the yardstick for a fleet's 12 months:
+  `after the warm-up (months 60-71): city 55.8 -> 62.3 (+6.5), population 2,724 -> 4,436 (+1,712)`.
+- **Reports.** The fleet report, the Problems tab, the Team tab and the collaboration score
+  cover the months after the warm-up only (`run_collab` reads `warmup_months` as `since`).
+  The report's header names the warm-up and the score change. In a region, `deals` keeps the
+  whole life of a deal made during the warm-up.
+- **Prompts.** `civitas prompt` plays the warm-up first, with no model and no logs, and
+  prints the role's first briefing after it (in the hand-over month, the roles before it play
+  with the warm-up line-up). It takes about 3 s for 60 months.
+- **Sessions.** A supervised run counts its sessions from the hand-over: with
+  `session_months = 6` the first pause is at month N + 6, and resume works as usual.
+  `civitas bench --warmup N` passes it to every seed.
+
+On seed 0, fleet_smoke_late's fleet starts at month 60 with 2,724 residents and a city score of
+55.8. Transit is at 17% on one bus line (230 of 1,500 seats), no road is congested, and the
+5,000-resident milestone (rail, harbour, hospital, university) is still ahead. The mayor
+has $10.2k, $11.8k to spend, and four buildings to fund: education's first high school, plus
+another police station, fire station and clinic.
+
 **Config.**
 
 ```toml
@@ -1841,9 +1898,9 @@ Hitting the per-turn action cap doesn't count. The tab shows these rates for the
 
 ### Output files (`runs/<run_id>/`)
 
-- `meta.json`: config, agents, map size, natural resources
+- `meta.json`: config, agents, map size, natural resources; after a warm-up also `warmup_months` and the warm-up line-up (`warmup`)
 - `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council; with fleet agents also `needs` in the months they act, read by the collaboration score's money aim). The viewer replays these.
-- `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores
+- `trajectories.jsonl`: one record per agent turn: the full prompt and raw response (LLM agents) or the observation text (scripted agents), actions, results, reward and scores; a warm-up's turns carry `"warmup": true`
 - `summary.json`: final and average scores, per-agent stats (invalid rate, spending, messages, LLM tokens, latency)
 - `fleet_report.json` / `fleet_report.md` (runs with fleet agents): scoreboard, plan, per-role tool use and failures, collaboration score, coaching hints (see [Agent fleets](#agent-fleets)); in a region, one section per city with fleet agents
 - `checkpoint.ckpt` / `playbooks.toml` / `PAUSED` (a supervised run between sessions): the game to resume, the playbooks to edit, the resume command (see Modes under [Agent fleets](#agent-fleets)). The checkpoint is a pickle signed with this installation's key (`~/.config/civitas/checkpoint.key`); resume refuses one whose signature is missing or doesn't match, so it only resumes on the machine and account that made it
@@ -1874,7 +1931,7 @@ civitas/
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
   cli.py      civitas run | resume | bench | serve | leaderboard | prompt | check-llm
 configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
-              · fleet_region_smoke · fleet_scripted
+              · fleet_region_smoke · fleet_region_both_120 · fleet_scripted · fleet_smoke_late · fleet_region_late
 docs/         MECHANICS.md (the design roadmap and what is implemented)
 examples/     remote_agent.py · rl_loop.py · export_sft.py
 tests/

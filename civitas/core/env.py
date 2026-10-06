@@ -48,6 +48,7 @@ class GameConfig:
     region: bool = False             # several cities, each with its own team (see core/region.py)
     cities: list = field(default_factory=lambda: ["north", "south"])   # region mode: which cities
     seasons: bool = True             # winter heating, summer cooling, snow, seasonal tourism
+    warmup_months: int = 0           # the first N months played by scripted agents (bench/runner.py: warm-up)
 
 
 class CivitasEnv:

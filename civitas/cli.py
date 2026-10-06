@@ -19,9 +19,16 @@ def _seeds(s: str) -> list[int]:
 
 
 def _load(args):
-    from .config import apply_cli_overrides, load_config
+    from .config import apply_cli_overrides, load_config, warmup_months
     cfg = load_config(args.config)
-    return apply_cli_overrides(cfg, args.agent, args.set)
+    cfg = apply_cli_overrides(cfg, args.agent, args.set)
+    if getattr(args, "warmup", None) is not None:
+        cfg["game"]["warmup_months"] = args.warmup
+    try:
+        warmup_months(cfg)
+    except ValueError as e:
+        sys.exit(f"civitas {args.cmd}: {e}")
+    return cfg
 
 
 def _hub(args):
@@ -87,20 +94,31 @@ def cmd_leaderboard(args):
 
 def cmd_prompt(args):
     """Print what an LLM agent would see on month 0 (system prompt + observation; for a fleet agent the
-    system prompt, the first briefing and the tool names)."""
+    system prompt, the first briefing and the tool names). With a warm-up (`--warmup N` or [game].warmup_months) the
+    warm-up is played first, with no logs and no model, and the prompt is the role's first turn after it."""
     from .agents.prompts import system_prompt
     from .config import agent_spec, build_agents, game_config, scoring_config
     from .core.env import make_env
     cfg = _load(args)
     game = game_config(cfg, args.seed)
-    env = make_env(game, scoring_config(cfg, game))        # a region when game.region: roles are "north.mayor" etc.
-    if args.role not in env.roles:
-        sys.exit(f"unknown role {args.role!r}; this game's roles: {', '.join(env.roles)}")
+    roles = make_env(game, scoring_config(cfg, game)).roles  # a region when game.region: "north.mayor" etc.
+    if args.role not in roles:
+        sys.exit(f"unknown role {args.role!r}; this game's roles: {', '.join(roles)}")
+    agent = None
+    if game.warmup_months:
+        from .bench.runner import warm_up
+        env, agents = warm_up(cfg, args.seed, role=args.role)
+        agent = agents[args.role]
+        print(f"(after a warm-up of {game.warmup_months} months played by scripted agents: month {env.world.month}, "
+              f"the roles before {args.role} in turn order played this month by the warm-up line-up)")
+    else:
+        env = make_env(game, scoring_config(cfg, game))
     if agent_spec(cfg, args.role).get("kind") == "fleet":
         from .fleet.briefing import briefing
         from .fleet.tools import ToolBox
-        agent = build_agents(cfg, [args.role], game, env.scoring)[args.role]
-        agent.bind(env)                                     # in a region: its city's env (agent.env)
+        if agent is None:
+            agent = build_agents(cfg, [args.role], game, env.scoring)[args.role]
+            agent.bind(env)                                 # in a region: its city's env (agent.env)
         print("=" * 30, "SYSTEM", "=" * 30)
         print(agent.system)
         print("=" * 30, "USER (briefing)", "=" * 30)
@@ -153,8 +171,14 @@ def main(argv=None):
         sp.add_argument("--set", action="append", default=[], help="override a value, e.g. game.months=24")
         sp.add_argument("--runs-dir", default="runs")
 
+    def warmup(sp):
+        sp.add_argument("--warmup", type=int, default=None, metavar="N",
+                        help="play the first N months with scripted agents, then hand the city to the configured ones "
+                             "(game.months stays the total; sets game.warmup_months)")
+
     sp = sub.add_parser("run", help="play one episode")
     common(sp)
+    warmup(sp)
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--serve", action="store_true", help="start the viewer + live API while running")
     sp.add_argument("--port", type=int, default=8765)
@@ -178,6 +202,7 @@ def main(argv=None):
 
     sp = sub.add_parser("bench", help="run several seeds and aggregate scores")
     common(sp)
+    warmup(sp)
     sp.add_argument("--seeds", default="0-4")
     sp.add_argument("--workers", type=int, default=1)
     sp.add_argument("--quiet", action="store_true")
@@ -194,8 +219,9 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(fn=cmd_leaderboard)
 
-    sp = sub.add_parser("prompt", help="print an agent's prompt for month 0")
+    sp = sub.add_parser("prompt", help="print an agent's prompt for month 0 (or its first turn after a warm-up)")
     common(sp)
+    warmup(sp)
     sp.add_argument("--role", default="planning")
     sp.add_argument("--seed", type=int, default=0)
     sp.set_defaults(fn=cmd_prompt)

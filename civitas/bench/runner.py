@@ -12,7 +12,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from ..config import agent_spec, apply_cli_overrides, build_agents, game_config, scoring_config
+from ..config import agent_spec, apply_cli_overrides, build_agents, game_config, scoring_config, warmup_config, \
+    warmup_months
 from ..core.env import make_env
 from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version, playbook_versions, session_months
 from ..fleet.report import fleet_report, turn_row
@@ -66,6 +67,9 @@ def agent_signature(cfg: dict, roles: list[str]) -> str:
         r = base if "." in r and agent_spec(cfg, f"north.{base}") == agent_spec(cfg, f"south.{base}") else r
         parts.append(f"{r}={k}:{a['model']}" if k == "llm" else
                      f"{r}={k}:{fleet_agent_config(cfg, r).model}" if k == "fleet" else f"{r}={k}")
+    warm = (cfg.get("game") or {}).get("warmup_months") or 0
+    if warm:
+        parts.append(f"warmup:{warm}")           # a warm-up run scores a game it played only the end of
     fleet = [r for r in roles if agent_spec(cfg, r).get("kind") == "fleet"]
     if fleet:
         parts.append(f"[{fleet_agent_config(cfg, fleet[0]).mode}]")
@@ -90,8 +94,8 @@ def _open_session(run: dict, *, previous: dict | None = None, config_file=None) 
     if not run["session_months"] and not run["sessions"]:
         return                                   # a run without sessions keeps its meta as it always was
     k = len(run["sessions"])
-    s = {"session": k + 1, "start_month": run["env"].world.month, "end_month": None, "status": "running",
-         "started": time.time(), "session_months": run["session_months"], "fleet_version": run["fv"],
+    s = {"session": k + 1, "start_month": max(run["env"].world.month, _warm_months(run)),   # after any warm-up
+         "end_month": None, "status": "running", "started": time.time(), "session_months": run["session_months"], "fleet_version": run["fv"],
          "playbooks": playbook_versions(run["cfg"], list(run["prompts"]))}
     if config_file:
         s["config_file"] = str(config_file)
@@ -106,6 +110,10 @@ def _open_session(run: dict, *, previous: dict | None = None, config_file=None) 
         if run["sig"] != previous["sig"]:
             s["signature"] = run["sig"]
     run["sessions"].append(s)
+
+
+def _warm_months(run: dict) -> int:
+    return (run.get("warmup") or {}).get("months", 0)
 
 
 def _save_sessions(run: dict) -> None:
@@ -127,7 +135,7 @@ def _pause(run: dict) -> dict:
     _save_sessions(run)
     run["log"].close()
     keep = ("cfg", "seed", "run_id", "env", "agents", "stats", "city_scores", "fleet_rows", "wall_s", "sessions",
-            "prompts", "prompt_ref", "sig", "mode", "settings", "log_observations")
+            "prompts", "prompt_ref", "sig", "mode", "settings", "log_observations", "warmup")
     ck = S.save_checkpoint(d, {**{k: run[k] for k in keep}, "lineup": S.lineup(run["cfg"], env.roles),
                                "month": env.world.month, "log_offsets": S.log_offsets(d), "saved": time.time()})
     cmd = _resume_cmd(run)
@@ -144,19 +152,132 @@ def _pause(run: dict) -> dict:
     return out
 
 
+def _new_stats() -> dict:
+    return {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0, "parse_errors": 0, "reward": 0.0}
+
+
+def lineups(cfg: dict, env, game, scoring, seed: int, hub=None) -> tuple[dict, dict | None]:
+    """(the configured agents, the warm-up's or None without a warm-up), every one reset and bound to `env` as a run
+    starts. The warm-up line-up is `config.warmup_config(cfg)`; a role it plays as configured (a scripted agent, the
+    scripted fleet) keeps one agent for the whole game, so its state carries on."""
+    agents = build_agents(cfg, env.roles, game, scoring, hub=hub)
+    warm = None
+    if game.warmup_months:
+        wcfg = warmup_config(cfg)
+        changed = [r for r in env.roles if agent_spec(wcfg, r) != agent_spec(cfg, r)]
+        built = build_agents(wcfg, changed, game, scoring, hub=hub) if changed else {}
+        warm = {r: built.get(r, agents[r]) for r in env.roles}
+    for a in {id(a): a for a in [*agents.values(), *(warm or {}).values()]}.values():
+        a.reset(seed)
+        a.bind(env)
+    return agents, warm
+
+
+def settle_fleet(agents: dict, warm: dict | None = None) -> None:
+    """At the hand-over: a fleet agent its city's FleetState never saw take a turn (a region's warm-up plays its roles
+    as plain scripted agents, outside the fleet tools) counts as having taken the warm-up's last turn, so its first
+    briefing's digest covers the months since then rather than every event and council message of the warm-up; and a
+    fleet mayor finds the plan the scripted fleet would have written (goals, notes, priorities, the warm-up mayor's
+    working balances as budgets) instead of none."""
+    from ..fleet.memory import DEPARTMENTS
+    from ..fleet.scripted import GOALS, PLAN_NOTES, PRIORITIES
+    for role, a in agents.items():
+        env = getattr(a, "env", None)
+        fleet = getattr(env, "fleet", None)
+        if a.kind != "fleet" or fleet is None or a.role in fleet.last_turn_month or not env.world.month:
+            continue
+        k = max(1, env.cfg.act_every)
+        prev = (env.world.month - 1) // k * k               # the warm-up's last acting month
+        fleet.last_turn_month[a.role] = prev
+        fleet.seen_messages[a.role] = sum(m["month"] < prev for m in env.council.visible_to(env._name(a.role), 0))
+        targets = getattr((warm or {}).get(role), "targets", None)
+        if a.role == "mayor" and targets and not fleet.plan_versions:
+            depts = [d for d in DEPARTMENTS if d in env.roles]
+            fleet.update_plan(prev, goals=GOALS, notes=PLAN_NOTES,
+                              budgets={d: round(float(v), 2) for d, v in targets.items() if d in depts},
+                              priorities={d: PRIORITIES[d] for d in depts if d in PRIORITIES})
+
+
+def snapshot(env) -> dict:
+    """The city score, scores and population after the months played so far (a region: its mean score, its total)."""
+    envs = getattr(env, "envs", None) or {"": env}
+    pop = sum(e.world.history[-1]["population"] if e.world.history else 0 for e in envs.values())
+    return {"month": env.world.month, "city": env.last_scores.get("city"), "population": pop,
+            "scores": dict(env.last_scores)}
+
+
+def warm_up(cfg: dict, seed: int, role: str | None = None) -> tuple:
+    """Play `cfg`'s warm-up without logging anything and hand over: (env, configured agents) at the first month the
+    configured agents act at or after `game.warmup_months` (the env as a run's first post-warm-up turn finds it), with
+    the roles before `role` in turn order played that month by the warm-up line-up (as `civitas prompt` shows it).
+    Without a warm-up, the env at month 0."""
+    warmup_months(cfg)
+    game = game_config(cfg, seed)
+    env = make_env(game, scoring_config(cfg, game))
+    agents, warm = lineups(cfg, env, game, env.scoring, seed)
+    while warm and env.world.month < game.warmup_months and not env.done:
+        acting = [r for r in env.roles if env.acts_this_month(r)]
+        early = {r: env.observe(r) for r in acting} if game.simultaneous else {}
+        for r in acting:
+            env.apply(r, warm[r].act(early.get(r) or env.observe(r)))
+        env.end_month()
+    if warm:
+        settle_fleet(agents, warm)
+        while role and not env.done and not env.acts_this_month(role):
+            env.end_month()                                  # months nobody acts in
+        if role and not env.done and not game.simultaneous:
+            for r in env.roles[:env.roles.index(role)]:
+                if env.acts_this_month(r):
+                    env.apply(r, warm[r].act(env.observe(r)))
+    return env, agents
+
+
+def _hand_over(run: dict) -> None:
+    """The warm-up is over: the configured agents (bound since the start) take the same env from here; the agent stats
+    restart (the warm-up's are kept for the summary) and the score and population at hand-over are noted."""
+    env, w = run["env"], run["warmup"]
+    w["at_handover"] = snapshot(env)
+    w["agent_stats"] = copy.deepcopy(run["stats"])
+    for r in run["stats"]:
+        run["stats"][r] = _new_stats()
+    settle_fleet(run["agents"], run["warm_agents"])
+    run["warm_agents"] = None
+    if run["verbose"]:
+        h = w["at_handover"]
+        print(f"[{run['run_id']}] warm-up over at month {env.world.month}: city {h['city'] or 0:.1f}, population "
+              f"{h['population']:,}; the configured agents take over")
+
+
+def _warmup_summary(run: dict, final_city: float, final_pop: int) -> dict:
+    """summary["warmup"]: the warm-up line-up, the city score and population at hand-over and at the end, the change
+    (what the configured agents' months added) and their average city score."""
+    w, env = run["warmup"], run["env"]
+    out = {k: w[k] for k in ("months", "signature", "agents")}
+    hand = w.get("at_handover")
+    out["handed_over"] = hand is not None
+    if hand is None:                                   # the game ended (bankrupt, recalled) during the warm-up
+        return out
+    after = run["city_scores"][w["months"]:]
+    out.update(at_handover=hand, at_end={"month": env.world.month, "city": final_city, "population": final_pop},
+               change={"city": round(final_city - (hand["city"] or 0.0), 3),
+                       "population": final_pop - hand["population"]},
+               avg_city_score=round(statistics.fmean(after), 3) if after else None,
+               agent_stats=w.get("agent_stats"))
+    return out
+
+
 def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None,
                 verbose: bool = True, log_observations: bool = True, run_id: str | None = None,
                 sessions: bool = True) -> dict:
     """Play a run to the end and return its summary. A supervised fleet run with `[fleet].session_months` stops
     at the first session boundary instead and returns `{"paused": True, ...}` (`sessions=False` plays through);
-    `resume_episode` continues it."""
+    `resume_episode` continues it. With `[game].warmup_months = N` the warm-up line-up (`config.warmup_config`) plays
+    months 0..N-1 and the configured agents the rest of the same game (`_hand_over`); its sessions start at N."""
+    warm = warmup_months(cfg)
     game = game_config(cfg, seed)
     scoring = scoring_config(cfg, game)
     env = make_env(game, scoring)
-    agents = build_agents(cfg, env.roles, game, scoring, hub=hub)
-    for a in agents.values():
-        a.reset(seed)
-        a.bind(env)
+    agents, warm_agents = lineups(cfg, env, game, scoring, seed, hub=hub)
 
     run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg['name']}_s{seed}_{os.getpid() % 1000:03d}"
     log = RunLogger(Path(runs_dir) / run_id)
@@ -164,8 +285,9 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
            "verbose": verbose, "log_observations": log_observations, "sessions_on": sessions, "sessions": [],
            "prompt_ref": {}, "wall_s": 0.0, "city_scores": [], "fleet_rows": [],
            "settings": {"game": dataclasses.asdict(game), "scoring": dataclasses.asdict(scoring)},
-           "stats": {r: {"turns": 0, "actions": 0, "invalid": 0, "messages": 0, "spent": 0.0,
-                         "parse_errors": 0, "reward": 0.0} for r in env.roles}}
+           "stats": {r: _new_stats() for r in env.roles}, "warm_agents": warm_agents,
+           "warmup": {"months": warm, "signature": agent_signature(warmup_config(cfg), env.roles),
+                      "agents": {r: warm_agents[r].describe() for r in env.roles}} if warm else None}
     _fleet_settings(run)
     _open_session(run)
     sig, prompts, fv = run["sig"], run["prompts"], run["fv"]
@@ -175,12 +297,15 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
               "config": cfg, "started": time.time(), **env.meta(),
               **({"fleet_version": fv} if fv else {}),
               **({"fleet_prompts": prompts} if prompts else {}),
-              **({"sessions": run["sessions"]} if run["sessions"] else {})})
+              **({"sessions": run["sessions"]} if run["sessions"] else {}),
+              **({"warmup_months": warm, "warmup": run["warmup"]} if warm else {})})
     if hub is not None:
         hub.run_id = run_id
     log.frame(env.frame())
     if verbose:
         print(f"[{run_id}] {sig}")
+        if warm:
+            print(f"[{run_id}] warm-up: months 0-{warm - 1} played by {run['warmup']['signature']}")
     return _play(run)
 
 
@@ -208,6 +333,7 @@ def resume_episode(run: str | Path, config: str | Path | None = None, *, runs_di
         (d / marker).unlink(missing_ok=True)
     run = {**{k: state[k] for k in ("seed", "run_id", "stats", "city_scores", "fleet_rows", "wall_s", "sessions",
                                     "prompt_ref", "settings", "log_observations")},
+           "warmup": state.get("warmup"), "warm_agents": None,      # a pause comes after the warm-up
            "cfg": cfg, "env": env, "agents": S.restore_agents(state["agents"], cfg, env, hub),
            "log": RunLogger(d), "hub": hub, "verbose": verbose, "sessions_on": True}
     _fleet_settings(run)
@@ -247,11 +373,16 @@ def _fleet_version(run: dict) -> str | None:
 
 def _play(run: dict) -> dict:
     """Months until the end of the game (-> summary) or of the session (-> `_pause`)."""
-    cfg, env, agents, stats, log, hub = run["cfg"], run["env"], run["agents"], run["stats"], run["log"], run["hub"]
+    cfg, env, stats, log, hub = run["cfg"], run["env"], run["stats"], run["log"], run["hub"]
     run_id, seed, game, verbose = run["run_id"], run["seed"], env.cfg, run["verbose"]
     log_observations, prompts, sig = run["log_observations"], run["prompts"], run["sig"]
-    city_scores, fleet_rows, t0, start = run["city_scores"], run["fleet_rows"], time.time(), env.world.month
+    city_scores, fleet_rows, t0 = run["city_scores"], run["fleet_rows"], time.time()
+    start = max(env.world.month, _warm_months(run))      # sessions count the months after the warm-up
     while not env.done:
+        if run.get("warm_agents") and env.world.month >= run["warmup"]["months"]:
+            _hand_over(run)
+        warming = bool(run.get("warm_agents"))
+        agents = run["warm_agents"] if warming else run["agents"]
         pending = []
         acting = [r for r in env.roles if env.acts_this_month(r)]
         # simultaneous mode: everybody sees the same start-of-month state, then all decisions apply in turn order
@@ -274,6 +405,8 @@ def _play(run: dict) -> dict:
                    "results": results, "parse_error": decision.parse_error}
             if run["sessions"]:
                 rec["session"] = run["sessions"][-1]["session"]
+            if warming:
+                rec["warmup"] = True                   # played by the warm-up line-up; reports skip these
             if "messages" in decision.meta:
                 rec["prompt"] = _prompt(run, role, decision.meta["messages"])
                 rec["response"] = decision.meta.get("response")
@@ -287,7 +420,7 @@ def _play(run: dict) -> dict:
             elif log_observations:
                 rec["observation_text"] = obs["text"]
             pending.append(rec)
-            if agents[role].kind == "fleet":
+            if agents[role].kind == "fleet" and not warming:
                 fleet_rows.append(turn_row(rec))       # slim: whole records hold every turn's messages
         info = env.end_month()
         for rec in pending:
@@ -310,6 +443,7 @@ def _play(run: dict) -> dict:
             return _pause(run)
 
     run["wall_s"] += time.time() - t0
+    agents = run["agents"]
     fv = _fleet_version(run)
     final = env.final_metrics()
     if "cities" in env.meta():
@@ -345,6 +479,8 @@ def _play(run: dict) -> dict:
         "wall_time_s": round(run["wall_s"], 2),        # playing time; a paused run's sessions add up
         **({"fleet_version": fv} if fv else {}),
     }
+    if run.get("warmup"):            # agent_stats cover the configured agents' turns; the warm-up's are in here
+        summary["warmup"] = _warmup_summary(run, info["scores"]["city"], final["population"])
     if run["sessions"]:
         s = run["sessions"][-1]
         s.update(status="finished", end_month=env.world.month, ended=time.time())
@@ -369,6 +505,12 @@ def _play(run: dict) -> dict:
     if verbose:
         print(f"[{run_id}] done: city {info['scores']['city']:.1f}  " +
               " ".join(f"{r}={info['scores'][r]:.1f}" for r in env.roles) + f"  ({summary['wall_time_s']}s)")
+        w = summary.get("warmup") or {}
+        if w.get("handed_over"):
+            h, e, c = w["at_handover"], w["at_end"], w["change"]
+            print(f"[{run_id}] after the warm-up (months {w['months']}-{e['month'] - 1}): city {h['city'] or 0:.1f} -> "
+                  f"{e['city']:.1f} ({c['city']:+.1f}), population {h['population']:,} -> {e['population']:,} "
+                  f"({c['population']:+,})")
     return summary
 
 

@@ -7,7 +7,8 @@ call of the same tool in the turn succeeded, with other arguments or, after anot
 same ones), heeded (a guard refused and the agent did something else), overridden
 (it repeated the refused call with confirm), repeated (it sent the same failing call again), escalated (it gave up on
 it but messaged another role, e.g. asked the mayor for money), dropped (it gave up on that tool this turn), and, across turns, recurred (the same role hit the same cause on its next turn). Rates over
-these say how an agent solves problems, not only how often it makes them.
+these say how an agent solves problems, not only how often it makes them. A warm-up's turns (`"warmup": true`, played
+by the scripted warm-up line-up before the configured agents take over) are left out.
 """
 from __future__ import annotations
 
@@ -101,6 +102,8 @@ def run_problems(path: str | Path, report: str | Path | None = None) -> dict:
                     pass
     items, turns = [], {}
     for rec in recs:
+        if rec.get("warmup"):                      # a warm-up's scripted turns (bench/runner.py) aren't under test
+            continue
         turns.setdefault(rec.get("role"), []).append(rec.get("month"))
         items.extend(turn_problems(rec))
     # recurred: the same role hit the same cause on its next turn (guards are the harness's, not a recurrence)

@@ -20,6 +20,11 @@ Matching, inside a window of 2 x act_every months after the request (turn order 
 With fleet agents each frame of a month the agents act in also carries `needs` (FleetState.needs): what each
 department's money was for as the mayor's Departments block showed it that month. A top-up then carries its
 department's record as `need` ([kind, top_up, covered]), which the report's money aim reads (fleet/report.py).
+
+After a warm-up (meta.json `warmup_months`, bench/runner.py) everything here covers the configured agents' months
+only: `since` drops the events (messages, money, builds, deal events) of earlier months and their threads, so the
+Team tab and the fleet report's collaboration score say how the agents under test worked together, not the scripted
+warm-up. A region's `deals` keep every deal's whole life (a deal from the warm-up can still be live).
 """
 from __future__ import annotations
 
@@ -134,9 +139,10 @@ def _needs(frame: dict, city: str | None) -> dict | None:
 
 
 def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str | None = None,
-           external: bool = True) -> dict:
-    """The events, threads and per-role stats of a run's frames (see the module doc). For one city of a region run
-    (external=True) also that city's deals and its messages with other cities (city_external)."""
+           external: bool = True, since: int = 0) -> dict:
+    """The events, threads and per-role stats of a run's frames (see the module doc), from month `since` on (the
+    warm-up's end). For one city of a region run (external=True) also that city's deals and its messages with other
+    cities (city_external)."""
     order = {r: i for i, r in enumerate(roles)}
     events: list[dict] = []
     needs: dict[int, dict] = {}
@@ -146,15 +152,19 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
         last = max(last, int(f.get("month", 0)))
         months.add(int(f.get("month", 0)))
         council, turns = _local(f, city)
-        if n := _needs(f, city):
+        if (n := _needs(f, city)) and int(f.get("month", 0)) >= since:
             needs[int(f.get("month", 0))] = n
         for m in council:
+            if int(m.get("month", 0)) < since:
+                continue
             to, text = str(m.get("to") or "all"), str(m.get("text") or "")
             events.append({"month": int(m.get("month", 0)), "kind": "message", "from": m.get("sender"), "to": to,
                            "text": text[:TEXT_CHARS], "amount": _amount(text), "tiles": _tiles(text),
                            "ask": is_request(to, text)})
         for t in turns:
             role, month = t.get("role"), int(t.get("month", f.get("month", 0)))
+            if month < since:
+                continue
             for r in t.get("results") or []:
                 a = r.get("action") or {}
                 if not r.get("ok"):
@@ -191,15 +201,15 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
         for eid in (th.pop("_ids")):
             if events[eid]["thread"] is None:
                 events[eid]["thread"] = i
-    out = {"roles": roles, "act_every": act_every, "last_month": last, "window": window,
+    out = {"roles": roles, "act_every": act_every, "last_month": last, "window": window, "since": since,
            "needs_from": min(needs, default=None),      # the first month with a needs record (None: no record)
            # frames from then on, in months the mayor acts, without one (FleetState.needs failed: logged once per run)
-           "needs_missing": sum(m not in needs for m in months if needs and m >= min(needs)
+           "needs_missing": sum(m not in needs for m in months if needs and m >= min(needs) and m >= since
                                 and m % max(1, int(act_every)) == 0),
            "events": [{k: v for k, v in e.items() if k != "tiles" or v} for e in events],
            "threads": threads, "handoffs": handoffs(events, key, window), "stats": _stats(roles, events, threads)}
     if city is not None and external and any("cities" in f for f in frames):
-        out.update(city_external(frames, roles, act_every, city))
+        out.update(city_external(frames, roles, act_every, city, since))
     return out
 
 
@@ -500,12 +510,13 @@ def _cross_messages(frames: list[dict], cities) -> list[dict]:
     return ev
 
 
-def _region_parts(frames: list[dict], roles: list[str], act_every: int, cities: list[str]) -> dict:
-    """The cross-city events (messages and deal events, in turn order), threads and deals of a region run."""
+def _region_parts(frames: list[dict], roles: list[str], act_every: int, cities: list[str], since: int = 0) -> dict:
+    """The cross-city events (messages and deal events, in turn order), threads and deals of a region run; events and
+    threads from month `since` on, deals whole."""
     rank = {r: i for i, r in enumerate(roles)}
     ci = {c: i for i, c in enumerate(cities)}
     deals = deal_history(frames, cities)
-    events = _cross_messages(frames, cities) + _deal_events(deals)
+    events = [e for e in _cross_messages(frames, cities) + _deal_events(deals) if (e["month"] or 0) >= since]
     key = lambda e: (e["month"], LATE if e.get("what") == "expired" else rank.get(str(e["from"]).split(".")[-1], LATE),
                      ci.get(e["from_city"], len(ci)), 0 if e["kind"] == "message" else 1)
     events.sort(key=key)
@@ -513,7 +524,7 @@ def _region_parts(frames: list[dict], roles: list[str], act_every: int, cities: 
         e["id"] = i
     last = max([int(f.get("month", 0)) for f in frames] or [0])
     window = 2 * max(1, int(act_every))
-    threads = [_deal_thread(d, events, key, window, last) for d in deals]
+    threads = [_deal_thread(d, events, key, window, last) for d in deals if (d["offered"] or 0) >= since]
     threads += [_cross_thread(e, events, deals, key, window, last) for e in events if e["kind"] == "message" and e["ask"]]
     threads.sort(key=lambda t: (t["month"], t.pop("_k")))
     for i, t in enumerate(threads):
@@ -570,14 +581,15 @@ def _cross_thread(req: dict, events: list[dict], deals: list[dict], key, window:
             "outcome": outcome, "_k": k0}
 
 
-def _region_stats(cities: list[str], roles: list[str], frames: list[dict], act_every: int, parts: dict) -> dict:
+def _region_stats(cities: list[str], roles: list[str], frames: list[dict], act_every: int, parts: dict,
+                  since: int = 0) -> dict:
     """Per city: requests inside the city and how many were answered, builds, the mayor's money moved, messages to
     and from other cities, asks between cities and their answers, deals proposed / offered to it / accepted / active,
     and what it earned selling and paid buying through deals."""
     out = {}
     events, threads, deals = parts["events"], parts["threads"], parts["deals"]
     for c in cities:
-        st = collab(frames, roles, act_every, c, external=False)["stats"]
+        st = collab(frames, roles, act_every, c, external=False, since=since)["stats"]
         tot = lambda k: sum(v[k] for v in st.values())
         msgs = [e for e in events if e["kind"] == "message"]
         asks = [t for t in threads if t["kind"] != "deal"]
@@ -597,19 +609,20 @@ def _region_stats(cities: list[str], roles: list[str], frames: list[dict], act_e
     return out
 
 
-def region_collab(frames: list[dict], roles: list[str], act_every: int = 1, cities: list[str] | None = None) -> dict:
+def region_collab(frames: list[dict], roles: list[str], act_every: int = 1, cities: list[str] | None = None,
+                  since: int = 0) -> dict:
     """The Team tab's Region view: the cities, the events between them (messages; deals offered, accepted, cancelled,
     expired), their threads, every deal's life, and per-city stats (see the region block's doc)."""
     cities = list(cities or _cities(frames))
-    parts = _region_parts(frames, roles, act_every, cities)
-    return {"region": True, "cities": cities, "roles": roles, "act_every": act_every,
+    parts = _region_parts(frames, roles, act_every, cities, since)
+    return {"region": True, "cities": cities, "roles": roles, "act_every": act_every, "since": since,
             "last_month": max([int(f.get("month", 0)) for f in frames] or [0]), "window": 2 * max(1, int(act_every)),
-            **parts, "stats": _region_stats(cities, roles, frames, act_every, parts)}
+            **parts, "stats": _region_stats(cities, roles, frames, act_every, parts, since)}
 
 
-def city_external(frames: list[dict], roles: list[str], act_every: int, city: str) -> dict:
+def city_external(frames: list[dict], roles: list[str], act_every: int, city: str, since: int = 0) -> dict:
     """One city's part of region_collab: its deals, its events with other cities and their threads."""
-    parts = _region_parts(frames, roles, act_every, _cities(frames))
+    parts = _region_parts(frames, roles, act_every, _cities(frames), since)
     mine = lambda x: city in (x.get("from_city"), x.get("to_city"))
     return {"deals": [d for d in parts["deals"] if city in (d["seller"], d["buyer"])],
             "external": [e for e in parts["events"] if mine(e)],
@@ -618,8 +631,8 @@ def city_external(frames: list[dict], roles: list[str], act_every: int, city: st
 
 
 def run_collab(run_dir: str | Path, city: str | None = None, region: bool = False) -> dict:
-    """collab() of a run folder: frames.jsonl, with roles and act_every from meta.json; region_collab() with
-    region=True (or city="*")."""
+    """collab() of a run folder: frames.jsonl, with roles, act_every and the warm-up (`since`) from meta.json;
+    region_collab() with region=True (or city="*")."""
     d = Path(run_dir)
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
     frames = []
@@ -630,6 +643,7 @@ def run_collab(run_dir: str | Path, city: str | None = None, region: bool = Fals
     roles = list(dict.fromkeys(roles)) or ["mayor", "planning", "utilities", "transport", "police", "fire", "health",
                                            "education"]
     act = int(((meta.get("config") or {}).get("game") or {}).get("act_every", 1) or 1)
+    since = int(meta.get("warmup_months") or 0)
     if region or city == "*":
-        return region_collab(frames, roles, act, meta.get("cities"))
-    return collab(frames, roles, act, city)
+        return region_collab(frames, roles, act, meta.get("cities"), since)
+    return collab(frames, roles, act, city, since=since)

@@ -5,7 +5,7 @@ Endpoints
   GET  /api/runs/<id>/meta|summary   run metadata / final summary
   GET  /api/runs/<id>/frames?since=N replay frames from index N
   GET  /api/runs/<id>/turns?month=M  every agent turn of month M: prompt / briefing, reasoning, reply (+ a
-                                     fleet turn's tool-call summary under "trace")
+                                     fleet turn's tool-call summary under "trace"; "warmup": true on a warm-up turn)
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
   GET  /api/runs/<id>/problems   every failed / refused call and bad turn end, how the agent handled it, per-role rates
   GET  /api/runs/<id>/collab?city=C   requests between agents, the money and builds that answered them (bench/collab.py),
@@ -409,6 +409,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                         "observation": (user or "")[:30000], "usage": t.get("usage"),
                                         "latency_s": t.get("latency_s"), "finish_reason": t.get("finish_reason"),
                                         "notes": t.get("notes"),
+                                        **({"warmup": True} if t.get("warmup") else {}),   # the scripted warm-up's
                                         **({"trace": trace_summary(t)} if "tool_trace" in t else {})})
                         return self._json(out)
                     if parts[3] == "trace":         # one fleet turn's tool calls

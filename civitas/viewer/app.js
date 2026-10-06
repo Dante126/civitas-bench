@@ -279,12 +279,12 @@ function renderVitals(f) {
 }
 function renderDepts(f) {
   const roles = S.meta.roles, p = ago();
-  const kinds = [...new Set(roles.map(r => S.meta.agents[r]))];
+  const kinds = [...new Set(roles.map(r => agentOf(r, f.month)))];
   $("lineup").textContent = kinds.length === 1 ? kinds[0] : `${kinds.length} kinds of agent`;
-  $("lineup").title = roles.map(r => `${r}: ${S.meta.agents[r]}`).join("\n");
+  $("lineup").title = roles.map(r => `${r}: ${agentOf(r, f.month)}`).join("\n");
   $("scoreCards").innerHTML = roles.map(r => {
     const v = f.scores[r] ?? 0;
-    return `<div class="drow ${roleOn(r) ? "" : "off"}" data-role="${r}" style="--c:${roleColor(r)}" title="${esc(r)} (${esc(S.meta.agents[r])}): click to show only this department in the right panel">
+    return `<div class="drow ${roleOn(r) ? "" : "off"}" data-role="${r}" style="--c:${roleColor(r)}" title="${esc(r)} (${esc(agentOf(r, f.month))}): click to show only this department in the right panel">
       <span class="n">${r}</span><span class="t"><i style="width:${Math.max(0, Math.min(100, v)).toFixed(1)}%"></i></span>
       <span class="sc">${v.toFixed(1)}</span><span class="dd">${trend(v, p.scores[r] ?? 0)}</span></div>`;
   }).join("") + teamworkRow();
@@ -515,7 +515,7 @@ function turnCard(t, ti, em) {
     <button class="thead" data-role="${esc(t.role)}" aria-expanded="${open}"><span class="trole">${esc(t.role)}</span><span class="twhat">${turnHeadline(t)}</span>
       <span class="tmeta">${spent ? `<span>${fmt$(spent)}</span>` : ""}<span>${ok} ✓</span>${bad ? `<span class="badn">${bad} ✗</span>` : ""}${(t.messages || []).length ? `<span title="messages sent">✉ ${t.messages.length}</span>` : ""}<span class="qref" data-role="${esc(t.role)}"></span><span class="qend" data-role="${esc(t.role)}"></span></span><span class="chev">▸</span></button>
     <div class="tbody" ${open ? "" : "hidden"}>
-      <div class="tagline"><span>${esc(S.meta.agents[t.role] || "")}</span><span>month ${t.month}</span></div>
+      <div class="tagline"><span>${esc(agentOf(t.role, t.month))}</span><span>month ${t.month}</span></div>
       ${t.parse_error ? `<div class="small" style="color:var(--warn)">⚠ ${esc(t.parse_error).slice(0, 140)}</div>` : ""}
       ${t.thinking ? `<div class="think" title="click to read it all">${esc(t.thinking)}</div>` : ""}
       <div class="tsec">Actions</div>${acts || `<div class="small muted">no actions</div>`}
@@ -766,7 +766,8 @@ function renderTeam() {
   teamStep(teamGraph);
   const em = teamMonth();
   $("teamScore").innerHTML = scoreStrip(S.collab, scoreMonth());
-  $("teamSum").innerHTML = teamSummary(em);
+  const since = Math.max(0, Math.floor(+S.collab.since || 0));
+  $("teamSum").innerHTML = (since ? `<div class="small muted">Months 0–${since - 1} were a scripted warm-up: the Team view and its score count month ${since} on.</div>` : "") + teamSummary(em);
   $("teamList").innerHTML = handoffList(em) + `<div class="teamh">Requests</div>` + teamList(em) + externalList(em);
   bindThreads($("teamList")); bindHandoffs($("teamList")); bindRegionList($("teamList"));
   const un = $("teamList").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamGraph.selected = null; onTeamPick(null); };
@@ -1471,6 +1472,16 @@ function drawMinimap() {
 // the timeline track: played part filled, years marked, city events above the line (red crises, blue disasters and
 // offers, gold milestones) and the agents' problems below it (amber, red when unsolved); hover names the month
 const TRACK_Y = 22, TRACK_PAD = 7;
+// a warm-up run (meta.warmup, bench/runner.py): months before it were played by scripted agents
+function warmupMonths() { return (S.meta && S.meta.warmup && S.meta.warmup.months) || 0; }
+function agentOf(role, month) {
+  const w = S.meta.warmup;
+  if (w && month < w.months) {
+    const a = (w.agents || {})[S.city ? `${S.city}.${role}` : role] || (w.agents || {})[role];
+    if (a) return `${a} (warm-up)`;
+  }
+  return S.meta.agents[role] || "";
+}
 function trackEvents(f) {
   const out = [];
   for (const e of f.events || []) {
@@ -1488,6 +1499,13 @@ function drawTrackMarks() {
   const months = Math.max(1, S.meta.months || S.frames.length - 1), X = (m) => TRACK_PAD + (w - 2 * TRACK_PAD) * m / months;
   const cur = S.frames.length ? S.frames[S.idx].month : 0, have = S.frames.length ? S.frames[S.frames.length - 1].month : 0;
   const bar = (x1, x2, color) => { g.fillStyle = color; g.beginPath(); g.roundRect(x1, TRACK_Y - 2, Math.max(0, x2 - x1), 4, 2); g.fill(); };
+  const warm = warmupMonths();
+  if (warm) {                                               // the scripted warm-up: a shaded span, labelled, then the hand-over
+    g.fillStyle = "rgba(154,163,173,.13)"; g.fillRect(X(0), TRACK_Y - 7, X(warm) - X(0), 14);
+    g.fillStyle = "rgba(233,236,239,.45)"; g.fillRect(Math.round(X(warm)), TRACK_Y - 8, 1, 16);
+    g.font = "600 8.5px ui-sans-serif, system-ui, sans-serif"; g.textAlign = "left";
+    g.fillStyle = "rgba(190,198,206,.7)"; g.fillText("scripted warm-up", X(0) + 2, 8, Math.max(20, X(warm) - X(0) - 4));
+  }
   bar(X(0), X(months), "rgba(255,255,255,.08)");            // the whole game
   bar(X(0), X(have), "rgba(255,255,255,.16)");              // months played so far (a live run grows)
   bar(X(0), X(cur), "#3ecf9e");                             // up to the month on show
@@ -1514,6 +1532,7 @@ function trackTip(e) {
   const lines = ev.slice(0, 3).map(([c, t]) => `<div class="ev"><i style="background:${c}"></i>${esc(t.length > 70 ? t.slice(0, 70) + "…" : t)}</div>`);
   if (pr.length) lines.push(`<div class="ev"><i style="background:${pr.some(p => UNSOLVED.has(p.handled)) ? "#ff6b5e" : "#ffc857"}"></i>${pr.length} agent problem${pr.length > 1 ? "s" : ""}</div>`);
   if (msgs) lines.push(`<div class="ev muted"><i style="background:#9aa3ad"></i>${msgs} message${msgs > 1 ? "s" : ""}</div>`);
+  if (m - 1 < warmupMonths()) lines.push(`<div class="ev muted"><i style="background:#6c757d"></i>scripted warm-up (the configured agents take over at month ${warmupMonths()})</div>`);
   tip.innerHTML = `<b>Year ${Math.floor(m / 12) + 1}${f.season ? `, ${f.season}` : ""} · month ${m}</b>` + (lines.join("") || `<div class="muted">nothing notable</div>`);
   tip.style.left = `${Math.max(90, Math.min(r.width - 90, e.clientX - r.left))}px`; tip.hidden = false;
 }
