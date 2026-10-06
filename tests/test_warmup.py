@@ -113,7 +113,7 @@ def test_the_late_configs_keep_the_smoke_fleets():
     both, rlate = (load_config(str(ROOT / f"configs/{n}.toml")) for n in ("fleet_region_both_120", "fleet_region_late"))
     assert rlate["fleet"] == both["fleet"] and rlate["agents"] == both["agents"]
     g = game_config(rlate)
-    assert g.region and (g.months, g.warmup_months) == (72, 60) and g.cities == ["north", "south"]
+    assert g.region and (g.months, g.warmup_months) == (108, 96) and g.cities == ["north", "south"]
 
 
 # ------------------------------------------------------------- determinism
