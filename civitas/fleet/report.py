@@ -583,7 +583,8 @@ def collaboration(c: dict) -> dict:
         "money_aim": {"score": _share(aimed, given, len(gifts)), "n": len(gifts), "aimed": round(aimed, 2),
                       "given": round(given, 2), "basis": "needs" if c.get("needs_from") is not None
                       and c["needs_from"] <= last else "messages",
-                      "needed": round(by_need, 2), "asked": round(by_ask, 2)}}
+                      "needed": round(by_need, 2), "asked": round(by_ask, 2),
+                      "needs_missing": int(c.get("needs_missing") or 0)}}
     vals = [v["score"] for v in comps.values() if v["score"] is not None]
     per = {}
     for r in roles:
@@ -849,8 +850,10 @@ def _aim_text(ma: dict) -> str:
     head = f"{money(ma['aimed'])} of {money(ma['given'])} in {ma['n']} top-ups"
     if ma.get("basis") != "needs":
         return f"{head} answered the department's request (message-based: this run has no needs record)"
+    miss = ma.get("needs_missing") or 0
     return (f"{head} went to a first building, supply, planning's road or another building the money covered "
-            f"({money(ma['needed'])}), or answered the department's request ({money(ma['asked'])})")
+            f"({money(ma['needed'])}), or answered the department's request ({money(ma['asked'])})"
+            + (f"; {miss} month{'s' * (miss != 1)} without a needs record" if miss else ""))
 
 
 def _body(rep: dict, h: str = "##") -> list[str]:

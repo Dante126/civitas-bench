@@ -464,7 +464,7 @@ export function dealPaid(d, m) {
   return Math.max(0, last - d.accepted + 1);
 }
 export function dealEnd(d) {
-  if (d.end === "expired") return "ran out";
+  if (d.end === "expired") return d.accepted == null ? "offer expired" : "ran out";
   if (d.accepted == null) return d.ended_by === d.proposer ? "withdrawn" : "declined";
   return `cancelled${d.ended_by ? ` by ${d.ended_by}` : ""}`;
 }
@@ -592,7 +592,8 @@ export class RegionGraph {
       const col = RES_C[e.resource] || GOLD;
       if (e.what === "offered") this.parts.push({ type: "doc", a, b, k: 0.2, t0, dur: dur * 1.2, color: col, text: `${Math.round(e.amount)} ${e.resource}?` });
       else this.flash.set(e.deal, { color: e.what === "accepted" ? OK : e.what === "cancelled" ? BAD : "#8a93a0", t0: t0 + dur * 0.4, dur: 1000,
-        cross: e.what === "cancelled", text: e.what === "accepted" ? `deal #${e.deal} ✓` : e.what === "cancelled" ? `#${e.deal} cancelled` : `#${e.deal} ran out` });
+        cross: e.what === "cancelled", text: e.what === "accepted" ? `deal #${e.deal} ✓` : e.what === "cancelled" ? `#${e.deal} cancelled`
+          : (this._deal(e.deal) || {}).accepted == null ? `#${e.deal} offer expired` : `#${e.deal} ran out` });
     });
     // this step's payments: coins from buyer to seller along the deal's edge
     for (const d of this.data.deals) {

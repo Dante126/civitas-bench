@@ -34,6 +34,13 @@ MAX_FOOTPRINT = max(max(f) for f in [*C.FOOTPRINT.values(), *(t["footprint"] for
                                                                 for t in ts)])
 
 
+def own_supply(m: dict, resource: str) -> float:
+    """A supply ("power", "water", "sewage") in World.metrics() `m` without service imports: the city's own plants
+    plus neighbour deals (+ bought, - sold). Imports cover at most IMPORT_SHARE_MAX of demand and stop once the city's
+    own output covers it, so they are no capacity to plan on (fleet.tools.supply_need, RegionEnv.supply_state)."""
+    return m[f"{resource}_supply"] - m["service_imports"].get(resource, 0.0)
+
+
 @dataclass
 class Network:
     id: int
@@ -472,8 +479,10 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         if s[ty, tx] == C.TOWNHALL:
             p_need[ty, tx] = C.TOWNHALL_POWER
             w_need[ty, tx] = C.TOWNHALL_WATER
-        p_need *= self.event_factor("power_demand")
-        w_need *= self.event_factor("water_demand")
+        pf, wf = self.event_factor("power_demand"), self.event_factor("water_demand")
+        self.demand_factor = {"power": pf, "water": wf, "sewage": wf}     # season / event multipliers now applied
+        p_need *= pf
+        w_need *= wf
 
         # producers: one entry per building (multi-tile plants count once)
         plants_by_net: dict[int, list] = {i: [] for i in range(n)}
@@ -918,6 +927,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
             "power_clean_capacity": clean,
             "utility_upkeep": round(sum(self.facility_spec(x, y)["upkeep"] for x, y in utils), 2),
             "water_supply": round(water_supply, 1), "water_demand": round(water_demand, 1),
+            "demand_factor": {k: round(v, 4) for k, v in getattr(self, "demand_factor", {}).items()},
             "power_coverage": round(float(p_need[self.powered].sum() / tot_p), 4) if tot_p > 0 else None,
             "water_coverage": round(float(w_need[self.watered].sum() / tot_w), 4) if tot_w > 0 else None,
             "sewage_supply": round(sewage_supply, 1), "sewage_demand": round(sewage_demand, 1),

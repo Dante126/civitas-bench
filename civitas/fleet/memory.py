@@ -7,6 +7,7 @@ world's metrics snapshot and events into it (every month, from `CivitasEnv.end_m
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from dataclasses import dataclass, field
 
@@ -19,6 +20,7 @@ MEMORY_FIELDS = ("commitments", "open_tasks", "lessons")
 KINDS = ("action", "event", "report", "metrics")
 HISTORY_KINDS = (*KINDS, "failure")       # failure = action entries with ok False
 MAX_HISTORY = 40
+log = logging.getLogger(__name__)
 
 
 def _empty_plan() -> dict:
@@ -63,6 +65,7 @@ class FleetState:
     last_turn_month: dict = field(default_factory=dict)
     seen_messages: dict = field(default_factory=dict)   # {role: council messages visible to it at its last turn}
     synced_month: int | None = None
+    needs_failures: int = 0     # months needs() failed (logged once per run; collab counts the months missing a record)
 
     @classmethod
     def of(cls, env) -> "FleetState":
@@ -132,8 +135,10 @@ class FleetState:
         tools.KINDS, top_up what its needs line lacks (0 without one), covered 1 when the to-fund line's cover clause
         (fund_cover) names it. A frame of month M is written before month M's turns, so it is what the mayor sees
         that month (the mayor acts first). Only in months the agents act (act_every) and with a mayor in the game;
-        None otherwise or on any error (a frame must never end a run). Read-only: report-only (the collaboration
-        score's money aim), never shown to agents. About 5-10 ms a call."""
+        None otherwise or on any error (a frame must never end a run): the first error of a run is logged with its
+        traceback, later ones only counted (needs_failures), and the frame goes without a record, which the
+        collaboration block counts (bench/collab.py: needs_missing) and the fleet report notes. Read-only:
+        report-only (the collaboration score's money aim), never shown to agents. About 5-10 ms a call."""
         if "mayor" not in env.roles or not env.acts_this_month("mayor"):
             return None
         from .tools import fund_cover, funding_gaps      # tools imports this module
@@ -142,6 +147,10 @@ class FleetState:
             ups, cover = {i.dept: i.amount for i in f.to_fund}, set(fund_cover(f))
             return {d: [m.kind, ups.get(d, 0), int(d in cover)] for d, m in f.depts.items()}
         except Exception:
+            self.needs_failures = getattr(self, "needs_failures", 0) + 1
+            if self.needs_failures == 1:
+                log.warning("FleetState.needs failed at month %s (the frame goes without a needs record; later "
+                            "failures this run are not logged)", env.world.month, exc_info=True)
             return None
 
     def history(self, kind: str | None = None, months: int | None = 3, role=None,

@@ -71,8 +71,9 @@ BLOCKED_NOTE = "- blocked for lack of land: money buys nothing there until plann
 # department reports quoted on the mayor's Departments block (history kind=report has them whole): shorter than
 # REPORT_PREVIEW_CHARS, so the Finances split, the to spend / to fund lines and the debt line fit its 7,700 characters.
 # 180 until review: with every department on a needs line (3 first, planning's road, 3 another) in a hold, debt at the
-# cap and a 6x deficit, the worst mix took 7,694, over the plan's 7,650; at 170, 7,624
-MAYOR_REPORT_CHARS = 170
+# cap and a 6x deficit, the worst mix took 7,694, over the plan's 7,650; at 170, 7,624. 165 since the City line shows
+# imported supply apart ("power 1,046 own + 35 imported / 1,081"): at 170 that mix took 7,706
+MAYOR_REPORT_CHARS = 165
 # the Finances costs line names the dearest this many buildings lines, then "N more $X": with 3, the worst mix of
 # test_briefings_stay_bounded_at_the_limits (needs lines on six departments, debt at the cap, a 6x deficit, seven
 # buildings lines, a partial cover in a hold) took the mayor's briefing to 7,695 of its 7,700 characters; with 2, 7,677
@@ -475,6 +476,16 @@ def _finances(w, cf: CashFlow) -> list[str]:
     return L
 
 
+def _supply_parts(v: dict) -> str:
+    """A supply on the mayor's City line: "1,081", or with service imports "1,046 own + 35 imported" (imports cover at
+    most a quarter of demand and stop once the city's own output covers it; counted in, a city importing read
+    "power 1,081 / 1,081" and looked served)."""
+    imp = v.get("imported") or 0.0
+    if round(imp) < 1:
+        return num(v["supply"])
+    return f"{num(round(v['supply'] - imp, 1))} own + {num(imp)} imported"
+
+
 def _mayor(env, fleet: FleetState) -> list[str]:
     w = env.world
     o = overview(env)
@@ -487,7 +498,7 @@ def _mayor(env, fleet: FleetState) -> list[str]:
          "- jobs: " + ", ".join(f"{k} {num(v)}" for k, v in o["jobs"].items())
          + " | demand: " + _value("demand", o["demand"]),
          "- supply / demand (coverage): " + ", ".join(
-             f"{k} {num(o[k]['supply'])} / {num(o[k]['demand'])} ({pct(o[k]['coverage_pct'])})"
+             f"{k} {_supply_parts(o[k])} / {num(o[k]['demand'])} ({pct(o[k]['coverage_pct'])})"
              for k in ("power", "water", "sewage")),
          "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),

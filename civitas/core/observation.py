@@ -31,6 +31,13 @@ def _pct(v):
     return None if v is None else round(100 * v, 1)
 
 
+def _supply(v: dict) -> str:
+    """A power / water supply in the City block: "250.0", or with service imports "1046.0 own + 35.0 imported" (the
+    dict's `supply` counts them in)."""
+    imp = v.get("imported") or 0.0
+    return f"{round(v['supply'] - imp, 1)} own + {imp} imported" if imp >= 0.5 else f"{v['supply']}"
+
+
 def _cov(v) -> str:
     return "n/a (no buildings yet)" if v is None else f"{v}%"
 
@@ -605,9 +612,11 @@ def build_observation(world: World, role: str, *, council_msgs: list[dict], memo
             "demand": world.demand and {k: round(v, 2) for k, v in world.demand.items()},
             "tax_pct": {k: round(100 * v, 1) for k, v in world.taxes.items()},
             "power": {"supply": m["power_supply"], "demand": m["power_demand"],
-                      "coverage_pct": _pct(m["power_coverage"])},
+                      "coverage_pct": _pct(m["power_coverage"]),
+                      "imported": round(m["service_imports"].get("power", 0.0), 1)},    # part of supply
             "water": {"supply": m["water_supply"], "demand": m["water_demand"],
-                      "coverage_pct": _pct(m["water_coverage"])},
+                      "coverage_pct": _pct(m["water_coverage"]),
+                      "imported": round(m["service_imports"].get("water", 0.0), 1)},
             "sewage": {"supply": m["sewage_supply"], "demand": m["sewage_demand"],
                        "coverage_pct": _pct(m["sewage_coverage"])},
             "river_pollution_pct": _pct(m["river_pollution"]),
@@ -921,8 +930,8 @@ def render_text(obs: dict) -> str:
     L.append(f"Demand (-1..1, positive = people/businesses want more of this zone): {_kv(c['demand'])}"
              + (f" | CAPPED: {_kv(c['demand_caps'])} (a big city needs a train station and enough parks)" if c["demand_caps"] else ""))
     L.append(f"Taxes %: {_kv(c['tax_pct'])}")
-    L.append(f"Power: supply {c['power']['supply']}, demand {c['power']['demand']}, coverage {_cov(c['power']['coverage_pct'])} | "
-             f"Water: supply {c['water']['supply']}, demand {c['water']['demand']}, coverage {_cov(c['water']['coverage_pct'])}")
+    L.append(f"Power: supply {_supply(c['power'])}, demand {c['power']['demand']}, coverage {_cov(c['power']['coverage_pct'])} | "
+             f"Water: supply {_supply(c['water'])}, demand {c['water']['demand']}, coverage {_cov(c['water']['coverage_pct'])}")
     L.append(f"Sewage: capacity {c['sewage']['supply']}, produced {c['sewage']['demand']}, coverage {_cov(c['sewage']['coverage_pct'])} | "
              f"River pollution {c['river_pollution_pct']}% (the river flows north to south)")
     L.append(f"Pollution at homes {c['pollution_at_homes_pct']}%, avg land value {c['avg_land_value_pct']}%")

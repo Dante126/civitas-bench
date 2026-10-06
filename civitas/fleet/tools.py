@@ -25,9 +25,11 @@ from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST,
 from ..core.observation import (MAP_LEGEND, _far_from_homes, _residents, _road_extensions, _suggest_stops,
                                 _uncrowded_first, _zone_suggestions, build_observation)
 from ..core.region import DEAL_ACTIONS
+from ..core.money import RESERVE_MIN, reserve, reserve_months as _reserve_months   # re-exported
 from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, shift
+from ..sim.world import own_supply
 from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
@@ -63,8 +65,6 @@ BUILT_NAMES = {"R": "home", "C": "shop", "I": "factory", "O": "office", "M": "mi
 # what planning's road_extension price buys (road_price: the road and zoning the land it opens), for the mayor's needs
 # line and the report
 ROAD_NAME = "road into open land and zoning it"
-RESERVE_MIN = 3000           # the treasury reserve (mirrors the fleet configs' mayor playbook): this, or 3 months of
-                             # expenses (6 in a deficit)
 GAP_MIN, GAP_SHARE = 100, 0.1   # a department within max($100, 10% of its plan target) of it counts as funded
 SPEND_MONTHS = 3             # the mayor's Departments block: what each department spent over this many months
 IDLE_MULT, IDLE_MIN = 2, 1000   # a department keeps max(IDLE_MULT x that, its dearest ready first building,
@@ -187,7 +187,7 @@ SUPPLIES = ("power", "water", "sewage")
 # and power stayed at 0-18% until month 10
 SUPPLY_MARGIN = 1.5
 SUPPLY_GROWTH = {"power": 60, "water": 50, "sewage": 50}
-BANK_BUSY = 0.9
+BANK_BUSY = C.SUPPLY_BUSY
 # ... now or within this many months at its growth over the last as many months (demand_ahead): a quarter, the next
 # turn at act_every 3, so utilities builds (and asks) ahead of a supply that will run short before then
 AHEAD_MONTHS = 3
@@ -977,7 +977,8 @@ def overview(env) -> dict:
            "department_funds": {k: round(v) for k, v in w.dept_funds.items()},
            "tax_pct": {k: round(100 * v, 1) for k, v in w.taxes.items()},
            "demand": {k: round(v, 2) for k, v in (w.demand or {}).items()},
-           **{k: {"supply": m[f"{k}_supply"], "demand": m[f"{k}_demand"], "coverage_pct": pct(m[f"{k}_coverage"])}
+           **{k: {"supply": m[f"{k}_supply"], "demand": m[f"{k}_demand"], "coverage_pct": pct(m[f"{k}_coverage"]),
+                  "imported": round(m["service_imports"].get(k, 0.0), 1)}     # part of supply (service imports)
               for k in ("power", "water", "sewage")},
            "coverage_pct": {k: pct(m[f"{k}_coverage"]) for k in ("police", "fire", "health", "garbage", "school")},
            "scores": {k: round(v, 1) for k, v in env.last_scores.items()}}
@@ -1008,24 +1009,6 @@ def plan_slice(fleet: FleetState, role: str) -> dict:
     if p["notes"]:
         out["notes"] = p["notes"]
     return out
-
-
-def _reserve_months(w) -> tuple[int, int, int]:
-    """(months of expenses the reserve holds, last month's income, its expenses), in rounded dollars: 3, or 6 after a
-    deficit month; (3, 0, 0) before the first month."""
-    if not w.history:
-        return 3, 0, 0
-    last = w.history[-1]
-    income, expenses = round(last["income"]), round(last["expenses"])
-    return (3 if income >= expenses else 6), income, expenses
-
-
-def reserve(w) -> float:
-    """The treasury to keep back: RESERVE_MIN or last month's expenses x 3 (x 6 after a deficit month), in rounded
-    dollars, as reserve_why shows it (agents/scripted.py keeps its own). Smoke v16 seed 1, month 6: a $0.70 deficit
-    doubled the reserve."""
-    mult, _, expenses = _reserve_months(w)
-    return max(RESERVE_MIN, mult * expenses)
 
 
 def reserve_why(w) -> str:
@@ -2509,13 +2492,20 @@ def demand_ahead(w, supply: str) -> float:
     early on, scaled to AHEAD_MONTHS; no growth when it fell or before two months are recorded): demand now plus that
     growth. Region run 20261005 (trinity in both cities, 120 months, act_every 3): 28 money asks were held back on
     "supply has room", 16 of them right after utilities built; 5 of those supplies reached 99%+ used before its next
-    turn, and all 5 had demand plus the last quarter's growth at 90% or more of the supply (13 of the 28 did)."""
-    now = w.metrics()[f"{supply}_demand"]
+    turn, and all 5 had demand plus the last quarter's growth at 90% or more of the supply (13 of the 28 did).
+    Growth that persists only: each month's demand is taken without the season / event multiplier it was computed
+    under (metrics' demand_factor: summer water x1.15, winter power x1.2, a heatwave's x1.2-1.3), and the growth put
+    back at today's, so spring-to-summer or a heatwave's first month reads as no growth (a review found utilities
+    building for a temporary spike)."""
+    m = w.metrics()
+    now = m[f"{supply}_demand"]
     h, key = w.history, f"{supply}_demand"
     span = min(AHEAD_MONTHS, len(h) - 1)
     if span <= 0:
         return now
-    return now + max(0.0, (h[-1][key] - h[-1 - span][key]) * AHEAD_MONTHS / span)
+    base = lambda x: x[key] / (x.get("demand_factor", {}).get(supply) or 1.0)
+    grew = (base(h[-1]) - base(h[-1 - span])) * (m.get("demand_factor", {}).get(supply) or 1.0)
+    return now + max(0.0, grew * AHEAD_MONTHS / span)
 
 
 def supply_ahead(w, supply: str) -> str:
@@ -2534,8 +2524,7 @@ def supply_need(w, supply: str) -> float:
     stop once the city's own output covers it (a fresh map's power 1.5 of 6 is all imports)."""
     m = w.metrics()
     demand = m[f"{supply}_demand"]
-    own = m[f"{supply}_supply"] - m["service_imports"].get(supply, 0.0)
-    return max(SUPPLY_MARGIN * demand, demand + SUPPLY_GROWTH[supply]) - own
+    return max(SUPPLY_MARGIN * demand, demand + SUPPLY_GROWTH[supply]) - own_supply(m, supply)
 
 
 def supply_output(name: str, supply: str, site: dict) -> float:

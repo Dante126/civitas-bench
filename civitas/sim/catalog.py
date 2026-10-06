@@ -544,6 +544,8 @@ IMPORT_PRICE = {"power": 1.5, "water": 0.8}   # $ per unit per month, rising wit
 IMPORT_PRICE_GROWTH = 0.01                    # +1% per 1,000 residents
 IMPORT_SHARE_MAX = 0.25                       # imports cover at most 25% of demand
 POWER_SELL_PRICE = 0.25                       # surplus power sold to the region, per unit
+SUPPLY_BUSY = 0.9   # a power / water / sewage supply is at its limit once demand reaches this share of it
+                    # (fleet.tools.BANK_BUSY, core.region.DEAL_BUSY copy it at import: not a balance knob)
 HARBOUR_SPEC = {"cost": 10000, "upkeep": 90}
 HARBOUR_ROWS = 6                              # the harbour sits near the river mouth (south edge)
 

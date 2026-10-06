@@ -52,7 +52,7 @@ def test_score_components_and_rows():
     assert cp["follow_through"]["by_status"] == {"met": 1, "partial": 1, "acted": 1, "replied": 0, "unanswered": 1}
     assert cp["handoffs"] == {"score": 33.3, "n": 3, "used": 1}                       # 1 of planning's 3 roads
     assert cp["money_aim"] == {"score": 85.7, "n": 3, "aimed": 3000.0, "given": 3500.0,   # transport's $500 unasked
-                               "basis": "messages", "needed": 0.0, "asked": 3000.0}        # no needs record
+                               "basis": "messages", "needed": 0.0, "asked": 3000.0, "needs_missing": 0}        # no needs record
     assert co["score"] == 61.6                                                         # (75 + 52.5 + 33.3 + 85.7) / 4
     r = co["roles"]
     assert r["mayor"] == {"asked": 0, "answered": 0, "asked_of": 3, "answered_for": 2, "responsiveness": 66.7,
@@ -125,10 +125,11 @@ def test_money_aim_reads_the_needs_record():
     # police 2,000 + 500 of its 1,000 (short 2,500), planning 300, fire 2,500 (covered), education 1,000 (asked);
     # health's uncovered 2,000, transport's idle 500 and month 3's unrecorded 1,000 miss
     assert ma == {"score": round(100 * 6300 / 10300, 1), "n": 8, "aimed": 6300.0, "given": 10300.0, "basis": "needs",
-                  "needed": 5300.0, "asked": 1000.0}
+                  "needed": 5300.0, "asked": 1000.0, "needs_missing": 4}   # frames 2, 3, 4 and 9 have none
     md = "\n".join(_collab_lines(collaboration(c)))
     assert ("| money aim | 61.2 | $6,300 of $10.3k in 8 top-ups went to a first building, supply, planning's road or "
-            "another building the money covered ($5,300), or answered the department's request ($1,000) |") in md
+            "another building the money covered ($5,300), or answered the department's request ($1,000); 4 months "
+            "without a needs record |") in md
 
 
 def test_money_aim_without_a_needs_record_is_message_based():
@@ -137,9 +138,29 @@ def test_money_aim_without_a_needs_record_is_message_based():
     ma = co["components"]["money_aim"]
     assert collab(_need_frames(needs=None), ROLES, act_every=1)["needs_from"] is None
     assert ma == {"score": round(100 * 1000 / 10300, 1), "n": 8, "aimed": 1000.0, "given": 10300.0,
-                  "basis": "messages", "needed": 0.0, "asked": 1000.0}
+                  "basis": "messages", "needed": 0.0, "asked": 1000.0, "needs_missing": 0}
     assert "answered the department's request (message-based: this run has no needs record) |" in \
         "\n".join(_collab_lines(co))
+
+
+def test_a_failing_needs_record_is_logged_once(monkeypatch, caplog):
+    """Review: FleetState.needs swallowed every exception silently. It stays non-fatal (a frame must never end a run),
+    logs the first failure of a run with its traceback and counts the rest; the frame goes without a record, which
+    collab counts (needs_missing, test_money_aim_reads_the_needs_record) and the report notes."""
+    import logging
+
+    from civitas.core.env import CivitasEnv, GameConfig
+    from civitas.fleet import tools as T
+    from civitas.fleet.memory import FleetState
+    env = CivitasEnv(GameConfig(seed=0, months=6))
+    fleet = FleetState.of(env)
+    assert fleet.needs(env)                                              # a record while it works
+    monkeypatch.setattr(T, "funding_gaps", lambda *a: 1 / 0)
+    with caplog.at_level(logging.WARNING, logger="civitas.fleet.memory"):
+        assert fleet.needs(env) is None and fleet.needs(env) is None and "needs" not in env.frame()
+    assert fleet.needs_failures == 3
+    assert [r.getMessage()[:31] for r in caplog.records] == ["FleetState.needs failed at mont"]
+    assert "ZeroDivisionError" in caplog.text
 
 
 def test_money_aim_reads_a_region_citys_needs():

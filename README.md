@@ -438,11 +438,21 @@ in every city, `[agents."south.planning"]` sets one city.
   other. Each mayor's observation (`RegionEnv.deal_opportunities`) names a deal
   opportunity when one city is at 90% or more of its own supply (imports left out) while
   another has spare beyond 90%. It gives the amount that brings the buyer back to 90%
-  (at most the seller's spare), a price halfway between the seller's floor and the buyer's
-  import price, a term of two mayor turns and the exact `offer_deal` call. An offer to the
-  city says whether it is worth taking, and an active deal says when it ends and whether
-  to cancel it (`RegionEnv.deal_check`). The scripted mayors follow these lines: they
-  accept fair offers, cancel the others and offer each opportunity.
+  (at most the seller's spare, `offer_deal`'s 2,000 units and what the buyer can afford),
+  a price halfway between the seller's floor and the buyer's
+  import price, a term of two mayor turns and the exact `offer_deal` call. Need and spare
+  count the deals the supply doesn't show yet (accepted this month, the city's own open
+  offers, offers to it worth taking), so two sellers aren't both sent to cover one need.
+  An offer to the city says whether it is worth taking (`RegionEnv.deal_check`): cheaper
+  than its imports, not already covered by its other deals, the seller still has some
+  capacity to sell, and affordable (the deal's cost beyond the imports it replaces, over its term,
+  within the treasury above the fleet's reserve plus last month's surplus). An active deal
+  says when it ends and whether to cancel it. An offer not accepted within two mayor turns
+  (`2 x act_every` months) expires (status `expired`), and `accept_deal` refuses an offer
+  whose seller has no capacity left (its own supply no longer above its demand) or whose
+  need the buyer's deals accepted this month already cover. The scripted mayors follow these lines: they accept fair offers
+  (the second of two for one need only if need is left), cancel the others and offer each
+  opportunity.
 
 Each city is scored on its own; the region score is their average.
 
@@ -454,10 +464,20 @@ Each city is scored on its own; the region score is their average.
 | `region.toml` seeds 0–7, with deals | 76.76 ± 1.05 | 28,434 | 18 / 22 |
 | `region_trio.toml` seeds 0–2, before deals | 76.13 ± 0.78 | 40,755 | 0 / 0 |
 | `region_trio.toml` seeds 0–2, with deals | 77.10 ± 1.00 | 42,004 | 51 / 67 |
+| `region.toml` seeds 0–2, deal checks | 77.35 ± 1.14 | 29,429 | 21 / 24 |
+| `region.toml` seeds 0–7, deal checks | 76.84 ± 1.10 | 28,660 | 18 / 22 |
+| `region_trio.toml` seeds 0–2, deal checks | 76.40 ± 0.15 | 41,525 | 41 / 48 |
+| `region_trio.toml` seeds 0–7, with deals / deal checks | 77.02 ± 0.71 / 76.71 ± 0.64 | 42,346 / 42,383 | – / 36 / 42 |
 
 The deals are small money: $650–2,200 paid per two-city game, with most deals running
 1–2 months before the buyer's own plant gives it room. The gain is within seed noise
-(7 of 8 seeds up, seed 7 down 2.3). Single-city play is unchanged. Fleet agents play region
+(7 of 8 seeds up, seed 7 down 2.3). The deal checks (pending deals counted, offers
+expiring, affordability, a seller with nothing left refused) leave the two-city numbers up
+slightly; three cities make fewer deals (counting pending offers stops two sellers both
+covering one need, which had given buyers extra capacity), the same population on seeds
+0–7 and a score 0.3 lower, within noise. Refusing a seller with less capacity than the
+amount (not only none) cost 0.8 on `region.toml` seeds 0–2, so a partly short seller still
+sells and ends the deal itself once its demand reaches its own supply. Single-city play is unchanged. Fleet agents play region
 roles too (see [Agent fleets](#agent-fleets), "Regions").
 
 ### Agent fleets
@@ -707,7 +727,9 @@ tasks and money, and to let people coach it.
   kept for sewage)`, `- pump: 1 site, best (33,23), pollution 0 (riverbank: kept for
   sewage)`, `- sewage: 1 site, best (33,23) (riverbank: kept for sewage)`. While a supply
   is short or at least 90% used, now or within 3 months at its growth over the last 3
-  (`tools.py:demand_ahead`, `AHEAD_MONTHS`; then `water 84% used, 92% in 3 months`), its
+  (`tools.py:demand_ahead`, `AHEAD_MONTHS`; then `water 84% used, 92% in 3 months`; the
+  growth leaves out season and event multipliers, metrics' `demand_factor`, so summer
+  water or a heatwave isn't read as growth), its
   budget block adds each such supply in the words of
   the mayor's needs line and what its funds pay for, most urgent first, with the
   buildings its needs line names: `- supply needed now: power 25% covered (supply 1.80,
@@ -1158,8 +1180,11 @@ mayor, deals). The mayor's briefing gains a Region block: per other city its pop
 specialisations, surplus and shortfall, unemployed and open jobs, links, what a connector
 would cost transport and last month's goods, commuters and tourists between the two, then
 the river's pollution and up to 4 deals with what to do about them (an offer to the city
-with whether it is worth taking and the `accept_deal` call; an active deal with its last
-month and, when the city should end it, the `cancel_deal` call). Below those come its deal
+with the month it is open until, whether it is worth taking or why not, e.g. "can't afford
+it" or "already covered by deal #2", and the `accept_deal` call; an active deal with its last
+month and, when the city should end it, the `cancel_deal` call; an offer that expired since
+the last turn). Its City line shows supply bought from outside apart ("power 1,046 own +
+35 imported / 1,081"). Below those come its deal
 opportunities, at most one per resource, each with why, the exact `offer_deal` call and
 what it pays or earns a month; without one, its spare beyond 90% of its own supply. The
 system prompt's Deals rule gives the import and resale prices that make a deal pay.
@@ -1308,7 +1333,9 @@ months, the Team tab's "open") is left out. There are four components:
   that month (`FleetState.needs`, from `funding_gaps()`; per city in a region frame; report
   only, agents never see it). A run without that record (scripted line-ups, runs from before
   it) keeps the old rule, the dollars that answered a money request, and the report says
-  "message-based: this run has no needs record". Since departments ask only for what the
+  "message-based: this run has no needs record". If computing the record fails, the run goes
+  on: the first failure is logged with its traceback, the frame goes without a record and the
+  report adds "N months without a needs record". Since departments ask only for what the
   mayor can fund and the mayor funds first buildings unasked, the message rule alone read 43
   / 37 on the 120-month region run of 2026-10-05.
 

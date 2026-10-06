@@ -32,9 +32,11 @@ import numpy as np
 
 from ..bench.scoring import ScoringConfig
 from ..sim import catalog as C
+from ..sim.world import own_supply
 from .council import Council
 from .decision import Decision
 from .env import CivitasEnv, GameConfig
+from .money import reserve
 
 LAYOUT = {"north": (0, 0), "south": (0, 1), "east": (1, 0), "west": (-1, 0), "southeast": (1, 1), "southwest": (-1, 1)}
 SIDE = {(0, 1): "south", (0, -1): "north", (1, 0): "east", (-1, 0): "west"}
@@ -47,9 +49,20 @@ DEAL_RESOURCES = ("power", "water")
 # between the two leaves both better off; once the buyer has room again it is a transfer (the buyer resells surplus
 # power at POWER_SELL_PRICE). The 120-month fleet region run (seed 0) had 43 city-months of imports, the other city
 # had spare in 29 of them, and with nothing saying so the mayors made no deal.
-DEAL_BUSY = 0.9          # a supply is at its limit once demand reaches this share of it (fleet.tools.BANK_BUSY)
+DEAL_BUSY = C.SUPPLY_BUSY   # a supply is at its limit once demand reaches this share of it (fleet.tools.BANK_BUSY)
 DEAL_MIN = 20            # the smallest amount a deal opportunity names (units)
 DEAL_STEP = 10           # amounts are rounded to this
+DEAL_AMOUNT_MAX = 2000   # offer_deal's limits (_deal_action); an opportunity names at most this amount
+DEAL_PRICE_MAX = 10
+DEAL_MONTHS_MAX = 120
+# Review of the deal opportunities (e41e684): with a third city (or game.simultaneous) two sellers could each offer a
+# buyer its whole need and both offers read "worth it" against the same need (supply moves only at the next tick), so
+# the buyer took both and paid twice; a deal could cost several times the import bill it replaced, with no money check;
+# an ignored offer stayed open (and blocked that pair) for the rest of the game, and accepted months later could make
+# the seller sell capacity it no longer had. Now: a city's need and spare count every deal its supply doesn't show yet
+# (RegionEnv._pending), an offer lapses after offer_window months (status "expired"), deal_check rates an offer the
+# buyer can't afford (deal_budget) or whose seller can't deliver (capacity) not worth it, and accept_deal refuses a
+# seller short of the capacity or a buyer whose deals accepted this month already cover its need.
 
 
 def split_role(role: str) -> tuple[str, str]:
@@ -72,9 +85,33 @@ def opportunity_text(o: dict, city: str) -> tuple[str, str]:
     pay = o["amount"] * o["price"]
     what = (f"{'buys' if buy else 'sells'} {o['amount']:,.0f} at ${o['price']:g}/unit/month "
             f"({'-' if buy else '+'}${pay:,.0f}/month) for {o['months']} months")
+    if o.get("capped") == "afford":
+        what += ", as much as " + ("you" if buy else o["buyer"].upper()) + " can afford"
+    elif o.get("capped") == "max":
+        what += f", offer_deal's {DEAL_AMOUNT_MAX:,} limit"
     if not buy:
         what += f"; unsold, spare {r} earns " + (f"${o['floor']:g}/unit" if o["floor"] else "nothing")
     return why, what
+
+
+REASONS = {"floor": "below what your spare earns now", "short": "more than your spare",
+           "room": "you have room without it", "dearer": "not cheaper than your imports",
+           "covered": "your other deals already cover it", "too_big": "more than you need",
+           "seller_short": "the seller no longer has it spare", "afford": "you can't afford it"}
+
+
+def _footer_deal(d: dict) -> str:
+    """One deal (an observation's region deals entry: a _deal_view with its deal_check) in the core Region footer."""
+    s = (f"#{d['id']} {d['status']}: you are {d['you_are']} {d['amount']:g} {d['resource']} with {d['partner']} at "
+         f"${d['price']}/unit/month, {d['months_left']} months{' left' * (d['status'] == 'active')} (proposed by "
+         f"{d['proposed_by']})")
+    if d["status"] == "expired":
+        return s + f", not accepted by month {d['expires']}"
+    if d["status"] == "offered":
+        s += f", open until month {d['expires']}" if d.get("expires") is not None else ""
+        if d["proposed_by"] == d["partner"]:
+            s += " - worth taking" if d.get("worth") else f" - not worth it: {REASONS.get(d.get('reason'), '?')}"
+    return s
 
 
 class RegionEnv:
@@ -234,13 +271,13 @@ class RegionEnv:
         w = env.world
         obs["city_name"] = city
         obs["region"] = self._region_view(city)
-        states = {c: self.supply_state(c) for c in self.cities}
+        # every city's supply for the mayor (its deal opportunities and checks read the partners'); its own otherwise
+        states = self.supply_states() if base == "mayor" else {city: self.supply_state(city)}
         obs["region"]["supply"] = states[city]
         obs["region"]["deal_opportunities"] = [{**o, "offer": self.offer_args(o, city)}
-                                               for o in self.deal_opportunities(city, states)]
+                                               for o in self.deal_opportunities(city, states)] if base == "mayor" else []
         obs["region"]["deals"] = [{**v, **{k: x for k, x in self.deal_check(v, city, states).items() if k != "s"}}
-                                  for v in (self._deal_view(d, city) for d in self.deals
-                                            if d["status"] != "ended" and city in (d["seller"], d["buyer"]))]
+                                  for v in (self._deal_view(d, city) for d in self.listed(city))]
         obs["neighbour"] = {"river_inflow_pollution_pct": round(100 * (1 - np.exp(-w.upstream_inflow / C.RIVER_NORM)), 1),
                             "river_outflow_pollution_pct": round(100 * float(w.river_row[-1]), 1)}
         obs["text"] = self._region_header(city) + obs["text"] + self._region_footer(city, base, obs)
@@ -279,7 +316,18 @@ class RegionEnv:
         role = "selling" if d["seller"] == city else "buying"
         partner = d["buyer"] if role == "selling" else d["seller"]
         return {"id": d["id"], "you_are": role, "partner": partner, "resource": d["resource"], "amount": d["amount"],
-                "price": d["price"], "months_left": d["months_left"], "status": d["status"], "proposed_by": d["proposer"]}
+                "price": d["price"], "months_left": d["months_left"], "status": d["status"], "proposed_by": d["proposer"],
+                "expires": d.get("expires")}
+
+    def listed(self, city: str) -> list[dict]:
+        """The deals a city's Region block and observation list: its open offers and active deals, and offers that
+        expired within the mayors' last turn (act_every months)."""
+        keep = max(1, self.cfg.act_every)
+        return [d for d in self.deals if city in (d["seller"], d["buyer"]) and (
+            d["status"] in ("offered", "active") or d["status"] == "expired" and self.month - d["expires"] <= keep)]
+
+    def deal(self, i) -> dict | None:
+        return next((d for d in self.deals if d["id"] == i), None)
 
     # --------------------------------------------------------------- deals
     def supply_state(self, city: str) -> dict[str, dict]:
@@ -291,8 +339,8 @@ class RegionEnv:
         m = w.metrics()
         out = {}
         for r in DEAL_RESOURCES:
-            demand, imported = float(m[f"{r}_demand"]), float(w.imports.get(r, 0.0))
-            own = round(max(0.0, float(m[f"{r}_supply"]) - imported), 1)
+            demand, imported = float(m[f"{r}_demand"]), float(m["service_imports"].get(r, 0.0))
+            own = round(max(0.0, own_supply(m, r)), 1)
             out[r] = {"own": own, "demand": round(demand, 1), "imported": round(imported, 1),
                       "unserved": round(max(0.0, demand - own - imported), 1),
                       "use_pct": round(100 * demand / own) if own >= 1 else None,
@@ -301,10 +349,61 @@ class RegionEnv:
                       "floor": C.POWER_SELL_PRICE if r == "power" else 0.0}
         return out
 
+    def supply_states(self) -> dict[str, dict]:
+        return {c: self.supply_state(c) for c in self.cities}
+
     @staticmethod
     def spare(s: dict) -> float:
         """What a city can sell without reaching its own limit (0 while it imports)."""
         return 0.0 if s["imported"] > 0 else max(0.0, -s["need"])
+
+    @staticmethod
+    def capacity(s: dict) -> float:
+        """What a city can sell before its own supply stops covering its demand (0 while it imports): what an accepted
+        deal must still find at the seller (spare keeps DEAL_BUSY of headroom; this none)."""
+        return 0.0 if s["imported"] > 0 else max(0.0, s["own"] - s["demand"])
+
+    def offer_window(self) -> int:
+        """Months an offer stays open: two turns of the mayors, the collaboration window (bench/collab.py). An offer
+        made in month m can be accepted through month m + offer_window - 1 (its `expires`), then lapses."""
+        return 2 * max(1, self.cfg.act_every)
+
+    def deal_budget(self, city: str, months: int) -> float:
+        """What a city has for a deal's extra cost over `months`: its treasury above its reserve (core.money.reserve,
+        as the fleet's money tools keep it) plus last month's surplus for each month."""
+        w = self.envs[city].world
+        last = w.history[-1] if w.history else {"income": 0.0, "expenses": 0.0}
+        return max(0.0, w.treasury - reserve(w)) + max(0.0, last["income"] - last["expenses"]) * months
+
+    @staticmethod
+    def deal_net(amount: float, price: float, s: dict) -> float:
+        """A deal's monthly cost to the buyer less the service imports it replaces (they stop as its own supply
+        covers demand): < 0 while the deal only replaces dearer imports."""
+        return amount * price - min(amount, s["imported"]) * s["import_price"]
+
+    def afford_max(self, city: str, price: float, months: int, s: dict) -> float:
+        """The most a city can buy at `price` for `months` within deal_budget (inf at price 0)."""
+        if price <= 0 or months <= 0:
+            return math.inf
+        return (self.deal_budget(city, months) / months + s["imported"] * s["import_price"]) / price
+
+    def _pending(self, city: str, r: str, side: str, exclude: dict | None = None, states: dict | None = None,
+                 mode: str = "all") -> tuple[float, list[int]]:
+        """(amount, deal ids) of `city`'s deals for resource `r` on `side` ("buyer" or "seller") that its supply
+        doesn't show yet: active deals accepted this month (they start at the month's end); with mode "own" or
+        "all" also its own open offers, with "all" also open offers to it that deal_check rates worth taking (the
+        ones it would accept). Its need and spare less these is what a further deal may cover."""
+        amt, ids = 0.0, []
+        for d in self.deals:
+            if d is exclude or d[side] != city or d["resource"] != r:
+                continue
+            if not (d["status"] == "active" and d.get("accepted") == self.month
+                    or d["status"] == "offered" and mode != "committed" and (
+                        d["proposer"] == city or mode == "all" and self.deal_check(d, city, states).get("worth"))):
+                continue
+            amt += d["amount"]
+            ids.append(d["id"])
+        return amt, ids
 
     def deal_months(self) -> int:
         """Term of a suggested deal: two turns of the mayors (at least 3 months) within the game; 0 at its end."""
@@ -312,36 +411,48 @@ class RegionEnv:
 
     def deal_opportunities(self, city: str, states: dict | None = None) -> list[dict]:
         """At most one per resource: this city at its limit and a neighbour with spare (it buys), or this city with
-        spare and a neighbour at its limit (it sells), with no offer for that resource open between the two. Amount:
-        what brings the buyer back to DEAL_BUSY, at most the seller's spare (rounded to DEAL_STEP, at least
-        DEAL_MIN); price: halfway between the seller's floor and the buyer's import price; months: deal_months.
-        Any two cities can deal; no link is needed."""
+        spare and a neighbour at its limit (it sells), with no offer for that resource open between the two. The
+        buyer's need and the seller's spare count every deal their supply doesn't show yet (_pending: accepted this
+        month, their own open offers, offers to them they'd take), so a need another deal covers names none. Amount:
+        what brings the buyer back to DEAL_BUSY, at most the seller's spare, DEAL_AMOUNT_MAX and what the buyer can
+        afford (afford_max; `capped` says which held it) (rounded to DEAL_STEP, at least DEAL_MIN); price: halfway
+        between the seller's floor and the buyer's import price; months: deal_months. Any two cities can deal; no
+        link is needed."""
         months = self.deal_months()
         if not months:
             return []
-        st = states or {c: self.supply_state(c) for c in self.cities}
+        st = states if states and all(c in states for c in self.cities) else self.supply_states()
         out = []
         for r in DEAL_RESOURCES:
             open_with = {d["seller"] if d["buyer"] == city else d["buyer"] for d in self.deals
                          if d["status"] == "offered" and d["resource"] == r and city in (d["seller"], d["buyer"])}
             others = [c for c in self.others(city) if c not in open_with]
-            me = st[city][r]
-            if me["need"] > 0:
-                pairs = [(city, c, me["need"], self.spare(st[c][r])) for c in others]
+            need = lambda c: st[c][r]["need"] - self._pending(c, r, "buyer", states=st)[0]
+            spare = lambda c: self.spare(st[c][r]) - self._pending(c, r, "seller", states=st)[0]
+            if st[city][r]["need"] > 0:
+                pairs = [(city, c, need(city), spare(c)) for c in others]
             else:
-                pairs = [(c, city, st[c][r]["need"], self.spare(me)) for c in others]
-            pairs = [(b, s, min(math.ceil(need / DEAL_STEP), math.floor(sp / DEAL_STEP)) * DEAL_STEP)
-                     for b, s, need, sp in pairs if need > 0]
-            pairs = [p for p in pairs if p[2] >= DEAL_MIN]
-            if not pairs:
+                pairs = [(c, city, need(c), spare(city)) for c in others]
+            sized = []
+            for b, sl, nd, sp in pairs:
+                if nd <= 0 or sp <= 0:
+                    continue
+                price = round((st[sl][r]["floor"] + st[b][r]["import_price"]) / 2, 2)
+                caps = {None: min(math.ceil(nd / DEAL_STEP), math.floor(sp / DEAL_STEP)) * DEAL_STEP,
+                        "max": DEAL_AMOUNT_MAX,
+                        "afford": math.floor(min(self.afford_max(b, price, months, st[b][r]), 1e9) / DEAL_STEP)
+                        * DEAL_STEP}
+                capped = min(caps, key=lambda k: (caps[k], k is not None))
+                if caps[capped] >= DEAL_MIN:
+                    sized.append((b, sl, int(caps[capped]), price, capped))
+            if not sized:
                 continue
-            buyer, seller, amount = max(pairs, key=lambda p: p[2])
+            buyer, seller, amount, price, capped = max(sized, key=lambda p: p[2])
             b, sl = st[buyer][r], st[seller][r]
-            out.append({"resource": r, "buyer": buyer, "seller": seller, "amount": int(amount),
-                        "price": round((sl["floor"] + b["import_price"]) / 2, 2), "months": months,
-                        "buyer_use_pct": b["use_pct"], "buyer_imported": b["imported"], "buyer_unserved": b["unserved"],
-                        "import_price": b["import_price"], "floor": sl["floor"],
-                        "seller_spare": round(self.spare(sl))})
+            out.append({"resource": r, "buyer": buyer, "seller": seller, "amount": amount, "price": price,
+                        "months": months, "buyer_use_pct": b["use_pct"], "buyer_imported": b["imported"],
+                        "buyer_unserved": b["unserved"], "import_price": b["import_price"], "floor": sl["floor"],
+                        "seller_spare": round(self.spare(sl)), "capped": capped})
         return out
 
     @staticmethod
@@ -351,20 +462,55 @@ class RegionEnv:
         return {"to": opp["buyer"] if sell else opp["seller"], "resource": opp["resource"], "amount": opp["amount"],
                 "price": opp["price"], "months": opp["months"], "sell": sell}
 
+    def _state(self, city: str, r: str, states: dict | None) -> dict:
+        return (states or {}).get(city, {}).get(r) or self.supply_state(city)[r]
+
     def deal_check(self, d: dict, city: str, states: dict | None = None) -> dict:
-        """What a deal (raw or a _deal_view) means to this city now: `worth` for an offer (it buys cheaper than its
-        imports while at its limit, at most twice what it needs, or sells no more than its spare at its floor or
-        above), `ends` (the last month an
-        active deal runs), `cancel` for an active deal it should end (it sells and its own supply no longer covers
-        its demand, or it buys and has room without it), and `s`, the city's supply_state of that resource."""
+        """What a deal (raw or a _deal_view) means to this city now: `ends` (the last month an active deal runs),
+        `cancel` for an active deal it should end (it sells and its own supply no longer covers its demand, or it buys
+        and has room without it), and `s`, the city's supply_state of that resource. For an offer, `worth` and, when
+        it isn't, `reason`: selling, "floor" (below what its spare earns now) or "short" (more than its spare less its
+        other pending sales, `spare_left`); buying, "room" (it isn't at its limit), "dearer" (not cheaper than its
+        imports), "covered" (its deals accepted this month and its own open offers, `covered_by`, already cover its
+        need), "too_big" (more than twice the need left, `need_left`), "seller_short" (the seller has nothing left to
+        sell: its capacity less its sales accepted this month, `seller_has`, is 0; see _accept_refusal) or "afford"
+        (its extra cost over the deal's months, `net` a month, is more than deal_budget, `budget`)."""
+        raw = d if "you_are" not in d else self.deal(d["id"])
         view = d if "you_are" in d else self._deal_view(d, city)
-        s = (states or {}).get(city, {}).get(view["resource"]) or self.supply_state(city)[view["resource"]]
+        r = view["resource"]
+        s = self._state(city, r, states)
         sell = view["you_are"] == "selling"
         out = {"s": s, "ends": self.month + view["months_left"] - 1}
         if view["status"] == "offered":
-            out["worth"] = (view["price"] >= s["floor"] and view["amount"] <= self.spare(s) if sell else
-                            view["price"] < s["import_price"] and 0 < s["need"]
-                            and view["amount"] <= max(2 * s["need"], DEAL_MIN))
+            if sell:
+                took, ids = self._pending(city, r, "seller", exclude=raw, states=states, mode="own")
+                left = self.spare(s) - took
+                out["spare_left"] = round(max(0.0, left), 1)
+                reason = "floor" if view["price"] < s["floor"] else "short" if view["amount"] > left else None
+                if ids:
+                    out["taken_by"] = ids
+            else:
+                took, ids = self._pending(city, r, "buyer", exclude=raw, states=states, mode="own")
+                left = s["need"] - took
+                out["need_left"] = round(left, 1)
+                partner = view["partner"]
+                ps = self._state(partner, r, states)
+                has = self.capacity(ps) - self._pending(partner, r, "seller", exclude=raw, states=states,
+                                                        mode="committed")[0]
+                net = self.deal_net(view["amount"], view["price"], s)
+                budget = self.deal_budget(city, view["months_left"])
+                out.update(seller_has=round(max(0.0, has), 1), net=round(net, 2), budget=round(budget))
+                reason = ("room" if s["need"] <= 0 else
+                          "dearer" if view["price"] >= s["import_price"] else
+                          "covered" if left <= 0 else
+                          "too_big" if view["amount"] > max(2 * left, DEAL_MIN) else
+                          "seller_short" if has <= 0 else
+                          "afford" if net > 0 and net * view["months_left"] > budget else None)
+                if reason == "covered":
+                    out["covered_by"] = ids
+            out["worth"] = reason is None
+            if reason:
+                out["reason"] = reason
         elif view["status"] == "active":
             out["cancel"] = s["demand"] >= s["own"] if sell else s["need"] + view["amount"] <= 0
         return out
@@ -406,11 +552,9 @@ class RegionEnv:
         n = obs["neighbour"]
         L.append(f"River pollution arriving from upstream: {n['river_inflow_pollution_pct']}%; leaving downstream: "
                  f"{n['river_outflow_pollution_pct']}%")
-        deals = [self._deal_view(d, city) for d in self.deals if d["status"] != "ended" and city in (d["seller"], d["buyer"])]
+        deals = r.get("deals", [])
         if deals:
-            L.append("Deals: " + "; ".join(f"#{d['id']} {d['status']}: you are {d['you_are']} {d['amount']} {d['resource']} "
-                                           f"with {d['partner']} at ${d['price']}/unit/month, {d['months_left']} months left "
-                                           f"(proposed by {d['proposed_by']})" for d in deals))
+            L.append("Deals: " + "; ".join(_footer_deal(d) for d in deals))
         L.append("Links carry trade, commuters and tourists: highway/rail to neighbours (transport: build_connector on the "
                  "facing map edge, both cities must build their side), boats between harbour cities, planes between "
                  "airport cities. Specialise: mining/farming needs resources, high tech needs graduates, casinos need "
@@ -462,31 +606,66 @@ class RegionEnv:
                     return res(False, "resource must be 'power' or 'water'")
                 amount, price = float(a.get("amount", 0)), float(a.get("price", 0))
                 months = int(a.get("months", 24))
-                if not (0 < amount <= 2000 and 0 <= price <= 10 and 1 <= months <= 120):
-                    return res(False, "amount 1-2000 units, price $0-10 per unit per month, months 1-120")
+                if not (0 < amount <= DEAL_AMOUNT_MAX and 0 <= price <= DEAL_PRICE_MAX and 1 <= months <= DEAL_MONTHS_MAX):
+                    return res(False, f"amount 1-{DEAL_AMOUNT_MAX} units, price $0-{DEAL_PRICE_MAX} per unit per month, "
+                                      f"months 1-{DEAL_MONTHS_MAX}")
                 sell = bool(a.get("sell", True))
+                expires = self.month + self.offer_window() - 1
                 deal = {"id": len(self.deals) + 1, "seller": city if sell else to, "buyer": to if sell else city,
                         "resource": resource, "amount": amount, "price": price, "months_left": months,
-                        "status": "offered", "proposer": city}
+                        "status": "offered", "proposer": city, "offered": self.month, "expires": expires}
                 self.deals.append(deal)
                 self.council.post(self.month, f"{city}.mayor",
                                   f"DEAL #{deal['id']} proposed: {deal['seller']} sells {amount:.0f} {resource} to "
-                                  f"{deal['buyer']} at ${price}/unit/month for {months} months", to)
-                return res(True, f"proposed deal #{deal['id']}; the {to} mayor must accept it")
-            deal = next((d for d in self.deals if d["id"] == int(a.get("deal", -1))), None)
+                                  f"{deal['buyer']} at ${price}/unit/month for {months} months (open until month "
+                                  f"{expires})", to)
+                return res(True, f"proposed deal #{deal['id']}; the {to} mayor must accept it by month {expires}")
+            deal = self.deal(int(a.get("deal", -1)))
             if deal is None:
                 return res(False, f"no deal #{a.get('deal')}")
             if kind == "accept_deal":
+                if deal["status"] == "expired" and deal["proposer"] != city and city in (deal["seller"], deal["buyer"]):
+                    return res(False, f"deal #{deal['id']} expired after month {deal['expires']}: offer_deal to make "
+                                      "it again if it still fits")
                 if deal["status"] != "offered" or deal["proposer"] == city or city not in (deal["seller"], deal["buyer"]):
                     return res(False, "you can only accept an open offer made to your city")
-                deal["status"] = "active"
+                why = self._accept_refusal(deal, city)
+                if why:
+                    return res(False, why)
+                deal["status"], deal["accepted"] = "active", self.month
                 return res(True, f"deal #{deal['id']} is active")
-            if city not in (deal["seller"], deal["buyer"]) or deal["status"] == "ended":
+            if city not in (deal["seller"], deal["buyer"]) or deal["status"] in ("ended", "expired"):
                 return res(False, "that deal is not yours or already ended")
             deal["status"] = "ended"
             return res(True, f"deal #{deal['id']} cancelled")
         except (TypeError, ValueError) as e:
             return res(False, f"bad deal parameters: {e}")
+
+    def _accept_refusal(self, deal: dict, city: str) -> str:
+        """Why accept_deal can't take this offer now ("" if it can): the seller has nothing left to sell (capacity:
+        own supply less demand, less its sales accepted this month, at 0: it would sell supply it doesn't have), or
+        the buyer's deals accepted this month already cover its need (a second seller's offer would make it pay
+        twice). A seller with less capacity than the amount but some may still sell: refusing that too took the
+        scripted region bench (region.toml seeds 0-2) from 77.35 to 76.59, since the buyer gains more than the
+        seller loses before the seller's own check (deal_check's `cancel`: demand at its own supply) ends the deal."""
+        r = deal["resource"]
+        seller, buyer = deal["seller"], deal["buyer"]
+        ss = self.supply_state(seller)[r]
+        sold, ids = self._pending(seller, r, "seller", exclude=deal, mode="committed")
+        if self.capacity(ss) - sold <= 0:
+            who, its = ("you", "your") if city == seller else (seller, "its")
+            after = f", less {sold:,.0f} sold this month (deal {', '.join(f'#{i}' for i in ids)})" if sold else ""
+            return (f"{who} no longer {'have' if who == 'you' else 'has'} any {r} to sell: {its} own supply "
+                    f"{ss['own']:,.0f} against demand {ss['demand']:,.0f}{after}; the offer stays open until it "
+                    "expires")
+        if city == buyer:
+            bs = self.supply_state(buyer)[r]
+            got, ids = self._pending(buyer, r, "buyer", exclude=deal, mode="committed")
+            if got > 0 and bs["need"] - got <= 0:
+                return (f"deal {', '.join(f'#{i}' for i in ids)} accepted this month already covers your {r} need "
+                        f"({max(0.0, bs['need']):,.0f} to reach {round(100 * DEAL_BUSY)}% use): cancel_deal to decline "
+                        f"#{deal['id']}")
+        return ""
 
     # ------------------------------------------------------------ advance
     def _run_deals(self) -> None:
@@ -494,6 +673,8 @@ class RegionEnv:
             w.external = {"power": 0.0, "water": 0.0}
             w.deal_cash = 0.0
         for d in self.deals:
+            if d["status"] == "offered" and self.month >= d.get("expires", math.inf):
+                d["status"] = "expired"         # nobody accepted it in offer_window months
             if d["status"] != "active":
                 continue
             buyer, seller = self.envs[d["buyer"]].world, self.envs[d["seller"]].world

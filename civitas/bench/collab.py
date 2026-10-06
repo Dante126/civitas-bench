@@ -141,8 +141,10 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
     events: list[dict] = []
     needs: dict[int, dict] = {}
     last = 0
+    months = set()
     for f in frames:
         last = max(last, int(f.get("month", 0)))
+        months.add(int(f.get("month", 0)))
         council, turns = _local(f, city)
         if n := _needs(f, city):
             needs[int(f.get("month", 0))] = n
@@ -191,6 +193,9 @@ def collab(frames: list[dict], roles: list[str], act_every: int = 1, city: str |
                 events[eid]["thread"] = i
     out = {"roles": roles, "act_every": act_every, "last_month": last, "window": window,
            "needs_from": min(needs, default=None),      # the first month with a needs record (None: no record)
+           # frames from then on, in months the mayor acts, without one (FleetState.needs failed: logged once per run)
+           "needs_missing": sum(m not in needs for m in months if needs and m >= min(needs)
+                                and m % max(1, int(act_every)) == 0),
            "events": [{k: v for k, v in e.items() if k != "tiles" or v} for e in events],
            "threads": threads, "handoffs": handoffs(events, key, window), "stats": _stats(roles, events, threads)}
     if city is not None and external and any("cities" in f for f in frames):
@@ -434,6 +439,8 @@ def deal_history(frames: list[dict], cities) -> list[dict]:
                 d["accepted"] = fm
             if st == "ended" and d["ended"] is None:
                 d["ended"], d["end"] = fm, "expired" if (left or 0) <= 0 else "cancelled"
+            elif st == "expired" and d["ended"] is None:       # an offer nobody accepted in time (RegionEnv)
+                d["ended"], d["end"] = fm, "expired"
     out = []
     for i in sorted(seen):
         d = seen[i]
@@ -473,7 +480,8 @@ def _deal_events(deals: list[dict]) -> list[dict]:
                        "what": "cancelled", "text": f"deal #{d['id']} cancelled by {by}"})
         elif d["end"] == "expired":
             ev.append({**base, **two(d["seller"], d["buyer"]), "month": d["ended"], "what": "expired",
-                       "text": f"deal #{d['id']} ran out after {d['months_paid']} months, ${d['paid']:,.0f} paid"})
+                       "text": f"deal #{d['id']} ran out after {d['months_paid']} months, ${d['paid']:,.0f} paid"
+                       if d["accepted"] is not None else f"deal #{d['id']} offer expired, not accepted"})
     return ev
 
 
@@ -532,7 +540,7 @@ def _deal_thread(d: dict, events: list[dict], key, window: int, last: int) -> di
             status, response = "replied", {"month": reply["month"], "kind": "message", "amount": None, "deal": None,
                                            "text": reply["text"]}
     if status is None:
-        status = "open" if last < t0 + window else "unanswered"
+        status = "open" if last < t0 + window and d["end"] != "expired" else "unanswered"
     return {"month": t0, "from": f"{a}.mayor", "to": f"{b}.mayor", "from_city": a, "to_city": b, "kind": "deal",
             "deal": d["id"], "amount": None, "text": f"offers deal #{d['id']}: {d['text']}", "status": status,
             "response": response, "outcome": None, "_k": key(offer)}

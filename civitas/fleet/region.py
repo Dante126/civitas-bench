@@ -28,7 +28,8 @@ from functools import partial
 
 from ..core.actions import connector_feeder
 from ..core.observation import _connector_sites
-from ..core.region import DEAL_BUSY, DEAL_MIN, RegionEnv, opportunity_text
+from ..core.region import DEAL_AMOUNT_MAX, DEAL_BUSY, DEAL_MIN, DEAL_MONTHS_MAX, DEAL_PRICE_MAX, RegionEnv, \
+    opportunity_text
 from ..sim import catalog as C
 from .fmt import money, num
 from .tools import Tool, ToolError, to_schema
@@ -88,8 +89,9 @@ def connector_prices(world) -> dict[str, dict]:
 
 
 def _deals(region, city: str) -> list[dict]:
-    return [region._deal_view(d, city) for d in region.deals if d["status"] != "ended"
-            and city in (d["seller"], d["buyer"])]
+    """The city's deals as its Region block lists them (RegionEnv.listed: open offers, active deals, offers that
+    expired within the mayors' last turn)."""
+    return [region._deal_view(d, city) for d in region.listed(city)]
 
 
 def overview(region, city: str) -> dict:
@@ -98,6 +100,7 @@ def overview(region, city: str) -> dict:
     (RegionEnv.supply_state) and its deal opportunities with their offer_deal arguments."""
     view = region._region_view(city)
     w = region.envs[city].world
+    states = region.supply_states()
     return {"ok": True, "city": city, "cities": view["cities"], "my_specialisations": view["my_specialisations"],
             "river": river(region, city),
             "links": [dict(l) for l in region.links if city in (l["a"], l["b"])],
@@ -105,9 +108,9 @@ def overview(region, city: str) -> dict:
             "connectors": [dict(c) for c in w.connectors],
             "connector_sites": connector_prices(w),
             "deals": _deals(region, city),
-            "supply": region.supply_state(city),
+            "supply": states[city],
             "deal_opportunities": [{**o, "offer_deal": region.offer_args(o, city)}
-                                   for o in region.deal_opportunities(city)]}
+                                   for o in region.deal_opportunities(city, states)]}
 
 
 # ---------------------------------------------------------------- prompts
@@ -143,7 +146,8 @@ def region_rules(region, city: str, role: str) -> str:
                  f"${C.IMPORT_PRICE['water']:g} (water) a unit a month, and while it imports no new lot connects, so "
                  "it stops growing; spare power earns only "
                  f"${C.POWER_SELL_PRICE:g} a unit and spare water nothing. A deal between those prices pays both "
-                 "sides: your Region block names one when it fits.")
+                 "sides: your Region block names one when it fits, and says whether an offer to you is worth taking "
+                 f"(and affordable). An offer not accepted within {region.offer_window()} months expires.")
     L.append("- region_overview shows the other cities, the links, last month's flows"
              + (", connector sites" if role == "transport" else "") + (" and the deals" if role == "mayor" else "")
              + (" (your briefing's Region block has the summary)." if role in REGION_BLOCK else "."))
@@ -202,6 +206,10 @@ def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
     else:
         what = (f"the city {'sells' if sell else 'buys'} {num(d['amount'])} {d['resource']} {'to' if sell else 'from'} "
                 f"{d['partner']} ({'-' if sell else '+'}{num(d['amount'])} {d['resource']} supply)")
+    if d["status"] == "expired":
+        by = "you" if d["proposed_by"] != d["partner"] else d["partner"]
+        return (f"- deal #{d['id']} expired: {what} for {n} months, offered by {by}, was not accepted by month "
+                f"{d['expires']}" + (": offer_deal again if it still fits" if mayor else ""))
     if d["status"] == "active":
         line = f"- deal #{d['id']} active: {what}, {n} month{'s' * (n != 1)} left"
         if check:
@@ -212,42 +220,66 @@ def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
                          f"; you have room without it: {call('cancel_deal')} saves "
                          f"{money(d['amount'] * d['price'])}/month")
         return line
+    until = f" (open until month {d['expires']})" if d.get("expires") is not None else ""
     if not mayor:
-        return f"- deal #{d['id']} offered by {d['proposed_by']}: {what} for {n} months, if the mayors agree"
+        return f"- deal #{d['id']} offered by {d['proposed_by']}: {what} for {n} months, if the mayors agree{until}"
     if d["proposed_by"] == d["partner"]:
-        line = f"- deal #{d['id']} offered by {d['partner']}: {what} for {n} months"
+        line = f"- deal #{d['id']} offered by {d['partner']}: {what} for {n} months{until}"
         if not check:
             return line + ": accept_deal to take it"
-        s = check["s"]
-        if sell:
-            why = (f"you have {num(RegionEnv.spare(s))} spare" if check["worth"] else
-                   f"you have only {num(RegionEnv.spare(s))} spare" if d["price"] >= s["floor"] else
-                   f"below the ${s['floor']:g}/unit your spare earns now")
-        elif s["need"] <= 0:
-            why = f"you have room ({_use(s, d['resource'])})"
-        elif d["price"] >= s["import_price"]:
-            why = f"dearer than imports (${s['import_price']:g}/unit)"
-        else:
-            why = f"{_use(s, d['resource'])}, imports cost ${s['import_price']:g}/unit" + (
-                "" if check["worth"] else f", but you need only {num(math.ceil(s['need']))}")
+        why = _offer_why(d, check)
+        if check.get("reason") == "afford":
+            return line + f"; {why}: leave it or {call('cancel_deal')}"
         return line + f"; {why}: " + (f"{call('accept_deal')} takes it" if check["worth"] else
                                       f"not worth it, leave it or {call('cancel_deal')}")
-    return f"- deal #{d['id']} offered by you: {what} for {n} months, waiting for {d['partner']}.mayor to accept"
+    return (f"- deal #{d['id']} offered by you: {what} for {n} months, waiting for {d['partner']}.mayor to accept"
+            + until)
 
 
-def _deal_lines(region, city: str, note: str, mayor: bool = True) -> list[str]:
-    deals = _deals(region, city)
+def _ids(ids) -> str:
+    return ", ".join(f"#{i}" for i in ids)
+
+
+def _offer_why(d: dict, check: dict) -> str:
+    """Why an offer to the city is worth taking or not (RegionEnv.deal_check's `reason`), in the mayor's words."""
+    s, r, reason = check["s"], d["resource"], check.get("reason")
+    if d["you_are"] == "selling":
+        left = check.get("spare_left", RegionEnv.spare(s))
+        after = f" after deal {_ids(check['taken_by'])}" if check.get("taken_by") else ""
+        return (f"below the ${s['floor']:g}/unit your spare earns now" if reason == "floor" else
+                f"you have only {num(left)} spare{after}" if reason == "short" else
+                f"you have {num(left)} spare{after}")
+    if reason == "room":
+        return f"you have room ({_use(s, r)})"
+    if reason == "dearer":
+        return f"dearer than imports (${s['import_price']:g}/unit)"
+    if reason == "covered":
+        return f"{_use(s, r)}, already covered by deal {_ids(check.get('covered_by', []))}"
+    base = f"{_use(s, r)}, imports cost ${s['import_price']:g}/unit"
+    if reason == "too_big":
+        return base + f", but you need only {num(math.ceil(check.get('need_left', s['need'])))}"
+    if reason == "seller_short":
+        return base + f", but {d['partner']} has no {r} left to sell (its own supply only covers its demand)"
+    if reason == "afford":
+        return (f"{base}, but you can't afford it: {money(check['net'])}/month more than imports for "
+                f"{d['months_left']} months is over the {money(check['budget'])} you have for it (above the reserve, "
+                "with last month's surplus)")
+    if check.get("worth") and check.get("seller_has", d["amount"]) < d["amount"]:
+        return base + f" ({d['partner']} has only {num(check['seller_has'])} spare now and may end it early)"
+    return base
+
+
+def _deal_lines(region, city: str, note: str, mayor: bool = True, states: dict | None = None) -> list[str]:
+    deals = _deals(region, city) if mayor else [d for d in _deals(region, city) if d["status"] != "expired"]
     if not deals:
         return [f"- deals: none{note}"]
-    states = {c: region.supply_state(c) for c in region.cities} if mayor else None
     L = [_deal_line(d, mayor, region.deal_check(d, city, states) if mayor else None) for d in deals[:MAX_DEALS]]
     return L + ([f"- (+{len(deals) - MAX_DEALS} more deals: region_overview)"] if len(deals) > MAX_DEALS else [])
 
 
-def _opportunity_lines(region, city: str) -> list[str]:
+def _opportunity_lines(region, city: str, states: dict) -> list[str]:
     """The mayor's deal opportunities (RegionEnv.deal_opportunities), each with its offer_deal call; else, with spare
-    beyond DEAL_BUSY of its own supply, one line saying so."""
-    states = {c: region.supply_state(c) for c in region.cities}
+    beyond DEAL_BUSY of its own supply, one line saying so. `states`: RegionEnv.supply_states()."""
     L = []
     opps = region.deal_opportunities(city, states)
     for o in opps:
@@ -293,8 +325,10 @@ def region_lines(env, role: str) -> list[str]:
         spec = {k: v for k, v in view["my_specialisations"].items() if v >= 0.5}
         L.append("- your specialisations: " + (", ".join(f"{k} {v:g}" for k, v in spec.items()) or "none yet"))
         L += _river_line(region, city)
-        L += _deal_lines(region, city, ": offer_deal sells or buys power / water capacity with another mayor")
-        L += _opportunity_lines(region, city)
+        states = region.supply_states()           # once for the deal and opportunity lines
+        L += _deal_lines(region, city, ": offer_deal sells or buys power / water capacity with another mayor",
+                         states=states)
+        L += _opportunity_lines(region, city, states)
     elif role == "transport":
         view = {v["city"]: v for v in region._region_view(city)["cities"]}
         for c, cs in connector_prices(w).items():
@@ -379,9 +413,10 @@ def region_tools(box) -> list[Tool]:
         deal = {"type": "integer", "description": "the deal number (#1 is 1)"}
         tools += [
             Tool("offer_deal", "Offer another city's mayor a power or water deal: sell (sell: true, the default) or buy "
-                 "(sell: false) `amount` units of capacity (1-2000) at `price` dollars per unit per month (0-10) for "
-                 "`months` (1-120, default 24). It runs once that mayor calls accept_deal; the offer is posted on the "
-                 "council.", partial(_deal, box, region, "offer_deal"),
+                 f"(sell: false) `amount` units of capacity (1-{DEAL_AMOUNT_MAX}) at `price` dollars per unit per month "
+                 f"(0-{DEAL_PRICE_MAX}) for `months` (1-{DEAL_MONTHS_MAX}, default 24). It runs once that mayor calls "
+                 f"accept_deal within {region.offer_window()} months (then the offer expires); the offer is posted on "
+                 "the council.", partial(_deal, box, region, "offer_deal"),
                  {"to": {"type": "string", "enum": others}, "resource": {"type": "string", "enum": list(RESOURCES)},
                   "amount": {"type": "number"}, "price": {"type": "number"}, "months": {"type": "integer"},
                   "sell": {"type": "boolean"}}, ("to", "resource", "amount", "price")),

@@ -11,6 +11,7 @@ from ..sim import catalog as C
 from .base import Agent
 from ..core.decision import Decision
 from ..core.observation import GARBAGE_BUSY_RANK
+from ..core.region import DEAL_MIN
 from .mapview import MapView
 
 
@@ -131,13 +132,28 @@ def _deal_actions(obs: dict) -> list[dict]:
     """A region mayor's power / water deals (RegionEnv.observe's region block): accept an offer to the city that is
     worth it (it buys cheaper than its imports while at its limit, or sells no more than its spare at its floor or
     above) and cancel one that isn't, cancel an active deal it no longer wants (it sells and has reached its own limit,
-    or buys and has room without it), and offer each deal opportunity as named. Deal actions run through the region,
-    outside the city's action cap."""
+    or buys and has room without it), and offer each deal opportunity as named. Each offer is rated alone
+    (RegionEnv.deal_check), so of two worth taking for one resource it takes the second only while the need (or spare)
+    the first left still holds it: two sellers covering one need would make the city pay twice. The opportunities
+    already count the offers it takes (RegionEnv._pending). Deal actions run through the region, outside the city's
+    action cap."""
     reg, city = obs["region"], obs.get("city_name")
     acts = []
+    took = {}                 # (resource, side) -> amount accepted this turn
     for d in reg.get("deals", []):
         if d["status"] == "offered" and d["proposed_by"] != city:
-            acts.append({"type": "accept_deal" if d.get("worth") else "cancel_deal", "deal": d["id"]})
+            key = (d["resource"], d["you_are"])
+            done = took.get(key, 0.0)
+            if not d.get("worth"):
+                ok = False
+            elif d["you_are"] == "buying":
+                left = d.get("need_left", 0.0) - done
+                ok = not done or (left > 0 and d["amount"] <= max(2 * left, DEAL_MIN))
+            else:
+                ok = d["amount"] <= d.get("spare_left", 0.0) - done
+            acts.append({"type": "accept_deal" if ok else "cancel_deal", "deal": d["id"]})
+            if ok:
+                took[key] = done + d["amount"]
         elif d["status"] == "active" and d.get("cancel"):
             acts.append({"type": "cancel_deal", "deal": d["id"]})
     return acts + [{"type": "offer_deal", **o["offer"]} for o in reg.get("deal_opportunities", [])]

@@ -2,6 +2,8 @@
 the money results. Each unit's tests sit under its own header."""
 from types import SimpleNamespace
 
+import pytest
+
 from civitas.core.actions import apply_action
 from civitas.core.env import CivitasEnv, GameConfig
 from civitas.fleet import tools as T
@@ -2049,9 +2051,10 @@ def test_a_supply_is_wanted_ahead_of_its_growth(monkeypatch):
     env = _env(act_every=3)
     _months_spent(env, {}, {}, {}, {}, {})
     w = env.world
-    _supplies(monkeypatch, env, power=(250, 180))
+    m = _supplies(monkeypatch, env, power=(250, 180))
+    m["demand_factor"] = {"power": 1.0, "water": 1.0, "sewage": 1.0}
     for h, d in zip(w.history[-4:], (120, 140, 160, 180)):
-        h["power_demand"] = d
+        h["power_demand"], h["demand_factor"] = d, {"power": 1.0}
     assert T.demand_ahead(w, "power") == 240                        # +60 over the last 3 months
     assert T._busy(w, "power") and T._wanted(w, "coal_or_gas")      # 240 >= 90% of 250, though 72% used now
     assert T.supply_ahead(w, "power") == "power 72% used, 96% in 3 months"
@@ -2069,6 +2072,31 @@ def test_a_supply_is_wanted_ahead_of_its_growth(monkeypatch):
     assert b.status == "power 72% used, 96% in 3 months"
     assert b._replace(demand=230).status == "power 92% used"        # busy now: as before
     assert b._replace(ahead=None).status == "power 72% used"
+
+
+def test_the_supply_forecast_leaves_out_seasons_and_events(monkeypatch):
+    """demand_ahead projects growth that persists: a review found summer water (x1.15) or a winter / heatwave power
+    jump (x1.2-1.3, World.event_factor) read as growth, so utilities could build for a temporary spike. Each month's
+    demand is taken without the multiplier it was computed under (metrics' demand_factor)."""
+    env = _env(act_every=3)
+    _months_spent(env, {}, {}, {}, {}, {})
+    w = env.world
+    m = _supplies(monkeypatch, env, water=(250, 207))
+    m["demand_factor"] = {"power": 1.0, "water": 1.15, "sewage": 1.15}           # summer now
+    for h, d, f in zip(w.history[-4:], (180, 180, 180, 207), (1.0, 1.0, 1.0, 1.15)):
+        h["water_demand"], h["demand_factor"] = d, {"water": f}
+    assert T.demand_ahead(w, "water") == 207 and not T._busy(w, "water")       # 83% used: the jump is the season
+    assert T.supply_ahead(w, "water") == "water 83% used, 83% in 3 months"
+    for h, d, f in zip(w.history[-4:], (180, 190, 200, 241.5), (1.0, 1.0, 1.0, 1.15)):
+        h["water_demand"], h["demand_factor"] = d, {"water": f}                # +10 a month underneath
+    assert T.demand_ahead(w, "water") == pytest.approx(207 + 30 * 1.15)        # at today's multiplier: 241.5
+    assert T._busy(w, "water")
+    # the record: refresh notes the multipliers it applied, metrics carry them into the history
+    fresh = _env(events="none")
+    _months_spent(fresh, {}, {}, {}, {}, {})
+    h = fresh.world.history                     # month 1's record was computed in January (winter), month 5's in May
+    assert h[0]["demand_factor"] == {"power": 1.2, "water": 1.0, "sewage": 1.0}
+    assert h[-1]["demand_factor"] == {"power": 1.0, "water": 1.0, "sewage": 1.0}
 
 
 def test_a_target_with_nothing_to_buy_is_flagged_not_a_gap(monkeypatch):

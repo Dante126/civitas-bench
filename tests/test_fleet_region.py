@@ -151,13 +151,13 @@ def test_a_fleet_city_and_a_scripted_city_play_a_region_episode(tmp_path, monkey
     assert (0, "north.police", "south", "north police says hi") in council
     seen = [m["text"] for m in south.council.visible_to("south.fire", since_month=0)]
     assert "north police says hi" in seen and "hello south, want power?" not in seen
-    # south's scripted mayor (agents/scripted.py:_deal_actions) takes the first offer (20 power at $0.5 while all its
-    # power is imported at $1.5), ends it once its own plant gives it room and turns down the later ones
+    # south's scripted mayor (agents/scripted.py:_deal_actions) turns down the first offer (north has no power of its
+    # own to sell yet: its utilities build after the mayors' turns, RegionEnv.deal_check's "seller_short") and the
+    # later ones (south's own plant gives it room)
     assert [(x["proposer"], x["seller"], x["buyer"], x["status"]) for x in region.deals] == [("north", "north", "south",
                                                                                                "ended")] * 3
     assert [(t["month"], a["type"], a["deal"]) for t in scripted if t["role"] == "south.mayor" for a in t["actions"]
-            if a["type"].endswith("_deal")] == [(0, "accept_deal", 1), (1, "cancel_deal", 1), (1, "cancel_deal", 2),
-                                                (2, "cancel_deal", 3)]
+            if a["type"].endswith("_deal")] == [(0, "cancel_deal", 1), (1, "cancel_deal", 2), (2, "cancel_deal", 3)]
     # the system prompts name the city; the run records them by the region's role names
     meta = json.loads((d / "meta.json").read_text())
     assert set(meta["fleet_prompts"]) == {f"north.{r}" for r in TURN_ORDER}
@@ -309,29 +309,31 @@ def test_mayors_make_deals_with_their_tools():
     nb, sb = ToolBox(n, "mayor"), ToolBox(s, "mayor")
     offer = {"to": "south", "resource": "power", "amount": 50, "price": 1, "months": 3}
     r = nb.call("offer_deal", offer)
-    assert r == {"ok": True, "message": "proposed deal #1; the south mayor must accept it", "cost": 0.0,
+    assert r == {"ok": True, "message": "proposed deal #1; the south mayor must accept it by month 1", "cost": 0.0,
                  "budget_left": n.world.treasury}
     assert region.council.messages[-1].sender == "north.mayor" and region.council.messages[-1].to == "south"
     assert not nb.call("accept_deal", {"deal": 1})["ok"]                          # not its own offer
     assert nb.call("accept_deal", {"deal": 1})["refused"] == "repeat"
     assert "must be one of" in nb.call("offer_deal", {**offer, "resource": "gold"})["error"]
     assert "the police role cannot use 'offer_deal'" in ToolBox(n, "police").call("offer_deal", offer)["error"]
-    assert ("- deal #1 offered by north: you buy 50 power from north at $1/unit/month (-$50/month) for 3 months; no "
-            "power supply of your own, imports cost $1.5/unit, but you need only 7: not worth it, leave it or "
-            'cancel_deal {"deal": 1}') in briefing(s, "mayor", mark=False)       # a fresh map's power: 6 of demand
+    assert ("- deal #1 offered by north: you buy 50 power from north at $1/unit/month (-$50/month) for 3 months (open "
+            "until month 1); no power supply of your own, imports cost $1.5/unit, but you need only 7: not worth it, "
+            'leave it or cancel_deal {"deal": 1}') in briefing(s, "mayor", mark=False)   # a fresh map's power: 6 of demand
     assert ("- deal #1 offered by you: you sell 50 power to south at $1/unit/month (+$50/month) for 3 months, waiting "
-            "for south.mayor to accept") in briefing(n, "mayor", mark=False)
+            "for south.mayor to accept (open until month 1)") in briefing(n, "mayor", mark=False)
     assert ("- deal #1 offered by north: the city buys 50 power from north (+50 power supply) for 3 months, if the "
-            "mayors agree") in region_lines(s, "utilities")
+            "mayors agree (open until month 1)") in region_lines(s, "utilities")
+    _coal(n)                                        # north needs power of its own to sell (RegionEnv._accept_refusal)
     assert sb.call("accept_deal", {"deal": 1})["ok"]
     assert ("- deal #1 active: you sell 50 power to south at $1/unit/month (+$50/month), 3 months left (through month "
-            '2); you need it back (no power supply of your own): cancel_deal {"deal": 1}') in briefing(n, "mayor", mark=False)
+            "2)") in briefing(n, "mayor", mark=False)
     assert ("- deal #1 active: you buy 50 power from north at $1/unit/month (-$50/month), 3 months left (through month "
             "2)") in region_lines(s, "mayor")
     assert "- deal #1 active: the city sells 50 power to south (-50 power supply), 3 months left" in \
         region_lines(n, "utilities")
     # the executed deals are logged like any action: in the city's history and the region's turn log
-    assert [e["action"]["type"] for e in n.fleet.log if e["kind"] == "action"] == ["offer_deal", "accept_deal"]
+    assert [e["action"]["type"] for e in n.fleet.log if e["kind"] == "action" and e["role"] == "mayor"] == \
+        ["offer_deal", "accept_deal"]
     res = region.apply("north.mayor", Decision(executed=nb.executed))
     assert [x["ok"] for x in res] == [True, False] and n.invalid_counts["mayor"] == 1
     region.apply("south.mayor", Decision(executed=sb.executed))
@@ -349,21 +351,30 @@ def test_deals_count_towards_the_action_cap():
 
 
 # ------------------------------------------------------------ deal opportunities
-def _short_north(months=24):
+def _coal(env):
+    """A coal plant (250 power) in env's city, on the first site utilities' find_sites names."""
+    env.world.dept_funds["utilities"] = env.world.dept_funds.get("utilities", 0) + 10000
+    box = ToolBox(env, "utilities")
+    site = box.call("find_sites", {"purpose": "coal_or_gas"})["sites"][0]
+    assert box.call("build_power_plant", {"kind": "coal", "x": site["x"], "y": site["y"]})["ok"]
+
+
+def _short_north(months=24, cities=None):
     """North with 37 level-3 homes along its road and no plant (power and water imported, the rest unserved); south
-    with a coal plant and nobody living there (power: 243 spare beyond DEAL_BUSY of its 250)."""
+    (and every other city of `cities`) with a coal plant and nobody living there (power: 243 spare beyond DEAL_BUSY of
+    its 250)."""
     import numpy as np
-    region, n, s = _linked(months)
+    region = _region(months, **({"cities": list(cities)} if cities else {}))
+    link(region)
+    n, s = region.envs["north"], region.envs["south"]
     w = n.world
     for y, x in zip(*np.nonzero(w.struct == C.ROAD)):
         for yy in (y - 1, y + 1):
             if w.struct[yy, x] == C.NONE and w.terrain[yy, x] != C.WATER:
                 w.struct[yy, x], w.level[yy, x] = C.RES, 3
     w.refresh()
-    s.world.dept_funds["utilities"] = 10000
-    box = ToolBox(s, "utilities")
-    site = box.call("find_sites", {"purpose": "coal_or_gas"})["sites"][0]
-    assert box.call("build_power_plant", {"kind": "coal", "x": site["x"], "y": site["y"]})["ok"]
+    for c in region.cities[1:]:
+        _coal(region.envs[c])
     return region, n, s
 
 
@@ -405,7 +416,7 @@ def test_a_deal_opportunity_when_one_city_is_short_and_the_other_has_spare():
     assert not any("opportunity" in x for x in region_lines(n, "mayor") + region_lines(s, "mayor"))
     accept = next(x for x in region_lines(s, "mayor") if x.startswith("- deal #1"))
     assert accept == ("- deal #1 offered by north: you sell 160 power to north at $0.88/unit/month (+$141/month) for "
-                      '3 months; you have 243 spare: accept_deal {"deal": 1} takes it')
+                      '3 months (open until month 1); you have 243 spare: accept_deal {"deal": 1} takes it')
     assert sb.call("accept_deal", _call_in(accept, "accept_deal"))["ok"]
     region.apply("north.mayor", Decision(executed=nb.executed))
     region.apply("south.mayor", Decision(executed=sb.executed))
@@ -432,7 +443,7 @@ def test_offers_to_a_city_say_whether_they_are_worth_taking():
     nb = ToolBox(n, "mayor")
     assert nb.call("offer_deal", {"to": "south", "resource": "power", "amount": 500, "price": 1, "sell": False})["ok"]
     line = next(x for x in region_lines(s, "mayor") if x.startswith("- deal #3"))
-    assert line.endswith('; you have only 243 spare: not worth it, leave it or cancel_deal {"deal": 3}')
+    assert line.endswith('; you have only 0 spare after deal #1, #2: not worth it, leave it or cancel_deal {"deal": 3}')
     # the scripted mayor follows the same checks
     from civitas.agents.scripted import _deal_actions
     assert _deal_actions(region.observe("north.mayor")) == [{"type": "cancel_deal", "deal": 1},
@@ -466,6 +477,146 @@ def test_the_scripted_region_mayor_makes_the_deal():
     assert north.act(obs).actions == [{"type": "cancel_deal", "deal": 1}]
     single = CivitasEnv(GameConfig(seed=0, months=3))                # a single city: no deal actions
     assert not any(a["type"].endswith("_deal") for a in ScriptedMayor("mayor").act(single.observe("mayor")).actions)
+
+
+def test_two_sellers_cannot_both_cover_one_need():
+    """Review: with a third city two sellers could each offer the buyer its whole need, both offers read "worth it"
+    against the same need (supply moves only at the next tick), and the buyer took both and paid twice."""
+    from civitas.agents.scripted import _deal_actions
+    region, n, s = _short_north(cities=("north", "south", "east"))
+    e = region.envs["east"]
+    sb, eb, nb = ToolBox(s, "mayor"), ToolBox(e, "mayor"), ToolBox(n, "mayor")
+    sell = next(x for x in region_lines(s, "mayor") if x.startswith("- deal opportunity"))
+    assert sb.call("offer_deal", _call_in(sell, "offer_deal"))["ok"]              # south offers north its whole need
+    # east's opportunity counts south's open offer: north's need is covered, so it names none
+    assert region.deal_opportunities("east") == [] and \
+        not any(x.startswith("- deal opportunity") for x in region_lines(e, "mayor"))
+    # offered anyway, each offer alone is worth taking; the first accepted, the second is covered
+    assert eb.call("offer_deal", {"to": "north", "resource": "power", "amount": 160, "price": 0.88, "months": 3})["ok"]
+    assert [region.deal_check(d, "north")["worth"] for d in region.deals] == [True, True]
+    obs = region.observe("north.mayor")
+    assert _deal_actions(obs) == [{"type": "accept_deal", "deal": 1}, {"type": "cancel_deal", "deal": 2}]
+    assert obs["region"]["deal_opportunities"] == []                              # the offers it takes cover it
+    assert nb.call("accept_deal", {"deal": 1})["ok"]
+    check = region.deal_check(region.deals[1], "north")
+    assert (check["worth"], check["reason"], check["covered_by"]) == (False, "covered", [1])
+    assert any(x.startswith("- deal #2 offered by east") and ", already covered by deal #1: not worth it" in x
+               for x in region_lines(n, "mayor"))
+    r = nb.call("accept_deal", {"deal": 2})                                      # the region refuses it too
+    assert not r["ok"] and r["message"].startswith("deal #1 accepted this month already covers your power need")
+
+
+def test_a_deal_the_buyer_cannot_afford_is_not_worth_it():
+    """Review: "worth it" checked only the price against imports; imports cover at most a quarter of demand, so a
+    deal topping supply up to its limit could cost several times the import bill, with no money check."""
+    from civitas.agents.scripted import _deal_actions
+    from civitas.core.money import reserve
+    region, n, s = _short_north()
+    w = n.world
+    w.treasury = reserve(w) + 30.0                  # $30 above the reserve, no surplus on record (month 0)
+    st = region.supply_state("north")["power"]
+    # north affords a deal that only replaces its imports, plus $30 over 3 months: (30 / 3 + 35 x 1.5) / 0.88 -> 70
+    opp, = region.deal_opportunities("north")
+    assert (opp["amount"], opp["capped"]) == (math.floor((10 + st["imported"] * 1.5) / 0.88 / 10) * 10, "afford")
+    line = next(x for x in region_lines(n, "mayor") if x.startswith("- deal opportunity"))
+    assert "for 3 months, as much as you can afford (no link needed)" in line
+    assert ToolBox(s, "mayor").call("offer_deal", {"to": "north", "resource": "power", "amount": 160, "price": 0.88,
+                                                   "months": 3})["ok"]
+    check = region.deal_check(region.deals[0], "north")
+    assert (check["worth"], check["reason"]) == (False, "afford") and check["budget"] == 30
+    assert check["net"] == pytest.approx(160 * 0.88 - st["imported"] * 1.5)
+    line = next(x for x in region_lines(n, "mayor") if x.startswith("- deal #1"))
+    assert (f"but you can't afford it: {money(check['net'])}/month more than imports for 3 months is over the $30 you "
+            "have for it (above the reserve, with last month's surplus)") in line
+    assert line.endswith('leave it or cancel_deal {"deal": 1}') and "worth" not in line
+    assert _deal_actions(region.observe("north.mayor")) == [{"type": "cancel_deal", "deal": 1}]
+    w.treasury += 10000                                                          # now it can
+    assert region.deal_check(region.deals[0], "north")["worth"]
+
+
+def test_a_deal_opportunity_stays_within_offer_deals_limit(monkeypatch):
+    """Review: amounts had no cap, but offer_deal refuses more than 2,000 units, so a big city's named call failed."""
+    from civitas.core.region import DEAL_AMOUNT_MAX
+    region, n, s = _linked()
+    n.world.treasury = 1e7
+    base = {"imported": 0.0, "unserved": 0.0, "use_pct": 100, "import_price": 1.5, "floor": 0.25, "demand": 9000.0}
+    states = {"north": {"power": {**base, "own": 9000.0, "need": 1000.0}, "water": {**base, "own": 0.0, "need": 0.0}},
+              "south": {"power": {**base, "own": 20000.0, "demand": 1000.0, "need": -18888.9},
+                        "water": {**base, "own": 0.0, "need": 0.0}}}
+    states["north"]["power"]["need"] = 5000.0
+    monkeypatch.setattr(region, "supply_state", lambda c: states[c])
+    opp, = region.deal_opportunities("north")
+    assert (opp["amount"], opp["capped"]) == (DEAL_AMOUNT_MAX, "max")
+    assert "offer_deal's 2,000 limit" in next(x for x in region_lines(n, "mayor") if "deal opportunity" in x)
+    assert ToolBox(n, "mayor").call("offer_deal", region.offer_args(opp, "north"))["ok"]
+
+
+def test_an_unanswered_offer_expires(tmp_path):
+    """Review: an ignored offer stayed open for the rest of the game, blocking that pair and resource, and accepted
+    months later could make the seller sell capacity it no longer had. It now lapses after offer_window months
+    (two mayor turns) as status "expired", shown in the Region block and the frames' deals."""
+    from civitas.bench.collab import deal_history, region_collab
+    region, n, s = _short_north()
+    assert region.offer_window() == 2                                            # act_every 1
+    nb, sb = ToolBox(n, "mayor"), ToolBox(s, "mayor")
+    buy = next(x for x in region_lines(n, "mayor") if x.startswith("- deal opportunity"))
+    assert nb.call("offer_deal", _call_in(buy, "offer_deal"))["message"].endswith("must accept it by month 1")
+    frames = [region.frame()]
+    region.end_month()
+    assert region.deals[0]["status"] == "offered"                                # still open in month 1
+    region.end_month()
+    assert region.deals[0]["status"] == "expired" and region.month == 2
+    frames.append(region.frame())
+    assert frames[-1]["deals"][0]["status"] == "expired"
+    assert any(x.startswith("- deal #1 expired: you sell 160 power to north") and "not accepted by month 1" in x
+               for x in region_lines(s, "mayor"))
+    assert "#1 expired: you are buying 160 power with south" in region.observe("north.mayor")["text"]
+    r = ToolBox(s, "mayor").call("accept_deal", {"deal": 1})
+    assert not r["ok"] and r["message"].startswith("deal #1 expired after month 1")
+    # the pair is free again: the opportunity is back
+    assert any(x.startswith("- deal opportunity") for x in region_lines(n, "mayor"))
+    # replays: the deal ended "expired" without being accepted, its offer unanswered
+    d, = deal_history(frames, region.cities)
+    assert (d["end"], d["accepted"], d["ended"]) == ("expired", None, 1)
+    rc = region_collab(frames, region.roles, 1, region.cities)
+    assert any(ev.get("what") == "expired" and ev["text"] == "deal #1 offer expired, not accepted"
+               for ev in rc["events"])
+    assert next(t for t in rc["threads"] if t["kind"] == "deal")["status"] == "unanswered"
+    # a month later it leaves the Region block
+    region.end_month()
+    assert not any("deal #1" in x for x in region_lines(s, "mayor"))
+
+
+def test_supply_states_are_computed_once_per_view(monkeypatch):
+    """Review: supply_state ran for every role's observation (only mayors use the others') and twice in the mayor's
+    Region block. DEAL_BUSY and BANK_BUSY are one constant (catalog.SUPPLY_BUSY)."""
+    from civitas.core.region import DEAL_BUSY
+    from civitas.fleet.tools import BANK_BUSY
+    assert DEAL_BUSY == BANK_BUSY == C.SUPPLY_BUSY
+    region, n, s = _short_north()
+    calls = []
+    real = region.supply_state
+    monkeypatch.setattr(region, "supply_state", lambda c: calls.append(c) or real(c))
+    region.observe("north.police")
+    assert calls == ["north"]
+    calls.clear()
+    region_lines(n, "mayor")
+    assert sorted(calls) == ["north", "south"]
+
+
+def test_the_city_block_shows_imported_supply_apart():
+    """Review: the mayor's City line counted service imports in ("power 1,081 / 1,081"), hiding the shortage."""
+    region, n, s = _short_north()
+    m = n.world.metrics()
+    imp = m["service_imports"]["power"]
+    assert imp > 0
+    from civitas.fleet.fmt import num
+    assert (f"- supply / demand (coverage): power {num(round(m['power_supply'] - imp, 1))} own + {num(imp)} imported "
+            f"/ {num(m['power_demand'])}") in briefing(n, "mayor", mark=False)
+    assert "sewage 0 / " in briefing(n, "mayor", mark=False)                    # no imports: as before
+    obs = region.observe("north.mayor")
+    assert obs["city"]["power"]["supply"] == m["power_supply"] and obs["city"]["power"]["imported"] == round(imp, 1)
+    assert f"Power: supply {round(m['power_supply'] - imp, 1)} own + {round(imp, 1)} imported, demand" in obs["text"]
 
 
 def test_spare_without_a_short_neighbour_and_the_longest_opportunity_line():
