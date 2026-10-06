@@ -1208,6 +1208,14 @@ another police station, fire station and clinic. From month 96 (the configs) it 
 residents and a score of 66.8; transit is still 17-20% on seeds 0-1 (the scripted transport keeps
 it up), and seed 0 has a jammed stretch for an avenue.
 
+First late smoke (2026-10-06, seed 0, `runs/20261006-152140_fleet_smoke_late_s0_861`, 32 fleet turns,
+about 10 minutes): city 66.8 -> **69.1 (+2.3)**, population 6,036 -> **8,100 (+2,064)**, against the
+scripted fleet's +1.1 / +268 over the same months. Transport read "another bus line ($1,500):
+transit 11% now, about 22% with it", built it and an avenue at month 96 (transit 22% by month 99;
+transport 92.1 -> 91.3), then ended its turns in 1 step once the Next line said nothing was left
+("jammed roads are avenues already"). Teamwork 84.8 (money aim 100); 2 asks held back, 1 bus_line
+refusal, and 3 failed actions in 32 turns.
+
 **Config.**
 
 ```toml
