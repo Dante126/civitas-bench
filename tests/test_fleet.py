@@ -684,7 +684,7 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     res = ToolBox(env, "health").call("find_sites", {"purpose": "clinic"})
     assert res["sites"] == [] and "nothing needs this right now" in res["note"] and "planning" not in res["note"]
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
-    assert res["sites"] == [] and "too few homes" in res["note"]
+    assert res["sites"] == [] and "below 1,500 residents" in res["note"]
     env = CivitasEnv(GameConfig(seed=0, months=12))    # residents, but every roadside tile taken
     agents = {r: SCRIPTED[r](r) for r in env.roles}
     for _ in range(6):
@@ -3252,6 +3252,12 @@ def test_congested_roads_are_priced_per_avenue_tile(open_env, monkeypatch):
     assert fleet_line().startswith(f"- transport: funds ${cost - 1:,}, spent $0; needs $1,500 for its first bus line (")
     real = T.buildings_of
     monkeypatch.setattr(T, "buildings_of", lambda w, name: 1 if name == "bus_line" else real(w, name))
+    # with one line, another one its list offers (bus_room) still comes before the avenues: 120-month LLM runs named
+    # "$30 for an avenue tile" on 131 of the mayor's transport lines, another bus line on 9, and transit fell to 1-3%
+    line_up = f"${T.upkeep_of(w, 'transport', 'bus_line'):,.0f}/month"
+    assert fleet_line() == (f"- transport: funds ${cost - 1:,}, spent $0; needs $1,500 for another bus line "
+                            f"(transit 0%, {line_up})")
+    monkeypatch.setattr(T, "bus_room", lambda w, sites: ("buses have room", "the buses have room"))
     assert fleet_line() == (f"- transport: funds ${cost - 1:,}, spent $0; needs ${cost:,} for 4 avenue "
                             f"tiles (1 site, ${4 * (C.ROAD_UPKEEP[2] - C.ROAD_UPKEEP[1]):g}/month)")
     w.dept_funds["transport"] = cost                   # the whole stretch: cheaper than another $1,500 bus line
@@ -3320,7 +3326,11 @@ def test_no_bus_stops_before_1500_residents():
     assert _ready_sites(text)[0] == f"- bus_stops: none - {SITE_NOTES['bus_stops'][0]}", _ready_sites(text)
     assert _block(text, "## Your budget")[1:] == ["- no money ask to the mayor now: nothing ready to buy. Ask when a "
                                                   "site is ready for you. This turn: nothing is ready to build; say "
-                                                  "what you need in your end_turn report"] and "can't pay" not in text
+                                                  "what you need in your end_turn report",
+                                                  "- Next: no bus line or avenue to build: the first bus line comes "
+                                                  f"at 1,500 residents (now {w.metrics()['population']:,}), "
+                                                  "no road over capacity. End your turn"] \
+        and "can't pay" not in text
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
     assert res["sites"] == [] and res["note"] == SITE_NOTES["bus_stops"][1]
     _no_spending(env)
@@ -5866,10 +5876,13 @@ def test_the_first_bus_line_comes_before_avenues(open_env):
     assert ToolBox(env, "transport").call("upgrade_road", _street(w))["ok"]
 
 
-def test_another_bus_line_only_when_buses_run_full(open_env):
+def test_another_bus_line_only_when_it_adds_riders(open_env, monkeypatch):
     """The mayor read "needs $1,500 for another bus line (transit 4.6%)" with buses at ~210 of 1,500 seats, and s1 ran
-    four lines on the same stops (riders take the best line). With a line under BUS_FULL of its seats the bus_stops
-    list says the buses have room and prices nothing; near full another line is ready again."""
+    four lines on the same stops (riders take the best line). With buses under BUS_FULL of their seats the bus_stops
+    list offers another line only while transit is under TRANSIT_GOAL (the 12% transport_score counts) and the next
+    line (new_line_stops) adds at least BUS_GAIN of the trips (transit_estimate); near full it is ready again. v23
+    120-month runs: transit 15-21% at month 24, 4-6% by month 48 with one line and "buses have room" on 68 of 68 turns;
+    region run 20261005, north, month 66: 61% of residents near a stop, transit 9.6%, no line offered."""
     import civitas.fleet.tools as T
     env = copy.deepcopy(open_env)
     _no_spending(env)
@@ -5878,24 +5891,95 @@ def test_another_bus_line_only_when_buses_run_full(open_env):
     w.dept_funds["transport"] = 1500
     assert apply_action(w, "transport", {"type": "create_bus_line", "stops": stops}).ok and len(w.bus_lines) == 1
     w.bus_lines[0].update(riders=210, capacity=1500)
-    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
-    assert lst.short == ("buses have room (210 of 1,500 seats, 73% of residents near a stop); another line at 90% "
-                         "full or 40% away from stops"), lst
+    bus = lambda: T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    metrics = w.metrics
+    transit = lambda share: monkeypatch.setattr(w, "metrics", lambda: {**metrics(), "transit_share": share})
+    # transit at the goal: buses have room, nothing priced
+    transit(0.13)
+    lst = bus()
+    assert lst.short == "buses have room (210 of 1,500 seats); transit 13% reaches the 12% your score counts", lst
     assert "bus_stops" not in T.ready_prices(w, "transport", {"bus_stops": lst})
     text = briefing(env, "transport", mark=False)
-    assert "- bus riders: 210 of 1,500 seats (1 line)" in text and "First bus line" not in text
+    assert "- bus riders: 210 of 1,500 seats (1 line), transit 13% of trips" in text and "First bus line" not in text
+    # under the goal, but the next line would add under BUS_GAIN of the trips
+    transit(0.05)
+    real = T.transit_estimate
+    monkeypatch.setattr(T, "transit_estimate", lambda w, stops=None: (0.05, 0.055))
+    assert bus().short == "buses have room (210 of 1,500 seats); a new line here would add 0.5% of trips (transit 5.0%)"
+    monkeypatch.setattr(T, "transit_estimate", real)
+    # near full: another line whatever the transit
+    transit(0.13)
     w.bus_lines[0]["riders"] = 1400
-    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
+    lst = bus()
     assert lst.short is None and "bus_stops" in T.ready_prices(w, "transport", {"bus_stops": lst})
-    # a city grown past its line (v23 120-month runs: transit 15-21% at month 24, 4-6% by month 48 with one line):
-    # with 40% of residents away from every stop the next line is offered, through homes the line doesn't reach
+    # a city grown past its line: one line on two stops, transit under the goal; the next line, through the job
+    # centres and the homes the line doesn't reach, carries more trips (transit_estimate: what traffic computes)
+    transit(0.05)
     w.bus_lines[0]["riders"] = 210
     w.bus_lines[0]["stops"] = [list(p) for p in stops[:2]]
-    cover = T.bus_cover(w)
-    assert T.bus_away(w, cover) >= T.BUS_AWAY
-    lst = T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"]
-    assert lst.short is None and sum(not cover[s["y"], s["x"]] for s in lst.sites) >= 2, lst
+    lst = bus()
+    assert lst.short is None, lst
     assert [[s["x"], s["y"]] for s in lst.sites] == T.new_line_stops(w)[:len(lst.sites)]
-    # an upgrade with a bus line in place: never refused for it
+    now, more = T.transit_estimate(w, T.bus_stops(lst))
+    assert more - now >= T.BUS_GAIN and T.transit_estimate(w) == (now, now)
+    # transport's Next line names it, with transit now and with it; the mayor's needs line names it before avenues
     w.dept_funds["transport"] = 30
+    line = next(ln for ln in briefing(env, "transport", mark=False).splitlines() if ln.startswith("- Next:"))
+    from civitas.fleet.fmt import pct
+    assert line.startswith(f"- Next: another bus line ($1,500): transit 5.0% now, about {pct(100 * (0.05 + more - now))} "
+                           "with it (your score counts transit up to 12%): create_bus_line through all the bus_stops "
+                           "stops below, before any avenue; you have $30"), line
+    assert T.first_build(env, "transport").named[0].label == "another bus line"
+    # an upgrade with a bus line in place: never refused for it
     assert ToolBox(env, "transport").call("upgrade_road", _street(w))["ok"]
+
+
+def test_transport_next_line_names_an_avenue_or_nothing(open_env, monkeypatch):
+    """With a bus line and transit at the goal, transport's Next line names the most jammed stretch whole, priced, as
+    one upgrade_road call (the mayor's needs line prices the same stretch); with no jam, that there is nothing to build
+    and no population threshold to wait for. 120-month LLM runs: 156 of 240 transport turns did nothing, 142 of them
+    reasoning about "1,500 residents" past 1,500."""
+    import civitas.fleet.tools as T
+    env = copy.deepcopy(open_env)
+    _no_spending(env)
+    w = env.world
+    stops = T.bus_stops(T.site_lists(w, "transport", T.role_obs(env, "transport"))["bus_stops"])
+    w.dept_funds["transport"] = 1500
+    assert apply_action(w, "transport", {"type": "create_bus_line", "stops": stops}).ok
+    w.bus_lines[0].update(riders=210, capacity=1500)
+    metrics = w.metrics
+    monkeypatch.setattr(w, "metrics", lambda: {**metrics(), "transit_share": 0.13})
+    w.congestion[:] = 0
+    w.congestion[40:44, 3] = 1.5                       # the street down x=3 (all land): one jammed stretch, 4 tiles
+    w.dept_funds["transport"] = 100
+    nxt = lambda: next(ln for ln in briefing(env, "transport", mark=False).splitlines() if ln.startswith("- Next:"))
+    tile = C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]]
+    assert nxt() == (f"- Next: an avenue on the most jammed stretch, load 1.5x capacity (${4 * tile} for 4 tiles): "
+                     'upgrade_road {"x1":3,"y1":40,"x2":3,"y2":43,"to":"avenue"}; you have $100: ask the mayor for '
+                     f"${4 * tile - 100} (send_message)"), nxt()
+    w.congestion[:] = 0
+    assert nxt() == ("- Next: no bus line or avenue to build: transit 13% (your score counts transit up to 12%), no "
+                     "road over capacity. End your turn; there is no population threshold to wait for")
+
+
+def test_transit_estimate_is_what_traffic_computes():
+    """transit_estimate replays traffic's gravity model read-only: for the city's lines it is the month's bus share,
+    and with one more line it is what the next traffic pass gives (scripted seed 0, month 72: 14.66% now, 19.91% with
+    new_line_stops' line)."""
+    import civitas.fleet.tools as T
+    env = CivitasEnv(GameConfig(seed=0, months=120))
+    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    for _ in range(72):
+        for r in env.roles:
+            env.apply(r, agents[r].act(env.observe(r)))
+        env.end_month()
+    w = env.world
+    assert len(w.bus_lines) == 1 and not w.metro_lines
+    stops = T.new_line_stops(w)[:C.MAX_STOPS]
+    now, more = T.transit_estimate(w, stops)
+    assert now == pytest.approx(w.stats["bus_riders"] / w.stats["trips"])
+    w.dept_funds["transport"] = 5000
+    assert apply_action(w, "transport", {"type": "create_bus_line", "stops": stops}).ok
+    w.refresh()
+    w._compute_traffic()
+    assert more == pytest.approx(w.stats["bus_riders"] / w.stats["trips"]) and more - now > 0.04

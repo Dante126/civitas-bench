@@ -34,7 +34,7 @@ playbook = """
 safety, health and education are the other half.
 - The order that works: roads from the highway and zones (planning), then power, water and sewage on the same \
 road network (utilities), then services once people live there (a landfill from ~100 residents, fire and police \
-from ~150, a clinic from ~400, a school when children arrive). Transport matters once the city has ~1,500 residents.
+from ~150, a clinic from ~400, a school when children arrive). Transport builds its first bus line at ~1,500 residents.
 - Never let the treasury go negative (bankruptcy halves the score and ends the game). Upkeep is paid monthly \
 from the treasury, so every building also costs money every month.
 - Money sitting in a department's funds does nothing: spend it on what the plan asks for, or tell the mayor you \
@@ -76,8 +76,8 @@ allocate_budget in the same turn. A good start from $30,000: planning $3,000 (ro
 quarter's work; after that keep its budget near what it spends, about $1,000-1,500 a quarter) and utilities \
 $7,000 for its first plants (its month-0 needs line leaves out the pump and outlet until planning's road \
 reaches the river). From month 3, fund every first building a needs line names ("its first ..."; \
-police, fire, health, education: $2,000-2,500 each; less buys nothing), whatever its target; transport $0 until \
-~1,500 residents. After month 0 give utilities what its needs line asks, not its target. The rest stays in the \
+police, fire, health, education: $2,000-2,500 each; less buys nothing), whatever its target; transport's first \
+is its bus line at ~1,500 residents, and later its needs line names more lines as transit falls. After month 0 give utilities what its needs line asks, not its target. The rest stays in the \
 treasury: every building adds upkeep for good (its needs line says how much).
 - Every turn: read the reports and the Departments block (most urgent first). First take back the idle money the \
 'to spend' line counts (at most the idle a line shows), before any top-up or loan; then fund what the 'to fund' \
@@ -154,10 +154,13 @@ pumping station / treatment plant instead of adding tier-1 buildings. Treatment 
 [agents.transport]
 kind = "fleet"
 playbook = """
-- Early on there is little to do: don't spend before ~1,500 residents or real congestion; your score counts cost \
-per resident.
-- From ~1,500 residents: one create_bus_line through all suggested stops (your bus_stops line), before any \
-avenue; another only when buses run 90% full (bus riders in Key metrics).
+- Your score: commute time, congestion, the share of trips by transit (counted up to 12%) and cost per resident. \
+Every turn your budget block's Next line names the build that raises it most now, with its price and the call: \
+build it, or ask the mayor for the amount it names.
+- Bus lines: the first through all suggested stops (your bus_stops line) once the list offers it, at 1,500 \
+residents, before any avenue; another whenever the list offers one again (transit under 12% and a new line \
+would carry more trips, or full buses). Lines keep their stops while the city grows, so transit falls without \
+new ones.
 - Jammed streets (find_sites congested_roads): upgrade the stretch to an avenue (unlocks at 1k).
 - From 5k: a train station, and a harbour when freight runs full; metro at 10k. Ask the mayor for the exact cost.
 """

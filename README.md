@@ -858,15 +858,32 @@ tasks and money, and to let people coach it.
   riders against seats. The bus_stops list reads as one line (`6 stops for one line:
   create_bus_line stops [[40,5],...]`, and `find_sites bus_stops` returns `stops`),
   since the model had built lines of 1–2 stops from "6 sites, best (40,5)". It offers
-  another line only while every line carries 90% of its seats, or once 40% of the
-  residents live away from every stop and the next line has 2+ stops there (a trip rides
-  the best line covering both its ends, so a second line on the same stops buys nothing
-  but one in new areas adds riders; at most 4 lines). The next line's stops are the big
-  job centres plus the home areas no stop reaches. In the v23 120-month runs one 7-stop
-  line from month 12–18 took transit to 15–21%, then the city outgrew it (4–6% by month
-  48, 124–196 riders of 1,500 seats) and no second line was offered, and congested
-  roads are listed from 1.0× capacity, as the scripted transport upgrades them. A failed
-  `create_bus_line` names the suggested stops. The mayor's `allocate_budget` identical to one that already succeeded
+  another line while every line carries 90% of its seats, or while transit is under the
+  12% transport's score counts and the next line would carry at least 1% more of the
+  trips (at most 4 lines). A trip rides the best line covering both its ends, so a second
+  line on the same stops buys nothing; the next line's stops are today's big job centres
+  plus the home areas no stop reaches, and `transit_estimate` replays the traffic model
+  read-only to say what it adds (exactly what the next month's traffic pass gives). In
+  the v23 120-month runs one 7-stop line from month 12–18 took transit to 15–21%, then
+  the city outgrew it (4–6% by month 48, 124–196 riders of 1,500 seats) and no second
+  line was offered; the rule after it (40% of residents beyond every stop) still offered
+  none at 61% near a stop and 9.6% transit (region run, north, month 66), as job centres
+  moved. Congested roads are listed from 1.0× capacity, as the scripted transport
+  upgrades them. A failed `create_bus_line` names the suggested stops.
+- **Transport's next step.** Transport's budget block has a Next line every turn: the first
+  bus line, else another line its list offers (`Next: another bus line ($1,500): transit
+  6.6% now, about 13% with it (your score counts transit up to 12%)`), else an avenue on
+  the most jammed stretch with the whole stretch's price and its `upgrade_road` call, else
+  that nothing is to build (before 1,500 residents, how far off the first line is). Its
+  needs line (`first_build`) names the line before any avenue stretch, so the mayor reads
+  `needs $1,500 for another bus line (transit 6.6%, $76/month)` and transport asks for
+  it. In the 120-month LLM runs (v19, v23 and the region run, 240 transport turns) the
+  cheapest site was named instead: a $30 avenue tile undercut the $1,500 line on 131 of
+  the mayor's transport lines (another line: 9), transport got 0.8–3.2% of the mayor's
+  top-ups, 47 of 52 region turns that listed another line read "funds cover your next
+  build" with $30–750 and never asked, and 156 of 240 turns did nothing. The playbooks no
+  longer say "don't spend before ~1,500 residents" or "another only when buses run 90%
+  full": 122 turns past 1,500 residents still had "waiting for 1,500 residents" in memory. The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too
   (`refused: "duplicate"`), naming what the department now holds; other amounts pass. An
   identical take-back is a duplicate as well (`you already took $1,140 back from planning
@@ -1687,7 +1704,8 @@ parallel; the Mac slept overnight, so wall times don't count):
 - **Transport:** both cities built a 7-stop bus line early (months 18 and 12; v19: never on seed 0, month 72 on
   seed 1), with transit at 15–21% by month 24. It then fell to 4–6% by month 48 and 1–4% by the end as the cities
   outgrew the line, and the full-buses rule offered no second line. Since 49fdafd another line goes where no stop
-  reaches.
+  reaches; since then it is offered while transit is under 12% and the line adds riders, named on the mayor's
+  needs line before avenues, and transport's briefing has a Next line (Guards, "Transport's next step").
 - **Seed 0:** planning asked the mayor for money 18 times (v19: 37), spent $7.8k (v19: $13.3k) and zoned 40% fewer
   tiles while residential demand stayed at its maximum. The zone hint and playbook line said "zone fewer tiles rather
   than asking"; they now say to zone the part that fits and ask for the rest.

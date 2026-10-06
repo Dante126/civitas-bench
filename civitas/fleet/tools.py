@@ -28,7 +28,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.money import RESERVE_MIN, reserve, reserve_months as _reserve_months   # re-exported
 from ..core.roles import ROLES
 from ..sim import catalog as C
-from ..sim.grid import box_sum, label_components, shift
+from ..sim.grid import INF, box_sum, label_components, shift
 from ..sim.world import own_supply
 from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
@@ -150,9 +150,10 @@ SITE_NOTES = {"levee": ("no flood forecast", "no flood is forecast within 3 mont
                         "appear with a flood warning"),
               "congested_roads": ("no road over capacity", "no road carries more than its capacity right now; an "
                                   "avenue pays only on a stretch at 1.0x or more"),
-              "bus_stops": ("too few homes and jobs on the roads yet (~1,500 residents)",
-                            "too few homes and job centres on the highway-connected roads yet to suggest stops; "
-                            "bus lines pay off once the city is bigger (~1,500 residents)")}
+              "bus_stops": ("the first bus line is offered at 1,500 residents",
+                            "no stops are suggested below 1,500 residents: a bus line costs more than it carries in a "
+                            "smaller town; from 1,500 the first line is listed here, and later ones whenever transit "
+                            "falls under 12% and a new line would carry more trips")}
 # purpose -> the population its list waits for (empty below it, with its SITE_NOTES reason): observation's suggested
 # stops have no floor, so from month 1 transport read "can't pay (cheapest: bus_stops $1,500)" and the mayor "needs
 # $1,500 for a bus line", against both playbooks (no bus line before ~1,500 residents)
@@ -162,11 +163,15 @@ SITE_MIN_POP = {"bus_stops": 1500}
 # the same stops buys nothing: the 120-month LLM runs built lines at ~210 of 1,500 seats. Congested stretches are
 # listed from CONGESTED_LOAD x capacity (the scripted transport upgrades only there; observation lists from 0.8)
 BUS_FULL, BUS_LINES_MAX, CONGESTED_LOAD = 0.9, 4, 1.0
-# ... or once BUS_AWAY of the residents live beyond every stop's reach and the next line (new_line_stops) has at least
-# 2 stops there: a trip rides the best line covering both its ends, so a line in new areas adds riders. v23 120-month
+# ... or while transit is under TRANSIT_GOAL (transport_score counts the share up to 12%: scoring.transport_score) and
+# the next line (new_line_stops: today's biggest job centres and the homes the lines don't reach) would add at least
+# BUS_GAIN of the trips (transit_estimate: traffic's gravity model, read-only). A trip rides the best line covering both
+# its ends, so a line on the same stops adds nothing, and a line through hubs that moved adds riders. v23 120-month
 # runs: one 7-stop line from month 12-18 took transit to 15-21%, then the city outgrew it (4-6% by month 48, riders
-# 124-196 of 1,500 seats) and the full-buses rule offered no second line
-BUS_AWAY = 0.4
+# 124-196 of 1,500 seats) and the full-buses rule offered no second line. The rule after it (40% of residents beyond
+# every stop) still missed hubs that moved: region run 20261005, north, month 66: 61% of residents near a stop,
+# transit 9.6%, no line offered; 1-3% at month 108-120 in every 120-month LLM run (scripted fleet: 10-15%)
+TRANSIT_GOAL, BUS_GAIN = 0.12, 0.01
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 # utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
@@ -2370,9 +2375,11 @@ def bus_seats(w) -> tuple[int, int]:
 def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
     """(short, note) when the bus_stops list offers no line to build: fewer than the 2 stops create_bus_line needs, or
     BUS_LINES_MAX lines already, or buses with room (a line under BUS_FULL of its seats: the scripted transport's
-    rule); None when a line is worth building (none yet, or every line near full). Smoke / 120-month LLM runs: the
-    mayor read "needs $1,500 for another bus line (transit 4.6%)" with buses at ~210 of 1,500 seats. None without
-    stops (SITE_NOTES says why)."""
+    rule) while transit reaches TRANSIT_GOAL or the next line through `sites` would add under BUS_GAIN of the trips
+    (transit_estimate); None when a line is worth building (none yet, every line near full, or transit under the goal
+    and the line adds riders). Smoke / 120-month LLM runs: the mayor read "needs $1,500 for another bus line (transit
+    4.6%)" with buses at ~210 of 1,500 seats, a second line on the same stops. None without stops (SITE_NOTES says
+    why)."""
     if not sites:
         return None
     if len(sites) < 2:
@@ -2383,18 +2390,75 @@ def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
         return (f"{len(lines)} bus lines already", f"the city has {len(lines)} bus lines; more add upkeep, not riders")
     if not lines or all(ln.get("riders", 0) >= BUS_FULL * ln.get("capacity", C.LINE_CAPACITY) for ln in lines):
         return None
-    cover = bus_cover(w)
-    away = bus_away(w, cover)
-    fresh = sum(not cover[s["y"], s["x"]] for s in sites)
-    if away >= BUS_AWAY and fresh >= 2:                  # a line in new areas (new_line_stops)
+    transit = w.metrics()["transit_share"]
+    est = transit_estimate(w, [[s["x"], s["y"]] for s in sites[:C.MAX_STOPS]])
+    gain = est[1] - est[0]
+    if transit < TRANSIT_GOAL and gain >= BUS_GAIN:
         return None
     riders, seats = bus_seats(w)
-    full = (f"another line pays once buses run {pct(100 * BUS_FULL)} full or {pct(100 * BUS_AWAY)} of residents live "
-            "away from the stops")
-    return (f"buses have room ({riders:,} of {seats:,} seats, {pct(100 * (1 - away))} of residents near a stop); "
-            f"another line at {pct(100 * BUS_FULL)} full or {pct(100 * BUS_AWAY)} away from stops",
-            f"the bus lines carry {riders:,} riders of {seats:,} seats and reach {pct(100 * (1 - away))} of residents; "
-            f"a trip rides the best line covering both its ends, so another line pays only in new areas: {full}")
+    why = (f"transit {pct(100 * transit)} reaches the {pct(100 * TRANSIT_GOAL)} your score counts"
+           if transit >= TRANSIT_GOAL else
+           f"a new line here would add {pct(100 * max(0.0, gain))} of trips (transit {pct(100 * transit)})")
+    return (f"buses have room ({riders:,} of {seats:,} seats); {why}",
+            f"the bus lines carry {riders:,} riders of {seats:,} seats; {why}. A trip rides the best line covering both "
+            f"its ends, so another line pays once buses run {pct(100 * BUS_FULL)} full, or while transit is under "
+            f"{pct(100 * TRANSIT_GOAL)} and the next line (today's job centres and the homes the lines miss) would "
+            f"add {pct(100 * BUS_GAIN)} of trips or more")
+
+
+def _trip_flows(w) -> tuple[np.ndarray, np.ndarray, list[dict]] | None:
+    """(flows hubs x tiles, trips per tile, hubs) of the month's commuting trips as traffic's gravity model sends them
+    (TrafficMixin._compute_traffic, read-only: World.hubs from the last tick, the shortest-path trees it caches per
+    road network); None without workers or hubs."""
+    hubs = w.hubs
+    if not hubs:
+        return None
+    res = w.residents_grid()
+    anchor = w._anchors()
+    ok = anchor >= 0
+    wshare = w.stats.get("workers", 0.0) / max(1.0, float(res.sum()))
+    omass = np.bincount(anchor[ok].ravel(), weights=(res * wshare)[ok].ravel(), minlength=w.h * w.w)
+    if omass.sum() <= 0:
+        return None
+    D = np.stack([w._tree((hb["x"], hb["y"]))[0].ravel() for hb in hubs])
+    reach = D < INF
+    A = np.array([hb["jobs"] for hb in hubs])[:, None] * np.exp(-np.where(reach, D, 0) / C.COMMUTE_DECAY) * reach
+    tot = A.sum(0)
+    P = np.divide(A, tot, out=np.zeros_like(A), where=tot > 0)
+    return omass[None, :] * P, omass, hubs
+
+
+def transit_estimate(w, stops: list[list[int]] | None = None) -> tuple[float, float]:
+    """(now, with) the bus share of trips, estimated as traffic computes it (a trip rides when one line's stops reach
+    both its home and its job centre: the share at the fare, buses full at their seats), for the city's lines and
+    with one more line through `stops` (the same with none). Metro riders are left out, so `now` can sit below the
+    month's transit_share; the difference is what the line adds. (0, 0) without trips."""
+    flows = _trip_flows(w)
+    if flows is None:
+        return 0.0, 0.0
+    flows, omass, hubs = flows
+    free = w.policy_on("free_transit")
+    fare = 1.0 if free else float(np.clip(1.25 - 0.25 * w.fare, 0.3, 1.2))
+    base = min(0.8, C.TRANSIT_BASE * fare * (C.POLICIES["free_transit"]["ridership"] if free else 1.0))
+    seats = C.LINE_CAPACITY * w.funding_eff("transport")
+
+    def disk(pts) -> np.ndarray:
+        cov = np.zeros((w.h, w.w), bool)
+        for x, y in pts:
+            cov |= w._disk(x, y, C.STOP_RADIUS)
+        return cov
+
+    def share(covs: list[np.ndarray]) -> float:
+        best = np.zeros_like(flows)
+        for cov in covs:
+            served = np.array([bool(cov[hb["y"], hb["x"]]) for hb in hubs], float)
+            best = np.maximum(best, np.outer(served, cov.ravel().astype(float)))
+        riders = min(float((flows * best).sum()) * base, seats * len(covs))
+        return riders / float(omass.sum())
+
+    covs = [disk(ln["stops"]) for ln in w.bus_lines]
+    now = share(covs)
+    return now, (share(covs + [disk(stops)]) if stops else now)
 
 
 def bus_cover(w) -> np.ndarray:
@@ -2882,7 +2946,12 @@ def first_build(env, dept: str) -> FirstBuild | None:
         return supply._replace(funded=_funded_of(w, dept, lists))
     lacking = {p: pr for p, pr in prices.items()                                         # cheapest skips SUPPLEMENTARY
                if pr.first and labels[p][1] == 0 and (p != "jail" or _cells_busy(w))}
-    purposes, low = cheapest(lacking) or cheapest(prices) or ((), None)
+    # transport's next bus line, while its list offers one (bus_room: transit under TRANSIT_GOAL and the line adds
+    # riders, or full buses), before any avenue stretch: the 120-month LLM runs named "$30 for an avenue tile" on 131
+    # of the mayor's transport lines and another bus line on 9, transport got 0.8-3.2% of the mayor's top-ups, and
+    # transit fell to 1-3% (TRANSPORT_NEXT in briefing.py says the same to transport)
+    line = (("bus_stops",), prices["bus_stops"]) if dept == "transport" and "bus_stops" in prices else None
+    purposes, low = cheapest(lacking) or line or cheapest(prices) or ((), None)
     if low is None and not blocked:
         extra = cheapest(prices, supplementary=True)
         if len(prices) == len(ready) and extra is None:

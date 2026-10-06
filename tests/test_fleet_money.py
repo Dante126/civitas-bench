@@ -950,8 +950,11 @@ def test_a_first_building_the_city_lacks_comes_before_a_cheaper_build(monkeypatc
         funding_gaps(env, FleetState.of(env)).to_fund
     w.dept_funds["transport"] = C.BUS_LINE_COST
     assert DeptMoney(env, "transport").state == "funds cover its next build"
-    w.bus_lines.append({"id": 1, "stops": [(1, 1), (5, 1)]})     # it has one: the avenue stretch is next again
-    avenue = T.first_build(env, "transport")
+    w.bus_lines.append({"id": 1, "stops": [(1, 1), (5, 1)]})     # it has one: another line while its list offers one
+    again = T.first_build(env, "transport")
+    assert again.cost == C.BUS_LINE_COST and [(n.what, n.have, n.first) for n in again.named] == [("bus line", 1, False)]
+    fake["transport"]["bus_stops"] = fake["transport"]["bus_stops"]._replace(short="buses have room")
+    avenue = T.first_build(env, "transport")                     # buses have room: the avenue stretch is next again
     assert avenue.cost == 5 * C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]] and avenue.named[0].what == "5 avenue tiles"
     school = T.first_build(env, "education")                      # another elementary school is cheaper
     assert [(n.what, n.have) for n in school.named] == [("high school", 0)] and school.cost == 5000
