@@ -3301,8 +3301,10 @@ def test_a_congested_bridge_is_priced_as_upgrade_road_charges():
     assert next(ln for ln in mayor if ln.startswith("- transport:")) == (
         f"- transport: funds $0; needs ${4 * per:,} for 4 avenue tiles (2 sites, "
         f"${4 * (C.ROAD_UPKEEP[2] - C.ROAD_UPKEEP[1]):g}/month)")
-    w.road_class[24, 5:9] = C.ROAD_CLASSES["avenue"]      # none left to charge: one tile, as when a site doesn't say
-    assert best_stretch(w, "congested_roads", sites) == (1, 1)
+    w.road_class[24, 5:9] = C.ROAD_CLASSES["avenue"]      # none left to charge: nothing to buy (review: "$30 for an
+    assert best_stretch(w, "congested_roads", sites) == (0, 0)   # avenue tile" named an upgrade_road that failed)
+    mayor = briefing(env, "mayor", mark=False).splitlines()
+    assert "avenue" not in next(ln for ln in mayor if ln.startswith("- transport:"))
 
 
 def test_no_bus_stops_before_1500_residents():

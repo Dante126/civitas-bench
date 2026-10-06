@@ -2237,11 +2237,11 @@ def site_tiles(w, purpose: str, site: dict) -> tuple[int, int]:
 
 
 def best_stretch(w, purpose: str, sites: list[dict]) -> tuple[int, int]:
-    """site_tiles of the best (first) site, one tile when it has nothing to charge: site_lists ranks congested
+    """site_tiles of the best (first) site, (0, 0) when it has nothing to charge: site_lists ranks congested
     stretches that are avenues already last (seed 0's most congested roads were by month 60), so a first one with
-    nothing to charge means none has."""
-    t = site_tiles(w, purpose, sites[0])
-    return t if t[0] else (1, 1)
+    nothing to charge means none has, and first_build leaves the purpose out (review: it priced "an avenue tile
+    ($30)" and the Next line's upgrade_road failed "already avenue")."""
+    return site_tiles(w, purpose, sites[0])
 
 
 def ready_prices(w, role: str, lists: dict[str, SiteList]) -> dict[str, Price]:
@@ -2919,9 +2919,12 @@ def first_build(env, dept: str) -> FirstBuild | None:
     blocked = blocked_firsts(w, dept, lists)
     ready = ready_prices(w, dept, lists)
     prices, tiles = {p: pr for p, pr in ready.items() if _wanted(w, p)}, {}
-    for p, pr in prices.items():
+    for p, pr in list(prices.items()):
         if pr.per_tile:                  # the whole stretch; a bridge tile charged BRIDGE_UPGRADE times costs twice
             tiles[p], units = best_stretch(w, p, lists[p].sites)     # the upkeep (World.road_upgrade_upkeep)
+            if not tiles[p]:             # every listed stretch is an avenue already: nothing to buy there
+                del prices[p], tiles[p]
+                continue
             bridges = (units - tiles[p]) / (BRIDGE_UPGRADE - 1)
             prices[p] = pr._replace(cost=pr.cost * units, upkeep=pr.upkeep * (tiles[p] + bridges))
     labels = {p: _label(w, pr, tiles.get(p, 1)) for p, pr in prices.items()}
