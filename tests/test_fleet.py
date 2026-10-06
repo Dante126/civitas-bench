@@ -2864,10 +2864,11 @@ def test_ready_sites_in_department_briefings(grown, grown_env):
         purposes = list(SITE_PURPOSES[role])
         dense = role == "planning" and not w.unlocked("high_density")                 # + the high density line
         land = sum(role == "planning" and ln.startswith(("- blocked for lack of land: ", "- leave free (funded): ",
-                                                          "- away from homes ("))
+                                                          "- away from homes (", "- parks: "))
                    for ln in lines)
         assert len(lines) == len(purposes) + 1 + dense + land
-        assert lines[-1] == "find_sites <purpose> lists up to 6 with details"
+        assert lines[-1] == "find_sites <purpose> lists up to 6 with details" + (
+            "; zoning $5/tile at low density, $8 at high density and for I and M" if role == "planning" else "")
         box = ToolBox(env, role)
         for purpose, line in zip(purposes, lines):
             # bus_stops names every stop of its one line (up to C.MAX_STOPS)
@@ -2921,8 +2922,11 @@ def test_planning_ready_sites_say_high_density_is_locked(env12):
     pop = w.metrics()["population"]
     assert 0 < pop < 1000 and not w.unlocked("high_density")
     plan = _ready_sites(briefing(env12, "planning", mark=False))
+    parks = plan[-2].startswith("- parks: ")                         # the parks line, when a park raises anything
+    plan = plan[:-2] + plan[-1:] if parks else plan
     assert plan[-2:] == [f'- high density: locked until 1,000 residents (now {pop:,}): zone with density "low"',
-                         "find_sites <purpose> lists up to 6 with details"], plan
+                         "find_sites <purpose> lists up to 6 with details; zoning $5/tile at low density, $8 at "
+                         "high density and for I and M"], plan
     assert plan[-4 if plan[-3].startswith("- blocked") else -3].startswith("- casino: "), plan   # the last purpose
     for role in DEPTS[1:]:                                           # the other departments
         assert not any("high density" in ln for ln in _ready_sites(briefing(env12, role, mark=False))), role
@@ -2930,7 +2934,7 @@ def test_planning_ready_sites_say_high_density_is_locked(env12):
     env.world.milestones_reached.append("Town")                       # the 1,000 milestone
     assert env.world.unlocked("high_density")
     plan = _ready_sites(briefing(env, "planning", mark=False))
-    assert not any("high density" in ln for ln in plan) and plan[-1].startswith("find_sites"), plan
+    assert not any(ln.startswith("- high density") for ln in plan) and plan[-1].startswith("find_sites"), plan
 
 
 def test_ready_sites_extra_fields():
@@ -3078,10 +3082,13 @@ def test_department_briefings_price_ready_sites_and_say_when_none_is_affordable(
         "mayor for $1,500 with a reason (send_message) unless you already did, then end_turn.")   # the needs line's
     assert "(cheapest: station $2,500)" in briefing(env, "fire", mark=False)       # never the $1,500 shelter
     assert "(cheapest: clinic or landfill $2,000)" in briefing(env, "health", mark=False)     # a tie names both
-    planning = briefing(env, "planning", mark=False)  # only its road priced, and never on the budget line
-    priced = [ln for ln in _ready_sites(planning) if "$" in ln]
-    assert "can't pay" not in planning and len(priced) == 1 and priced[0].startswith("- road_extension: "), priced
-    assert re.search(r"; \$[\d,]+ road \+ \$[\d,]+ zoning - you have \$0$", priced[0]), priced
+    planning = briefing(env, "planning", mark=False)  # its road and zone strips priced, never on the budget line
+    priced = [ln for ln in _ready_sites(planning) if re.search(r"; \$[\d,.k]+", ln)
+              and not ln.startswith(("- parks: ", "find_sites"))]
+    assert "can't pay" not in planning and all(ln.startswith(("- road_extension: ", "- zone_")) for ln in priced)
+    road, = [ln for ln in priced if ln.startswith("- road_extension: ")]
+    assert re.search(r"; \$[\d,]+ road \+ \$[\d,]+ zoning - you have \$0$", road), road
+    assert all(re.search(r"; \$[\d,]+ - you have \$0$", ln) for ln in priced if ln.startswith("- zone_")), priced
     transport = briefing(env, "transport", mark=False)
     assert _ready_sites(transport)[0].endswith("; $1,500 - you have $0") and "(cheapest: bus_stops $1,500)" in transport
     w.dept_funds["police"] = 3000
@@ -3699,7 +3706,7 @@ def test_planning_ready_sites_name_what_funded_departments_will_build(env12):
     items = _claimed(env, fire, clinic, landfill)      # the clinic's best lot is the fire station's: its next one
     assert _best(env, "fire", "station") == _best(env, "health", "clinic") and not items[1].endswith(
         _best(env, "health", "clinic"))
-    block = _ready_sites(briefing(env, "planning", mark=False))
+    block = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if not ln.startswith("- parks: ")]
     assert block[-3] == "- leave free (funded): " + ", ".join(items) + ": zone around them"
     assert block[-2].startswith("- high density: locked"), block                         # nothing blocked here
     w.treasury = 10000
@@ -3729,9 +3736,10 @@ def test_planning_zone_strips_spare_funded_sites(env12):
     w.dept_funds.update(fire=2500, health=2000)
     assert _best(env, "fire", "station") == _best(env, "health", "clinic") == "(20,22)"
     ready = _ready_sites(briefing(env, "planning", mark=False))
-    assert next(ln for ln in ready if ln.startswith("- zone_R:")) == "- zone_R: 5 sites, best (0,22)-(3,23), 8 tiles"
+    assert next(ln for ln in ready if ln.startswith("- zone_R:")) == (       # priced at low density
+        "- zone_R: 5 sites, best (0,22)-(3,23), 8 tiles; $40")
     assert next(ln for ln in ready if ln.startswith("- zone_C:")) == (       # a strip of its own sparing the lots
-        "- zone_C: 5 sites, best (0,25)-(6,26), 14 tiles")
+        "- zone_C: 5 sites, best (0,25)-(6,26), 14 tiles; $70")
     sites = ToolBox(env, "planning").call("find_sites", {"purpose": "zone_R"})["sites"]
     leaves = [s.get("leave") for s in sites]                                  # marked ones after the others
     assert leaves[0] is None and "(20,22) for the fire station" in leaves and \
@@ -4199,7 +4207,7 @@ def test_briefing_lists_new_council_messages_for_this_role():
     c = env.council
     c.post(0, "mayor", "OLD-MSG before the last turn", "planning")
     briefing(env, "planning")
-    c.post(0, "utilities", "TO-PLANNING need road access at the river " + "r" * 300, "planning")
+    c.post(0, "utilities", "TO-PLANNING road access at the river works now " + "r" * 300, "planning")   # no ask
     c.post(0, "mayor", "TO-ALL keep the treasury positive", "all")
     c.post(0, "fire", "TO-POLICE share the corner lot", "police")
     c.post(0, "planning", "OWN-POST zoning the east side", "all")
@@ -4295,6 +4303,10 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     w.struct[25:41, 10:25:2] = C.ROAD
     w.refresh()
     _months_spent(env, spend)
+    for d in TURN_ORDER:                                # planning's Open requests block: every role asks it for land
+        if d != "planning":
+            env.council.post(w.month - 1, d, f"{d} needs a lot near (40,40) at the town edge please " + "z" * 300,
+                             "planning")
     w.dept_funds.update(planning=9876, transport=9876, police=9876, fire=9876, education=9876)   # idle: keep $6,666
     w.months_negative, w.low_approval_months, w.treasury = 11, 11, -123456.78        # every warning, below the reserve
     w.offers.append({"id": 12345, "jobs": 1234, "bonus": 123456, "expires": 123})
@@ -4307,7 +4319,9 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
         assert ("spent $3,333" in text) == (role == "mayor"), role
         assert len(text) < 13000, (role, len(text))
         assert "MEM-C" in text and "MEM-L" in text                            # memory shown to every role
-        assert f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text and f"msg {MAX_ENTRIES + 4} " in text
+        assert f"msg {MAX_ENTRIES + 4} " in text and (                      # planning: requests to it read too
+            f"({MAX_ENTRIES} older; get_messages shows only the latest {MAX_ENTRIES})" in text if role != "planning"
+            else " older; get_messages shows only the latest " in text and "## Open requests to you" in text)
     sizes = {}
 
     def check(tag: str) -> str:

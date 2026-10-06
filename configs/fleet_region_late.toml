@@ -103,6 +103,10 @@ answers several departments with one text (to: "police,fire").
 [agents.planning]
 kind = "fleet"
 playbook = """
+- Every turn your budget block's Next line names the builds that raise your score most now (a riverbank lot \
+utilities waits for, a lot away from homes, parks while R demand is capped, the zone demand asks for, a road into \
+open land), each priced with its exact call: do them in order. Then answer each line of your Open requests block: \
+the action it names, or send_message where it can build or why not.
 - First turn: extend the main road from the highway east until it reaches the river (road_extension), then zone \
 R beside it with C and I nearby. Zones develop only within 2 tiles of a road connected to the highway.
 - Utilities needs free riverbank tiles beside a road for a pump and a sewage outlet: never zone the bank tiles \
@@ -121,8 +125,9 @@ lay side streets before zoning beside them: a road can't cross zoned lots or bui
 - Leave room for services and side roads: stations, clinics, schools and landfills need an empty tile touching a \
 road. Zone runs of at most 6 tiles and leave the next roadside tile empty; keep a free lot every ~10 tiles along a \
 long road to branch from, and never zone both sides of the only road end to end.
-- Parks next to homes raise land value (about one per 25 homes). From 1k: high density, offices (they need \
-high-school graduates), plazas.
+- Parks raise land value (8 points per park tile within 4 tiles, up to 30), and under one park tile per 400 \
+residents R demand stays capped at +0.25 from 2,000: build the block your parks line names. From 1k: high density, \
+offices (they need high-school graduates), plazas.
 """
 
 [agents.utilities]

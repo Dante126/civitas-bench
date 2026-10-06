@@ -12,14 +12,17 @@ import calendar
 import json
 import math
 from collections import Counter
+from typing import NamedTuple
 
 from ..agents.prompts import GAME_RULES
 from ..bench.scoring import ScoringConfig
+from ..core.actions import zone_price
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, cash, cut, money, months, num, pct, signed
 from .memory import DEPARTMENTS, FleetState
+from .planning import cap_line, parks_line, planning_next, request_fix
 from .region import region_lines
 from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SITE_PURPOSES, SPEND_MONTHS, CashFlow, \
     DeptMoney, Funding, SupplyBuild, bank_keep, cash_flow, cheapest, claim_spots, dept_lists, funded_sites, \
@@ -210,7 +213,30 @@ def _map(w, role: str) -> list[str]:
     return ["## Map"] + map_lines(map_facts(w), MAYOR_MAP if role == "mayor" else MAP_PARTS)
 
 
-def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_bank: dict | None = None) -> list[str]:
+class _PlanningView(NamedTuple):
+    """What planning's Next line and Ready sites block share, from one observation per priced department."""
+    depts: dict             # dept_lists
+    funded: dict            # funded_sites
+    claims: dict            # claim_spots: each funded building's own lot
+    lists: dict             # planning's site lists with its zone strips sparing those lots (spare_funded)
+    roads: list             # its road_extension sites
+
+    @property
+    def spots(self) -> list:
+        return list(self.claims.values())
+
+
+def _planning_view(env, lists: dict) -> _PlanningView:
+    w = env.world
+    depts = dept_lists(env)                                        # one observation per priced department
+    funded = funded_sites(w, depts)
+    claims = claim_spots(funded)
+    roads = lists["road_extension"].sites if "road_extension" in lists else []
+    return _PlanningView(depts, funded, claims, spare_funded(lists, list(claims.values())), roads)
+
+
+def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_bank: dict | None = None,
+                 view: _PlanningView | None = None) -> list[str]:
     """One line per find_sites purpose (count, best site and price, or why there is none), so agents don't re-run
     find_sites for every purpose each turn. Planning's also names what funded departments are about to build
     (_leave_line; its zone strips spare those sites: spare_funded) and the first buildings blocked for lack of land
@@ -221,18 +247,17 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_b
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
         f"{w.metrics()['population']:,}): zone with density \"low\""]
-    land = []
-    if role == "planning":
-        depts = dept_lists(env)                                    # one observation per priced department
-        funded = funded_sites(w, depts)
-        claims = claim_spots(funded)
-        spots = list(claims.values())
-        roads = lists["road_extension"].sites if "road_extension" in lists else []
-        lists = spare_funded(lists, spots)
-        land = _leave_line(spots, unclaimed_spots(funded, claims)) + _land_line(env, depts, roads)
+    land, tail = [], ""
     keep = scarce_bank(w) if keep_bank is None else keep_bank
+    if role == "planning":
+        v = view or _planning_view(env, lists)
+        lists = v.lists
+        land = _leave_line(v.spots, unclaimed_spots(v.funded, v.claims)) + _land_line(env, v.depts, v.roads)
+        dense += parks_line(w, funds, {t for sp in v.spots for t in sp.tiles} | scarce_bank(w))
+        tail = (f"; zoning {money(zone_price('low'))}/tile at low density, {money(zone_price('high'))} at high "
+                "density and for I and M")
     return (["## Ready sites"] + ready_lines(role, lists, keep, prices, funds) + land + dense
-            + [f"find_sites <purpose> lists up to {MAX_SITES} with details"])
+            + [f"find_sites <purpose> lists up to {MAX_SITES} with details{tail}"])
 
 
 def _supply_state(b: SupplyBuild) -> str:
@@ -574,6 +599,27 @@ def _requests(reqs: list[OpenRequest], f, now: int) -> list[str]:
     return L
 
 
+def _planning_requests(env, reqs: list[OpenRequest], v: _PlanningView) -> list[str]:
+    """Planning's Open requests block: one line per department asking it (open_requests to planning), the longest
+    waiting first, at most REQUESTS_SHOWN: when it asked, how long it has waited, "last turn to answer" when its next
+    turn falls outside the window, what planning can do (planning.request_fix) and the request quoted. 176 requests went
+    to planning in the 120-month runs, 85 unanswered; in the late smokes all of them."""
+    w = env.world
+    groups = request_groups(reqs)
+    L = ["", "## Open requests to you (answer each: do it, or send_message where it can build or why not; one call "
+             "answers several)"]
+    for d, rs in groups[:REQUESTS_SHOWN]:
+        n = Counter(r.month for r in rs)
+        asked = ", ".join(f"m{m}" + (f" x{k}" if k > 1 else "") for m, k in n.items())
+        last = "; last turn to answer" if any(r.last for r in rs) else ""
+        fix = request_fix(env, d, v.depts, v.claims, v.roads, v.lists, " ".join(r.text for r in rs))
+        L.append(f"- {d}: {asked} (waiting {months(w.month - rs[0].month)}{last}): {fix}; "
+                 f"\"{cut(rs[-1].text, REQUEST_CHARS)}\"")
+    if len(groups) > REQUESTS_SHOWN:
+        L.append(f"- +{len(groups) - REQUESTS_SHOWN} more: " + ", ".join(d for d, _ in groups[REQUESTS_SHOWN:]))
+    return L
+
+
 def _bus_first(bus, funds: float, ask: Ask) -> str:
     """Transport's priority line while the city has no bus line and its first is ready (first_bus_line): the line
     before any avenue, and what to ask the mayor for when short (only when it would fund it: mayor_ask). The 120-month
@@ -724,14 +770,23 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
         L.append(_ask_line(ask))
     if role == "transport":
         L.append(_transport_next(env, lists, funds, ask, money_of.build))
+    view = _planning_view(env, lists) if role == "planning" else None
+    if view is not None:
+        L.append(planning_next(env, obs["city"], view.lists, view.depts, view.spots, funds, ask))
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     if role == "transport":
         L.append(_bus_riders(w))
-    L += [""] + _digest(env, fleet, role)
+    if role == "planning":
+        L += cap_line(w)
+    reqs = open_requests(env, fleet, to="planning") if view is not None else []
+    asks = _planning_requests(env, reqs, view) if reqs else []
+    # each department line of the Open requests block takes the place of a quoted message, as on the mayor's
+    cap = max(1, MAX_MESSAGES - max(0, len(asks) - 2))
+    L += [""] + _digest(env, fleet, role, {(r.month, r.dept, r.text) for r in reqs}, cap) + asks
     if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
         prices = {**prices, "road_extension": road}
     keep = bank_keep(w, supplies) if role == "utilities" else None
-    return (L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds, keep) + [""]
+    return (L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds, keep, view) + [""]
             + _memory(fleet, role))
 
 

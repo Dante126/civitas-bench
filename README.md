@@ -894,7 +894,45 @@ tasks and money, and to let people coach it.
   top-ups, 47 of 52 region turns that listed another line read "funds cover your next
   build" with $30–750 and never asked, and 156 of 240 turns did nothing. The playbooks no
   longer say "don't spend before ~1,500 residents" or "another only when buses run 90%
-  full": 122 turns past 1,500 residents still had "waiting for 1,500 residents" in memory. The mayor's `allocate_budget` identical to one that already succeeded
+  full": 122 turns past 1,500 residents still had "waiting for 1,500 residents" in memory.
+- **Planning's next step** (`fleet/planning.py`). Planning was the lowest LLM department
+  (v19 / v23 / the region run / the late smokes: 62.5–76.6) and repeated its mistakes
+  across quarters (178 recurrences in the Problems tab, the next role 33). Measured over
+  its 244 turns in those runs: no parks (1 park tile built; R demand sat at the +0.25 cap
+  for lack of parks from about month 24 to the end in every run, no home was within 4
+  tiles of a park, and developed land value was 14–19% against 44% in the scripted
+  warm-up city; land value and demand balance are its two biggest score losses);
+  utilities' riverbank lot (in 103 turns its pump or outlet waited for a bank lot by a
+  road, and planning spent 10–20 inspects a turn hunting for it: 417 in 36 turns of v23
+  seed 0, 52 turns on the step limit); zoning over budget (134 failures, 131 after the
+  turn's earlier actions spent the money, 72 recurring the next turn; the zone lines had
+  no price); requests to planning (176, 98 of them utilities' bank lots, 85 unanswered;
+  in the late smokes police's jail site and health's landfill and cemetery at the town
+  edge got no answer). So its budget block has a Next line every turn with up to three
+  builds, each priced with its exact call: the riverbank lot utilities waits for (dezone
+  a zoned bank lot, else a road that reaches free bank), a road whose far end is away
+  from homes for a blocked jail, landfill or cemetery, a park block while R demand is
+  capped for lack of parks (the 2x2 block that raises the most developed homes, shops and
+  offices, off the roadside lots), the zone type with the largest demand and fewer than
+  10 tiles waiting on the strip its Ready line shows (sized to the funds left, sparing
+  funded lots), then a road into open land:
+  `- Next: 2 park tiles by 20 homes (parks 14 of 16; R demand capped at +0.25 until 16)
+  ($300): build_park {...}; then zone 10 tiles R high density (...) ($80): zone {...};
+  then a road into open land (...) ($300): build_road {...}`. Its zone lines carry their
+  price (`zone_R: 6 sites, best (10,12)-(14,13), 10 tiles; $50`), a parks line names the
+  park tiles against one per 400 residents and the best block, Key metrics say what caps
+  demand (`- demand capped: R +0.25, C +0.25: parks 14 of 16 tiles (yours: build_park), no
+  train station or harbour (transport's)`), and an Open requests block (as the mayor's)
+  lists each department asking it, with what to do (`dezone {...}`, `leave (0,29) free,
+  the far end of road_extension ...`, or reply where or why not); the model's first
+  `end_turn` with any open is refused once. A failed dezone names the bank lot utilities
+  waits for, a road blocked by a building names a detour (`around it: build_road {...},
+  then build_road {...} ($80)`; s1 v23 sent `build_road` through the same water pump 16
+  times), and a zone leaving under $100 says what the rest pays for. At a warm-up
+  hand-over the scripted fleet's failure echoes leave the agents' memory "lessons" (the
+  late smoke's planning read "build_park: no empty land tiles there" as a lesson). None of
+  this changes what an action does: the scripted fleet plays turn for turn as before.
+  The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too
   (`refused: "duplicate"`), naming what the department now holds; other amounts pass. An
   identical take-back is a duplicate as well (`you already took $1,140 back from planning
