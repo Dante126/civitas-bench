@@ -149,6 +149,44 @@ class TrafficMixin:
         return hubs
 
     # -------------------------------------------------------------- model
+    # The pieces of _compute_traffic that don't write the world: the fleet's transit_estimate (fleet/tools.py) replays
+    # the month's trip split with them for a bus line not yet built, so both compute it the same way.
+    def _trip_origins(self, res: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+        """Commuting workers per road node (flat index): residents x the worker share, on their anchor tile."""
+        pop = max(1.0, float(res.sum()))
+        wshare = self.stats.get("workers", 0.0) / pop
+        ok = anchor >= 0
+        return np.bincount(anchor[ok].ravel(), weights=(res * wshare)[ok].ravel(), minlength=self.h * self.w)
+
+    def _gravity(self, hubs: list[dict]):
+        """(trees, D, reach, P): each hub's shortest-path tree, distances (hubs x tiles), reachability and the share of
+        each origin's trips that go to each hub (jobs x exp(-distance / COMMUTE_DECAY), normalised)."""
+        trees = [self._tree((hb["x"], hb["y"])) for hb in hubs]
+        D = np.stack([t[0].ravel() for t in trees])
+        reach = D < INF
+        A = np.array([hb["jobs"] for hb in hubs])[:, None] * np.exp(-np.where(reach, D, 0) / C.COMMUTE_DECAY) * reach
+        tot = A.sum(0)
+        P = np.divide(A, tot, out=np.zeros_like(A), where=tot > 0)
+        return trees, D, reach, P
+
+    def _split_trips(self, flows: np.ndarray, share: np.ndarray, m_share: np.ndarray, n_lines: int):
+        """(metro, metro riders, bus flows, transit, bus riders): metro takes its share of the trips up to its lines'
+        capacity, buses their share (at most 1) of the rest up to n_lines' seats; the rest drive."""
+        metro = flows * m_share
+        m_riders = float(metro.sum())
+        m_cap = C.METRO_CAPACITY * self.funding_eff("transport") * len(self.metro_lines)
+        if m_riders > m_cap > 0:
+            metro *= m_cap / m_riders
+            m_riders = m_cap
+        flows_bus = flows - metro
+        transit = flows_bus * share
+        riders = float(transit.sum())
+        cap_total = C.LINE_CAPACITY * self.funding_eff("transport") * n_lines
+        if riders > cap_total > 0:                                # full buses: the rest drive
+            transit *= cap_total / riders
+            riders = cap_total
+        return metro, m_riders, flows_bus, transit, riders
+
     def _compute_traffic(self) -> None:
         s = self.struct
         road = self.road_labels >= 0
@@ -159,40 +197,21 @@ class TrafficMixin:
         anchor = self._anchors()
         lvl = self.level
         res = self.residents_grid()
-        pop = max(1.0, float(res.sum()))
-        wshare = self.stats.get("workers", 0.0) / pop
         jobs = self._people_grid() - res
         ok = anchor >= 0
-        omass = np.bincount(anchor[ok].ravel(), weights=(res * wshare)[ok].ravel(), minlength=n_tiles)
+        omass = self._trip_origins(res, anchor)
         self.hubs = hubs = self._pick_hubs(jobs, anchor)
         load = np.zeros(n_tiles)
         riders = 0.0
         if omass.sum() <= 0 or not hubs:
             self._set_traffic(load.reshape(self.h, self.w), cap, np.zeros(n_tiles), 0.0, 0.0)
             return
-        trees = [self._tree((hb["x"], hb["y"])) for hb in hubs]
-        D = np.stack([t[0].ravel() for t in trees])              # hubs x tiles
-        reach = D < INF
-        A = np.array([hb["jobs"] for hb in hubs])[:, None] * np.exp(-np.where(reach, D, 0) / C.COMMUTE_DECAY) * reach
-        tot = A.sum(0)
-        P = np.divide(A, tot, out=np.zeros_like(A), where=tot > 0)
+        trees, D, reach, P = self._gravity(hubs)                 # D, P: hubs x tiles
         flows = omass[None, :] * P
         share, per_line = self._transit_share(hubs)               # hubs x tiles
         m_share = self._metro_share(hubs)
-        metro = flows * m_share
-        m_riders = float(metro.sum())
-        m_cap = C.METRO_CAPACITY * self.funding_eff("transport") * len(self.metro_lines)
-        if m_riders > m_cap > 0:
-            metro *= m_cap / m_riders
-            m_riders = m_cap
-        flows_bus = flows - metro
         share = np.minimum(share, 1.0)
-        transit = flows_bus * share
-        riders = float(transit.sum())
-        cap_total = C.LINE_CAPACITY * self.funding_eff("transport") * len(self.bus_lines)
-        if riders > cap_total > 0:                                # full buses: the rest drive
-            transit *= cap_total / riders
-            riders = cap_total
+        metro, m_riders, flows_bus, transit, riders = self._split_trips(flows, share, m_share, len(self.bus_lines))
         for line, ls in zip(self.bus_lines, per_line):
             line["riders"] = round(float((flows * ls).sum()) * (riders / max(1e-9, float((flows * share).sum()))), 1)
             line["capacity"] = round(C.LINE_CAPACITY * self.funding_eff("transport"))
@@ -267,12 +286,30 @@ class TrafficMixin:
     def _refresh_transit(self) -> None:
         cov = np.zeros((self.h, self.w), bool)
         for line in self.bus_lines:
-            m = np.zeros((self.h, self.w), bool)
-            for x, y in line["stops"]:
-                m |= self._disk(x, y, C.STOP_RADIUS)
+            m = self._cover(line["stops"], C.STOP_RADIUS)
             line["_cov"] = m
             cov |= m
         self.transit_cov = cov
+
+    def _cover(self, points, r: float) -> np.ndarray:
+        """Tiles within walking distance r of any of `points` (bus stops, metro stations)."""
+        m = np.zeros((self.h, self.w), bool)
+        for x, y in points:
+            m |= self._disk(x, y, r)
+        return m
+
+    def _bus_base(self) -> float:
+        """Share of covered trips that ride the bus at the fare (free transit: no fare, more riders)."""
+        free = self.policy_on("free_transit")
+        fare_f = 1.0 if free else float(np.clip(1.25 - 0.25 * self.fare, 0.3, 1.2))
+        boost = C.POLICIES["free_transit"]["ridership"] if free else 1.0
+        return min(0.8, C.TRANSIT_BASE * fare_f * boost)
+
+    @staticmethod
+    def _hub_share(hubs: list[dict], cov: np.ndarray, base: float) -> np.ndarray:
+        """hubs x tiles: `base` where a line (or metro line) covering `cov` reaches both the hub and the origin."""
+        served = np.array([bool(cov[hb["y"], hb["x"]]) for hb in hubs], float)
+        return np.outer(served, cov.ravel().astype(float)) * base
 
     def _transit_share(self, hubs: list[dict]):
         """Share of trips (origin road tile -> hub) that take the bus, overall and per line."""
@@ -281,28 +318,25 @@ class TrafficMixin:
         if not self.bus_lines:
             return share, per_line
         self._refresh_transit()
-        free = self.policy_on("free_transit")
-        fare_f = 1.0 if free else float(np.clip(1.25 - 0.25 * self.fare, 0.3, 1.2))
-        boost = C.POLICIES["free_transit"]["ridership"] if free else 1.0
-        base = min(0.8, C.TRANSIT_BASE * fare_f * boost)
+        base = self._bus_base()
         for line in self.bus_lines:
-            served = np.array([bool(line["_cov"][hb["y"], hb["x"]]) for hb in hubs], float)
-            ls = np.outer(served, line["_cov"].ravel().astype(float)) * base
+            ls = self._hub_share(hubs, line["_cov"], base)
             per_line.append(ls)
             share = np.maximum(share, ls)
         return share, per_line
 
-    def _metro_share(self, hubs: list[dict]) -> np.ndarray:
+    def _metro_cover(self, hubs: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        """(share, cover): the share of trips that take the metro (hubs x tiles) and the tiles its stations reach."""
         share = np.zeros((len(hubs), self.h * self.w))
         cov_all = np.zeros((self.h, self.w), bool)
         for line in self.metro_lines:
-            m = np.zeros((self.h, self.w), bool)
-            for x, y in line["stations"]:
-                m |= self._disk(x, y, C.METRO_RADIUS)
+            m = self._cover(line["stations"], C.METRO_RADIUS)
             cov_all |= m
-            served = np.array([bool(m[hb["y"], hb["x"]]) for hb in hubs], float)
-            share = np.maximum(share, np.outer(served, m.ravel().astype(float)) * C.METRO_BASE)
-        self.metro_cov = cov_all
+            share = np.maximum(share, self._hub_share(hubs, m, C.METRO_BASE))
+        return share, cov_all
+
+    def _metro_share(self, hubs: list[dict]) -> np.ndarray:
+        share, self.metro_cov = self._metro_cover(hubs)
         return share
 
     def _disk(self, x: int, y: int, r: float) -> np.ndarray:

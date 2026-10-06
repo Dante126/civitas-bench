@@ -28,7 +28,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
 from .tools import Ask, mayor_ask
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
-from .tools import SITE_MIN_POP, TRANSIT_GOAL, bus_seats, bus_stops, first_bus_line, site_tiles, transit_estimate
+from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -585,50 +585,62 @@ def _bus_first(bus, funds: float, ask: Ask) -> str:
             f"below; upgrade_road is refused while it would leave you short of it{lack}")
 
 
-def _transport_next(w, lists: dict, prices: dict, funds: float, ask: Ask) -> str:
-    """Transport's Next line, every turn: the build that raises its score most now, its price and the call. The first
-    bus line while the city has none (_bus_first); another one while its bus_stops list offers it (bus_room: transit
-    under TRANSIT_GOAL and the line adds riders, or full buses), with transit now and with it (transit_estimate);
-    else an avenue on the most jammed stretch, the whole stretch priced, as one upgrade_road call; else that no bus
-    line or avenue is to build, and why (a region city's links are its Region block's). What to ask the mayor for when short, only when it would fund it (mayor_ask; first_build names the
-    same build, so the amounts agree). 120-month LLM runs: 156 of 240 transport turns did nothing, 142 reasoned about
-    "1,500 residents" past 1,500 (122 with it in memory), and in the region run 47 of 52 turns that listed another
-    line with funds short of it read "funds cover your next build" ($30 avenue tiles) and never asked."""
-    if bus := first_bus_line(w, lists):
-        return _bus_first(bus, funds, ask)
+# transport's supplementary builds -> their action (the Next line's call when first_build names one as `extra`)
+STATION_ACTIONS = {"train_station": "build_train_station", "harbour": "build_harbour",
+                   "metro_station": "build_metro_station"}
 
-    def lack(cost: float) -> str:
+
+def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | None) -> str:
+    """Transport's Next line, every turn: the build first_build names (`b`, its DeptMoney.build: the one the mayor's needs line and mayor_ask
+    name, so the price and the ask amount always agree), shown with its call. The first bus line (_bus_first); another
+    one (first_build names it while its bus_stops list offers it), with transit now and with it (transit_estimate);
+    an avenue stretch, priced whole, as one upgrade_road call on the most jammed stretch; with nothing else ready, the
+    cheapest station or harbour (FirstBuild.extra) and its build call; else that nothing is to build, and why (a
+    region city's links are its Region block's). When funds are short, the ask amount when the mayor would fund it
+    (mayor_ask), else to say so in the end_turn report. 120-month LLM runs: 156 of 240 transport turns did nothing, 142
+    reasoned about "1,500 residents" past 1,500 (122 with it in memory), and in the region run 47 of 52 turns that
+    listed another line with funds short of it read "funds cover your next build" ($30 avenue tiles) and never asked."""
+    w = env.world
+    purpose = b.purposes[0] if b is not None and b.purposes else None
+    cost = (b.cost if b.cost is not None else b.extra[1]) if purpose else None
+
+    def lack() -> str:
         if not short_of(funds, cost):
             return ""
         return f"; you have {money(math.floor(funds))}" + (
             f": ask the mayor for {money(ask.amount)} (send_message)" if ask.ok and ask.amount else
-            ": the mayor can't fund it now, say so in your end_turn report")
+            ": say what you need in your end_turn report")
 
-    m = w.metrics()
-    transit = m["transit_share"]
     goal = f"your score counts transit up to {pct(100 * TRANSIT_GOAL)}"
-    if w.bus_lines and (pr := prices.get("bus_stops")):
+    if purpose == "bus_stops" and not w.bus_lines and (bus := first_bus_line(w, lists)):
+        return _bus_first(bus, funds, ask)
+    if purpose == "bus_stops":
         now, more = transit_estimate(w, bus_stops(lists["bus_stops"]))
-        return (f"- Next: another bus line ({pr.text()}): transit {pct(100 * transit)} now, about "
-                f"{pct(100 * (transit + more - now))} with it ({goal}): create_bus_line through all the bus_stops "
-                f"stops below, before any avenue{lack(pr.cost)}")
-    sites = lists["congested_roads"].sites if "congested_roads" in prices else []
-    if sites and site_tiles(w, "congested_roads", sites[0])[0]:      # streets left on it (avenues are ranked last)
-        pr, s, (tiles, units) = prices["congested_roads"], sites[0], site_tiles(w, "congested_roads", sites[0])
+        return (f"- Next: {b.named[0].label} ({money(cost)}): transit {pct(100 * now)} now, about "
+                f"{pct(100 * more)} with it ({goal}): create_bus_line through all the bus_stops stops below, before "
+                f"any avenue{lack()}")
+    if purpose == "congested_roads":
+        s = lists["congested_roads"].sites[0]
         call = json.dumps({"x1": s["x1"], "y1": s["y1"], "x2": s["x2"], "y2": s["y2"], "to": "avenue"},
                           separators=(",", ":"))
-        return (f"- Next: an avenue on the most jammed stretch, load {s.get('load_vs_capacity')}x capacity "
-                f"({money(pr.cost * units)} for {tiles} tile{'s' * (tiles != 1)}): upgrade_road {call}"
-                f"{lack(pr.cost * units)}")
+        return (f"- Next: {b.named[0].label} on the most jammed stretch, load {s.get('load_vs_capacity')}x capacity "
+                f"({money(cost)}): upgrade_road {call}{lack()}")
+    if purpose in STATION_ACTIONS:
+        s = lists[purpose].sites[0]
+        call = json.dumps({"x": s["x"], "y": s["y"]}, separators=(",", ":"))
+        return (f"- Next: {a_or_an(b.extra[0])} ({money(cost)}): {STATION_ACTIONS[purpose]} {call}"
+                + (" (a metro line needs 2 stations, then create_metro_line)" if purpose == "metro_station" else "")
+                + lack())
+    m = w.metrics()
     roads = lists["congested_roads"]
     jam = ("no road over capacity" if not roads.sites else "jammed roads are avenues already"
-           if "congested_roads" in prices else f"avenues unlock at {C.UNLOCK_POP['avenue']:,} residents")
+           if w.unlocked("avenue") else f"avenues unlock at {C.UNLOCK_POP['avenue']:,} residents")
     links = "; links to your neighbours: your Region block" if w.region_info else ""
     if not w.bus_lines and m["population"] < SITE_MIN_POP["bus_stops"]:
         return (f"- Next: no bus line or avenue to build: the first bus line comes at {SITE_MIN_POP['bus_stops']:,} "
                 f"residents (now {m['population']:,}), {jam}{links}. End your turn")
-    return (f"- Next: no bus line or avenue to build: transit {pct(100 * transit)} ({goal}), {jam}{links}. End your "
-            "turn; there is no population threshold to wait for")
+    return (f"- Next: nothing to build: transit {pct(100 * transit_estimate(w)[0])} ({goal}), {jam}{links}. End "
+            "your turn; there is no population threshold to wait for")
 
 
 def _ask_line(a: Ask) -> str:
@@ -698,7 +710,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     more = _supply_money(supplies, funds)[2]
     # whether to ask the mayor for money (mayor_ask): for the needs line's top-up (utilities: its supply line's), or
     # else say what is needed in the end_turn report; one line, the "can't pay" one when it shows
-    ask = mayor_ask(env, fleet, role)
+    money_of = DeptMoney(env, dept)          # its next build (first_build), shared by the ask and transport's Next line
+    ask = mayor_ask(env, fleet, role, money_of)
     if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
         L.append("- You can't pay for any ready site" + (" (the supply above needs " + money(more) + " more)" if more
                                                          else f" (cheapest: {' or '.join(purposes)} {low.text()})")
@@ -710,7 +723,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     else:
         L.append(_ask_line(ask))
     if role == "transport":
-        L.append(_transport_next(w, lists, prices, funds, ask))
+        L.append(_transport_next(env, lists, funds, ask, money_of.build))
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     if role == "transport":
         L.append(_bus_riders(w))

@@ -862,20 +862,25 @@ tasks and money, and to let people coach it.
   12% transport's score counts and the next line would carry at least 1% more of the
   trips (at most 4 lines). A trip rides the best line covering both its ends, so a second
   line on the same stops buys nothing; the next line's stops are today's big job centres
-  plus the home areas no stop reaches, and `transit_estimate` replays the traffic model
-  read-only to say what it adds (exactly what the next month's traffic pass gives). In
+  plus the home areas no stop reaches. `transit_estimate` runs the traffic model's own
+  trip split (bus after metro, at the fare, up to the seats) on the lines as they are now,
+  writing nothing, so a line built this turn counts at once and what a new one adds is
+  exactly what the next month's traffic pass gives. In
   the v23 120-month runs one 7-stop line from month 12–18 took transit to 15–21%, then
   the city outgrew it (4–6% by month 48, 124–196 riders of 1,500 seats) and no second
   line was offered; the rule after it (40% of residents beyond every stop) still offered
   none at 61% near a stop and 9.6% transit (region run, north, month 66), as job centres
   moved. Congested roads are listed from 1.0× capacity, as the scripted transport
   upgrades them. A failed `create_bus_line` names the suggested stops.
-- **Transport's next step.** Transport's budget block has a Next line every turn: the first
-  bus line, else another line its list offers (`Next: another bus line ($1,500): transit
-  6.6% now, about 13% with it (your score counts transit up to 12%)`), else an avenue on
-  the most jammed stretch with the whole stretch's price and its `upgrade_road` call, else
-  that nothing is to build (before 1,500 residents, how far off the first line is). Its
-  needs line (`first_build`) names the line before any avenue stretch, so the mayor reads
+- **Transport's next step.** Transport's budget block has a Next line every turn, showing
+  the build its needs line (`first_build`) names, so the Next line, the mayor's line and
+  transport's ask always agree on the build and the amount: the first bus line, else
+  another line its list offers (`Next: another bus line ($1,500): transit 6.6% now, about
+  13% with it (your score counts transit up to 12%)`), else the most jammed stretch with
+  its whole price and `upgrade_road` call, else, with nothing else ready, the cheapest
+  train station, harbour or metro station and its build call, else that nothing is to
+  build (before 1,500 residents, how far off the first line is). `first_build` names the
+  line before any avenue stretch, so the mayor reads
   `needs $1,500 for another bus line (transit 6.6%, $76/month)` and transport asks for
   it. In the 120-month LLM runs (v19, v23 and the region run, 240 transport turns) the
   cheapest site was named instead: a $30 avenue tile undercut the $1,500 line on 131 of

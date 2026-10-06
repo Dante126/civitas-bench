@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import re
+import weakref
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property, partial
@@ -28,7 +29,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.money import RESERVE_MIN, reserve, reserve_months as _reserve_months   # re-exported
 from ..core.roles import ROLES
 from ..sim import catalog as C
-from ..sim.grid import INF, box_sum, label_components, shift
+from ..sim.grid import box_sum, label_components, shift
 from ..sim.world import own_supply
 from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
@@ -1650,7 +1651,7 @@ def target_above(target: float | None, funds: float) -> bool:
     return bool(target) and target - funds >= max(GAP_MIN, GAP_SHARE * target)
 
 
-def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
+def mayor_ask(env, fleet: FleetState, dept: str, m: DeptMoney | None = None) -> Ask:
     """What `dept` can ask the mayor for now, by its DeptMoney.kind: the top-up its needs line names when it is
     first/supply or growth (the mayor funds those first, from the treasury above $3,000), or another building that
     fund_cover covers (the money above the reserve after them; never in a hold); else no ask, and why: another building
@@ -1659,8 +1660,9 @@ def mayor_ask(env, fleet: FleetState, dept: str) -> Ask:
     library ready ($1,500)"; planning's "your funds cover your road" / "no road is ready"), with _not_now's plan note,
     when to ask and what to do instead. The department's own DeptMoney decides (one observation, ~0.5 ms; its kind is
     funding_gaps' but for unclaimed first buildings, which read as their state); the whole funding_gaps (~7 ms) only
-    for another building, whose cover needs every top-up."""
-    m = DeptMoney(env, dept)
+    for another building, whose cover needs every top-up. `m`: the department's DeptMoney when the caller has one (the
+    briefing shares it with transport's Next line, so both read one first_build)."""
+    m = m or DeptMoney(env, dept)
     k, what = m.kind, _yours(m.what)
     if k in NEED_KINDS[:2]:
         return Ask(True, m.top_up, what, "the mayor funds first buildings, supply and planning's road first")
@@ -2319,6 +2321,8 @@ class FirstBuild(NamedTuple):
                                 # supply (short_supplies); else each is one way to spend `cost` (a tie)
     waits: tuple[str, ...] = () # utilities: each short supply's building with no ready site, and what it waits for
                                 # ("sewage outlet waits for a road to the river"): the mayor's needs line adds them
+    purposes: tuple[str, ...] = ()  # the find_sites purpose of each `named` building, in order; with nothing named,
+                                    # `extra`'s (transport's Next line renders the build from them: _transport_next)
 
     @property
     def what(self) -> str:
@@ -2390,9 +2394,8 @@ def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
         return (f"{len(lines)} bus lines already", f"the city has {len(lines)} bus lines; more add upkeep, not riders")
     if not lines or all(ln.get("riders", 0) >= BUS_FULL * ln.get("capacity", C.LINE_CAPACITY) for ln in lines):
         return None
-    transit = w.metrics()["transit_share"]
-    est = transit_estimate(w, [[s["x"], s["y"]] for s in sites[:C.MAX_STOPS]])
-    gain = est[1] - est[0]
+    transit, more = transit_estimate(w, [[s["x"], s["y"]] for s in sites[:C.MAX_STOPS]])
+    gain = more - transit
     if transit < TRANSIT_GOAL and gain >= BUS_GAIN:
         return None
     riders, seats = bus_seats(w)
@@ -2406,59 +2409,52 @@ def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
             f"add {pct(100 * BUS_GAIN)} of trips or more")
 
 
-def _trip_flows(w) -> tuple[np.ndarray, np.ndarray, list[dict]] | None:
-    """(flows hubs x tiles, trips per tile, hubs) of the month's commuting trips as traffic's gravity model sends them
-    (TrafficMixin._compute_traffic, read-only: World.hubs from the last tick, the shortest-path trees it caches per
-    road network); None without workers or hubs."""
-    hubs = w.hubs
-    if not hubs:
-        return None
-    res = w.residents_grid()
-    anchor = w._anchors()
-    ok = anchor >= 0
-    wshare = w.stats.get("workers", 0.0) / max(1.0, float(res.sum()))
-    omass = np.bincount(anchor[ok].ravel(), weights=(res * wshare)[ok].ravel(), minlength=w.h * w.w)
-    if omass.sum() <= 0:
-        return None
-    D = np.stack([w._tree((hb["x"], hb["y"]))[0].ravel() for hb in hubs])
-    reach = D < INF
-    A = np.array([hb["jobs"] for hb in hubs])[:, None] * np.exp(-np.where(reach, D, 0) / C.COMMUTE_DECAY) * reach
-    tot = A.sum(0)
-    P = np.divide(A, tot, out=np.zeros_like(A), where=tot > 0)
-    return omass[None, :] * P, omass, hubs
+# transit_estimate's results per world: (World.version, {(stops, the lines' stops, fare): (now, with)}), dropped when
+# the version moves (refresh() after every action, tick()). site_lists runs bus_room from every DeptMoney, so one
+# mayor turn asked for the same estimate dozens of times
+_ESTIMATES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def transit_estimate(w, stops: list[list[int]] | None = None) -> tuple[float, float]:
-    """(now, with) the bus share of trips, estimated as traffic computes it (a trip rides when one line's stops reach
-    both its home and its job centre: the share at the fare, buses full at their seats), for the city's lines and
-    with one more line through `stops` (the same with none). Metro riders are left out, so `now` can sit below the
-    month's transit_share; the difference is what the line adds. (0, 0) without trips."""
-    flows = _trip_flows(w)
-    if flows is None:
-        return 0.0, 0.0
-    flows, omass, hubs = flows
-    free = w.policy_on("free_transit")
-    fare = 1.0 if free else float(np.clip(1.25 - 0.25 * w.fare, 0.3, 1.2))
-    base = min(0.8, C.TRANSIT_BASE * fare * (C.POLICIES["free_transit"]["ridership"] if free else 1.0))
-    seats = C.LINE_CAPACITY * w.funding_eff("transport")
+    """(now, with) the transit share of trips as traffic computes it, for the city's bus and metro lines as they are
+    now and with one more bus line through `stops` (the same with none): traffic's own pieces (TrafficMixin
+    _trip_origins, _gravity, _metro_cover, _hub_share, _split_trips) on World.hubs from the last tick, writing
+    nothing. A trip rides a bus when one line's stops reach both its home and its job centre, after the metro took
+    its share, up to the lines' seats. `now` is this month's share for lines built since the tick (the transit_share
+    metric is last month's); with the same hubs and homes it is the metric exactly. (0, 0) without trips."""
+    lines = tuple(tuple(map(tuple, ln["stops"])) for ln in w.bus_lines)
+    key = (tuple(map(tuple, stops or ())), lines, w.fare)
+    version, cache = _ESTIMATES.get(w, (None, {}))
+    if version != w.version:
+        cache = {}
+        _ESTIMATES[w] = (w.version, cache)
+    if key not in cache:
+        cache[key] = _transit_estimate(w, stops)
+    return cache[key]
 
-    def disk(pts) -> np.ndarray:
-        cov = np.zeros((w.h, w.w), bool)
-        for x, y in pts:
-            cov |= w._disk(x, y, C.STOP_RADIUS)
-        return cov
+
+def _transit_estimate(w, stops: list[list[int]] | None) -> tuple[float, float]:
+    hubs = w.hubs
+    if not hubs:
+        return 0.0, 0.0
+    omass = w._trip_origins(w.residents_grid(), w._anchors())
+    if omass.sum() <= 0:
+        return 0.0, 0.0
+    flows = omass[None, :] * w._gravity(hubs)[3]
+    m_share = w._metro_cover(hubs)[0]
+    base = w._bus_base()
+    trips = float(omass.sum())
 
     def share(covs: list[np.ndarray]) -> float:
-        best = np.zeros_like(flows)
+        best = np.zeros((len(hubs), w.h * w.w))
         for cov in covs:
-            served = np.array([bool(cov[hb["y"], hb["x"]]) for hb in hubs], float)
-            best = np.maximum(best, np.outer(served, cov.ravel().astype(float)))
-        riders = min(float((flows * best).sum()) * base, seats * len(covs))
-        return riders / float(omass.sum())
+            best = np.maximum(best, w._hub_share(hubs, cov, base))
+        _, m_riders, _, _, riders = w._split_trips(flows, np.minimum(best, 1.0), m_share, len(covs))
+        return (riders + m_riders) / trips
 
-    covs = [disk(ln["stops"]) for ln in w.bus_lines]
+    covs = [w._cover(ln["stops"], C.STOP_RADIUS) for ln in w.bus_lines]
     now = share(covs)
-    return now, (share(covs + [disk(stops)]) if stops else now)
+    return now, (share(covs + [w._cover(stops, C.STOP_RADIUS)]) if stops else now)
 
 
 def bus_cover(w) -> np.ndarray:
@@ -2466,17 +2462,8 @@ def bus_cover(w) -> np.ndarray:
     recomputed only by the next tick, so it misses a line created this turn)."""
     cover = np.zeros((w.h, w.w), bool)
     for line in w.bus_lines:
-        for x, y in line["stops"]:
-            cover |= w._disk(x, y, C.STOP_RADIUS)
+        cover |= w._cover(line["stops"], C.STOP_RADIUS)
     return cover
-
-
-def bus_away(w, cover: np.ndarray | None = None) -> float:
-    """The share of residents beyond every bus stop's reach (bus_cover); 1.0 with no line, 0.0 with nobody."""
-    res = _residents(w)
-    total = float(res.sum())
-    cover = bus_cover(w) if cover is None else cover
-    return float(res[~cover].sum()) / total if total > 0 else 0.0
 
 
 def new_line_stops(w) -> list[list[int]]:
@@ -2949,7 +2936,7 @@ def first_build(env, dept: str) -> FirstBuild | None:
     # transport's next bus line, while its list offers one (bus_room: transit under TRANSIT_GOAL and the line adds
     # riders, or full buses), before any avenue stretch: the 120-month LLM runs named "$30 for an avenue tile" on 131
     # of the mayor's transport lines and another bus line on 9, transport got 0.8-3.2% of the mayor's top-ups, and
-    # transit fell to 1-3% (TRANSPORT_NEXT in briefing.py says the same to transport)
+    # transit fell to 1-3% (briefing._transport_next shows transport this same build)
     line = (("bus_stops",), prices["bus_stops"]) if dept == "transport" and "bus_stops" in prices else None
     purposes, low = cheapest(lacking) or line or cheapest(prices) or ((), None)
     if low is None and not blocked:
@@ -2957,10 +2944,12 @@ def first_build(env, dept: str) -> FirstBuild | None:
         if len(prices) == len(ready) and extra is None:
             return None
         return FirstBuild(None, (), 0.0, (), None, room=len(prices) < len(ready),
-                          extra=(extra[1].building, extra[1].cost) if extra else None)
-    named = {}
+                          extra=(extra[1].building, extra[1].cost) if extra else None,
+                          purposes=extra[0][:1] if extra else ())
+    named, which = {}, {}
     for p in purposes:
         pr, (what, have) = prices[p], labels[p]
+        which.setdefault(what, p)
         named.setdefault(what, Need(what, len(lists[p].sites[:MAX_SITES]), have,
                                     build_status(w, dept, p, pr.name) if have else "", have == 0 and pr.first,
                                     pr.upkeep))
@@ -2971,7 +2960,7 @@ def first_build(env, dept: str) -> FirstBuild | None:
     dearest = max(firsts, key=lambda t: t[0])                   # the first of the dearest, as max() reads them
     shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
     return FirstBuild(low.cost if low else None, tuple(named.values()), dearest[0], shut, _funded_of(w, dept, lists),
-                      keep_for=dearest[1])
+                      keep_for=dearest[1], purposes=tuple(which[k] for k in named))
 
 
 def _supply_build(w, lists: dict[str, SiteList], firsts: list[tuple[float, str]], label) -> FirstBuild | None:
