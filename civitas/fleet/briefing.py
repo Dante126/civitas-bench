@@ -667,6 +667,41 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
             "your turn; there is no population threshold to wait for")
 
 
+NEXT_ROLES = ("planning", "transport")      # the roles with a Next line (refreshed in their action results)
+NEXT_REFRESH_ITEMS = 2                      # builds a refreshed Next line names (the briefing's: planning's NEXT_ITEMS)
+NOTHING_LEFT = ("nothing to build", "no bus line or avenue to build")   # Next lines that name no build
+
+
+def next_line(env, role: str, most: int = NEXT_REFRESH_ITEMS) -> str:
+    """`role`'s Next line on the world as it is now, as _department builds it (the same site lists, funds, DeptMoney
+    and mayor_ask; planning's view), with at most `most` of planning's builds; "" for a role without one. ToolBox
+    puts it, shortened (next_clause), after each successful action of a model planning or transport agent: the late
+    smokes' planning re-sent its briefing's Next-line calls after doing them, 15 calls later."""
+    if role not in NEXT_ROLES:
+        return ""
+    w = env.world
+    fleet = FleetState.of(env)
+    funds = w.dept_funds[ROLES[role]["budget"]]
+    obs = role_obs(env, role)
+    lists = site_lists(w, role, obs)
+    money_of = DeptMoney(env, ROLES[role]["budget"])
+    ask = mayor_ask(env, fleet, role, money_of)
+    if role == "transport":
+        return _transport_next(env, lists, funds, ask, money_of.build)
+    return planning_next(env, obs["city"], planning_view(env, lists, funds), funds, ask, most)
+
+
+def next_clause(line: str) -> str:
+    """A Next line as the clause a tool result ends with: " | next: <its builds and calls>", or " | next: nothing
+    left: end_turn" when it names no build; "" for no line."""
+    if not line:
+        return ""
+    text = line.removeprefix("- ").removeprefix("Next: ")
+    if text.startswith(NOTHING_LEFT):
+        return " | next: nothing left: end_turn"
+    return f" | next: {text}"
+
+
 def _ask_line(a: Ask) -> str:
     """A department's Your budget line on asking the mayor for money (mayor_ask): "- ask the mayor for $2,500 for your
     first police station (send_message, with a reason): the mayor funds first buildings, supply and planning's road

@@ -426,8 +426,9 @@ def planning_view(env, lists: dict[str, SiteList], funds: float) -> View:
     return View(depts, funded, claims, spared, roads, blocked, avoid, bank, away, parks(w), park_site(w, left, avoid))
 
 
-def planning_next(env, city: dict, v: View, funds: float, ask) -> str:
-    """Planning's Next line, every turn: up to NEXT_ITEMS builds that raise its score most now, in this order, each
+def planning_next(env, city: dict, v: View, funds: float, ask, most: int = NEXT_ITEMS) -> str:
+    """Planning's Next line, every turn: up to `most` (NEXT_ITEMS; a refreshed Next line in a tool result, 2:
+    briefing.next_line) builds that raise its score most now, in this order, each
     priced with its exact call: the riverbank lot utilities' blocked pump or outlet waits for (bank_item); a road
     leaving a lot away from homes for a blocked jail, landfill or cemetery (away_item); parks while R demand is capped
     for lack of them, or soon will be (the view's park, the parks line's); the zone type demand asks for most
@@ -461,7 +462,7 @@ def planning_next(env, city: dict, v: View, funds: float, ask) -> str:
         dem = ", ".join(f"{k} {w.demand.get(k, 0.0):+.2f}" for k in ZONE_LETTERS)
         return (f"- Next: nothing to build now (demand {dem}; no type with demand has a free strip and fewer than "
                 f"{WAITING_MAX} zoned tiles waiting; parks {p.have} of {p.want}). End your turn")
-    shown = items[:NEXT_ITEMS]
+    shown = items[:most]
     text = lambda i: f"{i.text} ({money(i.cost) if i.cost else 'free'}): {i.call}"
     line = "- Next: " + text(shown[0]) + "".join(f"; then {text(i)}" for i in shown[1:])
     if short_of(funds, total := sum(i.cost for i in shown)):

@@ -3222,12 +3222,15 @@ class Took(NamedTuple):
 
 
 class ToolBox:
-    def __init__(self, env, role: str, branch_dezone: bool = False, max_steps: int | None = None):
+    def __init__(self, env, role: str, branch_dezone: bool = False, max_steps: int | None = None,
+                 next_line: bool = False):
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
         self.env, self.role = env, role
         self.world = env.world
         self.branch_dezone = branch_dezone                # planning's branch road dezones its empty lots (_branch_clear)
+        self.next_line = next_line                        # a successful action's result ends with the role's refreshed
+                                                          # Next line (_next_refresh; ToolAgent only)
         self.max_steps = max_steps                        # the turn's tool-call limit (ToolAgent only): the mayor's
         self.reminded = False                             # end_turn reminder of open requests, once a turn (end_turn)
         self.held_ask = False                             # a department's money ask held back, once a turn
@@ -3488,7 +3491,10 @@ class ToolBox:
         else:
             done, fix = self._done_note(name, args), self._explain(name, args, res["message"])
             note = done + (f"; {fix.removeprefix(' - ')}" if done and fix else fix)
-        out = {"ok": res["ok"], "message": cleared + res["message"] + note, "cost": res["cost"],
+        message = cleared + res["message"] + note
+        if res["ok"] and self.next_line:
+            message += self._next_refresh(len(message))
+        out = {"ok": res["ok"], "message": message, "cost": res["cost"],
                "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
         if override:
             out["override"] = override
@@ -3960,6 +3966,27 @@ class ToolBox:
                     f" (dezone {where} to leave one)" if where and where not in prior else "")
             return (" WARNING: that zoned the last lot a new road could branch from; leave one free"
                     + (f", e.g. dezone {where}" if where else ""))
+        except Exception:
+            return ""
+
+    def _next_refresh(self, used: int) -> str:
+        """For a successful action of planning or transport (ToolBox(next_line=True): the model's toolbox only): the
+        role's Next line recomputed on the world as it is now (briefing.next_line, at most NEXT_REFRESH_ITEMS builds,
+        the funds-short ask as the line words it), as " | next: ..." or " | next: nothing left: end_turn" (or that
+        the turn's successful-action cap is reached: end_turn), cut to what
+        RESULT_CHARS leaves after the `used` characters of the message; "" for other roles or on any error. The late
+        smokes: planning did its briefing's Next-line calls first, then sent them again word for word 6-15 calls
+        later, reading the briefing's stale line (_done_note)."""
+        try:
+            from .briefing import next_clause, next_line      # briefing imports this module
+            cap = self.env.cfg.max_actions_per_turn
+            if self.role in ("planning", "transport") and sum(r["ok"] for r in self.executed) >= cap:
+                return f" | next: action limit reached ({cap} successful actions this turn): end_turn"
+            clause = next_clause(next_line(self.env, self.role))
+            room = RESULT_CHARS - used
+            if len(clause) <= room:
+                return clause
+            return "" if room < len(" | next: ") + 20 else " " + cut(clause, room - 1)
         except Exception:
             return ""
 

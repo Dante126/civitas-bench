@@ -371,6 +371,11 @@ def _check_planning_calls(env, label: str) -> int:
     lines = text.splitlines()
     nxt = [ln for ln in lines if ln.startswith("- Next: ")]
     assert len(nxt) == 1, (label, nxt)
+    from civitas.fleet.briefing import next_line
+    from civitas.fleet.planning import NEXT_ITEMS
+    assert next_line(env, "planning", NEXT_ITEMS) == nxt[0]          # what action results refresh is the same line
+    tnext = [ln for ln in briefing(env, "transport", mark=False).splitlines() if ln.startswith("- Next: ")]
+    assert [next_line(env, "transport")] == tnext or not tnext, (label, tnext)
     short = "; you have $" in nxt[0]
     money_fail = lambda r: "budget only has" in r.message
     w, n = copy.deepcopy(env.world), 0
@@ -435,3 +440,58 @@ def test_a_repeat_of_a_call_done_this_turn_says_it_is_done():
     assert box.executed[-1]["message"] == "no empty land tiles in that area"              # the log keeps the core text
     other = box.call("build_park", {"x1": 3, "y1": 20, "x2": 3, "y2": 20})                  # not the same call
     assert "this exact call" not in other["message"] and "your park at call 1" in other["message"], other
+
+
+# ------------------------------------------------------------------ the refreshed Next line in action results
+ROAD = 'build_road {"x1":19,"y1":24,"x2":34,"y2":24}'
+ZONE_R = {"zone": "R", "density": "low", "x1": 0, "y1": 25, "x2": 19, "y2": 26}
+
+
+def test_a_successful_action_ends_with_the_next_line_as_it_is_now():
+    """The late smokes: planning did its briefing's Next-line calls first and re-sent them word for word 6-15 calls
+    later from the stale briefing. Now each successful action's result (the model's toolbox) ends with the Next line
+    recomputed after it: the next item, not the one just done."""
+    from civitas.fleet.briefing import next_clause, next_line
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 1000
+    line = next_line(env, "planning")
+    assert line.startswith("- Next: a road into open land") and ROAD in line, line        # the road, then zone R
+    assert 'zone {"zone":"R","density":"low","x1":0,"y1":25,"x2":19,"y2":26}' in line, line
+    box = ToolBox(env, "planning", next_line=True)
+    res = box.call("zone", ZONE_R)
+    head, nxt = res["message"].split(" | next: ")
+    assert res["ok"] and head == "zoned 40 tiles R (low density)", res
+    assert nxt.startswith("a road into open land") and ROAD in nxt and '"zone":"R"' not in nxt, nxt
+    assert " | next: " + nxt == next_clause(next_line(env, "planning"))
+    assert box.executed[-1]["message"] == "zoned 40 tiles R (low density)"               # the log keeps the plain text
+    res = box.call("build_road", {"x1": 19, "y1": 24, "x2": 34, "y2": 24})
+    assert res["ok"] and ROAD not in res["message"].split(" | next: ")[1], res
+    assert res["message"].count("; then ") <= 1                                           # at most 2 builds
+    plain = ToolBox(env, "planning").call("zone", {**ZONE_R, "y1": 22, "y2": 23})         # the scripted fleet's: none
+    assert plain["ok"] and " | next: " not in plain["message"], plain
+
+
+def test_the_refreshed_next_line_says_when_funds_are_short_and_when_nothing_is_left():
+    env = _env()
+    w = env.world
+    w.dept_funds["planning"] = 300
+    res = ToolBox(env, "planning", next_line=True).call("zone", ZONE_R)                  # $200: $100 left, road $300
+    assert res["ok"] and res["message"].split(" | next: ")[1].startswith("a road into open land"), res
+    assert "; you have $100" in res["message"], res
+    env = _env()
+    env.world.dept_funds["planning"] = 1000
+    env.world.demand = {k: -0.5 for k in env.world.demand}                               # no zone has demand
+    box = ToolBox(env, "planning", next_line=True)
+    res = box.call("build_road", {"x1": 19, "y1": 24, "x2": 34, "y2": 24})               # the riverbank road: done
+    assert res["ok"] and res["message"].endswith(" | next: nothing left: end_turn"), res
+    res = ToolBox(env, "transport", next_line=True).call("set_fare", {"fare": 2})         # transport's, before buses
+    assert res["message"] == "bus fare set to $2.00 | next: nothing left: end_turn", res
+
+
+def test_the_refreshed_next_line_stops_at_the_action_cap():
+    env = _env()
+    env.world.dept_funds["planning"] = 1000
+    env.cfg.max_actions_per_turn = 1
+    res = ToolBox(env, "planning", next_line=True).call("zone", ZONE_R)
+    assert res["message"].endswith(" | next: action limit reached (1 successful actions this turn): end_turn"), res

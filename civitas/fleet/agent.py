@@ -178,8 +178,9 @@ class ToolAgent(Agent):
             raise RuntimeError("ToolAgent.act before bind(env)")
         env, role, cfg = self.env, self.role, self.cfg
         try:
-            # the scripted fleet runs its own dezones and gets no end_turn reminder of open requests
-            box = ToolBox(env, role, branch_dezone=True, max_steps=cfg.max_steps)
+            # the scripted fleet runs its own dezones and gets no end_turn reminder of open requests, nor refreshed
+            # Next lines in its action results
+            box = ToolBox(env, role, branch_dezone=True, max_steps=cfg.max_steps, next_line=True)
             messages = [{"role": "system", "content": self.system},
                         {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
             tools = box.schemas()

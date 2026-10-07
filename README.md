@@ -885,7 +885,9 @@ tasks and money, and to let people coach it.
   13% with it (your score counts transit up to 12%)`), else the most jammed stretch with
   its whole price and `upgrade_road` call, else, with nothing else ready, the cheapest
   train station, harbour or metro station and its build call, else that nothing is to
-  build (before 1,500 residents, how far off the first line is). `first_build` names the
+  build (before 1,500 residents, how far off the first line is). Each successful action
+  of a model transport agent ends with this line recomputed (`| next: ...`, or `| next:
+  nothing left: end_turn`; see Planning's next step). `first_build` names the
   line before any avenue stretch, so the mayor reads
   `needs $1,500 for another bus line (transit 6.6%, $76/month)` and transport asks for
   it. In the 120-month LLM runs (v19, v23 and the region run, 240 transport turns) the
@@ -933,7 +935,16 @@ tasks and money, and to let people coach it.
   times), and a zone leaving under $100 says what the rest pays for. At a warm-up
   hand-over the memory the scripted fleet wrote is emptied (the late smoke's planning read
   "build_park: no empty land tiles there" as a lesson, and its "asked mayor: ..." open tasks
-  were requests the new agent never sent). None of
+  were requests the new agent never sent). Each successful action of a model planning or
+  transport agent ends with its Next line recomputed on the world as it is now, at most two
+  builds and the funds-short ask as the line words it (`zoned 8 tiles C (high density) |
+  next: a road into open land (...) ($350): build_road {...}`, `| next: nothing left:
+  end_turn`, or that the turn's action cap is reached); about 15 ms an action on the
+  seed-1 month-96 city. The late smokes' failed Next-line calls (s1 month 96, s0 month
+  102) had all succeeded at the turn's first calls: 6-15 calls later the model re-read its
+  briefing and sent them again word for word. A failed action that repeats one that
+  succeeded this turn now says it is done and that the briefing predates it, and a
+  `build_park` on taken land names what holds it and the best park block now. None of
   this changes what an action does: the scripted fleet plays turn for turn as before.
   The mayor's `allocate_budget` identical to one that already succeeded
   this turn (same department and amount; allocations add up) is refused too
@@ -1271,8 +1282,9 @@ After planning's Next line, parks and Open requests block (233c529), the same tw
 (`runs/20261006-174455_fleet_smoke_late_s0_940` and `..._s1_941`): seed 0 city +4.2 (was +2.3),
 population +3,524 (was +2,064), planning 62.9 -> 68.8; seed 1 city +5.6 (was +3.7), population +2,972
 (was +1,876), teamwork 73.7 (was 44.1). Planning built 4 and 2 park blocks (the long runs: 1 park tile
-in 244 planning turns). Some of the Next line's own calls still failed "no empty land tiles" (being
-fixed).
+in 244 planning turns). Some of the Next line's own calls still failed "no empty land tiles": each
+had succeeded earlier in the turn and was re-sent from the briefing, so action results now carry a
+refreshed Next line and repeats say they are done (Planning's next step).
 
 **Config.**
 
