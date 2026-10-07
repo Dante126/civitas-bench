@@ -1267,6 +1267,13 @@ south 55.7. It made the first deal offer by an LLM mayor: south, short of water,
 right call (`"sell": false`, buy 20 from north) but left `sell` out, the default made it an offer
 to sell, and north rightly let it expire. `offer_deal` now requires `sell` (64d9ef2).
 
+After planning's Next line, parks and Open requests block (233c529), the same two late smokes
+(`runs/20261006-174455_fleet_smoke_late_s0_940` and `..._s1_941`): seed 0 city +4.2 (was +2.3),
+population +3,524 (was +2,064), planning 62.9 -> 68.8; seed 1 city +5.6 (was +3.7), population +2,972
+(was +1,876), teamwork 73.7 (was 44.1). Planning built 4 and 2 park blocks (the long runs: 1 park tile
+in 244 planning turns). Some of the Next line's own calls still failed "no empty land tiles" (being
+fixed).
+
 **Config.**
 
 ```toml
