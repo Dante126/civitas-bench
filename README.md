@@ -535,6 +535,36 @@ tasks and money, and to let people coach it.
     - `needs $2,500 for another police station (coverage 74%, $55/month)` once it has one.
       Clinics, landfills, schools and high schools show their coverage too, and bus lines
       the transit share.
+    - **Keeping up with coverage.** When that coverage fell over the last quarters it reads
+      `coverage falling: 94 -> 86 -> 81%` (3 months apart). Under 90% (`KEEP_UP_GOAL`)
+      the line estimates what more buildings bring: the sim's own coverage computed with
+      buildings placed at the department's ready sites, picked greedily where each adds
+      the most (`tools.keep_up`, written nothing to the world), stopping at 90%, at 4, or
+      when the next adds under 1 point. A department short by more than one building
+      names them all when the money covers them (`keep_up_counts`: first what its own
+      funds pay for, then one more at a time in turn order while the treasury above the
+      reserve plus idle money still covers every other top-up; a hold keeps the
+      one-building line): `needs $5,000 for 2 more police stations (coverage falling:
+      75 -> 29%, ~75% with them, $110/month)`, the to-fund line `police $5,000 (2
+      buildings)`, the department's ask and money notes the same count, and its Your
+      budget line where and to build all of them this turn (`- keep up with growth: 2
+      more police stations at (22,30) and (20,27) (...): build both this turn: your funds
+      cover them ($5,000)`), naming the Ready line's best site when another adds more.
+      With one building it still names the site that adds the most. When no ready site
+      adds coverage, the line says where the uncovered homes are and how much is lost
+      downtown, where tier 1 covers 60% at most (`ready sites add under 1%: the uncovered
+      homes near (39,26) are out of their road reach; 7 points are lost downtown (level
+      4-5), ...: upgrade_facility to tier 2`), and the department is told to ask planning
+      for a lot or road there instead. Late smoke 20261007 seed 2 (the LLM fleet from
+      month 96, act_every 3): population grew 30% in a year while fire coverage went 94 ->
+      86 -> 81 -> 78% with $35–39k above the reserve. Replaying its tool calls showed
+      why: at month 99 fire and police built at their Ready lines' best site by need,
+      (37,23) and (36,23), which served one building (load 1 of 260) while (36,30) would
+      have taken each from 86–87% to ~92%; by month 102 no ready site reached the homes
+      without cover (another road), and 7 of the 19 missing points were downtown. The
+      guards and the scripted fleet don't change: one more building is still "another",
+      and what a department keeps for a take-back doesn't move (`fleet_scripted` stays
+      68.8 ± 2.0 / 7,341; the estimates add about 0.9 s an episode).
     - The last figure is the building's monthly upkeep at the department's funding level
       (the tier's or off-tier spec's, read when shown, so balance overrides reach it; a bus
       line with the 2 stops it needs at least). Every building adds it for good. In the 120-month run, service upkeep was a median 34% of
