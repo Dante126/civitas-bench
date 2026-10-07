@@ -150,15 +150,45 @@ def test_the_next_line_puts_parks_first_while_r_demand_is_capped_for_lack_of_the
     env = _boxed_in()
     w = env.world
     lists, city = _lists(env), role_obs(env, "planning")["city"]
-    nxt = lambda: P.planning_next(env, city, lists, {}, [], 1000, _no_ask())
+
+    def nxt(funds=1000, ask=None):
+        v = P.planning_view(env, lists, funds)
+        return v, P.planning_next(env, city, v, funds, ask or _no_ask())
     monkeypatch.setattr(P, "parks", lambda w: P.Parks(2, 10, 10, True, False))
-    line = nxt()
-    assert line.startswith("- Next: 4 park tiles by ") and "R demand capped at +0.25 until 10" in line, line
+    v, line = nxt()
+    assert "4 park tiles by " in line and "R demand capped at +0.25 until 10" in line, line
+    park, = P.parks_line(v.parks, v.park)                        # one park choice for the parks line and the Next line
+    assert park.endswith(P.call("build_park", v.park.args())) and P.call("build_park", v.park.args()) in line
+    v, line = nxt(funds=200)                                     # sized to the funds, the same call on both
+    assert v.park.tiles == 1 and P.call("build_park", v.park.args()) in line
+    assert P.parks_line(v.parks, v.park)[0].endswith(P.call("build_park", v.park.args()))
+    v, line = nxt(funds=0)                                       # short: report it, or ask what the items lack
+    assert line.endswith("; you have $0: say what you need in your end_turn report"), line
+    from civitas.fleet.tools import Ask
+    v, line = nxt(funds=0, ask=Ask(True, 600, "a road", "", "", "", ""))
+    total = sum(int(c) for c in __import__("re").findall(r"\(\$(\d+)\): ", line))
+    assert line.endswith(f"; you have $0: ask the mayor for ${total:,} for these (send_message)") and total != 600, line
     monkeypatch.setattr(P, "parks", lambda w: P.Parks(10, 10, 10, False, False))   # enough parks: none named
-    assert "park" not in nxt()
+    assert "park" not in nxt()[1]
     w.stats["demand_caps"] = {"R": 0.25}
     monkeypatch.setattr(P, "parks", lambda w: P.Parks(2, 10, 10, True, False))
     assert P.cap_line(w) == ["- demand capped: R +0.25: parks 2 of 10 tiles (yours: build_park)"]
+
+
+def test_the_parks_cap_is_the_worlds_own():
+    """Planning reads World.parks_capped / leisure_tiles, the helpers demand_caps uses, on the sim's population."""
+    from civitas.fleet import planning as P
+    env = _boxed_in()
+    w = env.world
+    for pop, parks in ((1999, 0), (2000, 4), (2000, 5), (4001, 10), (4001, 11)):
+        w.stats["population"] = float(pop)
+        w.struct[w.struct == C.PARK] = C.NONE
+        free = list(zip(*((w.struct == C.NONE) & (w.terrain == C.LAND)).nonzero()))[:parks]
+        for y, x in free:
+            w.struct[y, x] = C.PARK
+        assert w.leisure_tiles() == parks
+        assert P.parks(w).capped == w.parks_capped() == (w.demand_caps()["R"] < 1), (pop, parks)
+        assert P.parks(w).by_pop == -(-pop // 400)
 
 
 def test_the_next_line_zones_the_largest_demand_with_room_on_its_strip_within_the_funds():
@@ -166,27 +196,33 @@ def test_the_next_line_zones_the_largest_demand_with_room_on_its_strip_within_th
     from civitas.fleet import planning as P
     env = _env()
     w = env.world
-    strips = P.strips_shown(_lists(env))
-    assert set(strips) == {"zone_R", "zone_C"}                  # zone_I has no strip of its own (one type per strip)
-    w.demand.update(R=0.3, C=0.6, I=0.9, O=-0.2)
+    lists = _lists(env)
+    assert set(P.strips_shown(lists)) == {"zone_R", "zone_C"}   # zone_I has no strip of its own (one type per strip)
+    w.demand.update(R=0.3, C=0.6, I=0.9, O=0.95)
     city = {"zoned_tiles": {"R": 0, "C": 0}, "developed_tiles": {}}
-    item, blocked = P.zone_item(w, city, strips, 1000)
+    item, blocked = P.zone_item(w, city, lists, 1000)
     assert blocked == ["I"] and item.call.startswith('zone {"zone":"C","density":"low","x1":0,"y1":22'), item
+    assert lists["zone_O"].short.startswith("locked")            # offices locked: neither zoned nor "no free strip"
     assert item.cost == 34 * 5 and "demand +0.60, 0 zoned tiles waiting" in item.text
     city["zoned_tiles"]["C"] = 12                                # 10+ waiting: the next type
-    item, _ = P.zone_item(w, city, strips, 1000)
+    item, _ = P.zone_item(w, city, lists, 1000)
     assert '"zone":"R"' in item.call
-    item, _ = P.zone_item(w, city, strips, 23)                    # sized to the funds
+    item, _ = P.zone_item(w, city, lists, 23)                    # sized to the funds
     assert item.cost <= 23 and item.text.startswith("zone 4 tiles R"), item
     keep = {(x, 25) for x in range(0, 20)}
-    item, _ = P.zone_item(w, city, strips, 1000, avoid=keep)      # sparing funded lots: the other row only
+    item, _ = P.zone_item(w, city, lists, 1000, avoid=keep)      # sparing funded lots: the other row only
     assert '"y1":26,' in item.call and '"y2":26}' in item.call, item
+    city["zoned_tiles"]["C"] = 0                                 # C's whole strip spared: R next, C has no strip
+    spared = {(x, y) for x in range(0, 17) for y in (22, 23)}
+    item, blocked = P.zone_item(w, city, lists, 1000, avoid=spared)
+    assert '"zone":"R"' in item.call and blocked == ["C", "I"], (item, blocked)
     w.demand.update(R=-0.1, C=-0.1, I=-0.1)
-    assert P.zone_item(w, city, strips, 1000) == (None, [])
+    assert P.zone_item(w, city, lists, 1000) == (None, [])       # O locked: no road "for O" either
 
 
 def test_the_next_line_frees_the_riverbank_lot_utilities_waits_for():
-    """v23 seed 0: utilities' outlet waited for a bank lot in 36 of planning's 40 turns; planning inspected 417 times."""
+    """v23 seed 0: utilities' outlet waited for a bank lot in 36 of planning's 40 turns; planning inspected 417
+    times."""
     from civitas.fleet import planning as P
     from civitas.fleet.briefing import briefing
     from civitas.fleet.tools import dept_lists
@@ -271,8 +307,9 @@ def test_a_zone_that_leaves_planning_nearly_broke_says_what_the_rest_pays_for():
     assert res["message"] == "zoned 2 tiles R (low density)"
 
 
-def test_the_hand_over_from_the_scripted_fleet_clears_its_failure_lessons():
-    """Late smoke, month 96: planning's memory read "lessons: ... build_park: no empty land tiles there"."""
+def test_the_hand_over_from_the_scripted_fleet_clears_its_memory():
+    """Late smoke, month 96: planning's memory read "lessons: ... build_park: no empty land tiles there", and the
+    scripted fleet's "asked mayor: ..." open tasks are requests the new agent never sent."""
     from types import SimpleNamespace
     from civitas.bench.runner import settle_fleet
     from civitas.fleet.config import FleetAgentConfig
@@ -285,8 +322,24 @@ def test_the_hand_over_from_the_scripted_fleet_clears_its_failure_lessons():
     agent = SimpleNamespace(kind="fleet", role="planning", env=env)
     scripted = ScriptedFleetAgent("planning", cfg=FleetAgentConfig(model="scripted"))
     settle_fleet({"planning": agent}, {"planning": scripted})
-    assert fleet.memory["planning"]["lessons"] == [] and fleet.memory["planning"]["open_tasks"] == ["asked mayor"]
+    assert fleet.memory["planning"] == {"commitments": [], "open_tasks": [], "lessons": []}
     assert fleet.memory["police"]["lessons"] == ["kept"]
     fleet.update_memory("planning", lessons=["mine"])
     settle_fleet({"planning": agent}, {"planning": agent})        # played as configured: its own memory stays
     assert fleet.memory["planning"]["lessons"] == ["mine"]
+
+
+def test_failed_dezones_read_the_departments_lists_once_until_an_action_succeeds(monkeypatch):
+    import civitas.fleet.tools as T
+    env = _boxed_in()
+    calls = []
+    real = T.dept_lists
+    monkeypatch.setattr(T, "dept_lists", lambda e: calls.append(1) or real(e))
+    box = ToolBox(env, "planning")
+    for x in (3, 4):
+        res = box.call("dezone", {"x1": x, "y1": 3, "x2": x, "y2": 3})
+        assert "the riverbank lot utilities waits for" in res["message"], res
+    assert len(calls) == 1
+    assert box.call("dezone", {"x1": 26, "y1": 25, "x2": 26, "y2": 25})["ok"]     # a success: read afresh
+    box.call("dezone", {"x1": 5, "y1": 3, "x2": 5, "y2": 3})
+    assert len(calls) == 2
