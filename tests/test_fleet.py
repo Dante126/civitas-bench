@@ -2279,8 +2279,10 @@ def test_road_through_empty_zoned_lots_says_to_dezone_them_first():
     assert box.call("build_road", row)["ok"]
     res = box.call("build_road", row)
     assert res["ok"] is False and res["message"] == (
-        "every tile on that line is already road - the road line y=24 x 0-28 is already built (you built y=24 x 19-28 "
-        "at call 1 this turn); branch off it into free land (find_sites road_extension)"), res
+        "every tile on that line is already road - this exact call succeeded at call 1 this turn: it is done (your "
+        "briefing's Next line and Ready sites were written before it); go on to the next item, or end_turn; the road "
+        "line y=24 x 0-28 is already built (you built y=24 x 19-28 at call 1 this turn); branch off it into free land "
+        "(find_sites road_extension)"), res
     assert box.call("zone", {"zone": "R", "x1": 19, "y1": 21, "x2": 28, "y2": 23})["ok"]
     core = "tile (19,23) is occupied by residential; bulldoze it or route around"
     road = {"x1": 19, "y1": 24, "x2": 19, "y2": 20}
@@ -2564,7 +2566,9 @@ def test_rebuilding_its_own_new_road_names_the_call():
                               "y=24 x 19-40 at call 1 and x=35 y 15-23 at call 2 this turn); branch off them" + tail), res
     assert box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})["ok"]                # call 7: a 1-tile stub
     res = box.call("build_road", {"x1": 7, "y1": 25, "x2": 7, "y2": 25})
-    assert res["message"] == (f"{core} - you built (7,25) at call 7 this turn; highway-connected roads: x 0-40, y "
+    assert res["message"] == (f"{core} - this exact call succeeded at call 7 this turn: it is done (your briefing's "
+                              "Next line and Ready sites were written before it); go on to the next item, or "
+                              "end_turn; you built (7,25) at call 7 this turn; highway-connected roads: x 0-40, y "
                               "15-25, 51 tiles; start on the road and run" + tail), res
     box = ToolBox(env, "planning")                                                              # a new turn: not its own
     res = box.call("build_road", {"x1": 0, "y1": 24, "x2": 19, "y2": 24})

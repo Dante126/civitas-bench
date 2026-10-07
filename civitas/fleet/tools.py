@@ -3486,7 +3486,8 @@ class ToolBox:
             note += self._branch_warning(ways, before, prior) if ways is not None else ""
             note += self._zone_left() if name == "zone" and self.role == "planning" else ""   # when nearly spent
         else:
-            note = self._explain(name, args, res["message"])
+            done, fix = self._done_note(name, args), self._explain(name, args, res["message"])
+            note = done + (f"; {fix.removeprefix(' - ')}" if done and fix else fix)
         out = {"ok": res["ok"], "message": cleared + res["message"] + note, "cost": res["cost"],
                "budget_left": round(w.dept_funds[dept] if dept else w.treasury, 2)}
         if override:
@@ -3962,6 +3963,18 @@ class ToolBox:
         except Exception:
             return ""
 
+    def _done_note(self, name: str, args: dict) -> str:
+        """For a failed action that repeats, word for word, one that succeeded earlier this turn: that it is done, and
+        that the briefing (its Next line, Ready sites) predates it; "" otherwise. The late smokes: planning ran its Next
+        line's build_park and zone (s0 month 102) or zone (s1 month 96) at its first calls, then, re-reading the
+        briefing many calls later, sent them again word for word ("no empty land tiles there"), and once more
+        (refused "repeat"). The calls were valid when the briefing showed them; nothing said they were done."""
+        done = next((t for t in reversed(self.took) if t.action == name and t.args == args), None)
+        if done is None:
+            return ""
+        return (f" - this exact call succeeded at call {done.call} this turn: it is done (your briefing's Next line "
+                "and Ready sites were written before it); go on to the next item, or end_turn")
+
     def _explain(self, name: str, args: dict, message: str) -> str:
         """How to fix a failed build_road, zone or dezone, appended to the core message in the tool result (v8, seed 0
         month 0: planning zoned row 23, then ran four roads north through those lots, still empty, told only
@@ -3996,6 +4009,8 @@ class ToolBox:
             return (f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
                     + (f"; zone beside it instead: {' or '.join(beside)}" if beside else "")
                     + (self._bank_hint() if name == "dezone" else ""))
+        if name == "build_park" and message == "no empty land tiles there":
+            return self._park_hint(args)
         if name != "build_road":
             if name == "create_bus_line":          # the suggested stops as one call (the LLM runs: lines of 1-2 stops)
                 return self._stops_hint(message)
@@ -4056,6 +4071,25 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _park_hint(self, args: dict) -> str:
+        """For a build_park with no empty land in its rectangle: what the rectangle holds, this turn's own parks there
+        ("your park at call 1"), and the best park block now (planning's park_site, sparing funded sites and scarce
+        riverbank lots as the parks line does, sized to the funds) with its call; "" on any error. s0 month 102: a
+        build_park on the park it had built at call 1 was told only "no empty land tiles there"."""
+        try:
+            from .planning import call as as_call, park_site     # planning imports this module
+            w, tiles = self.world, _rect(self.world, args)
+            mine = [t.call for t in self.took if t.action == "build_park" and t.tiles & set(tiles)]
+            own = f"; your park{'s' * (len(mine) > 1)} at call{'s' * (len(mine) > 1)} {_and([str(c) for c in mine])}" \
+                if mine else ""
+            avoid = {t for sp in self._funded_spots() for t in sp.tiles} | scarce_bank(w)
+            site = park_site(w, w.dept_funds["planning"], avoid)
+            best = (f"; the best park block now: {as_call('build_park', site.args())} ({money(site.cost)})"
+                    if site is not None else "")
+            return f" - {_contents(w, tiles)}{own}{best}"
+        except Exception:
+            return ""
 
     def _bank_hint(self) -> str:
         """For planning's failed dezone: the riverbank lot utilities waits for, when it waits for one (planning's
