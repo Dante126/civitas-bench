@@ -3,6 +3,8 @@ empty lots in one call."""
 import json
 import re
 
+import pytest
+
 from civitas.core.env import CivitasEnv, GameConfig
 from civitas.fleet.briefing import briefing
 from civitas.fleet.tools import ToolBox, zone_fit
@@ -343,3 +345,93 @@ def test_failed_dezones_read_the_departments_lists_once_until_an_action_succeeds
     assert box.call("dezone", {"x1": 26, "y1": 25, "x2": 26, "y2": 25})["ok"]     # a success: read afresh
     box.call("dezone", {"x1": 5, "y1": 3, "x2": 5, "y2": 3})
     assert len(calls) == 2
+
+
+# ------------------------------------------------------------------ the Next line's calls are valid when shown
+CALLED = re.compile(r"\b(zone|dezone|build_park|build_road|bulldoze) (\{[^}]*\})")
+ZONE_LINE = re.compile(r"^- zone_([RCIOM]): .*?(?:best|next free) \((\d+),(\d+)\)-\((\d+),(\d+)\)")
+
+
+def _warm_state(config: str, seed: int, months: int, role: str):
+    from pathlib import Path
+    from civitas.bench.runner import warm_up
+    from civitas.config import apply_cli_overrides, load_config
+    cfg = apply_cli_overrides(load_config(str(Path(__file__).resolve().parents[1] / config)),
+                              sets=[f"game.warmup_months={months}"])
+    _, agents = warm_up(cfg, seed, role=role)
+    return agents[role].env                                       # in a region: the city's env
+
+
+def _check_planning_calls(env, label: str) -> int:
+    """Every call planning's Next line names, applied in order to a copy of the world, succeeds, or fails only for
+    money when the line says the funds are short; the parks line's call and each zone line's strip succeed alone."""
+    import copy
+    from civitas.core.actions import apply_action
+    text = briefing(env, "planning", mark=False)
+    lines = text.splitlines()
+    nxt = [ln for ln in lines if ln.startswith("- Next: ")]
+    assert len(nxt) == 1, (label, nxt)
+    short = "; you have $" in nxt[0]
+    money_fail = lambda r: "budget only has" in r.message
+    w, n = copy.deepcopy(env.world), 0
+    for action, js in CALLED.findall(nxt[0]):
+        r = apply_action(w, "planning", {"type": action, **json.loads(js)})
+        assert r.ok or (short and money_fail(r)), (label, nxt[0], action, js, r.message)
+        n += 1
+    for ln in lines:
+        if ln.startswith("- parks: ") and (found := CALLED.findall(ln)):
+            (action, js), = found
+            r = apply_action(copy.deepcopy(env.world), "planning", {"type": action, **json.loads(js)})
+            assert r.ok or ("you have $" in ln and money_fail(r)), (label, ln, r.message)
+            n += 1
+        elif m := ZONE_LINE.match(ln):
+            letter, (x1, y1, x2, y2) = m[1], map(int, m.groups()[1:])
+            r = apply_action(copy.deepcopy(env.world), "planning",
+                             {"type": "zone", "zone": letter, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            assert r.ok or ("you have $" in ln and money_fail(r)), (label, ln, r.message)
+            n += 1
+    return n
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("months", [60, 96])
+def test_every_call_the_next_line_names_is_valid_when_shown(seed, months):
+    """The late smokes' failed Next-line calls (s1 month 96 zone C (1,25)-(4,26); s0 month 102 build_park (22,16)-
+    (23,16) and zone C (3,27)-(6,28)) were repeats: each had succeeded at the turn's first calls, and the model sent it
+    again word for word after re-reading its briefing. On the scripted warm-up's cities the calls the Next line, the
+    parks line and the zone lines name all run as shown."""
+    env = _warm_state("configs/fleet_smoke_late.toml", seed, months, "planning")
+    assert env.world.month == months
+    assert _check_planning_calls(env, f"s{seed} m{months}") >= 2
+
+
+@pytest.mark.slow
+def test_every_call_the_next_line_names_is_valid_when_shown_in_a_region_city():
+    env = _warm_state("configs/fleet_region_late.toml", 0, 96, "south.planning")
+    assert _check_planning_calls(env, "south m96") >= 2
+
+
+def test_a_repeat_of_a_call_done_this_turn_says_it_is_done():
+    """s0 month 102: planning's Next-line build_park and zone succeeded at its first calls; 15 calls later it sent
+    both again word for word, told only "no empty land tiles there" for the park, then once more (refused "repeat")."""
+    env = _boxed_in()
+    box = ToolBox(env, "planning")
+    park = {"x1": 3, "y1": 20, "x2": 4, "y2": 20}
+    assert box.call("build_park", park)["ok"]
+    zone = {"zone": "C", "x1": 10, "y1": 26, "x2": 12, "y2": 26}
+    assert box.call("zone", zone)["ok"]
+    res = box.call("build_park", park)
+    msg = res["message"]
+    assert not res["ok"] and msg.startswith("no empty land tiles there - this exact call succeeded at call 1 this "
+                                            "turn: it is done (your briefing's Next line and Ready sites were "
+                                            "written before it); go on to the next item, or end_turn; "), msg
+    assert "all 2 tiles are park; your park at call 1; the best park block now: build_park {" in msg, msg
+    m = re.search(r"build_park (\{[^}]*\})", msg)
+    assert box.call("build_park", json.loads(m[1]))["ok"]                                  # the block it names is free
+    res = box.call("zone", zone)
+    assert "this exact call succeeded at call 2 this turn: it is done" in res["message"], res
+    assert "; you zoned them at call 2 this turn" in res["message"], res
+    assert box.executed[-1]["message"] == "no empty land tiles in that area"              # the log keeps the core text
+    other = box.call("build_park", {"x1": 3, "y1": 20, "x2": 3, "y2": 20})                  # not the same call
+    assert "this exact call" not in other["message"] and "your park at call 1" in other["message"], other
