@@ -1,4 +1,4 @@
-"""Command line: civitas run | resume | bench | serve | leaderboard | prompt | check-llm"""
+"""Command line: civitas run | resume | yardstick | bench | serve | leaderboard | prompt | check-llm"""
 from __future__ import annotations
 
 import argparse
@@ -56,7 +56,8 @@ def cmd_run(args):
     from .bench.runner import run_episode
     cfg = _load(args)
     hub = _hub(args)
-    out = run_episode(cfg, args.seed, args.runs_dir, hub=hub, verbose=not args.quiet, run_id=args.run_id)
+    out = run_episode(cfg, args.seed, args.runs_dir, hub=hub, verbose=not args.quiet, run_id=args.run_id,
+                      yardstick=not args.no_yardstick)
     _linger(args, out)
 
 
@@ -66,10 +67,28 @@ def cmd_resume(args):
     hub = _hub(args)
     try:
         out = resume_episode(args.run, args.config, runs_dir=args.runs_dir, agents=args.agent, sets=args.set,
-                             hub=hub, verbose=not args.quiet)
+                             hub=hub, verbose=not args.quiet, yardstick=not args.no_yardstick)
     except ValueError as e:
         sys.exit(f"civitas resume: {e}")
     _linger(args, out)
+
+
+def cmd_yardstick(args):
+    """The scripted yardstick of a warm-up run: its game from the same hand-over played by scripted agents (no model
+    calls, no logs), written to the run's yardstick.json and printed beside what the run's agents did."""
+    from .bench import yardstick as Y
+    from .bench.session import run_dir
+    d = run_dir(args.run, args.runs_dir)
+    try:
+        ys = Y.yardstick(d, write=not args.dry_run, verbose=not args.quiet)
+    except (ValueError, Y.ModelAgentError) as e:
+        sys.exit(f"civitas yardstick: {e}")
+    if args.json:
+        print(json.dumps(ys, indent=2))
+        return
+    print(Y.comparison(ys))
+    if not args.dry_run:
+        print(f"wrote {d / Y.FILE}")
 
 
 def cmd_bench(args):
@@ -176,6 +195,10 @@ def main(argv=None):
                         help="play the first N months with scripted agents, then hand the city to the configured ones "
                              "(game.months stays the total; sets game.warmup_months)")
 
+    def no_yardstick(sp):
+        sp.add_argument("--no-yardstick", action="store_true",
+                        help="a warm-up run: skip the scripted yardstick from the same start (yardstick.json)")
+
     sp = sub.add_parser("run", help="play one episode")
     common(sp)
     warmup(sp)
@@ -185,6 +208,7 @@ def main(argv=None):
     sp.add_argument("--exit", action="store_true", help="with --serve: exit when the run ends")
     sp.add_argument("--quiet", action="store_true")
     sp.add_argument("--run-id", default=None, help="name of the run folder (default: timestamp_name_seed)")
+    no_yardstick(sp)
     sp.set_defaults(fn=cmd_run)
 
     sp = sub.add_parser("resume", help="continue a paused supervised fleet run (see [fleet].session_months)")
@@ -198,7 +222,17 @@ def main(argv=None):
     sp.add_argument("--port", type=int, default=8765)
     sp.add_argument("--exit", action="store_true", help="with --serve: exit when the session ends")
     sp.add_argument("--quiet", action="store_true")
+    no_yardstick(sp)
     sp.set_defaults(fn=cmd_resume)
+
+    sp = sub.add_parser("yardstick", help="a warm-up run's scripted yardstick: the same game from its hand-over, "
+                                          "played by scripted agents (no model calls)")
+    sp.add_argument("run", help="run id in --runs-dir (or the run's folder)")
+    sp.add_argument("--runs-dir", default="runs")
+    sp.add_argument("--dry-run", action="store_true", help="print it, don't write yardstick.json")
+    sp.add_argument("--json", action="store_true", help="print the whole record")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(fn=cmd_yardstick)
 
     sp = sub.add_parser("bench", help="run several seeds and aggregate scores")
     common(sp)

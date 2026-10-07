@@ -148,6 +148,7 @@ civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5
 civitas run -c configs/fleet_smoke_late.toml
 civitas run -c configs/fleet_smoke.toml --set game.months=72 --warmup 60      # the same, from any config
 civitas prompt -c configs/fleet_smoke_late.toml --role transport               # its first briefing after the warm-up
+civitas yardstick <run_id>     # a warm-up run's scripted yardstick (written by `run` at the end; no model calls)
 
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
@@ -1267,10 +1268,29 @@ transit at 17% and no shortage, so a 60-month warm-up still tested the middle ga
   metrics history). `summary.json` adds `warmup`: the city score and population at the
   hand-over and at the end, the change (what the configured agents' months added), their
   average city score, and the warm-up's own agent stats. `agent_stats` count only the
-  configured agents' turns. The run's last line prints the same. The scripted fleet playing
-  on (`--set fleet.model=scripted`, seed 0) is the yardstick for a fleet's 12 months:
-  `after the warm-up (months 96-107): city 66.8 -> 67.9 (+1.1), population 6,036 -> 6,304 (+268)`
-  (from month 60 in a 72-month game: 55.8 -> 62.3, 2,724 -> 4,436).
+  configured agents' turns. The run's last line prints the same, and its scripted yardstick:
+  `after the warm-up (months 96-107): city 65.3 -> 67.5 (+2.3), population 5,040 -> 6,736 (+1,696); scripted from the same start: +1.4 / +868`.
+- **Yardstick.** At the end of a warm-up run the runner plays the same game again with no
+  logs and no model: the run's seed, `[game]` and `[scoring]`, every agent scripted for the
+  whole game (`warmup_config`'s line-up: the scripted fleet in a single city, plain scripted
+  agents in a region). Months 0 to N−1 are the run's warm-up, so the city at the hand-over is
+  the run's (`matches_run`), and only the agents after N differ. It takes ~5 s and goes to
+  `yardstick.json`: `summary["warmup"]`'s shape (city score and population at the hand-over
+  and the end, the change, the average city score after), the departments' final scores, the
+  city score and population per month from N (per city in a region, `by_city`), and the run's
+  own change under `run`. `--no-yardstick` skips it, `civitas bench` never plays it, and
+  `civitas yardstick <run_id>` computes it for a finished run (it refuses a run without a
+  warm-up). A yardstick never calls a model: `bench/yardstick.py` refuses a line-up config
+  with an `llm` or `remote` agent, or a fleet agent on a model other than `scripted`, and then
+  checks the built agents' exact classes (the scripted baselines, the scripted fleet, noop,
+  random) and that none holds a model client, before a month is played (`ModelAgentError`).
+  `GET /api/runs/<id>/yardstick` returns it, or `{"missing": true}` with why; for a finished
+  warm-up run without one the server starts `civitas yardstick` in the background
+  (`computing`). The viewer's left dock reads "since hand-over +2.3 (scripted +1.4)" and the
+  residents at the playhead, and the Compare view shows it beside the run's numbers. The
+  late runs' yardsticks (months 96-107): single city seeds 0 / 1 / 2 +1.1 / +268, +6.2 /
+  +1,532, +1.4 / +868; region seeds 0 / 1 +0.7 / +1,360, +5.1 / +3,520 (seed 0 from month 60
+  in a 72-month game: city 55.8 -> 62.3, population 2,724 -> 4,436).
 - **Reports.** The fleet report, the Problems tab, the Team tab and the collaboration score
   cover the months after the warm-up only (`run_collab` reads `warmup_months` as `since`).
   The report's header names the warm-up and the score change. In a region, `deals` keeps the
@@ -2011,7 +2031,10 @@ months played, the final and average city score (and after a warm-up the average
 change since hand-over), population, each department's final score, the Teamwork score with its four components as bars
 and its requests, and from `fleet_report.json` the fleet calls per turn (failed, refused, repeats, tool errors) and
 overrides. Above it, overlaid line charts of the city score, population and Teamwork per month, each run's scripted
-warm-up shaded and its line faded there. A region run's own column holds the region's city score and population and its
+warm-up shaded and its line faded there. A warm-up run with a scripted yardstick (see "Late-game smokes") shows it
+beside its own numbers in the "since hand-over" and "average after warm-up" rows (`+2.3 · scripted +1.4`) and as a
+dashed line of its colour from the hand-over in the city score and population charts (the legend's checkbox hides
+it). A region run's own column holds the region's city score and population and its
 departments' and Teamwork's mean over its cities; "Cities of region runs" adds a column (and a dashed line) per city.
 The picked runs stay picked (localStorage); click a run's name to open it. Backend: `GET /api/compare?runs=a,b,c`
 (`bench/compare.py:run_compare`, cached per run until its files change).

@@ -4,7 +4,8 @@
 when there is one) into a compact record: what kind of run it is (agents, region, warm-up), how long it played, its
 final and average city score, the departments' final scores, population, the Teamwork score with its components
 (fleet/report.py: collab_score, region_score; as of every month too), the fleet agents' failed and refused calls, and
-per month the city score, population and Teamwork. A region run carries the same record per city under `by_city`
+per month the city score, population and Teamwork; a warm-up run its scripted yardstick (`yardstick`, from
+yardstick.json: bench/yardstick.py) when it has one. A region run carries the same record per city under `by_city`
 and region values at the top: the region's city score and population, the departments' and Teamwork's mean over the
 cities, the calls summed. Works on running, paused and finished runs alike (a run without summary.json reads its
 last frame).
@@ -144,6 +145,22 @@ def _collab(d: Path, city: str | None) -> dict:
     return {"score": collab_score(c)}
 
 
+def _yard(ys: dict | None, city: str | None = None) -> dict | None:
+    """A warm-up run's scripted yardstick (yardstick.json, bench/yardstick.py) as a column shows it: the change since
+    the hand-over, the average city score after it, the end, and per frame month from the hand-over the city score
+    and population; `city` for a region's city."""
+    if not ys or not ys.get("handed_over"):
+        return None
+    src = ((ys.get("by_city") or {}).get(city) or None) if city else ys
+    if not src or not src.get("change"):
+        return None
+    s = src.get("series") or {}
+    return {"change": src["change"], "at_handover": src.get("at_handover"), "at_end": src.get("at_end"),
+            "avg_city_score": None if city else ys.get("avg_city_score"), "matches_run": ys.get("matches_run"),
+            "series": {"month": (ys.get("series") or {}).get("month") or [], "city": s.get("city") or [],
+                       "population": s.get("population") or []}}
+
+
 def run_compare(d: str | Path, collab=None) -> dict:
     """One run folder as the Compare view reads it (see the module doc). `collab(d, city)` returns run_collab's dict
     with `score` (the server passes its cached collab_data); city None for a single city, "*" for a region."""
@@ -171,12 +188,14 @@ def run_compare(d: str | Path, collab=None) -> dict:
     fm = (summ or {}).get("final_metrics") or {}
     wsum = (summ or {}).get("warmup") or {}
     hand = wsum.get("at_handover")
+    ys = _read(d / "yardstick.json") if warm else None
 
-    def entry(city_series: list, pop_series: list, roles: dict, final_city, pop, avg, team, counts, at_hand) -> dict:
+    def entry(city_series: list, pop_series: list, roles: dict, final_city, pop, avg, team, counts, at_hand,
+              yard=None) -> dict:
         a_all, a_after = _avg(fr["month"], city_series, warm)
         return {"city": _r(final_city, 3), "avg_city": avg if avg is not None else a_all, "avg_after_warmup": a_after,
                 "roles": {k: _r(v, 3) for k, v in roles.items()}, "population": pop,
-                "at_handover": at_hand, "teamwork": team, "calls": counts,
+                "at_handover": at_hand, "teamwork": team, "calls": counts, "yardstick": yard,
                 "series": {"city": city_series, "population": pop_series,
                            "teamwork": (team or {}).get("series") or []}}
 
@@ -191,7 +210,7 @@ def run_compare(d: str | Path, collab=None) -> dict:
         out.update(entry(fr["city"], fr["population"], roles, scores.get("city"),
                          fm.get("population", fr["population"][-1] if fr["population"] else None),
                          (summ or {}).get("avg_city_score"), _teamwork(sc),
-                         _counts((rep or {}).get("roles")), hand_at))
+                         _counts((rep or {}).get("roles")), hand_at, _yard(ys)))
         return out
     team, team_by = _region_teamwork(sc)
     by_city = {}
@@ -205,8 +224,10 @@ def run_compare(d: str | Path, collab=None) -> dict:
         if cpop is None and b["population"]:
             cpop = b["population"][-1]
         crep = ((rep or {}).get("cities") or {}).get(cty) or {}
+        i = fr["month"].index(warm) if hand and warm in fr["month"] else None    # the city at hand-over, its frame
+        chand = {"month": warm, "city": b["city"][i], "population": b["population"][i]} if i is not None else None
         by_city[cty] = entry(b["city"], b["population"], croles, cfinal, cpop, None, team_by.get(cty),
-                             _counts(crep.get("roles")), None)
+                             _counts(crep.get("roles")), chand, _yard(ys, cty))
     role_names = list(dict.fromkeys(r for e in by_city.values() for r in e["roles"]))
     mean_roles = {r: _mean([e["roles"].get(r) for e in by_city.values()]) for r in role_names}
     calls = [e["calls"] for e in by_city.values() if e["calls"]]
@@ -215,7 +236,7 @@ def run_compare(d: str | Path, collab=None) -> dict:
                      fm.get("population", fr["population"][-1] if fr["population"] else None),
                      (summ or {}).get("avg_city_score"), team, total,
                      {"month": hand["month"], "city": hand.get("city"), "population": hand.get("population")}
-                     if hand else None))
+                     if hand else None, _yard(ys)))
     out["roles_mean_of_cities"] = True
     out["by_city"] = by_city
     return out

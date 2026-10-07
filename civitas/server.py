@@ -12,6 +12,10 @@ Endpoints
                                       with the collaboration score per month as `score` (fleet/report.py collab_score)
   GET  /api/runs/<id>/collab?region=1 a region run's cities: mayors' deals and messages between cities
                                       (`score`: each city's, asks and deals answered between them)
+  GET  /api/runs/<id>/yardstick      a warm-up run's scripted yardstick (yardstick.json, bench/yardstick.py), else
+                                     {"missing": true, ...}: a finished run's is computed in the background
+                                     (`computing`), a `civitas yardstick` process; poll again
+  GET  /api/compare?runs=a,b,c       runs side by side (bench/compare.py), each warm-up run's yardstick included
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -205,13 +209,67 @@ def compare_data(d: Path) -> dict:
             return st.st_size, st.st_mtime_ns
         except OSError:
             return None
-    key = tuple(stamp(d / f) for f in ("frames.jsonl", "summary.json", "fleet_report.json", "meta.json"))
+    key = tuple(stamp(d / f) for f in ("frames.jsonl", "summary.json", "fleet_report.json", "meta.json",
+                                        "yardstick.json"))
     hit = _COMPARE.get(str(d))
     if hit is not None and hit[0] == key:
         return hit[1]
     c = run_compare(d, collab_data)
     _COMPARE[str(d)] = (key, c)
     return c
+
+
+_YARDSTICKS: dict[str, dict] = {}  # run folder -> {"proc", "log", "started"}: yardsticks computing in the background
+_YARD_LOCK = threading.Lock()
+YARDSTICK_JOBS = 2                  # yardsticks computed at once (each a `civitas yardstick` process, seconds)
+
+
+def yardstick_data(d: Path, compute: bool = True) -> dict:
+    """A run's scripted yardstick (bench/yardstick.py): yardstick.json when there is one, else `{"missing": true}`
+    with why, `computing` while a background `civitas yardstick` process (started here when `compute`, for a
+    finished warm-up run that handed over) works on it, or the `error` it ended with. Never blocks on the game."""
+    from .bench import yardstick as Y
+    ys = Y.read(d)
+    if ys is not None:
+        return ys
+    try:
+        meta = json.loads((d / "meta.json").read_text())
+    except (OSError, ValueError):
+        return {"missing": True, "reason": "no meta.json"}
+    if not int(meta.get("warmup_months") or 0):
+        return {"missing": True, "reason": "not a warm-up run"}
+    try:
+        summ = json.loads((d / "summary.json").read_text())
+    except (OSError, ValueError):
+        return {"missing": True, "reason": "the run hasn't finished (it writes its yardstick at the end)"}
+    if not (summ.get("warmup") or {}).get("handed_over"):
+        return {"missing": True, "reason": "the game ended during the warm-up"}
+    with _YARD_LOCK:
+        job = _YARDSTICKS.get(str(d))
+        if job is not None:
+            rc = job["proc"].poll()
+            if rc is None:
+                return {"missing": True, "computing": True, "started": job["started"]}
+            if rc != 0:
+                try:
+                    tail = job["log"].read_text().strip().splitlines()[-1:]
+                except OSError:
+                    tail = []
+                return {"missing": True, "error": tail[0] if tail else f"exit code {rc}"}
+            _YARDSTICKS.pop(str(d))                 # done, but no file: try again below
+        if not compute:
+            return {"missing": True}
+        if sum(j["proc"].poll() is None for j in _YARDSTICKS.values()) >= YARDSTICK_JOBS:
+            return {"missing": True, "queued": True}
+        logs = d.parent / "_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{d.name}.yardstick.log"
+        with open(log, "w") as fh:                  # the child keeps its own copy of the handle
+            proc = subprocess.Popen([sys.executable, "-m", "civitas.cli", "yardstick", d.name, "--runs-dir",
+                                     str(d.parent), "--quiet"], stdout=fh, stderr=subprocess.STDOUT,
+                                    cwd=os.getcwd(), env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        _YARDSTICKS[str(d)] = {"proc": proc, "log": log, "started": time.time()}
+    return {"missing": True, "computing": True, "started": _YARDSTICKS[str(d)]["started"]}
 
 
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
@@ -465,6 +523,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                         if (q.get("region") or ["0"])[0] not in ("", "0", "false"):
                             city = "*"              # the region view: the cities, their deals and messages
                         return self._json(collab_data(d, city))
+                    if parts[3] == "yardstick":     # the scripted agents from the same hand-over (a warm-up run)
+                        return self._json(yardstick_data(d, compute=launcher is not None))
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []

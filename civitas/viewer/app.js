@@ -134,7 +134,9 @@ async function openRun(id, { month = null } = {}) {
   scene.setMeta(S.meta);
   $("runLabel").textContent = `${S.meta.name} · seed ${S.meta.seed}`;
   $("agentsLine").innerHTML = (S.city ? `<b>${S.city}</b> · ` : "") + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
+  S.yard = null; S.yardState = null;
   await fetchFrames(true);
+  loadYard();
   S.idx = month != null ? Math.min(month, S.frames.length - 1) : (S.status === "running" ? S.frames.length - 1 : S.frames.length - 1);
   S.poll = setInterval(() => fetchFrames(false), 2000);
   store.set("lastRun", id);
@@ -165,7 +167,7 @@ async function fetchFrames(first) {
   if (d.frames.length) loadProblems();          // the timeline's problem marks; refetched as a live run grows
   if (d.frames.length) loadCollab();
   if (d.status !== "running") clearInterval(S.poll);
-  if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); }
+  if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); loadYard(); }
   if (!first && d.frames.length) {
     drawTrackMarks();
     if (S.follow && wasEnd && !S.playing) { const p = S.idx; S.idx = S.frames.length - 1; render(S.frames[p], S.idx === p + 1); }
@@ -245,7 +247,33 @@ function renderHero(f) {
   const side = f.regionScores ? `${esc(S.city)} · region ${(f.regionScores.city || 0).toFixed(1)}` : "out of 100";
   $("hero").innerHTML = `<div class="hlab"><span>City score</span><span>${side}</span></div>
     <div class="hval"><b>${v.toFixed(1)}</b><span class="d">${trend(v, ago().scores.city ?? 0, { zero: '<span class="flat">steady</span>' })}</span>
-    <span class="muted small">${S.idx >= YEAR ? "over the last year" : "since the start"}</span></div>${heroSpark(hist, S.meta.months)}`;
+    <span class="muted small">${S.idx >= YEAR ? "over the last year" : "since the start"}</span></div>${heroSpark(hist, S.meta.months)}${yardLine(f)}`;
+}
+// a warm-up run: what its agents added since the hand-over, at the playhead, beside its scripted yardstick (the same
+// game from the same start played by scripted agents: yardstick.json, bench/yardstick.py) at the same month
+function yardLine(f) {
+  const w = warmupMonths(), h = w && f.month >= w ? S.frames.find(x => x.month === w) : null;
+  if (!h) return "";
+  const sgn = (v, d) => (v > 0 ? "+" : v < 0 ? "−" : "±") + (d == null ? Math.abs(Math.round(v)).toLocaleString() : Math.abs(v).toFixed(d));
+  const cls = (v) => v > 0 ? "up" : v < 0 ? "down" : "";
+  const dc = (f.scores.city ?? 0) - (h.scores.city ?? 0), dp = (f.metrics.population || 0) - (h.metrics.population || 0);
+  const y = S.yard, src = y && y.series ? (S.city ? (y.by_city || {})[S.city] : y) : null;
+  const i = src ? y.series.month.indexOf(f.month) : -1;
+  const yc = i >= 0 && src.series.city[i] != null ? src.series.city[i] - src.series.city[0] : null;
+  const yp = i >= 0 && src.series.population[i] != null ? src.series.population[i] - src.series.population[0] : null;
+  const tip = `Since the hand-over at month ${w} (the end of the scripted warm-up), to month ${f.month}: the city score and residents the configured agents added`
+    + (yc != null ? `, and in brackets what scripted agents added over the same months from the same start (the run's yardstick).` : S.yardState ? `. Scripted yardstick: ${S.yardState}.` : ".");
+  return `<div class="hyard" title="${esc(tip)}"><span>since hand-over <b class="${cls(dc)}">${sgn(dc, 1)}</b>${yc != null ? ` (scripted ${sgn(yc, 1)})` : ""}</span>
+    <span><b class="${cls(dp)}">${sgn(dp)}</b> residents${yp != null ? ` (scripted ${sgn(yp)})` : ""}</span></div>`;
+}
+async function loadYard() {
+  const id = S.runId; S.yard = null; S.yardState = null;
+  if (!id || !warmupMonths()) return;
+  S.yardState = "loading";
+  const ys = await waitYardstick(id);
+  if (S.runId !== id) return;
+  S.yard = ys; S.yardState = ys ? null : S.status === "running" ? "written when the run ends" : "not available";
+  if (S.frames.length) renderHero(S.frames[S.idx]);
 }
 function alertsOf(m) {
   const out = [], bad = "var(--bad)", warn = "var(--warn)";
@@ -1348,7 +1376,7 @@ async function renderRunsTab() {
 
 // ================================================================ compare view (compare.js, /api/compare)
 // the picked runs and their colour slots are remembered; a run keeps its colour while it stays picked
-S.cmp = { ids: store.get("cmpRuns", []), slots: store.get("cmpSlots", {}), split: store.get("cmpSplit", false), data: {} };
+S.cmp = { ids: store.get("cmpRuns", []), slots: store.get("cmpSlots", {}), split: store.get("cmpSplit", false), yard: store.get("cmpYard", true), data: {} };
 if (!Array.isArray(S.cmp.ids)) S.cmp.ids = [];
 S.cmp.ids = S.cmp.ids.filter(x => typeof x === "string").slice(0, COMPARE_MAX);
 if (!S.cmp.slots || typeof S.cmp.slots !== "object") S.cmp.slots = {};
@@ -1402,12 +1430,30 @@ function renderCompare() {
   const cols = columns(runs, { split: S.cmp.split, colorOf: cmpColor });
   body.innerHTML = (waiting ? `<div class="small muted">Loading ${waiting} run${waiting === 1 ? "" : "s"}…</div>` : "") +
     (errs.length ? `<div class="small bad">Could not load ${errs.map(esc).join(", ")}: ${esc(S.cmp.data[errs[0]].error)}</div>` : "") +
-    (cols.length ? `${legendHTML(cols)}<div class="cmp-charts">${chartsHTML()}</div>
+    (cols.length ? `${legendHTML(cols, { yard: S.cmp.yard })}<div class="cmp-charts">${chartsHTML()}</div>
       <div class="cmp-scroll">${tableHTML(cols, { current: S.runId, roleColor })}</div>
       <div class="small muted cmp-foot">Best value per row in green. A region run's own column holds the region's city score and population, and its departments' and Teamwork's mean over its cities. Click a run's name to open it.</div>` : "");
   body.querySelectorAll("[data-open]").forEach(b => b.onclick = () => { $("compareModal").hidden = true; openRun(b.dataset.open); });
   body.querySelectorAll("[data-x]").forEach(b => b.onclick = () => { cmpRemove(b.dataset.x); renderCompare(); if (S.tab === "runs") renderRunsTab(); });
-  if (cols.length) drawCharts(body, cols);
+  if ($("cmpYard")) $("cmpYard").onchange = (e) => { S.cmp.yard = e.target.checked; store.set("cmpYard", S.cmp.yard); drawCharts(body, cols, { yard: S.cmp.yard }); };
+  if (cols.length) drawCharts(body, cols, { yard: S.cmp.yard });
+  // a finished warm-up run without its scripted yardstick yet: the server computes it in the background
+  for (const r of runs) if (r.warmup && r.status === "finished" && !r.yardstick && !cmpYardAsked.has(r.run_id)) {
+    cmpYardAsked.add(r.run_id);
+    waitYardstick(r.run_id).then(ys => { if (ys && S.cmp.ids.includes(r.run_id)) { delete S.cmp.data[r.run_id]; loadCompareRuns(); } });
+  }
+}
+const cmpYardAsked = new Set();
+// a warm-up run's scripted yardstick (/api/runs/<id>/yardstick, bench/yardstick.py): the file, or null; while the
+// server computes it (seconds) poll for up to two minutes
+async function waitYardstick(id, tries = 40) {
+  for (let i = 0; i < tries; i++) {
+    let d; try { d = await api(`/api/runs/${encodeURIComponent(id)}/yardstick`); } catch { return null; }
+    if (!d.missing) return d;
+    if (!d.computing && !d.queued) return null;
+    await new Promise(res => setTimeout(res, 3000));
+  }
+  return null;
 }
 
 // ================================================================ charts

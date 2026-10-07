@@ -18,6 +18,7 @@ from ..core.env import make_env
 from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version, playbook_versions, session_months
 from ..fleet.report import fleet_report, turn_row
 from . import session as S
+from . import yardstick as Y
 
 
 def _jsonable(o):
@@ -274,11 +275,13 @@ def _warmup_summary(run: dict, final_city: float, final_pop: int) -> dict:
 
 def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None,
                 verbose: bool = True, log_observations: bool = True, run_id: str | None = None,
-                sessions: bool = True) -> dict:
+                sessions: bool = True, yardstick: bool = True) -> dict:
     """Play a run to the end and return its summary. A supervised fleet run with `[fleet].session_months` stops
     at the first session boundary instead and returns `{"paused": True, ...}` (`sessions=False` plays through);
     `resume_episode` continues it. With `[game].warmup_months = N` the warm-up line-up (`config.warmup_config`) plays
-    months 0..N-1 and the configured agents the rest of the same game (`_hand_over`); its sessions start at N."""
+    months 0..N-1 and the configured agents the rest of the same game (`_hand_over`); its sessions start at N, and at
+    the end (unless `yardstick=False`) the scripted yardstick from the same start goes to yardstick.json
+    (bench/yardstick.py)."""
     warm = warmup_months(cfg)
     game = game_config(cfg, seed)
     scoring = scoring_config(cfg, game)
@@ -289,6 +292,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     log = RunLogger(Path(runs_dir) / run_id)
     run = {"cfg": cfg, "seed": seed, "run_id": run_id, "env": env, "agents": agents, "log": log, "hub": hub,
            "verbose": verbose, "log_observations": log_observations, "sessions_on": sessions, "sessions": [],
+           "yardstick": yardstick,
            "prompt_ref": {}, "wall_s": 0.0, "city_scores": [], "fleet_rows": [],
            "settings": {"game": dataclasses.asdict(game), "scoring": dataclasses.asdict(scoring)},
            "stats": {r: _new_stats() for r in env.roles}, "warm_agents": warm_agents,
@@ -317,7 +321,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
 
 def resume_episode(run: str | Path, config: str | Path | None = None, *, runs_dir: str | Path = "runs",
                    agents: list[str] | None = None, sets: list[str] | None = None, hub=None,
-                   verbose: bool = True) -> dict:
+                   verbose: bool = True, yardstick: bool = True) -> dict:
     """Continue a paused run (a run id in `runs_dir`, or its folder) with the playbooks of `config`, else of the
     run's `playbooks.toml`, merged over its config (`session.overlay`), then `--agent` / `--set` overrides. The
     game, scoring, line-up and mode must not change (ValueError). Returns what `run_episode` does."""
@@ -341,7 +345,7 @@ def resume_episode(run: str | Path, config: str | Path | None = None, *, runs_di
                                     "prompt_ref", "settings", "log_observations")},
            "warmup": state.get("warmup"), "warm_agents": None,      # a pause comes after the warm-up
            "cfg": cfg, "env": env, "agents": S.restore_agents(state["agents"], cfg, env, hub),
-           "log": RunLogger(d), "hub": hub, "verbose": verbose, "sessions_on": True}
+           "log": RunLogger(d), "hub": hub, "verbose": verbose, "sessions_on": True, "yardstick": yardstick}
     _fleet_settings(run)
     _open_session(run, previous=state, config_file=source)
     _save_sessions(run)
@@ -506,7 +510,11 @@ def _play(run: dict) -> dict:
         except Exception as e:                       # a report bug must not cost the run its summary
             print(f"[{run_id}] warning: fleet report failed: {type(e).__name__}: {e}", file=sys.stderr)
             summary["fleet"] = {"error": f"{type(e).__name__}: {e}"}
+    # played before summary.json marks the run finished (so the server never starts a second one), written after it
+    ys = _yardstick(run, summary) if run.get("yardstick") and (summary.get("warmup") or {}).get("handed_over") else None
     log.summary(summary)
+    if ys:
+        (log.dir / Y.FILE).write_text(json.dumps(_jsonable(ys), indent=2))
     log.close()
     if verbose:
         print(f"[{run_id}] done: city {info['scores']['city']:.1f}  " +
@@ -516,13 +524,33 @@ def _play(run: dict) -> dict:
             h, e, c = w["at_handover"], w["at_end"], w["change"]
             print(f"[{run_id}] after the warm-up (months {w['months']}-{e['month'] - 1}): city {h['city'] or 0:.1f} -> "
                   f"{e['city']:.1f} ({c['city']:+.1f}), population {h['population']:,} -> {e['population']:,} "
-                  f"({c['population']:+,})")
+                  f"({c['population']:+,})" + (f"; {Y.line(ys)}" if ys else ""))
     return summary
+
+
+def _yardstick(run: dict, summary: dict) -> dict | None:
+    """The scripted yardstick of a finished warm-up run (bench/yardstick.py: the same game from the same hand-over,
+    every agent scripted, no logs; seconds), for the run folder's yardstick.json. A failure only warns."""
+    try:
+        if run["verbose"]:
+            print(f"[{run['run_id']}] scripted yardstick: the same game from month {run['warmup']['months']}, "
+                  f"every agent scripted ...")
+        ys = Y.play(run["cfg"], run["seed"])
+        ys["run_id"] = run["run_id"]
+        Y.compare_with_run(ys, summary)
+        ys["created"] = time.time()
+        if ys.get("matches_run") is False:
+            print(f"[{run['run_id']}] warning: the yardstick's city at hand-over differs from the run's",
+                  file=sys.stderr)
+        return ys
+    except Exception as e:                           # the yardstick is extra: never lose the run over it
+        print(f"[{run['run_id']}] warning: yardstick failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
 
 
 def _run_one(args):
     cfg, seed, runs_dir, verbose = args
-    return run_episode(cfg, seed, runs_dir, verbose=verbose, sessions=False)
+    return run_episode(cfg, seed, runs_dir, verbose=verbose, sessions=False, yardstick=False)
 
 
 def run_benchmark(cfg: dict, seeds: list[int], runs_dir="runs", workers: int = 1, verbose=True) -> dict:
