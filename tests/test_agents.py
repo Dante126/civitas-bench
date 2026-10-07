@@ -126,16 +126,17 @@ def test_remote_agent_over_http(tmp_path):
     t = threading.Thread(target=lambda: result.update(run_episode(cfg, 0, tmp_path, hub=hub, verbose=False)))
     t.start()
     base = f"http://127.0.0.1:{port}/api/live"
-    turns = 0
-    while t.is_alive() and turns < 2:
-        turn = json.loads(urllib.request.urlopen(f"{base}/turn?role=planning").read())
+    turns, deadline = 0, time.time() + 60       # a missed turn fails here instead of polling forever (one suite run
+    while t.is_alive() and turns < 2:           # under heavy load hung 17 minutes in a test with a server socket)
+        assert time.time() < deadline, f"no planning turn to answer after 60 s ({turns} answered)"
+        turn = json.loads(urllib.request.urlopen(f"{base}/turn?role=planning", timeout=30).read())
         if not turn["waiting"]:
             time.sleep(0.05)
             continue
         body = json.dumps({"role": "planning", "turn_id": turn["turn_id"],
                            "decision": {"actions": [{"type": "noop"}], "thinking": "remote hi"}}).encode()
         req = urllib.request.Request(f"{base}/act", data=body, headers={"Content-Type": "application/json"})
-        assert json.loads(urllib.request.urlopen(req).read())["ok"]
+        assert json.loads(urllib.request.urlopen(req, timeout=30).read())["ok"]
         turns += 1
     t.join(timeout=30)
     httpd.shutdown()
