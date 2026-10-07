@@ -1332,7 +1332,15 @@ residents against the scripted +1.4 / +868; region seed 1 (`..._fleet_region_lat
 +6,104). The fleet out-grows the scripted agents on every seed, but on seed 2 its services fell
 behind: fire coverage 94% -> 78%, police 94 -> 79, health 83 -> 67, schools 93 -> 78, while the
 treasury held $35-39k above the reserve. Each needs line asked for one building a quarter, and the
-mayor funded exactly that.
+mayor funded exactly that. Replaying it showed the count mattered less than the site: the Ready line's "best"
+station site, ranked by straight-line radius, sat on another road (a fire station serving one
+building), and later no ready site reached the uncovered homes. With the keep-up needs lines
+(6885467: the site that adds the most real coverage, the trend, several buildings when the money
+allows, and what to do when no site helps) seed 2 reran at +2.3 city / +1,696 residents
+(`runs/20261007-104643_fleet_smoke_late_s2_631`; was +0.6, scripted +1.4): fire 85.8 -> 84.2 (was
+-> 70.1), police 74.5, health 89.3, education 83.1, and fire took the tier-2 hint (upgrade_facility).
+On city score the fleet now beats the scripted agents' months 96-107 on all three single-city
+seeds (+3.7 / +6.7 / +2.3 against +1.1 / +6.2 / +1.4).
 
 **Config.**
 
