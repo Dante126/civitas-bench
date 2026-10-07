@@ -1295,6 +1295,15 @@ ran its term), and north bought 40 power from south ($0.93, accepted the same tu
 that one at month 105 although it earned $37/month with 243 power spare; an active deal's line now
 says "keep it: it runs by itself, nothing to call" unless deal_check says to end it.
 
+Two more seeds (2026-10-07; scripted yardsticks with every role scripted on the same start, months
+96-107): single-city seed 2 (`runs/20261007-071421_fleet_smoke_late_s2_578`) +0.6 city / +1,524
+residents against the scripted +1.4 / +868; region seed 1 (`..._fleet_region_late_s1_579`) +4.8 /
++5,388 against +5.1 / +3,520 (region seed 0's yardstick: +0.7 / +1,360 against the fleet's +4.2 /
++6,104). The fleet out-grows the scripted agents on every seed, but on seed 2 its services fell
+behind: fire coverage 94% -> 78%, police 94 -> 79, health 83 -> 67, schools 93 -> 78, while the
+treasury held $35-39k above the reserve. Each needs line asked for one building a quarter, and the
+mayor funded exactly that.
+
 **Config.**
 
 ```toml
