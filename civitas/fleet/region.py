@@ -219,6 +219,8 @@ def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
                 line += (f"; you need it back ({_use(s, d['resource'])}): {call('cancel_deal')}" if sell else
                          f"; you have room without it: {call('cancel_deal')} saves "
                          f"{money(d['amount'] * d['price'])}/month")
+            elif mayor:                  # the region late smoke's south cancelled a +$37/month sale with 243 spare
+                line += "; keep it: it runs by itself, nothing to call"
         return line
     until = f" (open until month {d['expires']})" if d.get("expires") is not None else ""
     if not mayor:

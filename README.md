@@ -1288,6 +1288,13 @@ ends with the refreshed Next line (2495e4c). With that (`runs/20261006-215824_fl
 `..._s1_869`): seed 0 +3.7 / +2,868, teamwork 99.4, 5 failed actions in 32 turns, planning in 47 steps
 (was 71); seed 1 +6.7 / +2,324, past the scripted fleet's +6.2 on score too.
 
+The region late smoke after the `sell` fix (`runs/20261006-222703_fleet_region_late_s0_550`): city
+66.5 -> 70.7 (+4.2), population 12,084 -> 18,188 (+6,104), teamwork north 82.5 and south 93.0 (was
+55.7). The first deals between LLM mayors: north sold south 20 water ($0.43, accepted the same turn,
+ran its term), and north bought 40 power from south ($0.93, accepted the same turn). South cancelled
+that one at month 105 although it earned $37/month with 243 power spare; an active deal's line now
+says "keep it: it runs by itself, nothing to call" unless deal_check says to end it.
+
 **Config.**
 
 ```toml

@@ -331,7 +331,7 @@ def test_mayors_make_deals_with_their_tools():
     assert ("- deal #1 active: you sell 50 power to south at $1/unit/month (+$50/month), 3 months left (through month "
             "2)") in briefing(n, "mayor", mark=False)
     assert ("- deal #1 active: you buy 50 power from north at $1/unit/month (-$50/month), 3 months left (through month "
-            "2)") in region_lines(s, "mayor")
+            "2); keep it: it runs by itself, nothing to call") in region_lines(s, "mayor")
     assert "- deal #1 active: the city sells 50 power to south (-50 power supply), 3 months left" in \
         region_lines(n, "utilities")
     # the executed deals are logged like any action: in the city's history and the region's turn log
@@ -431,7 +431,7 @@ def test_a_deal_opportunity_when_one_city_is_short_and_the_other_has_spare():
     after = region.supply_state("north")["power"]
     assert after["own"] == 160 and after["imported"] < st["north"]["imported"]
     assert "- deal #1 active: you buy 160 power from south at $0.88/unit/month (-$141/month), 2 months left (through " \
-           "month 2)" in region_lines(n, "mayor")
+           "month 2); keep it: it runs by itself, nothing to call" in region_lines(n, "mayor")
     assert t0["north"] != n.world.treasury
 
 
