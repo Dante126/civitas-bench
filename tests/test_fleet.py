@@ -3166,10 +3166,10 @@ def test_shelter_and_cemetery_are_never_named_as_the_first_build(grown_env):
     for funds in (0, 1000, 1499, 1500, 1999):
         w.dept_funds.update(fire=funds, health=funds)
         assert line("fire") == (f"- fire: funds ${funds:,}, spent $0; needs $2,500 for another fire station "
-                                f"({_cover(w, 'fire_coverage')}, $55/month)")
+                                f"({_cover(w, 'fire_coverage', env, 'fire')}, $55/month)")
         assert line("health") == (f"- health: funds ${funds:,}, spent $0; needs $2,000 for another clinic "
-                                  f"({_cover(w, 'health_coverage')}, $40/month) or another landfill "
-                                  f"({_cover(w, 'garbage_coverage')}, $30/month)")                                    # a tie
+                                  f"({_cover(w, 'health_coverage', env, 'health')}, $40/month) or another landfill "
+                                  f"({_cover(w, 'garbage_coverage', env, 'health')}, $30/month)")                                    # a tie
     w.dept_funds.update(fire=1500, health=1500)        # v9: a shelter / cemetery affordable, the station / landfill not
     for dept, cheap, dear in (("fire", "shelter", "station"), ("health", "cemetery", "landfill")):
         text = briefing(env, dept, mark=False)
@@ -3420,8 +3420,8 @@ def test_mayor_briefing_says_what_short_departments_need(grown_env):
     got = lines()                                      # the building, not the find_sites purpose
     assert got["police"] == (f"- police: funds $1,000; needs $2,500 for its first police station ({n} sites, "
                              "$55/month)")
-    assert re.fullmatch(r"- health: funds \$0; needs \$2,000 for another clinic \(coverage \d+%, \$40/month\) or "
-                        r"another landfill \(coverage \d+%, \$30/month\)", got["health"])   # $2,000 each: a tie names both, not the cemetery
+    assert re.fullmatch(r"- health: funds \$0; needs \$2,000 for another clinic \(coverage [^()]*, \$40/month\) or "
+                        r"another landfill \(coverage [^()]*, \$30/month\)", got["health"])   # $2,000 each: a tie names both, not the cemetery
     assert got["education"].startswith("- education: funds $0; needs $2,500 for its first elementary school (")
     assert got["utilities"].startswith("- utilities: funds $0; needs $6,200 for another coal plant and water tower (")
     assert got["fire"] == "- fire: funds $5,000; idle $2,500 (keeps $2,500)"          # the station's $2,500
@@ -3441,9 +3441,15 @@ def _dept_lines(env) -> dict[str, str]:
             if ln.startswith("- ") and ": funds " in ln}
 
 
-def _cover(w, key: str) -> str:
+def _cover(w, key: str, env=None, dept: str = "") -> str:
+    """Another building's status on the mayor's needs line: its coverage (the falling note when it fell), and with
+    `env` and `dept` the estimate one more brings when keep_up finds a site that adds coverage."""
     from civitas.fleet.fmt import pct
-    return f"coverage {pct(100 * w.metrics()[key])}"
+    from civitas.fleet.tools import coverage_trend, funding_gaps
+    text = f"coverage {coverage_trend(w, key) or pct(100 * w.metrics()[key])}"
+    keep_ups = funding_gaps(env, FleetState.of(env)).depts[dept].keep_ups if env is not None else ()    # the sites
+    ku = next((ku for _, ku in keep_ups if ku.key == key), None)            # an earlier department picked are left
+    return text + (f", ~{pct(100 * ku.levels[1])} with it" if ku else "")
 
 
 def test_the_needs_line_says_first_or_another(grown_env):
@@ -3462,10 +3468,10 @@ def test_the_needs_line_says_first_or_another(grown_env):
     assert got["police"] == (f"- police: funds $0, spent $0; needs $2,500 for its first police station "
                              f"({n['station']} sites, $55/month)")
     assert got["fire"] == (f"- fire: funds $0, spent $0; needs $2,500 for another fire station "
-                           f"({_cover(w, 'fire_coverage')}, $55/month)")
+                           f"({_cover(w, 'fire_coverage', env, 'fire')}, $55/month)")
     assert got["health"] == (f"- health: funds $0, spent $0; needs $2,000 for another clinic "
-                             f"({_cover(w, 'health_coverage')}, $40/month) or another landfill "
-                             f"({_cover(w, 'garbage_coverage')}, $30/month)")
+                             f"({_cover(w, 'health_coverage', env, 'health')}, $40/month) or another landfill "
+                             f"({_cover(w, 'garbage_coverage', env, 'health')}, $30/month)")
     assert got["education"].endswith(f"; needs $2,500 for its first elementary school ({n['school']} sites, $45/month)")
     assert got["transport"].endswith(f"; needs $1,500 for its first bus line ({n['bus_stops']} sites, $76/month)")
     assert m["water_demand"] == m["water_supply"] == 313            # the pump counts: another one
@@ -3475,7 +3481,7 @@ def test_the_needs_line_says_first_or_another(grown_env):
     w.dept_funds["police"] = 2500
     assert apply_action(w, "police", {"type": "build_police_station", "x": s["x"], "y": s["y"]}).ok
     assert _dept_lines(env)["police"] == (f"- police: funds $0, spent $0; needs $2,500 for another police station "
-                                          f"({_cover(w, 'police_coverage')}, $55/month)")
+                                          f"({_cover(w, 'police_coverage', env, 'police')}, $55/month)")
     (x, y), = w.facilities(C.LANDFILL)                 # at a tie a first one is named alone: the landfill first
     w.remove_building(x, y)
     w.refresh()

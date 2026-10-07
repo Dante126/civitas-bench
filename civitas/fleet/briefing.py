@@ -28,7 +28,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spend_lines, unclaimed_spots
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
-from .tools import Ask, mayor_ask
+from .tools import Ask, keep_up_where, mayor_ask, needs_count
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
 
@@ -363,7 +363,8 @@ def _needs(m: DeptMoney) -> str:
     only "needs $6,200 for its first coal plant and water tower" while utilities read "sewage (0 of 5; no site yet)",
     and nothing told it sewage waited for planning's road to the river."""
     b = m.needs
-    return "" if b is None else f"; needs {money(b.cost)} for {b.text()}" + "".join(f"; {x}" for x in b.waits)
+    return "" if b is None else (f"; needs {money(b.cost)} for {b.text()}" + "".join(f"; {x}" for x in b.waits)
+                                 + (f"; {m.stuck}" if m.count == 1 and m.stuck else ""))
 
 
 def _dept_line(d: str, m: DeptMoney, f: Funding, budgets: dict) -> str:
@@ -732,6 +733,37 @@ def _ask_line(a: Ask) -> str:
             + (f" This turn: {a.instead}; say" if a.instead else " Say") + " what you need in your end_turn report")
 
 
+def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
+    """A department's Your budget line while its coverage is under KEEP_UP_GOAL and its next build is another building
+    of a KEEP_UP purpose: the buildings the mayor's count names (DeptMoney.count; one when the money covers no more),
+    where (the sites keep_up picked: the most coverage, not the Ready line's best by need, which it says when they
+    differ), what they bring coverage to, and to build all of them this turn when its funds cover them, else the ones
+    they pay for now; when no ready site adds coverage, where the uncovered homes are and to ask planning (stuck); []
+    otherwise. Late smoke 20261007 seed 2: fire read "build another fire station" every quarter while coverage went
+    94 -> 86 -> 81 -> 78%; at month 99 it built at the Ready line's best (37,23), which served one building, where
+    (36,30) would have brought coverage from 86% to ~92%."""
+    if not m.keep_ups:
+        if not m.stuck:
+            return []
+        n = m.build.named[0]
+        return [f"- keep up with growth: {n.label} at your ready sites adds little ({n.status}): {m.stuck}; ask "
+                f"planning for a lot or a road near ({m.gap[0]},{m.gap[1]}) before building another"]
+    g, k = m.goal, m.count
+    n = math.floor((funds + 1e-9) / (g.cost / k))
+    status = "; ".join(f"{nd.label}: {nd.status}" for nd in g.named) if len(g.named) > 1 else g.named[0].status
+    them, these = ("them", "both" if k == 2 else f"all {k}") if k > 1 else ("it", "it")
+    now = (f"build {these} this turn: your funds cover {them} ({money(g.cost)})" if n >= k
+           else f"build {these} this turn once your funds cover {them} ({money(g.cost)}, you "
+                f"have {money(math.floor(funds))})" + (f"; they pay for {n} now: build {'it' if n == 1 else 'those'}"
+                                                       if n else ""))
+    b = m.build
+    best = {p: spots[0] for p, spots in zip(b.purposes, b.sites) if spots}
+    other = [f"({best[p][0]},{best[p][1]})" for p, spots in zip(g.purposes, g.sites)
+             if p in best and best[p] not in spots and best[p] not in m.avoid]     # not one an earlier dept takes
+    note = f"; the Ready line's best {', '.join(other)} adds less" if other else ""
+    return [f"- keep up with growth: {keep_up_where(g)} ({status}): {now}{note}"]
+
+
 def _bus_riders(w) -> str:
     """The Key metrics line on transport's buses: riders against seats, and the share of trips they carry (what its
     score counts, up to TRANSIT_GOAL)."""
@@ -781,6 +813,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     # whether to ask the mayor for money (mayor_ask): for the needs line's top-up (utilities: its supply line's), or
     # else say what is needed in the end_turn report; one line, the "can't pay" one when it shows
     money_of = DeptMoney(env, dept)          # its next build (first_build), shared by the ask and transport's Next line
+    if needs_count(money_of):                # more than one building to keep its coverage up: the mayor's count
+        money_of = funding_gaps(env, fleet).depts.get(dept, money_of)
     ask = mayor_ask(env, fleet, role, money_of)
     if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
         L.append("- You can't pay for any ready site" + (" (the supply above needs " + money(more) + " more)" if more
@@ -792,6 +826,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
                      + (f"; ask when {ask.when}" if ask.when else "") + ": say what you need in your end_turn report."))
     else:
         L.append(_ask_line(ask))
+    L += _keep_up_line(money_of, funds)
     if role == "transport":
         L.append(_transport_next(env, lists, funds, ask, money_of.build))
     view = planning_view(env, lists, funds) if role == "planning" else None     # once a briefing

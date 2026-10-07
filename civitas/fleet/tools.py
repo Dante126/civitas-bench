@@ -30,7 +30,7 @@ from ..core.region import DEAL_ACTIONS
 from ..core.money import RESERVE_MIN, reserve, reserve_months as _reserve_months   # re-exported
 from ..core.roles import ROLES
 from ..sim import catalog as C
-from ..sim.grid import box_sum, label_components, shift
+from ..sim.grid import box_sum, label_components, road_bfs, shift, spread_to_tiles
 from ..sim.world import own_supply
 from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
@@ -1155,6 +1155,105 @@ class DeptMoney:
         # its funded first buildings with no lot of their own (unclaimed_firsts across departments): funding_gaps
         # sets it, so a DeptMoney made alone reads () and its kind is "blocked" only for lack of land
         self.unclaimed: tuple[str, ...] = ()
+        # the buildings its needs line names (goal): above 1 only to keep coverage up, up to `want`, as many as its
+        # funds and the mayor's money cover (funding_gaps sets it; keep_up_counts); 1 is the line as it always was
+        self.count = 1
+        self.counted = False                    # whether keep_up_counts set `count` (a DeptMoney made alone: no)
+        # sites an earlier department's keep-up buildings take (keep_up_counts sets it, in turn order, before its
+        # keep_ups are read): police stations and clinics rank the same uncovered homes, and both named (22,30)
+        self.avoid: frozenset = frozenset()
+
+    @cached_property
+    def keep_ups(self) -> tuple[tuple[int, KeepUp], ...]:
+        """For each building its next build names (build) whose coverage is under KEEP_UP_GOAL: (its index in
+        `named`, keep_up), lowest coverage first; () unless every named building is another one of a KEEP_UP purpose
+        with ready sites (FirstBuild.sites): a first building, utilities, transport and planning keep their line."""
+        if not self.keep_ups_tried:
+            return ()
+        return tuple((i, ku) for i, ku in self._keep_ups_all if ku.n)
+
+    @cached_property
+    def _keep_ups_all(self) -> tuple[tuple[int, KeepUp], ...]:
+        b, w = self.build, self.env.world
+        out = [(i, ku) for i, (p, spots) in enumerate(zip(b.purposes, b.sites))
+               if (ku := keep_up(w, self.dept, p, [s for s in spots if s not in self.avoid])) is not None]
+        return tuple(sorted(out, key=lambda t: t[1].now))
+
+    @property
+    def stuck(self) -> str:
+        """When its next build is another building of a KEEP_UP purpose under KEEP_UP_GOAL and no ready site of it
+        adds KEEP_UP_GAIN (keep_up's gap): "ready sites add under 1%: the uncovered homes near (38,28) are out of
+        their road reach", then, when DOWNTOWN_SHOWN or more of the coverage is lost on level 4-5 tiles, "; 7 points
+        are lost downtown (level 4-5), where tier 1 covers 60% at most: upgrade_facility to tier 2"; "" otherwise
+        (also with a tie of which one adds). Late smoke 20261007 seed 2, month 102: no ready fire or police station
+        site added coverage (the one built at (37,23) at month 99 served one building, load 1 of 260): the homes
+        without cover were on another road, and 7 of the 19 points missing were downtown."""
+        ku = next((ku for _, ku in self._keep_ups_all if ku.gap is not None), None) if self.gap else None
+        if ku is None:
+            return ""
+        x, y = ku.gap
+        hi = round(100 * ku.downtown)
+        return (f"ready sites add under {100 * KEEP_UP_GAIN:g}%: the uncovered homes near ({x},{y}) are out of "
+                "their road reach" + (f"; {hi} points are lost downtown (level 4-5), where tier 1 covers "
+                                       f"{pct(100 * C.T1_DOWNTOWN)} at most: upgrade_facility to tier 2"
+                                       if ku.downtown >= DOWNTOWN_SHOWN else ""))
+
+    @property
+    def gap(self) -> tuple[int, int] | None:
+        """keep_up's gap when no ready site of its next build adds coverage (stuck), else None."""
+        if not self.keep_ups_tried or self.keep_ups:
+            return None
+        return next((ku.gap for _, ku in self._keep_ups_all if ku.gap is not None), None)
+
+    @property
+    def keep_ups_tried(self) -> bool:
+        """keep_ups ran on its next build (every named building another one of a KEEP_UP purpose with sites). Never
+        for planning, utilities or transport, whose build isn't asked for here (no observation built for it)."""
+        m = self.env.world.metrics()                # every coverage it builds for at the goal: nothing to ask (and no
+        if all(m[COVERAGE_OF[d, p]] >= KEEP_UP_GOAL for d, p in KEEP_UP if d == self.dept):    # observation built)
+            return False
+        b = self.build
+        return not (b is None or b.cost is None or not b.named or b.all_of or len(b.sites) != len(b.named)
+                    or any(not n.have for n in b.named))
+
+    @property
+    def want(self) -> int:
+        """The buildings its coverage asks for (keep_ups' counts summed) when that is 2 or more, else 1."""
+        n = sum(ku.n for _, ku in self.keep_ups)
+        return n if n > 1 else 1
+
+    def goal_of(self, count: int) -> FirstBuild | None:
+        """Its next build for `count` buildings: `build` itself without keep_ups; else the first `count` of
+        the keep_ups' buildings (each service's in turn, lowest coverage first), bought together at `count` x the
+        price, each Need with its count, its sites' coverage estimate and its upkeep x count: "3 more fire stations
+        (coverage 78%, ~91% with them, $165/month)", "falling: 94 -> 86 -> 78%" for the coverage when it fell."""
+        b = self.build
+        if count < 1 or not self.keep_ups:
+            return b
+        order = [i for i, ku in self.keep_ups for _ in range(ku.n)][:count]
+        kus, named, purposes, sites = dict(self.keep_ups), [], [], []
+
+        def status(ku: KeepUp, k: int) -> str:
+            fall = coverage_trend(self.env.world, ku.key)
+            return f"coverage {fall or pct(100 * ku.now)}, ~{pct(100 * ku.levels[k])} with {'them' if k > 1 else 'it'}"
+
+        if count == 1 and len(b.named) > 1:     # a tie stays a choice, each with its estimate and best site
+            return b._replace(named=tuple(n._replace(status=status(kus[i], 1)) if i in kus else n
+                                          for i, n in enumerate(b.named)),
+                              sites=tuple(kus[i].sites[:1] if i in kus else spots[:1]
+                                          for i, spots in enumerate(b.sites)), keep_up=True)
+        for i in dict.fromkeys(order):
+            k, n, ku = order.count(i), b.named[i], kus[i]
+            named.append(n._replace(count=k, status=status(ku, k), upkeep=n.upkeep * k))
+            purposes.append(b.purposes[i])
+            sites.append(ku.sites[:k])
+        return b._replace(cost=b.cost * len(order), named=tuple(named), all_of=len(named) > 1,
+                          purposes=tuple(purposes), sites=tuple(sites), keep_up=True)
+
+    @property
+    def goal(self) -> FirstBuild | None:
+        """goal_of(count): what its needs line, its ask and the mayor's notes name."""
+        return self.goal_of(self.count)
 
     @cached_property
     def build(self) -> FirstBuild | None:
@@ -1176,11 +1275,17 @@ class DeptMoney:
 
     @property
     def needs(self) -> FirstBuild | None:
-        """Its cheapest ready site when its funds are short of it (the mayor's needs line), else None."""
+        """Its cheapest ready site when its funds are short of it (the mayor's needs line), else None; with a count
+        above 1, its goal when its funds are short of that."""
+        if self.count > 1:
+            b = self.goal
+            return b if short_of(self.funds, b.cost) else None
         if self.bound is not None and not short_of(self.funds, self.bound):
             return None
         b = self.build
-        return b if b and b.cost is not None and short_of(self.funds, b.cost) else None
+        if not (b and b.cost is not None and short_of(self.funds, b.cost)):
+            return None
+        return self.goal_of(1) if self.keep_ups else b      # the same price: the building where it adds the most
 
     @property
     def blocked(self) -> tuple[str, ...]:
@@ -1265,6 +1370,8 @@ class DeptMoney:
         month 108: utilities read "nothing ready to buy" with a pump and an outlet ready, water and sewage spare."""
         if self.dept == "planning":
             return ""
+        if self.count > 1 and not short_of(self.funds, self.goal.cost):
+            return f"funds cover {self.goal.what}"
         if self.priced and self.bound is not None and not short_of(self.funds, self.bound):
             return "funds cover its builds"
         b = self.build
@@ -1311,6 +1418,7 @@ class FundItem(NamedTuple):
     amount: int             # DeptMoney.top_up (> 0)
     upkeep: float           # DeptMoney.upkeep: the monthly upkeep the building adds (0 for planning's road)
     what: str               # DeptMoney.what: "its first police station", "another clinic or another landfill"
+    count: int = 1          # DeptMoney.count: the buildings it buys (more than one to keep coverage up)
 
 
 class Funding(NamedTuple):
@@ -1370,6 +1478,8 @@ def funding_gaps(env, fleet: FleetState) -> Funding:
     for d, m in depts.items():
         m.unclaimed = unclaimed.get(d, ())
     turn = list(depts)
+    keep = reserve(w)
+    keep_up_counts(depts, w.treasury - keep + sum(idle.values()))
     kinds = {d: m.kind for d, m in depts.items()}
     gaps, unusable = {}, {}
     for d, m in depts.items():
@@ -1381,12 +1491,47 @@ def funding_gaps(env, fleet: FleetState) -> Funding:
             target = budgets[d]
             gaps[d] = {"funds": round(m.funds), "target": round(target), "gap": round(target - m.funds)}
     order = tuple(sorted(depts, key=lambda d: (KIND_RANK[kinds[d]], turn.index(d))))
-    to_fund = [FundItem(d, kinds[d], m.top_up, m.upkeep, m.what) for d in order
+    to_fund = [FundItem(d, kinds[d], m.top_up, m.upkeep, m.what, m.count) for d in order
                if kinds[d] in NEED_KINDS and (m := depts[d]).top_up > 0]
     zero = tuple(d for d in order if kinds[d] == KINDS[0] and not budgets.get(d))
-    keep = reserve(w)
     return Funding(gaps, sum(g["gap"] for g in gaps.values()), keep, w.treasury - keep, idle, depts, unclaimed, order,
                    to_fund, zero, env.cfg.months - w.month, unusable)
+
+
+def keep_up_counts(depts: dict[str, DeptMoney], spendable: float) -> None:
+    """Sets each department's count (DeptMoney.count) where its coverage asks for 2 or more buildings (want; never
+    for idle money): first as many as its own funds pay for, then, while the money to spend (`spendable`: the treasury
+    above the reserve plus the idle money) covers every top-up the needs lines ask at those counts, one more at a time
+    in turn, most urgent first (kind, then turn order), as long as what the next one adds to its top-up fits in what
+    is left. So the to-fund line's cover clause still covers all of them (fund_cover), and a city short of money, or
+    in a hold, keeps its one-building lines. The guards read the kinds this leaves: one more building is still
+    "another" (RESERVE_REFUSED alike), and a department's keep (what a take-back leaves) doesn't change."""
+    taken: set = set()
+    for m in depts.values():                    # in turn order: a site goes to the first department picking it
+        m.counted, m.avoid = True, frozenset(taken)
+        if not m.idle:
+            taken |= {s for _, ku in m.keep_ups for s in ku.sites}
+    grow = [d for d, m in depts.items() if not m.idle and m.want > 1]
+    for d in grow:
+        m = depts[d]
+        m.count = max(1, min(m.want, math.floor((m.funds + 1e-9) / m.build.cost)))
+    if spendable <= 0:
+        return
+    rank = {d: (KIND_RANK[m.kind], i) for i, (d, m) in enumerate(depts.items())}
+    left = spendable - sum(m.top_up for m in depts.values() if m.kind in NEED_KINDS)
+    grow = sorted((d for d in grow if depts[d].count < depts[d].want), key=rank.get)
+    while grow and left > 0:
+        for d in list(grow):
+            m = depts[d]
+            before = m.top_up
+            m.count += 1
+            if m.top_up - before > left:
+                m.count -= 1
+                grow.remove(d)
+                continue
+            left -= m.top_up - before
+            if m.count >= m.want:
+                grow.remove(d)
 
 
 def _to_spend_line(w, f: Funding, cf: CashFlow) -> str:
@@ -1439,7 +1584,8 @@ def _to_fund_line(f: Funding) -> str:
             continue
         up = sum(i.upkeep for i in items)
         tail = f"upkeep +{money(up)}/month" if round(up) else ""
-        part = f"{kind}: " + ", ".join(f"{i.dept} {money(i.amount)}" for i in items)
+        part = f"{kind}: " + ", ".join(f"{i.dept} {money(i.amount)}" + (f" ({i.count} buildings)" if i.count > 1
+                                                                        else "") for i in items)
         if len(items) > 1:
             part += f" ({money(sum(i.amount for i in items))}" + (f", {tail}" if tail else "") + ")"
         elif tail:
@@ -1487,10 +1633,21 @@ def spend_lines(w, f: Funding) -> list[str]:
     return [_to_spend_line(w, f, cash_flow(w)), _to_fund_line(f)]
 
 
+def _buildings(count: int) -> str:
+    """", 3 buildings" after a to-fund item's kind when it buys more than one (keep_up_counts), else ""."""
+    return f", {count} buildings" if count > 1 else ""
+
+
+def keep_up_where(b: FirstBuild) -> str:
+    """The buildings of a keep-up goal (DeptMoney.goal) and where, in the department's words: "3 more fire stations
+    at (37,23), (12,20) and (30,28)", several services joined by "and" (by "or" for a tie: one of them)."""
+    return (" and " if b.all_of or len(b.named) < 2 else " or ").join(f"{n.label} at {_and([f'({x},{y})' for x, y in spots])}" for n, spots in zip(b.named, b.sites))
+
+
 def still_to_fund(f: Funding, n: int = FUNDED_SHOWN) -> str:
     """The to_fund items for a money result: "education $2,500 (first/supply), fire $2,500 (another)", the first `n`
     then "+N more"; "none" without any."""
-    items = [f"{i.dept} {money(i.amount)} ({i.kind})" for i in f.to_fund]
+    items = [f"{i.dept} {money(i.amount)} ({i.kind}{_buildings(i.count)})" for i in f.to_fund]
     if not items:
         return "none"
     return ", ".join(items[:n]) + (f", +{len(items) - n} more" if len(items) > n else "")
@@ -1593,7 +1750,7 @@ def request_state(f: Funding, dept: str, covered: list[str]) -> str:
     k = m.kind
     if k in NEED_KINDS:
         cover = "covered" if dept in covered else "not covered" + (" (hold)" if f.hold else " now")
-        return f"to fund {money(m.top_up)} ({k}), {cover}"
+        return f"to fund {money(m.top_up)} ({k}{_buildings(m.count)}), {cover}"
     return f"no top-up needed ({wait_why(m)})"
 
 
@@ -1684,6 +1841,13 @@ def _yours(text: str) -> str:
     return re.sub(r"\bits\b", "your", text)
 
 
+def needs_count(m: DeptMoney) -> bool:
+    """A DeptMoney made alone whose coverage asks for more than one building: its count comes from funding_gaps
+    (keep_up_counts), so a department reads the count the mayor's line names. The briefing and mayor_ask swap it for
+    funding_gaps' own."""
+    return not m.counted and not m.idle and m.want > 1
+
+
 def target_above(target: float | None, funds: float) -> bool:
     """A plan target above the funds by at least the gap rule (max(GAP_MIN, GAP_SHARE x target)): funding_gaps' "<"
     marker and its unusable targets, and mayor_ask's plan note."""
@@ -1701,14 +1865,19 @@ def mayor_ask(env, fleet: FleetState, dept: str, m: DeptMoney | None = None) -> 
     funding_gaps' but for unclaimed first buildings, which read as their state); the whole funding_gaps (~7 ms) only
     for another building, whose cover needs every top-up. `m`: the department's DeptMoney when the caller has one (the
     briefing shares it with transport's Next line, so both read one first_build)."""
+    f = None
     m = m or DeptMoney(env, dept)
+    if needs_count(m):                  # its count is the mayor's (keep_up_counts): one line, one ask
+        f = funding_gaps(env, fleet)
+        m = f.depts.get(dept, m)
     k, what = m.kind, _yours(m.what)
     if k in NEED_KINDS[:2]:
         return Ask(True, m.top_up, what, "the mayor funds first buildings, supply and planning's road first")
     if k == "another":
-        f = funding_gaps(env, fleet)
+        f = f or funding_gaps(env, fleet)
         if dept in fund_cover(f):
-            return Ask(True, m.top_up, what, "the mayor's money above its reserve covers it now")
+            return Ask(True, m.top_up, what, "the mayor's money above its reserve covers "
+                       + ("them" if m.count > 1 else "it") + " now")
         why = ("the mayor is in a hold (the treasury is at or under its reserve) and funds only first buildings, "
                "supply and planning's road" if f.hold else "the mayor's money above its reserve doesn't cover it "
                "after first buildings, supply and planning's road")
@@ -1749,6 +1918,11 @@ def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> 
         when = "a site is ready for you"
     if dept == "planning":                # its Next line: parks, zones, a lot for utilities, then the road
         instead = "the builds your briefing's Next line names"
+    elif m.keep_ups and not short_of(m.funds, m.goal.cost):       # every building keeping its coverage up, where
+        instead = (f"build {keep_up_where(m.goal)} ({money(m.goal.cost)}): your funds cover "
+                   + ("them" if m.count > 1 else "it"))
+    elif m.gap is not None:                                        # a building at a ready site would add nothing
+        instead = f"ask planning for a lot or a road near the uncovered homes at ({m.gap[0]},{m.gap[1]})"
     elif b is not None and b.cost is not None and b.named and not short_of(m.funds, b.cost):
         instead = f"build {_yours(b.what)} ({money(b.cost)}): your funds cover it"
     elif room:
@@ -1802,11 +1976,12 @@ def topped_up(m: DeptMoney) -> str:
     (FirstBuild.extra) or "had nothing ready to buy"."""
     if (b := m.needs) is not None:
         less = ("" if m.dept == "planning" else ": less buys fewer tiles" if any(n.have is None for n in b.named)
-                else ": less buys fewer of them" if b.all_of and len(b.named) > 1 else ": less buys nothing")
+                else ": less buys fewer of them" if b.all_of and len(b.named) > 1 or m.count > 1
+                else ": less buys nothing")
         return f"still {money(m.top_up)} short of {m.what}{less}"
     if m.unclaimed or m.blocked:
         return "blocked for lack of land: this buys nothing until planning frees a lot"
-    b = m.build
+    b = m.goal                                  # its next build, or the buildings that keep its coverage up
     if b is None or b.cost is None or not b.named:
         if b is not None and b.room:
             return "needs nothing now: supply has room"
@@ -2313,12 +2488,16 @@ class Need(NamedTuple):
                                 # supply building, first or another, its supply's cover (SupplyBuild.status)
     first: bool = False         # a primary first building (Price.first) the city lacks: the mayor's priority line
     upkeep: float = 0.0         # what it adds a month (Price.upkeep; per-tile ones for all their tiles); 0 for the road
+    count: int = 1              # how many: more than one only to keep coverage up (DeptMoney.goal), `upkeep` for all
 
     @property
     def label(self) -> str:
-        """What it is, without the details: "its first police station", "another clinic", "3 avenue tiles"."""
+        """What it is, without the details: "its first police station", "another clinic", "3 avenue tiles", "3 more
+        fire stations" (count)."""
         if self.have is None:
             return self.what
+        if self.count > 1:
+            return f"{self.count} more {self.what}s"
         return f"its first {self.what}" if not self.have else f"another {self.what}"
 
     def text(self) -> str:
@@ -2364,6 +2543,10 @@ class FirstBuild(NamedTuple):
                                 # ("sewage outlet waits for a road to the river"): the mayor's needs line adds them
     purposes: tuple[str, ...] = ()  # the find_sites purpose of each `named` building, in order; with nothing named,
                                     # `extra`'s (transport's Next line renders the build from them: _transport_next)
+    sites: tuple = ()           # for each `named` building of a KEEP_UP purpose, its ready sites ((x, y), best first,
+                                # up to MAX_SITES), else (): keep_up picks among them (DeptMoney.keep_ups)
+    keep_up: bool = False       # more than one building, to bring coverage back (DeptMoney.goal): `named` are bought
+                                # together (all_of when several), each with its count and coverage
 
     @property
     def what(self) -> str:
@@ -2386,6 +2569,8 @@ class FirstBuild(NamedTuple):
         7,700."""
         if not self.all_of or len(self.named) < 2:
             return " or ".join(n.text() for n in self.named)
+        if self.keep_up:                        # each with its coverage: "2 more clinics (...) and another landfill"
+            return " and ".join(n.text() for n in self.named)
         return self.what + (f" ({money(self.upkeep)}/month)" if round(self.upkeep) else "")
 
 
@@ -2543,7 +2728,231 @@ def build_status(w, dept: str, purpose: str, name: str) -> str:
         have, need = m[f"{supply}_supply"], m[f"{supply}_demand"]
         return f"{supply} {pct(100 * need / have)} used" if have > 0 else f"no {supply} supply"
     key = COVERAGE_OF.get((dept, purpose))
+    if key and (fall := coverage_trend(w, key)):
+        return f"coverage {fall}"
     return f"{COVERAGE_LABEL.get(key, 'coverage')} {pct(100 * m[key])}" if key else ""
+
+
+# ------------------------------------------------------------------ keeping up with coverage
+# Late smoke 20261007 seed 2 (the LLM fleet from month 96, act_every 3): population +30% in 12 months while fire
+# coverage went 94 -> 86 -> 81 -> 78%, police 94 -> 79, health 83 -> 67, schools 93 -> 78, with $35-39k above the
+# reserve all along. Each needs line named one "another <building>", the mayor funded that one every turn, and a
+# quarter later coverage was lower. A department short of KEEP_UP_GOAL now names the buildings it takes to get back
+# (keep_up), as many as the money above the reserve covers after every other top-up (funding_gaps)
+KEEP_UP_GOAL = 0.9           # coverage the count aims at (the score counts coverage linearly; most playbooks say 85%)
+KEEP_UP_MAX = 4              # buildings named at most for one service (the successful-action cap is 8 a turn)
+KEEP_UP_GAIN = 0.01          # a building adding less coverage than this isn't counted (crowded, or nothing near)
+DOWNTOWN_SHOWN = 0.02        # the stuck note names the coverage lost downtown from this much (2 points)
+TREND_STEP = 3               # months between the points of the falling note (a quarter: the fleet's cadence)
+TREND_POINTS = 3             # points it shows at most: "94 -> 86 -> 81%"
+# (dept, purpose) -> the service whose coverage its building adds to (service_coverage); COVERAGE_OF has the metric
+KEEP_UP = {("police", "station"): "police", ("fire", "station"): "fire", ("health", "clinic"): "health",
+           ("health", "landfill"): "garbage", ("education", "school"): "school",
+           ("education", "high_school"): "high"}
+# keep_up's results per world, dropped when what coverage reads moves (_cover_key): funding_gaps runs for every guard
+# and money note of a mayor turn, and its money moves (each a refresh: a new World.version) change none of it. Keyed
+# on the version, keep_up took 4.2 s of a 9.3 s fleet_scripted episode (6.3 s without it)
+_KEEP_UPS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _cover_key(w) -> tuple:
+    """What service_coverage reads that can change between two calls: the month (residents, cohorts, congestion and
+    landfill fill move only in a tick), the roads, the buildings and their levels and density, the funding levels,
+    the policies (city-wide and by district) and each facility's tier and modules."""
+    return (w.month, w.road_key, hash(w.struct.tobytes()), hash(w.level.tobytes()), hash(w.density.tobytes()),
+            tuple(sorted(w.funding.items())), tuple(sorted(w.policies)), hash(w.district_id.tobytes()),
+            tuple(sorted((d["id"], tuple(sorted(d["policies"]))) for d in w.districts.values())),
+            tuple(sorted((k, v.get("tier"), tuple(v.get("modules", ()))) for k, v in w.facility_state.items())))
+
+
+def coverage_trend(w, key: str) -> str:
+    """"falling: 94 -> 86 -> 81%" when the coverage metric `key` fell (in whole percent) at each of the last points
+    TREND_STEP months apart (the newest is now: World.metrics), at most TREND_POINTS of them; "" when it didn't fall
+    over the last step (or there is no such history). Transit is left out: its line is transport's own."""
+    if key == "transit_share" or len(w.history) <= TREND_STEP:
+        return ""
+    vals = [round(100 * w.metrics().get(key, 0.0))]
+    for k in range(1, TREND_POINTS):
+        i = len(w.history) - 1 - k * TREND_STEP
+        if i < 0 or key not in w.history[i]:
+            break
+        v = round(100 * w.history[i][key])
+        if v <= vals[-1]:
+            break
+        vals.append(v)
+    return "" if len(vals) < 2 else "falling: " + " -> ".join(map(str, reversed(vals))) + "%"
+
+
+def _road_cover(w, parts: list[list[tuple[int, int]]], radius: int, caps: np.ndarray, demand: np.ndarray,
+                full: float) -> np.ndarray:
+    """ServicesMixin._cover_group (with its _road_field) for buildings at `parts`, without the BFS cache: coverage
+    before funding and traffic."""
+    dist, lab = road_bfs(w.road_labels >= 0, parts, max_d=radius + 1)
+    td, tl = spread_to_tiles(dist, lab, C.ACCESS_RADIUS)
+    for k, tiles in enumerate(parts):                  # the facility's own tiles
+        if any(lab[max(0, y - 1):y + 2, max(0, x - 1):x + 2].max() >= 0 for x, y in tiles):
+            for x, y in tiles:
+                td[y, x], tl[y, x] = 0, k
+    reach = td <= radius
+    load = np.bincount(tl[reach], weights=demand[reach], minlength=len(parts))
+    ratio = np.where(load > caps, caps / np.maximum(load, 1e-9), 1.0)
+    f = np.clip((radius - td) / max(1e-9, (1.0 - full) * radius), 0.0, 1.0) * reach if full < 1 else reach * 1.0
+    return f * ratio[np.maximum(tl, 0)]
+
+
+class _Sources:
+    """ServicesMixin.coverage for the buildings of one struct, with buildings of a tier-1 `spec` added at top-left
+    tiles (grid(extra)); the buildings there and their capacities read once. Writes nothing."""
+
+    def __init__(self, w, struct: int, demand: np.ndarray, dept: str, spec: dict | None = None, *,
+                 full: float = C.COVERAGE_FULL, skip=frozenset(), traffic: bool = False, cap_key: str = "capacity",
+                 min_tier: int = 1):
+        self.w, self.demand, self.spec, self.full, self.traffic, self.cap_key = w, demand, spec, full, traffic, cap_key
+        sources = [s for s in w.facilities(struct) if w.building_network(*s) >= 0 and s not in skip
+                   and w.facility_tier(*s) >= min_tier]
+        self.eff = w.funding_eff(dept)
+        specs = [w.facility_spec(*s) for s in sources]
+        self.parts = [w.parts(*s) for s in sources]
+        self.caps = [sp[cap_key] * self.eff * w.module_factor(x, y, "expansion") for (x, y), sp in zip(sources, specs)]
+        self.radii = [int(sp["radius"]) for sp in specs]
+
+    def grid(self, extra=()) -> np.ndarray:
+        w, parts, caps, radii = self.w, list(self.parts), list(self.caps), list(self.radii)
+        for x, y in extra:
+            fw, fh = self.spec["footprint"]
+            parts.append([(x + i, y + j) for j in range(fh) for i in range(fw)])
+            caps.append(self.spec[self.cap_key] * self.eff)
+            radii.append(int(self.spec["radius"]))
+        if not parts:
+            return np.zeros((w.h, w.w))
+        cov = None
+        for r in sorted(set(radii)):
+            idx = [k for k, rk in enumerate(radii) if rk == r]
+            g = _road_cover(w, [parts[k] for k in idx], r, np.array([caps[k] for k in idx]), self.demand, self.full)
+            cov = g if cov is None else np.maximum(cov, g)
+        cov = cov * min(1.0, self.eff)
+        if self.traffic:
+            cov = cov * w.congestion_penalty
+        return np.clip(cov, 0.0, 1.0)
+
+
+class _Coverage:
+    """One service's coverage metric as ServicesMixin._compute_services computes it from the world as it is now, with
+    tier-1 buildings of `spec` added (value(extra)); what doesn't change with them (residents, demand, tier-2 and
+    hospital cover, incinerators) read once, so keep_up's tries cost one road BFS per radius each."""
+
+    def __init__(self, w, service: str, spec: dict | None = None):
+        self.res = res = w.residents_grid()
+        self.rsum = float(res.sum())
+        self.service = service
+        developed = np.isin(w.struct, C.ZONES) & (w.level > 0)
+        self.dev_hi = developed & (w.level >= C.DOWNTOWN_LEVEL)
+        self.fixed = None
+        if service in ("police", "fire"):
+            struct, demand = (C.POLICE, w._people_grid()) if service == "police" else (C.FIRE, developed.astype(float))
+            self.own = _Sources(w, struct, demand, service, spec, traffic=True)
+            self.fixed = _Sources(w, struct, demand, service, traffic=True, min_tier=2).grid()     # tier-2 cover
+        elif service == "health":
+            self.own = _Sources(w, C.CLINIC, res, "health", spec, traffic=True)
+            self.fixed = _Sources(w, C.HOSPITAL, res, "health", traffic=True).grid()
+        elif service in ("school", "high"):
+            n = w.cohorts
+            share = float(n[0 if service == "school" else 1].sum()) / max(1.0, float(n.sum()))
+            self.own = _Sources(w, C.SCHOOL if service == "school" else C.HIGHSCHOOL, res * share, "education", spec,
+                                cap_key="seats")
+        else:                                           # garbage: landfills with room left, and incinerators
+            prod = w._garbage_production()
+            full = {s for s in w.facilities(C.LANDFILL) if (cap := w.facility_spec(*s).get("fill"))
+                    and w.facility_state.get(s, {}).get("fill", 0.0) >= cap}       # _full_landfills, read-only
+            self.own = _Sources(w, C.LANDFILL, prod, "health", spec, full=1.0, skip=full, cap_key="collect")
+            self.fixed = _Sources(w, C.INCINERATOR, prod, "health", full=1.0, cap_key="collect").grid()
+
+    def value(self, extra=()) -> tuple[float, np.ndarray]:
+        """The metric, and the per-tile cover it weighs residents by (a school's: covered or not)."""
+        if self.rsum <= 0:
+            return 0.0, np.zeros(self.res.shape)
+        g, fixed = self.own.grid(extra), self.fixed
+        if self.service in ("school", "high"):
+            g = (g > 0.05).astype(float)
+        elif self.service == "garbage":
+            g = np.maximum(g, fixed)
+        else:                   # downtown tiles need tier-2 cover (T1_DOWNTOWN); a hospital covers like a clinic
+            if self.service == "health":
+                g = np.maximum(g, fixed)
+            g = np.where(self.dev_hi, np.maximum(C.T1_DOWNTOWN * g, fixed), g)
+        return float((g * self.res).sum() / self.rsum), g
+
+
+def service_coverage(w, service: str, extra=(), spec: dict | None = None) -> float:
+    """The coverage metric of `service` (a KEEP_UP value) as ServicesMixin._compute_services computes it from the
+    world as it is now, with tier-1 buildings of `spec` added at `extra` (top-left tiles); writes nothing. With no
+    extra and nothing changed since the last tick it is the metric. Tier-1 buildings add nothing to the tier-2 cover
+    downtown tiles also need (T1_DOWNTOWN)."""
+    return _Coverage(w, service, spec).value(extra)[0]
+
+
+class KeepUp(NamedTuple):
+    """What it takes to bring one service's coverage back to KEEP_UP_GOAL (keep_up)."""
+    key: str                                # the COVERAGE_OF metric
+    now: float                              # the metric now (last month's)
+    levels: tuple[float, ...]               # the estimated coverage with 0, 1, 2 ... of `sites` built
+    sites: tuple[tuple[int, int], ...]      # where, in the order picked
+    gap: tuple[int, int] | None = None      # with none picked (no ready site adds KEEP_UP_GAIN): the tile at the
+                                            # middle of the most uncovered residents outside downtown, which no ready
+                                            # site reaches
+    downtown: float = 0.0                   # with none picked: the coverage lost on level 4-5 tiles, which tier-1
+                                            # buildings cover only to T1_DOWNTOWN (a tier-2 one covers them)
+
+    @property
+    def n(self) -> int:
+        return len(self.sites)
+
+
+def keep_up(w, dept: str, purpose: str, sites) -> KeepUp | None:
+    """How many more of the building `dept`'s `purpose` builds bring its coverage metric to KEEP_UP_GOAL, picked
+    greedily among its ready `sites` ((x, y), best first; at most MAX_SITES): each next one where it adds the most
+    coverage (service_coverage: the sim's own coverage with the building placed), stopping at the goal, at
+    KEEP_UP_MAX, or when the best adds under KEEP_UP_GAIN. None for a purpose not in KEEP_UP, with the metric at or
+    above the goal, or with no site. Cached while what it reads stays (_cover_key). About 1-2 ms a building tried."""
+    service = KEEP_UP.get((dept, purpose))
+    key = COVERAGE_OF.get((dept, purpose))
+    sites = tuple(tuple(s) for s in sites)[:MAX_SITES]
+    if service is None or not sites or w.metrics()[key] >= KEEP_UP_GOAL:
+        return None
+    state, cache = _KEEP_UPS.get(w, (None, {}))
+    if state != (now := _cover_key(w)):
+        cache = {}
+        _KEEP_UPS[w] = (now, cache)
+    k = (dept, purpose, sites)
+    if k not in cache:
+        line = C.TIER_BY_NAME[SITE_BUILDS[dept][purpose][0]][0]
+        spec = C.TIER_LINES[line][0]
+        model = _Coverage(w, service, spec)
+        base, cover = model.value()
+        # lazy greedy: a site's gain only shrinks as others are picked (they share the uncovered homes), so a gain
+        # computed before the last pick bounds it; only the top one is recomputed (about 2 tries a pick, not 6)
+        levels, chosen = [base], []
+        value = {s: model.value([s])[0] for s in sites}             # with the buildings picked when `fresh`
+        fresh = set(sites)
+        while value and len(chosen) < KEEP_UP_MAX and levels[-1] < KEEP_UP_GOAL:
+            s = max(value, key=lambda t: (value[t], -sites.index(t)))
+            if s not in fresh:
+                value[s], fresh = model.value(chosen + [s])[0], fresh | {s}
+                continue
+            if value[s] - levels[-1] < KEEP_UP_GAIN:
+                break
+            chosen.append(s)
+            levels.append(value.pop(s))
+            fresh = set()
+        gap, downtown = None, 0.0
+        if not chosen and levels[0] < KEEP_UP_GOAL:     # where the uncovered residents are, out of the sites' reach
+            lost = model.res * (1.0 - cover)
+            hi = model.dev_hi if service in ("police", "fire", "health") else np.zeros_like(model.dev_hi)
+            downtown = float((lost * hi).sum()) / max(1.0, model.rsum)
+            y, x = np.unravel_index(int(np.argmax(box_sum(lost * ~hi, 2))), cover.shape)
+            gap = (int(x), int(y))
+        cache[k] = KeepUp(key, w.metrics()[key], tuple(levels), tuple(chosen), gap, downtown)
+    return cache[k]
 
 
 def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
@@ -3003,8 +3412,11 @@ def first_build(env, dept: str) -> FirstBuild | None:
         firsts.append((low.cost, next(iter(named.values())).label))
     dearest = max(firsts, key=lambda t: t[0])                   # the first of the dearest, as max() reads them
     shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
+    spots = tuple(tuple((int(s["x"]), int(s["y"])) for s in lists[which[k]].sites[:MAX_SITES])
+                  if (dept, which[k]) in KEEP_UP else () for k in named)
     return FirstBuild(low.cost if low else None, tuple(named.values()), dearest[0], shut, _funded_of(w, dept, lists),
-                      keep_for=dearest[1], purposes=tuple(which[k] for k in named))
+                      keep_for=dearest[1], purposes=tuple(which[k] for k in named),
+                      sites=spots if any(spots) else ())
 
 
 def _supply_build(w, lists: dict[str, SiteList], firsts: list[tuple[float, str]], label) -> FirstBuild | None:
