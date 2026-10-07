@@ -364,12 +364,19 @@ def test_mayor_finances_lines(monkeypatch):
     assert mayor(type="take_loan", amount=18800)
     lines = fin()
     assert "loans +$18.8k" in lines[0] and lines[0].endswith(")") and ", debt" not in lines[0], lines[0]
-    assert lines[2] == "- debt $18.8k: $94/month interest, $31.2k more can be borrowed"   # 0.5% of the debt a month
+    assert lines[2] == ("- debt $18.8k: $94/month interest, $31.2k more can be borrowed; repay_loan 18800 now: that "
+                        "much is spare above the reserve and what waits to be funded (saves $94/month)")   # 0.5% a month
+    treasury = w.treasury
+    w.treasury = 3000.0                                 # nothing spare above the reserve: no repayment suggested
+    assert fin()[2] == "- debt $18.8k: $94/month interest, $31.2k more can be borrowed"
+    w.treasury = treasury
     assert 18800 * C.LOAN_INTEREST == 94                # what a repayment saves: repay_loan's description, the playbook
     env.end_month()
     assert fin()[1].endswith(", interest $94")          # last month's, from the ledger
-    w.debt = C.MAX_DEBT
+    w.debt, treasury = C.MAX_DEBT, w.treasury
+    w.treasury = 3000.0
     assert fin()[2] == "- debt $50k: $250/month interest, at the $50k limit"
+    w.treasury = treasury
     # a milestone reward is the rest of the change: "other"
     env = _env()
     env.end_month()

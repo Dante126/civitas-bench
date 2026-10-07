@@ -438,7 +438,10 @@ def _header(env, role: str, mode: str) -> list[str]:
             f"up to {env.cfg.max_actions_per_turn} successful actions this turn", ""]
 
 
-def _finances(w, cf: CashFlow) -> list[str]:
+REPAY_MIN = 500          # a repayment the debt line suggests: at least this much spare (in $100 steps)
+
+
+def _finances(w, cf: CashFlow, spare: float = 0.0) -> list[str]:
     """The mayor's Finances lines (the WARNING line follows): the treasury and its change since overview's trend month
     split into operations, the mayor's top-ups, loans and the rest (cash_flow; parts that round to $0 left out),
     last month's income and expenses by kind (buildings, the dearest COSTS_SHOWN by name, then city services, imports
@@ -449,7 +452,11 @@ def _finances(w, cf: CashFlow) -> list[str]:
       add up; "imports $173" before the interest when there are any: review, a region's $173 of service imports read
       as city services)
     - "- debt $18.8k: $94/month interest, $31.2k more can be borrowed" (the first line then leaves the debt out; what a
-      repayment saves is in repay_loan's description and the playbook: review, the worst mix ran 27 characters over)
+      repayment saves is in repay_loan's description and the playbook: review, the worst mix ran 27 characters over),
+      and with `spare` (the treasury above the reserve after every top-up still to fund) of REPAY_MIN or more
+      "; repay_loan 5000 now: that much is spare above the reserve and what waits to be funded (saves $25/month)":
+      the 120-month region run ended with south at $55k treasury and $28k debt, north $137k and $5k, 2 repayments
+      against 23 loans
     Smoke v13-v19: the treasury change mixed in the mayor's own transfers, so 30 of 81 turns showed a "loss" while
     operations ran a surplus; interest never showed in dollars, and there were 0 repay_loan calls in 96 turns."""
     debt = round(w.debt) > 0
@@ -474,8 +481,11 @@ def _finances(w, cf: CashFlow) -> list[str]:
                  + (f", imports {money(cf.imports)}" if round(cf.imports) else "") + f", interest {money(cf.interest)}")
     if debt:
         room = C.MAX_DEBT - w.debt
+        pay = min(math.floor(w.debt), math.floor(max(0.0, spare) / 100) * 100)
         L.append(f"- debt {money(w.debt)}: {money(w.debt * C.LOAN_INTEREST)}/month interest, "
-                 + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit"))
+                 + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit")
+                 + (f"; repay_loan {pay} now: that much is spare above the reserve and what waits to be funded "
+                    f"(saves {money(pay * C.LOAN_INTEREST)}/month)" if pay >= REPAY_MIN else ""))
     return L
 
 
@@ -505,12 +515,13 @@ def _mayor(env, fleet: FleetState) -> list[str]:
              for k in ("power", "water", "sewage")),
          "- coverage: " + ", ".join(f"{k} {pct(v)}" for k, v in o["coverage_pct"].items()),
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
-         "", "## Finances", *_finances(w, cash_flow(w))]
+         "", "## Finances"]
+    f = funding_gaps(env, fleet)
+    L += _finances(w, cash_flow(w), f.spare - sum(i.amount for i in f.to_fund))
     if w.months_negative or w.low_approval_months:
         L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
                  f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
                  f"({C.RECALL_MONTHS} = recall)")
-    f = funding_gaps(env, fleet)
     reqs = open_requests(env, fleet)
     asks = _requests(reqs, f, w.month)
     # each department line of the Open requests block takes the place of a quoted message: the worst mix of
