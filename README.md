@@ -1282,9 +1282,11 @@ After planning's Next line, parks and Open requests block (233c529), the same tw
 (`runs/20261006-174455_fleet_smoke_late_s0_940` and `..._s1_941`): seed 0 city +4.2 (was +2.3),
 population +3,524 (was +2,064), planning 62.9 -> 68.8; seed 1 city +5.6 (was +3.7), population +2,972
 (was +1,876), teamwork 73.7 (was 44.1). Planning built 4 and 2 park blocks (the long runs: 1 park tile
-in 244 planning turns). Some of the Next line's own calls still failed "no empty land tiles": each
-had succeeded earlier in the turn and was re-sent from the briefing, so action results now carry a
-refreshed Next line and repeats say they are done (Planning's next step).
+in 244 planning turns). Some of the Next line's calls were sent again after they had succeeded earlier in
+the turn (the model restarted from the stale briefing); every successful planning or transport action now
+ends with the refreshed Next line (2495e4c). With that (`runs/20261006-215824_fleet_smoke_late_s0_868` and
+`..._s1_869`): seed 0 +3.7 / +2,868, teamwork 99.4, 5 failed actions in 32 turns, planning in 47 steps
+(was 71); seed 1 +6.7 / +2,324, past the scripted fleet's +6.2 on score too.
 
 **Config.**
 
