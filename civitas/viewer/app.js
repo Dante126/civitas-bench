@@ -118,7 +118,7 @@ function switchCity(c) {
   S.frames = S.raw.map(f => cityFrame(f, c)); S.traces = {};
   S.collab = null; S.teamPick = null; loadCollab(true);
   renderCitySwitch();
-  $("agentsLine").innerHTML = `<b>${c}</b> · ` + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
+  renderLineup();
   render(null, false);
 }
 
@@ -133,7 +133,7 @@ async function openRun(id, { month = null } = {}) {
   renderCitySwitch();
   scene.setMeta(S.meta);
   $("runLabel").textContent = `${S.meta.name} · seed ${S.meta.seed}`;
-  $("agentsLine").innerHTML = (S.city ? `<b>${S.city}</b> · ` : "") + S.meta.roles.map(r => `<span style="color:${roleColor(r)}">${r}</span> ${esc(S.meta.agents[r])}`).join(" · ");
+  renderLineup();
   S.yard = null; S.yardState = null;
   await fetchFrames(true);
   loadYard();
@@ -1648,6 +1648,26 @@ function drawMinimap() {
 const TRACK_Y = 22, TRACK_PAD = 7;
 // a warm-up run (meta.warmup, bench/runner.py): months before it were played by scripted agents
 function warmupMonths() { return (S.meta && S.meta.warmup && S.meta.warmup.months) || 0; }
+// the top bar's line-up: one chip naming who plays ("trinity-large-thinking · 8 agents", "trinity-mini × 6 ·
+// scripted × 2", "+ 96-month scripted warm-up"), the per-role list in its menu; the old line repeated the model
+// once per role and was cut off mid-word
+const agentLabel = (a) => !a ? "?" : a === "fleet:scripted" ? "scripted fleet" : a.replace(/^fleet:/, "");
+function renderLineup() {
+  const btn = $("lineupBtn"), menu = $("lineupMenu"), roles = (S.meta && S.meta.roles) || [];
+  if (!roles.length) { btn.hidden = true; return; }
+  const counts = new Map();
+  for (const r of roles) { const k = agentLabel(S.meta.agents[r]); counts.set(k, (counts.get(k) || 0) + 1); }
+  const groups = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const main = groups.length === 1 ? `${esc(groups[0][0])} <span class="muted">· ${groups[0][1]} agents</span>`
+    : groups.map(([k, n]) => `${esc(k)} <span class="muted">× ${n}</span>`).join(" <span class=\"muted\">·</span> ");
+  const w = S.meta.warmup && S.meta.warmup.months;
+  btn.innerHTML = main + (w ? ` <span class="tag" title="months 0-${w - 1} were played by scripted agents">warm-up ${w} mo</span>` : "")
+    + `<span class="caret">▾</span>`;
+  btn.hidden = false;
+  menu.innerHTML = `<div class="lh">${S.city ? `<b>${esc(S.city)}</b> · ` : ""}who plays each department</div>`
+    + roles.map(r => `<div class="lrow"><span style="color:${roleColor(r)}">${esc(r)}</span><span>${esc(agentLabel(S.meta.agents[r]))}</span></div>`).join("")
+    + (w ? `<div class="lh muted">months 0-${w - 1}: scripted warm-up (${esc(agentLabel((S.meta.warmup.agents || {})[roles[0]] || (S.meta.warmup.agents || {})[`${S.city}.${roles[0]}`] || "scripted"))})</div>` : "");
+}
 function agentOf(role, month) {
   const w = S.meta.warmup;
   if (w && month < w.months) {
@@ -1822,6 +1842,8 @@ async function launch() {
 
 // ================================================================ wiring
 $("runBtn").onclick = (e) => { e.stopPropagation(); $("runMenu").hidden = !$("runMenu").hidden; if (!$("runMenu").hidden) refreshRuns(); };
+$("lineupBtn").onclick = (e) => { e.stopPropagation(); $("lineupMenu").hidden = !$("lineupMenu").hidden; };
+document.addEventListener("click", (e) => { if (!$("lineupMenu").contains(e.target)) $("lineupMenu").hidden = true; });
 document.addEventListener("click", (e) => { if (!$("runMenu").contains(e.target)) $("runMenu").hidden = true;
   if (!$("layerMenu").contains(e.target)) $("layerMenu").hidden = true; });
 $("newRunBtn").onclick = openLaunch; $("emptyLaunch").onclick = openLaunch;
@@ -1859,7 +1881,7 @@ setInterval(drawMinimap, 250);
 document.addEventListener("keydown", (e) => {
   const tag = e.target.tagName;
   if ((tag === "INPUT" && e.target.type !== "range") || tag === "SELECT" || tag === "TEXTAREA") return;
-  if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); $("runMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
+  if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); $("runMenu").hidden = true; $("lineupMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
   if (!$("launchModal").hidden || !$("helpModal").hidden) return;
   const k = e.key;
   const map = {
