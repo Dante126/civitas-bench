@@ -187,3 +187,55 @@ export function drawCharts(root, cols, { yard = true } = {}) {
     svg.onmouseleave = () => { cross.setAttribute("visibility", "hidden"); tip.hidden = true; };
   }
 }
+
+// ---------------------------------------------------------------- evals (civitas eval, /api/evals)
+// one column per eval (a model on a suite) with the aggregate of its scorecard (civitas/bench/evals.py): the city
+// score against the scripted yardstick from the same hand-over, departments, Teamwork, failures and tokens
+const pm = (a, d = 1) => !a || a.mean == null ? "—" : (d ? signed(d) : signedInt)(a.mean) + (a.std != null ? `<span class="muted"> ± ${d ? a.std.toFixed(d) : Math.round(a.std).toLocaleString()}</span>` : "");
+const mfmt = (v) => Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(2) + "M" : kfmt(v);
+export const evalLabel = (e) => `${e.name || e.dir}`;
+const evalDate = (e) => e.created ? new Date(e.created * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+
+export function evalsTableHTML(evals, { roleColor = () => "#ccc" } = {}) {
+  const A = (e) => e.aggregate || {};
+  const roles = [...new Set(evals.flatMap(e => Object.keys(A(e).roles || {})))];
+  // [label, value, format, direction (+1 higher is better, -1 lower, 0 none), tip, role]; a label alone: a group
+  const R = [
+    ["Eval"],
+    ["model", e => e.model || "—", (v) => esc(v), 0],
+    ["suite", e => e.suite && e.suite.name, (v) => esc(v || "—"), 0],
+    ["runs scored / planned", e => A(e).scored, (v, e) => v == null ? "—" : `${v} / ${A(e).runs}`, 0, "runs finished with a scripted yardstick, of the eval's runs"],
+    ["status", e => e.status, (v, e) => `<span class="pill ${esc(v)}">${esc(v)}</span>${e.adopted ? ` <span class="muted small">adopted</span>` : ""}`, 0],
+    ["Against the scripted yardstick"],
+    ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "the run's city score change since the hand-over minus the scripted agents' change from the same hand-over; mean ± std over the runs (a region run counts once, by its region score)"],
+    ["beats scripted", e => A(e).scored ? A(e).beats_scripted / A(e).scored : null, (v, e) => v == null ? "—" : `${A(e).beats_scripted} of ${A(e).scored}`, 1],
+    ["city change since hand-over", e => A(e).city_change, signed(1), 1, "the model's own change (mean)"],
+    ["scripted change", e => A(e).yard_change, signed(1), 0, "the scripted agents' change from the same hand-over (mean)"],
+    ["population vs scripted", e => (A(e).population_delta || {}).mean, (v, e) => pm(A(e).population_delta, 0), 1],
+    ["Departments (final score vs scripted)"],
+    ...roles.map(r => [r, e => (A(e).roles || {})[r], signed(1), 1, null, r]),
+    ["Play"],
+    ["Teamwork", e => A(e).teamwork, num(1), 1, "mean Teamwork score over the runs"],
+    ["failed actions per turn", e => A(e).failed_per_turn, num(2), -1],
+    ["refusals per turn", e => A(e).refused_per_turn, num(2), -1, "calls a guard refused"],
+    ["Cost"],
+    ["tokens per model turn", e => (A(e).tokens || {}).per_turn, (v) => v == null ? "—" : kfmt(v), -1],
+    ["tokens in all", e => (A(e).tokens || {}).total, (v, e) => v == null ? "—" : `${mfmt(v)}<span class="muted"> (${mfmt(A(e).tokens.prompt)} / ${mfmt(A(e).tokens.completion)})</span>`, 0, "prompt / completion"],
+    ["model turns", e => (A(e).tokens || {}).turns, int, 0],
+    ["run time (sum)", e => (A(e).wall_time_s || {}).sum, dur, 0],
+  ];
+  const head = `<tr><th></th>${evals.map((e, i) => `<th style="--c:${RUN_COLORS[i % RUN_COLORS.length]}" title="${esc(e.dir)}">
+      <div class="cmp-h"><span class="cmp-sw"></span><b>${esc(evalLabel(e))}</b>
+        <button class="cmp-x" data-hide-eval="${esc(e.dir)}" title="Hide this eval" aria-label="Hide">×</button></div>
+      <div class="cmp-sub">${esc(evalDate(e))} · <button class="cmp-open" data-load-eval="${esc(e.dir)}" title="Compare this eval's runs">its runs</button></div></th>`).join("")}</tr>`;
+  const body = R.map(([label, get, fmt, dir, tip, role]) => {
+    if (!get) return `<tr class="cmp-g"><td colspan="${evals.length + 1}">${esc(label)}</td></tr>`;
+    const vals = evals.map(e => { try { return get(e); } catch { return null; } });
+    const nums = vals.filter(v => typeof v === "number" && isFinite(v));
+    const best = dir && nums.length > 1 && new Set(nums).size > 1 ? (dir > 0 ? Math.max(...nums) : Math.min(...nums)) : null;
+    const lab = role ? `<span class="cmp-role" style="--c:${roleColor(role)}">${esc(label)}</span>` : esc(label);
+    return `<tr><td${tip ? ` title="${esc(tip)}"` : ""}>${lab}${tip ? ` <span class="muted">ⓘ</span>` : ""}</td>${vals.map((v, i) =>
+      `<td class="${best != null && v === best ? "best" : ""}">${fmt(v, evals[i])}</td>`).join("")}</tr>`;
+  }).join("");
+  return `<table class="cmp-t">${head}${body}</table>`;
+}

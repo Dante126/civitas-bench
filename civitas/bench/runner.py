@@ -600,7 +600,9 @@ def leaderboard(runs_dir="runs") -> list[dict]:
             s = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
-        groups.setdefault((s["signature"], s.get("fleet_version")), []).append(s)
+        # a region's signature names each role once when its cities share the agent, as a single city's does: the
+        # agents' role names (north.mayor ...) keep the two apart
+        groups.setdefault((s["signature"], s.get("fleet_version"), tuple(s.get("agents") or ())), []).append(s)
     rows = [aggregate(v) for v in groups.values()]
     rows.sort(key=lambda r: -r["city"]["mean"])
     return rows

@@ -16,6 +16,8 @@ Endpoints
                                      {"missing": true, ...}: a finished run's is computed in the background
                                      (`computing`), a `civitas yardstick` process; poll again
   GET  /api/compare?runs=a,b,c       runs side by side (bench/compare.py), each warm-up run's yardstick included
+  GET  /api/evals                    model evals (civitas eval, bench/evals.py): each eval folder's model, suite, runs
+                                     and the aggregate of its scorecard
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
   GET  /api/processes                runs started from the browser
@@ -288,6 +290,7 @@ class Launcher:
         self.lock = threading.Lock()
 
     def configs(self) -> list[dict]:
+        from .bench.evals import is_suite
         from .config import load_config
         from .fleet.config import fleet_agent_config
         out = []
@@ -298,6 +301,8 @@ class Launcher:
                 cfg = load_config(p)
             except Exception as e:  # pragma: no cover
                 out.append({"file": p.name, "error": str(e)})
+                continue
+            if is_suite(cfg):                       # an eval suite (civitas eval -s), not a run config
                 continue
             agents = {}
             for r in ROLES:
@@ -544,6 +549,9 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                             continue
                         out.append({**compare_data(d), "status": self._status(d)})
                     return self._json({"runs": out, "missing": missing})
+                if parts[1:] == ["evals"]:          # model evals (civitas eval): eval_*/eval.json, newest first
+                    from .bench.evals import list_evals
+                    return self._json(list_evals(runs_dir))
                 if parts[1:] == ["leaderboard"]:
                     from .bench.runner import leaderboard
                     return self._json(leaderboard(runs_dir))

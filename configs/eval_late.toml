@@ -1,0 +1,31 @@
+# Eval suite (civitas eval -s configs/eval_late.toml --model M): the late-game smokes as one model evaluation.
+# Five late starts: scripted agents play months 0-95, then the model's fleet plays months 96-107 (4 turns per role),
+# and each run is scored against its scripted yardstick, the same game from the same hand-over played by scripted
+# agents (yardstick.json). `--dry-run` prints the plan and the estimates below without running anything.
+# Not a run config: the launcher (civitas serve) leaves suite files out.
+name = "late"
+description = "late starts: three single cities (32 model turns each) and two two-city regions (64 each)"
+
+[eval]
+workers = 5                 # runs at once: they wait on the API, not the CPU
+caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
+reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+
+# USD per million [prompt, completion] tokens by model, for the dry run's and the scorecard's cost line (optional).
+[eval.prices]
+
+# Per run: the reference wall time and tokens (trinity-large-thinking, eval trinity-large-v1); the dry run scales
+# them by the model turns when --set changes the months.
+[[runs]]
+config = "configs/fleet_smoke_late.toml"
+seeds = [0, 1, 2]
+minutes = 9.5
+prompt_tokens = 1_390_000
+completion_tokens = 146_000
+
+[[runs]]
+config = "configs/fleet_region_late.toml"
+seeds = [0, 1]
+minutes = 23.5
+prompt_tokens = 3_165_000
+completion_tokens = 349_000

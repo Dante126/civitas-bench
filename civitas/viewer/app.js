@@ -4,7 +4,7 @@ import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } fr
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
 import { CollabGraph, BeamLayer, RegionGraph, cityColor, dealState, dealPaid, dealEnd, cityTally, RES_C } from "./collab.js";
-import { RUN_COLORS, COMPARE_MAX, columns, tableHTML, chartsHTML, legendHTML, drawCharts } from "./compare.js";
+import { RUN_COLORS, COMPARE_MAX, columns, tableHTML, chartsHTML, legendHTML, drawCharts, evalsTableHTML, evalLabel } from "./compare.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -1394,8 +1394,43 @@ function cmpRemove(id) { S.cmp.ids = S.cmp.ids.filter(x => x !== id); delete S.c
 function openCompare() {
   if (!S.cmp.ids.length && S.runId) cmpAdd(S.runId);
   S.cmp.data = {};                                   // fresh numbers for live runs (the server caches the rest)
+  S.cmp.offer = null;
   $("compareModal").hidden = false;
+  renderCompare(); loadCompareRuns(); loadEvals();
+}
+// model evals (civitas eval, /api/evals): "Load eval…" adds an eval's runs; the Evals view compares evals by their
+// aggregate (one column per eval). Hidden evals are remembered.
+S.cmp.mode = store.get("cmpMode", "runs") === "evals" ? "evals" : "runs";
+S.cmp.hidden = new Set(store.get("cmpEvalsHidden", []));
+S.evals = null;
+async function loadEvals() {
+  try { S.evals = await api("/api/evals"); } catch { S.evals = []; }
+  if (!$("compareModal").hidden) renderCompare();
+}
+// an eval's runs into the comparison; when they don't fit beside the picked runs (COMPARE_MAX), an offer instead:
+// compare the evals by their aggregate, or replace the picked runs
+function cmpLoadEval(dir, replace = false) {
+  const ev = (S.evals || []).find(e => e.dir === dir); if (!ev) return;
+  const ids = ev.runs.map(r => r.run_id);
+  const fresh = ids.filter(id => !S.cmp.ids.includes(id));
+  if (!replace && S.cmp.ids.length + fresh.length > COMPARE_MAX) { S.cmp.offer = dir; renderCompare(); return; }
+  if (replace) { S.cmp.ids = []; S.cmp.slots = {}; }
+  for (const id of (replace ? ids : fresh).slice(0, COMPARE_MAX - S.cmp.ids.length)) cmpAdd(id);
+  if (ids.length > COMPARE_MAX) toast(`${evalLabel(ev)} has ${ids.length} runs: the first ${COMPARE_MAX} are compared.`, true);
+  S.cmp.offer = null; S.cmp.mode = "runs"; store.set("cmpMode", "runs");
   renderCompare(); loadCompareRuns();
+}
+function evalsBody(body) {
+  if (S.evals == null) { body.innerHTML = `<div class="small muted">Loading evals…</div>`; return; }
+  const shown = S.evals.filter(e => !S.cmp.hidden.has(e.dir));
+  const hidden = S.evals.filter(e => S.cmp.hidden.has(e.dir));
+  if (!S.evals.length) { body.innerHTML = `<div class="emptytab">No evals yet. Evaluate a model with <code>civitas eval -s configs/eval_late.toml --model M</code> (<code>--dry-run</code> first: it prints the plan and its cost).</div>`; return; }
+  body.innerHTML = (hidden.length ? `<div class="small muted cmp-hidden">Hidden: ${hidden.map(e => `<button class="chip" data-show-eval="${esc(e.dir)}" title="Show it again">${esc(evalLabel(e))} +</button>`).join(" ")}</div>` : "") +
+    (shown.length ? `<div class="cmp-scroll">${evalsTableHTML(shown, { roleColor })}</div>
+      <div class="small muted cmp-foot">Each eval is a model on a suite of late starts (<code>civitas eval</code>): scripted agents play the warm-up, the model's fleet the months after it. "vs scripted" is the run's change since the hand-over minus the scripted agents' change from the same hand-over (its yardstick); best value per row in green. "its runs" compares an eval's runs.</div>` : "");
+  body.querySelectorAll("[data-hide-eval]").forEach(b => b.onclick = () => { S.cmp.hidden.add(b.dataset.hideEval); store.set("cmpEvalsHidden", [...S.cmp.hidden]); renderCompare(); });
+  body.querySelectorAll("[data-show-eval]").forEach(b => b.onclick = () => { S.cmp.hidden.delete(b.dataset.showEval); store.set("cmpEvalsHidden", [...S.cmp.hidden]); renderCompare(); });
+  body.querySelectorAll("[data-load-eval]").forEach(b => b.onclick = () => cmpLoadEval(b.dataset.loadEval));
 }
 async function loadCompareRuns() {
   const want = S.cmp.ids.filter(id => !S.cmp.data[id]);
@@ -1414,11 +1449,34 @@ function renderCompare() {
   $("cmpCount").textContent = ids.length ? `${ids.length} run${ids.length === 1 ? "" : "s"}` : "";
   const others = (S.runs || []).filter(r => !ids.includes(r.run_id));
   const anyRegion = runs.some(r => r.region);
-  $("cmpTools").innerHTML = `<select id="cmpAdd" aria-label="Add a run"><option value="">＋ Add a run…</option>${others.map(r =>
+  const evals = S.evals || [];
+  const seg = `<div class="seg cmp-mode" role="tablist" title="Runs side by side, or model evals by their aggregate (civitas eval)"><button data-mode="runs" class="${S.cmp.mode === "runs" ? "on" : ""}">Runs</button><button data-mode="evals" class="${S.cmp.mode === "evals" ? "on" : ""}">Evals${evals.length ? ` (${evals.length})` : ""}</button></div>`;
+  const evalPick = evals.length ? `<select id="cmpEval" aria-label="Load an eval's runs"><option value="">＋ Load eval…</option>${evals.map(e =>
+      `<option value="${esc(e.dir)}">${esc(evalLabel(e))} · ${esc(e.model || "?")} · ${e.runs.length} runs${e.aggregate && e.aggregate.city_delta && e.aggregate.city_delta.mean != null ? ` · vs scripted ${e.aggregate.city_delta.mean >= 0 ? "+" : ""}${e.aggregate.city_delta.mean.toFixed(1)}` : ""}</option>`).join("")}</select>` : "";
+  if (S.cmp.mode === "evals") {
+    $("cmpTools").innerHTML = `${seg}<div class="grow"></div>`;
+  } else {
+    $("cmpTools").innerHTML = `${seg}<select id="cmpAdd" aria-label="Add a run"><option value="">＋ Add a run…</option>${others.map(r =>
       `<option value="${esc(r.run_id)}">${esc(r.name)} · seed ${r.seed ?? "?"} · ${r.scores ? `city ${r.scores.city.toFixed(1)} · ` : ""}${esc(r.run_id)}</option>`).join("")}</select>
+    ${evalPick}
     ${S.runId && !ids.includes(S.runId) ? `<button class="btn" id="cmpAddOpen">＋ The open run</button>` : ""}
     ${anyRegion ? `<label class="cmp-split" title="A region run as one column (region values), or one more column per city"><input type="checkbox" id="cmpSplit" ${S.cmp.split ? "checked" : ""}> Cities of region runs</label>` : ""}
     <div class="grow"></div>${ids.length ? `<button class="btn" id="cmpClear">Clear</button>` : ""}`;
+    const offer = S.cmp.offer && evals.find(e => e.dir === S.cmp.offer);
+    if (offer) $("cmpTools").insertAdjacentHTML("beforeend", `<div class="cmp-offer"><span>${esc(evalLabel(offer))}'s ${offer.runs.length} runs don't fit beside the ${ids.length} picked (${COMPARE_MAX} at most).</span>
+      <button class="btn primary" id="cmpOfferEvals">Compare the evals by their aggregate</button><button class="btn" id="cmpOfferReplace">Replace the picked runs</button><button class="btn icon" id="cmpOfferX" aria-label="Dismiss">✕</button></div>`);
+  }
+  document.querySelectorAll("#cmpTools .cmp-mode [data-mode]").forEach(b => b.onclick = () => { S.cmp.mode = b.dataset.mode; S.cmp.offer = null; store.set("cmpMode", S.cmp.mode); renderCompare(); });
+  if (S.cmp.mode === "evals") { $("cmpCount").textContent = evals.length ? `${evals.length} eval${evals.length === 1 ? "" : "s"}` : ""; evalsBody($("cmpBody")); return; }
+  if ($("cmpEval")) $("cmpEval").onchange = (e) => { if (e.target.value) cmpLoadEval(e.target.value); };
+  if ($("cmpOfferEvals")) $("cmpOfferEvals").onclick = () => {
+    // the offered eval and the evals the picked runs belong to, side by side
+    const keep = new Set([S.cmp.offer, ...evals.filter(e => e.runs.some(r => ids.includes(r.run_id))).map(e => e.dir)]);
+    keep.forEach(d => S.cmp.hidden.delete(d)); store.set("cmpEvalsHidden", [...S.cmp.hidden]);
+    S.cmp.offer = null; S.cmp.mode = "evals"; store.set("cmpMode", "evals"); renderCompare();
+  };
+  if ($("cmpOfferReplace")) $("cmpOfferReplace").onclick = () => cmpLoadEval(S.cmp.offer, true);
+  if ($("cmpOfferX")) $("cmpOfferX").onclick = () => { S.cmp.offer = null; renderCompare(); };
   $("cmpAdd").onchange = (e) => { if (e.target.value && cmpAdd(e.target.value)) { renderCompare(); loadCompareRuns(); } };
   if ($("cmpAddOpen")) $("cmpAddOpen").onclick = () => { if (cmpAdd(S.runId)) { renderCompare(); loadCompareRuns(); } };
   if ($("cmpSplit")) $("cmpSplit").onchange = (e) => { S.cmp.split = e.target.checked; store.set("cmpSplit", S.cmp.split); renderCompare(); };
@@ -1774,7 +1832,8 @@ document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.targ
 $("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
 document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); $("moreMenu").hidden = true; renderTab(); });
 $("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("moreMenu").hidden; };
-$("compareBtn").onclick = () => { $("moreMenu").hidden = true; openCompare(); };
+$("compareBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); };
+$("evalsBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "evals"; store.set("cmpMode", "evals"); openCompare(); };
 document.addEventListener("click", (e) => { if (!e.target.closest(".tabmore")) $("moreMenu").hidden = true; });
 buildLayerMenu();
 $("layerBtn").onclick = (e) => { e.stopPropagation(); $("layerMenu").hidden = !$("layerMenu").hidden; };

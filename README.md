@@ -180,6 +180,64 @@ Useful switches in `[game]` (or `--set game.X=...`):
 | `team_weight` | reward = w·Δcity + (1−w)·Δrole − penalty·invalid actions |
 | `balance` | override any constant, e.g. `"CATALOG.coal.cost" = 3000`, `"SERVICES.clinic.radius" = 9` or `"TIERS.pump.2.water" = 800` |
 
+## 5. Evaluating a model
+
+`civitas eval` turns the late-game smokes into one repeatable model evaluation with one scorecard. A **suite**
+(`configs/eval_late.toml`) lists the runs: `fleet_smoke_late.toml` seeds 0-2 (single city, 32 model turns each) and
+`fleet_region_late.toml` seeds 0-1 (two cities, 64 each). In every run scripted agents play months 0-95, then the
+model's fleet plays months 96-107, and the run is scored against its scripted yardstick: the same game from the same
+hand-over played by scripted agents (`yardstick.json`, see "Late-game smokes" under [Agent fleets](#agent-fleets)).
+
+```bash
+civitas eval -s configs/eval_late.toml --model trinity-mini --dry-run   # the plan, its tokens and time; runs nothing
+civitas eval -s configs/eval_late.toml --model trinity-mini             # 5 runs at once, ~25 min
+civitas eval -s configs/eval_late.toml --model M --provider openrouter --name m-v1 --workers 3
+civitas eval --resume runs/eval_trinity-mini_<time>                     # rerun the runs that failed or didn't finish
+civitas eval --report runs/eval_trinity-mini_<time>                     # rebuild the scorecard from the run folders
+civitas eval --compare runs/eval_trinity-large-v1_<time> runs/eval_trinity-mini_<time>   # models side by side
+civitas eval -s configs/eval_late.toml --adopt <run_id> ... --name x    # an eval of runs that exist already
+```
+
+- `--model` / `--provider` set `[fleet].model` / `.provider` and the model of every `[agents.<role>]` that names its
+  own (fleet or llm). `--agent` and `--set` reach every run, as for `run`.
+- The eval **refuses to start** (and `--dry-run` says why, exit code 2) when a fleet agent would play another model
+  than the one asked for (e.g. a role pinned to `model = "scripted"`), when no agent calls a model, when a config has
+  no warm-up, or when a provider is unknown or its API key env var (`ARCEE_API_KEY` for arcee, from `./.env`) is
+  unset.
+- Each run is a `civitas run` subprocess (`[eval].workers` at a time, default 5: the runs wait on the API, not the
+  CPU), under `caffeinate -dims` on macOS, its log in `runs/_logs/<run_id>.log`. Every run is a normal run folder in
+  `runs/`, so the viewer, Compare and the yardstick work as usual. Ctrl+C stops the runs; `--resume` reruns each run
+  that didn't finish under a new id (`<id>_a2`), keeping the old folder.
+- The eval folder `runs/eval_<name>_<time>/` (name: `--name`, else the model) holds `eval.json` (suite, model,
+  provider, overrides, the code commit, each run's id, command, status and attempts, and the scorecard data) and
+  `scorecard.md`.
+
+**The scorecard.** Per run: the city score at hand-over, its change by the end, the yardstick's change from the same
+hand-over and their difference, **vs scripted** (above 0: the model added more than the scripted baseline would
+have); the same for population; Teamwork (`fleet/report.py:run_collaboration`); failed actions and refusals per turn
+(`fleet_report.json`); model turns and tokens (prompt + completion, from `trajectories.jsonl`); wall time. A region
+run has a line for the region and one per city. Then, over the runs (a region counts once, by its region score):
+city score vs scripted as mean ± std, "beats scripted on N of M", population vs scripted, each department's final
+score minus the yardstick's, Teamwork, failures per turn, tokens per model turn and in all, run time; for all runs
+and per config. A Versions table gives each run's `fleet_version`, a hash of its logged system prompts and the code
+commit (adopted runs: the last commit before the run started, inferred from git).
+
+**Cost.** The suite keeps reference numbers per run (trinity-large-thinking): a single city ~1.4M prompt + 0.15M
+completion tokens and ~9.5 min, a region ~3.2M + 0.35M and ~23.5 min; the whole suite ~11.6M tokens (10.5M prompt,
+1.1M completion) and ~24 min with 5 workers (75 min of runs). `--dry-run` scales them by the model turns and, with
+`[eval.prices]` (USD per million prompt / completion tokens by model) in the suite, prints a price.
+
+**Comparing models.** `--compare` prints the evals' aggregates side by side. In the viewer, ⋯ → Model evals (or the
+Compare view's Evals switch) shows one column per eval with the same rows, best value per row in green; "Load eval…"
+in the Compare view adds an eval's runs, and when they don't fit beside the picked runs (8 at most) it offers to
+compare the evals by their aggregate or to replace the picked runs. Backend: `GET /api/evals`.
+
+The first eval, `trinity-large-v1` (trinity-large-thinking, adopted from the late smokes of 2026-10-06/07): city
+score vs scripted **+1.4 ± 1.5**, beats scripted on 4 of 5 (single cities +1.3 ± 1.1, 3 of 3; regions +1.6 ± 2.6,
+1 of 2), population +2,166 vs scripted, mayor +3.6, planning +1.6, police -3.7, fire -2.4, education -4.5,
+Teamwork 84.4, 0.24 failed actions and 0.23 refusals per turn, 52k tokens per model turn, 11.6M tokens in all. Its
+runs came from four commits of the same day (the fleet configs' `fleet_version` is the same in all).
+
 ---
 
 ## How it works
@@ -2022,7 +2080,7 @@ reached 1,280 / 47.0 and 504 / 42.8.
 - **Team.**
 - **Issues:** *Agent mistakes* (the Problems analysis) or *City events* (disasters, milestones, offers, and what residents complain about).
 - **Money.**
-- **⋯:** Charts, Region, All messages (the full council log), Runs and **Compare runs**.
+- **⋯:** Charts, Region, All messages (the full council log), Runs, **Compare runs** and **Model evals** (see [Evaluating a model](#5-evaluating-a-model)).
 
 **Compare view** (viewer: ⋯ → Compare runs, the Runs tab's checkboxes and **Compare (n)**, or `C`). Up to 8 runs side by
 side, e.g. the fleet's long runs, a region run, a late smoke and the scripted fleet. A table with the runs as columns
@@ -2037,7 +2095,8 @@ dashed line of its colour from the hand-over in the city score and population ch
 it). A region run's own column holds the region's city score and population and its
 departments' and Teamwork's mean over its cities; "Cities of region runs" adds a column (and a dashed line) per city.
 The picked runs stay picked (localStorage); click a run's name to open it. Backend: `GET /api/compare?runs=a,b,c`
-(`bench/compare.py:run_compare`, cached per run until its files change).
+(`bench/compare.py:run_compare`, cached per run until its files change). The Runs / Evals switch above the table shows
+model evals instead, one column per eval, and "Load eval…" adds an eval's runs (see [Evaluating a model](#5-evaluating-a-model)).
 
 **Team tab** (viewer). The departments as a live network (`viewer/collab.js`): the mayor in the centre, the departments on a ring, each node sized by its funds with an arc for its open requests. Edges glow with the last 12 months of messages and money. As the replay steps, each turn's events play out:
 - requests fly as comets with the amount asked, and reports as small pulses;
@@ -2071,6 +2130,9 @@ Double-click a city, or click its row, to open its team. The data is `GET /api/r
 Hitting the per-turn action cap doesn't count. The tab shows these rates for the run and per role, the fleet report's coaching hints, and a filterable list; clicking an item opens that quarter's card with the call outlined. The timeline marks quarters with problems, red when one went unsolved. On the 120-month seed-0 run: 208 problems, 33% fixed in turn, 43% escalated, 24% unsolved, 58 recurred; planning had most of them.
 
 ### Output files (`runs/<run_id>/`)
+
+(`civitas eval` also writes `runs/eval_<name>_<time>/` with `eval.json` and `scorecard.md`; its runs are ordinary run
+folders beside it.)
 
 - `meta.json`: config, agents, map size, natural resources; after a warm-up also `warmup_months` and the warm-up line-up (`warmup`)
 - `frames.jsonl`: one frame per month (tiles, levels, variants, road classes, overlay layers, metrics, scores, turns, council; with fleet agents also `needs` in the months they act, read by the collaboration score's money aim). The viewer replays these.

@@ -525,6 +525,10 @@ tr.cmp-comp td > span { vertical-align: middle; }
 .cmp-bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); opacity: .75; }
 td.best .cmp-bar i { opacity: 1; }
 .cmp-foot { margin-top: 6px; }
+.cmp-mode button { font-size: 12px; padding: 4px 10px; }
+.cmp-offer { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; padding: 7px 10px; border: 1px solid rgba(62,207,158,.45); border-radius: 10px; background: rgba(62,207,158,.06); }
+.cmp-offer > span { flex: 1 1 260px; }
+.cmp-hidden { margin-bottom: 8px; } .cmp-hidden .chip { font-size: 11px; }
 .cmpbox { display: inline-flex; align-items: center; margin-right: 6px; vertical-align: -2px; cursor: pointer; }
 .cmpbox input { margin: 0; accent-color: var(--accent); cursor: pointer; }
 @media (max-width: 900px) { .compare-card { padding: 12px; } table.cmp-t th { min-width: 88px; } table.cmp-t th, table.cmp-t td { padding: 4px 6px; } }
