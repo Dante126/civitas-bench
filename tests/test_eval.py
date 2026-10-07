@@ -126,6 +126,7 @@ def test_dry_run_runs_nothing(monkeypatch, tmp_path, capsys):
     assert out.count("_trinity-mini  ") == 5 and "--set fleet.model=trinity-mini" in out   # 5 table lines
     assert list(tmp_path.iterdir()) == []
     monkeypatch.delenv("ARCEE_API_KEY")
+    monkeypatch.setattr(cli, "load_dotenv", lambda *a, **k: None)   # a checkout's ./.env would supply the key
     with pytest.raises(SystemExit) as e:
         cli.main(["eval", "-s", str(SUITE), "--model", "trinity-mini", "--dry-run", "--runs-dir", str(tmp_path)])
     assert e.value.code == 2 and "would refuse to start" in capsys.readouterr().out
