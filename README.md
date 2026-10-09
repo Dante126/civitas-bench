@@ -192,6 +192,7 @@ hand-over played by scripted agents (`yardstick.json`, see "Late-game smokes" un
 civitas eval -s configs/eval_late.toml --model trinity-mini --dry-run   # the plan, its tokens and time; runs nothing
 civitas eval -s configs/eval_late.toml --model trinity-mini             # 5 runs at once, ~25 min
 civitas eval -s configs/eval_late.toml --model M --provider openrouter --name m-v1 --workers 3
+civitas eval -s configs/eval_late.toml --model trinity-mini --repeats 3    # each seed 3 times: measures the noise
 civitas eval --resume runs/eval_trinity-mini_<time>                     # rerun the runs that failed or didn't finish
 civitas eval --report runs/eval_trinity-mini_<time>                     # rebuild the scorecard from the run folders
 civitas eval --compare runs/eval_trinity-large-v1_<time> runs/eval_trinity-mini_<time>   # models side by side
@@ -212,6 +213,17 @@ civitas eval -s configs/eval_late.toml --adopt <run_id> ... --name x    # an eva
   provider, overrides, the code commit, each run's id, command, status and attempts, and the scorecard data) and
   `scorecard.md`.
 
+**Units, repeats and intervals.** A **unit** is a config and seed. Its warm-up is scripted and deterministic, so
+every run of a unit starts from the same city, and the model's temperature makes the runs differ after it.
+`repeats = K` on a `[[runs]]` entry, `[eval] repeats` or `--repeats K` plays each unit K times (run ids end in
+`_r<i>` when K > 1; `--dry-run` scales runs, tokens and time). The scorecard averages a unit's repeats and computes
+everything over the units (`civitas/bench/stats.py`, no dependencies): the mean vs scripted with a **95% t-interval**
+(an interval above 0: the model beats scripted beyond seed luck), the **seed spread** (std of the units), the
+**replay noise** (pooled std within units, K >= 2) and the **detectable difference**: the smallest gap between two
+evals on these units that a paired comparison finds 80% of the time, for 1, 2, 3 and 5 repeats, from the replay
+noise alone (a lower bound: two models also differ seed by seed). Departments, population and Teamwork get intervals
+too. `--adopt` takes several runs of one unit as its repeats.
+
 **The scorecard.** Per run: the city score at hand-over, its change by the end, the yardstick's change from the same
 hand-over and their difference, **vs scripted** (above 0: the model added more than the scripted baseline would
 have); the same for population; Teamwork (`fleet/report.py:run_collaboration`); failed actions and refusals per turn
@@ -227,14 +239,24 @@ completion tokens and ~9.5 min, a region ~3.2M + 0.35M and ~23.5 min; the whole 
 1.1M completion) and ~24 min with 5 workers (75 min of runs). `--dry-run` scales them by the model turns and, with
 `[eval.prices]` (USD per million prompt / completion tokens by model) in the suite, prints a price.
 
-**Comparing models.** `--compare` prints the evals' aggregates side by side. In the viewer, ⋯ → Model evals (or the
+**Comparing models.** `--compare A B ...` prints the evals' aggregates side by side, then each eval against the
+first, **paired by unit**: per shared config + seed the difference of the two evals' scores vs scripted (the hand-over's
+difficulty cancels), a t-interval over those differences and a verdict, `B is BETTER: +1.2 (95% CI +0.3 to +2.1)` or
+`no clear difference: ...; differences under ~1.3 can't be seen on this suite at these repeats`, with a line per
+department, population and Teamwork. It warns when a shared unit's hand-over differs (the warm-up changed: not
+comparable), names units only one eval has, and notes different code commits or system prompts. An eval saved
+before units gets them recomputed from its stored run cards. In the viewer, ⋯ → Model evals (or the
 Compare view's Evals switch) shows one column per eval with the same rows, best value per row in green; "Load eval…"
 in the Compare view adds an eval's runs, and when they don't fit beside the picked runs (8 at most) it offers to
-compare the evals by their aggregate or to replace the picked runs. Backend: `GET /api/evals`.
+compare the evals by their aggregate or to replace the picked runs. The Evals view shows intervals as
+`+1.4 [−0.5, +3.3]`, units × repeats, the replay noise, the detectable difference and, with two evals or more, a
+"vs <first eval>" row: the paired city verdict, green better, red worse, grey unclear (`compare.js:pairedCity`).
+Backend: `GET /api/evals` (each eval's `units`).
 
 The first eval, `trinity-large-v1` (trinity-large-thinking, adopted from the late smokes of 2026-10-06/07): city
-score vs scripted **+1.4 ± 1.5**, beats scripted on 4 of 5 (single cities +1.3 ± 1.1, 3 of 3; regions +1.6 ± 2.6,
-1 of 2), population +2,166 vs scripted, mayor +3.6, planning +1.6, police -3.7, fire -2.4, education -4.5,
+score vs scripted **+1.4 ± 1.5** (95% CI −0.5 to +3.3: not yet clear of 0 on 5 units), beats scripted on 4 of 5 (single cities +1.3 ± 1.1, 3 of 3; regions +1.6 ± 2.6,
+1 of 2), population +2,166 vs scripted (CI +145 to +4,188), mayor +3.6 (+1.6 to +5.6), planning +1.6 (+0.2 to +2.9),
+police -3.7, fire -2.4, education -4.5 (−7.9 to −1.0),
 Teamwork 84.4, 0.24 failed actions and 0.23 refusals per turn, 52k tokens per model turn, 11.6M tokens in all. Its
 runs came from four commits of the same day (the fleet configs' `fleet_version` is the same in all).
 

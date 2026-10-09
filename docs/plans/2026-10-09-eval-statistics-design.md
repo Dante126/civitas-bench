@@ -17,8 +17,8 @@ hand-over.
 - `[[runs]] repeats = K` per entry (default 1), `[eval] repeats` for the suite, `civitas eval --repeats K` over both.
 - Repeat ids: `<stamp>_<name>_s<seed>_r<i>_<label>` when K > 1; K = 1 keeps today's ids, so existing evals are valid.
   Each repeat is a normal run folder with its own yardstick.json (scripted, seconds).
-- `--dry-run` multiplies runs, tokens and time by K. `--resume` treats a repeat like any run. `--adopt` reads the
-  repeat from an `_r<i>` in the run id, else 1.
+- `--dry-run` multiplies runs, tokens and time by K. `--resume` treats a repeat like any run. `--adopt` takes
+  several runs of one config + seed as its repeats, numbered in the order given.
 - A quick tier later is another suite file; nothing else in the format.
 
 ## 2. Statistics in one eval (`civitas/bench/stats.py`, no new dependencies)

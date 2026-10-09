@@ -33,6 +33,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import stats as S
+
 try:
     import tomllib  # py3.11+
 except ModuleNotFoundError:  # pragma: no cover
@@ -61,6 +63,7 @@ class Entry:
     minutes: float | None = None        # reference wall time per run
     prompt_tokens: int | None = None    # reference tokens per run
     completion_tokens: int | None = None
+    repeats: int | None = None          # plays of each seed (None: the suite's [eval].repeats)
 
 
 @dataclass
@@ -73,6 +76,13 @@ class Suite:
     caffeinate: bool = True
     reference_model: str | None = None
     prices: dict = field(default_factory=dict)      # model -> [USD per million prompt tokens, per million completion]
+    repeats: int = 1                    # plays of each config + seed (a unit): [eval].repeats
+
+
+def _repeats(v, where: str) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise EvalError(f"{where}: repeats must be a whole number of at least 1, got {v!r}")
+    return v
 
 
 def parse_seeds(v) -> list[int]:
@@ -134,7 +144,9 @@ def load_suite(path: str | Path) -> Suite:
         num = lambda k, t: None if r.get(k) is None else t(r[k])
         entries.append(Entry(config=str(r["config"]), path=_resolve(str(r["config"]), p), seeds=seeds,
                              minutes=num("minutes", float), prompt_tokens=num("prompt_tokens", int),
-                             completion_tokens=num("completion_tokens", int)))
+                             completion_tokens=num("completion_tokens", int),
+                             repeats=None if r.get("repeats") is None
+                             else _repeats(r["repeats"], f"{p}: [[runs]] #{i + 1}")))
     workers = ev.get("workers", WORKERS)
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise EvalError(f"{p}: [eval].workers must be a whole number of at least 1, got {workers!r}")
@@ -142,7 +154,8 @@ def load_suite(path: str | Path) -> Suite:
               if isinstance(v, list) and len(v) == 2}
     return Suite(file=str(path), name=str(data.get("name") or p.stem), description=str(data.get("description") or ""),
                  entries=entries, workers=workers, caffeinate=bool(ev.get("caffeinate", True)),
-                 reference_model=ev.get("reference_model"), prices=prices)
+                 reference_model=ev.get("reference_model"), prices=prices,
+                 repeats=_repeats(ev.get("repeats", 1), f"{p}: [eval]"))
 
 
 # ---------------------------------------------------------------------------------------------------- plan
@@ -217,9 +230,11 @@ def effective(entry_path: Path, agents: list[str], sets: list[str]) -> dict:
 
 def plan(suite: Suite, *, model: str | None = None, provider: str | None = None, agents: list[str] = (),
          sets: list[str] = (), name: str | None = None, runs_dir: str | Path = "runs", workers: int | None = None,
-         stamp: str | None = None) -> dict:
-    """The eval record before it runs: one run per config and seed with its run id and `civitas run` command, the
-    model, the folder (`dir`), estimates from the suite's reference numbers. `check(ev)` says what would refuse it."""
+         stamp: str | None = None, repeats: int | None = None) -> dict:
+    """The eval record before it runs: one run per config, seed and repeat with its run id and `civitas run` command,
+    the model, the folder (`dir`), estimates from the suite's reference numbers. `repeats` (--repeats) plays every unit
+    (config + seed) that many times over the suite's own repeats; repeats of a unit share its hand-over, and their run
+    ids end in `_r<i>` before the label when a unit has more than one. `check(ev)` says what would refuse it."""
     from ..config import apply_cli_overrides, load_config
     stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
     runs_dir = Path(runs_dir)
@@ -236,9 +251,10 @@ def plan(suite: Suite, *, model: str | None = None, provider: str | None = None,
         scale = turns / ref_turns if ref_turns else 1.0
         from ..config import game_config
         g = game_config(cfg)
-        for seed in e.seeds:
+        k = repeats if repeats is not None else (e.repeats or suite.repeats)
+        for seed, rep in [(s, i) for s in e.seeds for i in range(1, _repeats(k, "--repeats") + 1)]:
             runs.append({"config": e.config, "config_path": str(e.path), "name": cfg["name"], "seed": seed,
-                         "region": bool(g.region), "cities": list(g.cities) if g.region else [],
+                         "repeat": rep, "repeats": k, "region": bool(g.region), "cities": list(g.cities) if g.region else [],
                          "warmup": g.warmup_months, "months": g.months, "fleet_turns": turns,
                          "agent_args": a_args, "set_args": s_args,
                          "estimate": {"minutes": None if e.minutes is None else round(e.minutes * scale, 1),
@@ -251,7 +267,7 @@ def plan(suite: Suite, *, model: str | None = None, provider: str | None = None,
     eff_prov = provider or (next(iter(models))[0] if len({p for p, _ in models}) == 1 else None)
     label = _label(name or eff_model or suite.name)
     for r in runs:
-        r["run_id"] = f"{stamp}_{r['name']}_s{r['seed']}_{label}"
+        r["run_id"] = f"{stamp}_{r['name']}_s{r['seed']}" + (f"_r{r['repeat']}" if r["repeats"] > 1 else "") + f"_{label}"
     ids = [r["run_id"] for r in runs]
     dup = sorted({i for i in ids if ids.count(i) > 1})
     ev = {"version": VERSION, "name": label, "dir": str(runs_dir / f"{PREFIX}{label}_{stamp}"),
@@ -259,6 +275,7 @@ def plan(suite: Suite, *, model: str | None = None, provider: str | None = None,
           "suite": {"file": suite.file, "name": suite.name, "description": suite.description,
                     "reference_model": suite.reference_model,
                     "entries": [{"config": e.config, "seeds": e.seeds} for e in suite.entries]},
+          "repeats": sorted({r["repeats"] for r in runs}),
           "model": eff_model, "provider": eff_prov, "agents": list(agents), "sets": list(sets),
           "workers": int(workers or suite.workers), "caffeinate": suite.caffeinate, "prices": suite.prices,
           "status": "planned", "runs": runs}
@@ -356,7 +373,11 @@ def _usd(ev: dict, prompt: float, completion: float) -> float | None:
 def dry_run_text(ev: dict, errors: list[str]) -> str:
     """The plan as `civitas eval --dry-run` prints it: runs, model, estimates, the first command, refusals."""
     runs = ev["runs"]
-    L = [f"Eval plan '{ev['name']}': suite {ev['suite']['name']} ({ev['suite']['file']}), {len(runs)} runs, "
+    units = len({(r["name"], r["seed"]) for r in runs})
+    ks = sorted({r.get("repeats") or 1 for r in runs})
+    reps = f" ({units} units x {ks[0]} repeats)" if ks != [1] and len(ks) == 1 else \
+        f" ({units} units, {'/'.join(map(str, ks))} repeats)" if ks != [1] else ""
+    L = [f"Eval plan '{ev['name']}': suite {ev['suite']['name']} ({ev['suite']['file']}), {len(runs)} runs{reps}, "
          f"model {ev['model'] or '?'}" + (f" (provider {ev['provider']})" if ev.get("provider") else "")
          + f", {ev['workers']} at a time" + (" under caffeinate -dims" if _caffeinate(ev) else ""), ""]
     w = max(len(r["run_id"]) for r in runs) if runs else 10
@@ -477,6 +498,16 @@ def commit_before(ts: float | None, root: Path = ROOT) -> dict | None:
     return {"commit": parts[0], "date": parts[1], "subject": parts[2], "inferred": True}
 
 
+def unit_key(r: dict) -> str:
+    """A run's unit (config name + seed): what repeats share and what a paired comparison matches."""
+    return f"{r.get('name') or r.get('config')} s{r.get('seed')}"
+
+
+def run_label(r: dict) -> str:
+    """The unit, and the repeat when the unit has several: "fleet_smoke_late s1 r2"."""
+    return unit_key(r) + (f" r{r.get('repeat') or 1}" if (r.get("repeats") or 1) > 1 else "")
+
+
 def _start(ev: dict, r: dict, runs_dir: Path) -> tuple[subprocess.Popen, Path]:
     logs = runs_dir / "_logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -547,7 +578,7 @@ def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
                 save(ev)
                 if verbose:
                     took = (r["ended"] - r["started"]) / 60
-                    line = f"{st}: {r['name']} s{r['seed']} after {took:.1f} min"
+                    line = f"{st}: {run_label(r)} after {took:.1f} min"
                     if st == "finished":
                         c = run_card(runs_dir / r["run_id"])
                         t = c.get("total") or {}
@@ -563,7 +594,7 @@ def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
                 running[r["run_id"]] = (proc, r)
                 save(ev)
                 if verbose:
-                    out(f"[eval {ev['name']}] started {r['name']} s{r['seed']} as {r['run_id']} (log {log})")
+                    out(f"[eval {ev['name']}] started {run_label(r)} as {r['run_id']} (log {log})")
             if running:
                 time.sleep(POLL_S)
     except KeyboardInterrupt:
@@ -637,7 +668,8 @@ def start(ev: dict, *, verbose: bool = True, out=print) -> dict:
 # ---------------------------------------------------------------------------------------------------- adopt
 def adopt(run_ids: list[str], suite: Suite, *, name: str, runs_dir: str | Path = "runs") -> dict:
     """An eval of runs that exist already (no run is played): each matched to the suite's entry by its config name
-    and seed, its code version inferred from git (the last commit before it started); then the scorecard."""
+    and seed, its code version inferred from git (the last commit before it started); then the scorecard. Several
+    runs of one config + seed are repeats of that unit, numbered in the order given."""
     from ..config import load_config
     from .compare import model_of
     runs_dir = Path(runs_dir)
@@ -645,6 +677,8 @@ def adopt(run_ids: list[str], suite: Suite, *, name: str, runs_dir: str | Path =
     for e in suite.entries:
         by_name[load_config(e.path)["name"]] = e
     runs, models, provs = [], set(), set()
+    if len(set(run_ids)) < len(run_ids):
+        raise EvalError("a run is given twice")
     for rid in run_ids:
         d = runs_dir / rid
         try:
@@ -669,8 +703,9 @@ def adopt(run_ids: list[str], suite: Suite, *, name: str, runs_dir: str | Path =
                      "adopted": True, "started": meta.get("started"),
                      "code": commit_before(meta.get("started")), "act_every": g.get("act_every")})
     keys = [(r["name"], r["seed"]) for r in runs]
-    if len(set(keys)) < len(keys):
-        raise EvalError("two of the runs are the same config and seed")
+    for r in runs:
+        mine = [x for x in runs if (x["name"], x["seed"]) == (r["name"], r["seed"])]
+        r.update(repeat=mine.index(r) + 1, repeats=len(mine))
     missing = [f"{n} s{s}" for n, e in by_name.items() for s in e.seeds if (n, s) not in keys]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     label = _label(name)
@@ -868,27 +903,76 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
     return out
 
 
+def unit_values(cards: list[dict]) -> dict:
+    """The scored runs grouped by unit (config + seed), in order: {unit: {runs, city, population, teamwork, roles,
+    handover, values}}, each the mean over the unit's repeats of the run's value vs scripted (a region by its region
+    values); `values` the city deltas of its runs, `handover` the city score at the hand-over (the same for every
+    repeat while the warm-up code is the same)."""
+    groups: dict[str, list] = {}
+    for c in cards:
+        u = c.get("total")
+        if u and u.get("delta"):
+            groups.setdefault(unit_key(c), []).append(u)
+    out = {}
+    for k, us in groups.items():
+        roles = list(dict.fromkeys(r for u in us for r in u["role_delta"]))
+        out[k] = {"runs": len(us), "city": _r(_mean([u["delta"]["city"] for u in us])),
+                  "population": _r(_mean([u["delta"]["population"] for u in us]), 1),
+                  "teamwork": _r(_mean([u.get("teamwork") for u in us]), 1),
+                  "roles": {r: _r(_mean([u["role_delta"].get(r) for u in us])) for r in roles},
+                  "handover": (us[0].get("at_handover") or {}).get("city"),
+                  "values": [u["delta"]["city"] for u in us]}
+    return out
+
+
+def _ci(values, d=3) -> dict:
+    """stats.mean_ci rounded: {n, mean, std, lo, hi} (all None without values)."""
+    c = S.mean_ci(values) or {"n": 0, "mean": None, "std": None, "lo": None, "hi": None}
+    return {k: v if k == "n" else _r(v, d) for k, v in c.items()}
+
+
+def noise_of(units: dict) -> dict | None:
+    """The replay noise of the city score vs scripted: the pooled standard deviation within units ({sd, df}), None
+    while no unit has two runs."""
+    n = S.pooled_sd([u["values"] for u in units.values()])
+    return None if n is None else {"sd": _r(n["sd"]), "df": n["df"]}
+
+
+def _mde(noise: dict | None, n_units: int) -> dict | None:
+    if not noise or n_units < 2:
+        return None
+    return {str(k): _r(S.mde(noise["sd"], n_units, k), 2) for k in S.MDE_REPEATS}
+
+
 def _agg(cards: list[dict], ev: dict) -> dict:
-    """Aggregates over finished runs (a region run counts once, by its region values)."""
+    """Aggregates over finished runs. Scores vs scripted are over units (config + seed, a region once by its region
+    values), each the mean of its repeats: mean, std of the units (the seed spread) and a 95% t-interval (lo, hi);
+    `values` lists every run's. `noise`: the replay noise (K >= 2), `mde`: the smallest difference a paired comparison
+    with another eval on these units can see, by repeats."""
     units = [c["total"] for c in cards if c.get("total")]
     scored = [u for u in units if u.get("delta")]
     cd = [u["delta"]["city"] for u in scored]
-    pdl = [u["delta"]["population"] for u in scored if u["delta"]["population"] is not None]
-    sd = lambda xs: _r(statistics.stdev(xs)) if len(xs) >= 2 else None
+    uv = unit_values(cards)
+    U = list(uv.values())
     roles = list(dict.fromkeys(r for u in units for r in u["role_delta"]))
     calls = [u["calls"] for u in units if u.get("calls")]
     ct = {k: sum(x[k] for x in calls) for k in CALLS} if calls else None
     tk = {k: sum((u.get("tokens") or {}).get(k) or 0 for u in units) for k in ("turns", "prompt", "completion")}
     per = lambda k: _r(ct[k] / ct["turns"], 3) if ct and ct["turns"] else None
     wall = [c.get("wall_time_s") for c in cards if c.get("wall_time_s") is not None]
-    out = {"runs": len(cards), "finished": len(units), "scored": len(scored),
-           "city_delta": {"mean": _r(_mean(cd)), "std": sd(cd), "values": cd},
-           "population_delta": {"mean": _r(_mean(pdl), 1), "std": sd(pdl)},
+    roles_ci = {r: _ci([u["roles"].get(r) for u in U]) for r in roles}
+    team = _ci([u["teamwork"] for u in U], 1) if U else _ci([u.get("teamwork") for u in units], 1)
+    noise = noise_of(uv)
+    out = {"runs": len(cards), "finished": len(units), "scored": len(scored), "n_units": len(uv),
+           "repeats": sorted({u["runs"] for u in U}),
+           "city_delta": {**_ci([u["city"] for u in U]), "values": cd},
+           "population_delta": _ci([u["population"] for u in U], 1),
            "city_change": _r(_mean([u["change"]["city"] for u in units if u.get("change")])),
            "yard_change": _r(_mean([u["yard_change"]["city"] for u in scored])),
-           "beats_scripted": sum(x > 0 for x in cd),
-           "roles": {r: _r(_mean([u["role_delta"].get(r) for u in units])) for r in roles},
-           "teamwork": _r(_mean([u.get("teamwork") for u in units]), 1),
+           "beats_scripted": sum(u["city"] > 0 for u in U),
+           "roles": {r: c["mean"] for r, c in roles_ci.items()}, "roles_ci": roles_ci,
+           "teamwork": team["mean"], "teamwork_ci": team,
+           "noise": noise, "mde": _mde(noise, len(uv)), "units": uv,
            "calls": ct, "failed_per_turn": per("failed"), "refused_per_turn": per("refused"),
            "tool_errors_per_turn": per("tool_errors"),
            "tokens": {**tk, "total": tk["prompt"] + tk["completion"],
@@ -907,7 +991,8 @@ def scorecard(ev: dict, *, compute_yardstick: bool = True) -> dict:
     cards = []
     for r in ev["runs"]:
         c = run_card(runs_dir / r["run_id"], compute_yardstick=compute_yardstick)
-        c.update(config=r["config"], status=run_status(runs_dir, r), code=r.get("code") or ev.get("code"))
+        c.update(config=r["config"], status=run_status(runs_dir, r), code=r.get("code") or ev.get("code"),
+                 repeat=r.get("repeat") or 1, repeats=r.get("repeats") or 1)
         if r.get("attempts"):
             c["attempts"] = [a["run_id"] for a in r["attempts"]]
         cards.append(c)
@@ -929,6 +1014,23 @@ def plus_minus(a: dict, d=1) -> str:
     return _f(a["mean"], d, True) + (f" ± {a['std']:,.{d}f}" if a.get("std") is not None else "")
 
 
+def ci_text(c: dict | None, d=1) -> str:
+    """"+1.4 (-0.5 to +3.3)": a mean and its 95% interval; the mean alone from one unit, "n/a" without."""
+    if not c or c.get("mean") is None:
+        return "n/a"
+    if c.get("lo") is None:
+        return _f(c["mean"], d, True)
+    return f"{_f(c['mean'], d, True)} ({_f(c['lo'], d, True)} to {_f(c['hi'], d, True)})"
+
+
+def mde_text(a: dict) -> str:
+    """The detectable-difference line: "~2.1 (1 repeat), ~1.3 (3), ..." or why it is unknown."""
+    m = a.get("mde")
+    if not m:
+        return "n/a: needs --repeats 2+" if not a.get("noise") else "n/a: needs 2+ units"
+    return ", ".join(f"~{v:.1f} ({k} repeat{'s' if k != '1' else ''})" for k, v in m.items())
+
+
 def _dur(s) -> str:
     if s is None:
         return "n/a"
@@ -937,12 +1039,20 @@ def _dur(s) -> str:
 
 def _summary_rows(a: dict) -> list[tuple[str, str]]:
     t = a["tokens"]
+    reps = a.get("repeats") or []
+    n_units = a.get("n_units", a["scored"])
+    noise = a.get("noise")
     rows = [("runs scored / finished / planned", f"{a['scored']} / {a['finished']} / {a['runs']}"),
-            ("city score vs scripted (mean ± std)", plus_minus(a["city_delta"])),
-            ("beats scripted", f"{a['beats_scripted']} of {a['scored']}"),
+            ("units (config + seed) x repeats",
+             f"{n_units} x {'/'.join(map(str, reps)) or 'n/a'}"),
+            ("city score vs scripted (mean, 95% CI)", ci_text(a["city_delta"])),
+            ("seed spread (std of the units)", _f(a["city_delta"].get("std"))),
+            ("replay noise (std on the same seed)", _f(noise["sd"]) if noise else "n/a: needs --repeats 2+"),
+            ("detectable difference vs another eval", mde_text(a)),
+            ("beats scripted", f"{a['beats_scripted']} of {n_units} units"),
             ("city score change since hand-over (mean)", _f(a["city_change"], 1, True)),
             ("scripted change from the same start (mean)", _f(a["yard_change"], 1, True)),
-            ("population vs scripted (mean ± std)", plus_minus(a["population_delta"], 0)),
+            ("population vs scripted (mean, 95% CI)", ci_text(a["population_delta"], 0)),
             ("Teamwork (mean)", _f(a["teamwork"])),
             ("failed actions per turn", _f(a["failed_per_turn"], 2)),
             ("refusals per turn", _f(a["refused_per_turn"], 2)),
@@ -994,7 +1104,12 @@ def markdown(ev: dict) -> str:
           "city. **vs scripted** is the run's change since the hand-over minus the change the scripted agents make "
           "from the same hand-over (the run's yardstick.json): above 0, the model added more than the scripted "
           "baseline would have. Department scores are final scores minus the yardstick's. A region run counts once, "
-          "by its region values (the region score, departments and Teamwork averaged over its cities).", ""]
+          "by its region values (the region score, departments and Teamwork averaged over its cities).", "",
+          "A **unit** is a config and seed; its value is the mean over its repeats (runs of the same hand-over). "
+          "Intervals are 95% t-intervals over the units: an interval above 0 means the model beats scripted on this "
+          "suite beyond seed luck. **Replay noise** is how much one unit varies between runs of the same model; the "
+          "**detectable difference** is the smallest gap between two evals on these units that a paired comparison "
+          "(`civitas eval --compare`) finds 80% of the time, from the replay noise alone (a lower bound).", ""]
     cols = list(groups) if len(groups) > 1 else []
     L += ["## Summary", "", "| | all runs" + "".join(f" | {g}" for g in cols) + " |",
           "|---|---:" + "|---:" * len(cols) + "|"]
@@ -1003,18 +1118,19 @@ def markdown(ev: dict) -> str:
         L.append(f"| {k} | {v}" + "".join(f" | {pg.get(k, '')}" for pg in per_group) + " |")
     roles = list(a["roles"])
     if roles:
-        L += ["", "## Departments: final score vs scripted (mean)", "",
+        L += ["", "## Departments: final score vs scripted (mean, 95% CI)", "",
               "| department | all runs" + "".join(f" | {g}" for g in cols) + " |",
               "|---|---:" + "|---:" * len(cols) + "|"]
+        rc = lambda x, r: ci_text((x.get("roles_ci") or {}).get(r)) if x.get("roles_ci") else \
+            _f(x["roles"].get(r), 1, True)
         for r in roles:
-            L.append(f"| {r} | {_f(a['roles'].get(r), 1, True)}"
-                     + "".join(f" | {_f(groups[g]['roles'].get(r), 1, True)}" for g in cols) + " |")
+            L.append(f"| {r} | {rc(a, r)}" + "".join(f" | {rc(groups[g], r)}" for g in cols) + " |")
     L += ["", "## Runs", "",
           "| run | city at hand-over | city change | scripted | vs scripted | population change | scripted "
           "| vs scripted | Teamwork | failed / turn | refused / turn | model turns | tokens | run time |",
           "|---|" + "---:|" * 13]
     for c in cards:
-        name = f"{c['name']} s{c['seed']}"
+        name = run_label(c)
         if not c.get("total"):
             L.append(f"| {name} (`{c['run_id']}`) | {c.get('status')}" + " |" * 13)
             continue
@@ -1028,8 +1144,8 @@ def markdown(ev: dict) -> str:
         L += ["", "## Departments per run", "", "Final score (vs scripted).", "",
               "| run | " + " | ".join(roles) + " |", "|---|" + "---:|" * len(roles)]
         for c in cards:
-            units = ([(f"{c['name']} s{c['seed']}", c["total"])] if not c["region"] else
-                     [(f"{c['name']} s{c['seed']} · {x}", c["by_city"][x]) for x in c["cities"]]) if c.get("total") else []
+            units = ([(run_label(c), c["total"])] if not c["region"] else
+                     [(f"{run_label(c)} · {x}", c["by_city"][x]) for x in c["cities"]]) if c.get("total") else []
             for label, u in units:
                 L.append(f"| {label} | " + " | ".join(
                     f"{_f(u['roles'].get(r))} ({_f(u['role_delta'].get(r), 1, True)})" for r in roles) + " |")
@@ -1042,7 +1158,7 @@ def markdown(ev: dict) -> str:
         extra = (f"; earlier attempts {', '.join(c['attempts'])}" if c.get("attempts") else "") + \
             ("; WARNING: the yardstick's hand-over differs from the run's" if c.get("yardstick_matches") is False
              else "") + (f"; yardstick failed: {c['yardstick_error']}" if c.get("yardstick_error") else "")
-        L.append(f"| {c['name']} s{c['seed']} | `{c['run_id']}` | {c.get('status')}{extra} | {c.get('fleet_version') or 'n/a'} "
+        L.append(f"| {run_label(c)} | `{c['run_id']}` | {c.get('status')}{extra} | {c.get('fleet_version') or 'n/a'} "
                  f"| {c.get('prompts') or 'n/a'} | {ctext} |")
     notes = _version_notes(cards, ev)
     if notes:
@@ -1075,10 +1191,16 @@ def _version_notes(cards: list[dict], ev: dict) -> list[str]:
     return out
 
 
+def aggregate_of(ev: dict) -> dict:
+    """The eval's scorecard aggregate; one saved before units and intervals is recomputed from its run cards."""
+    a = (ev.get("scorecard") or {}).get("aggregate") or {}
+    return _agg(_cards(ev), ev) if a and "n_units" not in a and _cards(ev) else a
+
+
 def compare_rows(evs: list[dict]) -> tuple[list[str], list[tuple[str, list[str]]]]:
     """(column heads, rows) of several evals' aggregates side by side."""
     heads = [f"{e['name']}" for e in evs]
-    aggs = [(e.get("scorecard") or {}).get("aggregate") or {} for e in evs]
+    aggs = [aggregate_of(e) for e in evs]
     roles = list(dict.fromkeys(r for a in aggs for r in (a.get("roles") or {})))
     rows = [("model", [str(e.get("model") or "?") for e in evs]),
             ("suite", [e["suite"]["name"] for e in evs])]
@@ -1091,11 +1213,88 @@ def compare_rows(evs: list[dict]) -> tuple[list[str], list[tuple[str, list[str]]
     for k in keys or []:
         rows.append((k, [t.get(k, "n/a") for t in table]))
     for r in roles:
-        rows.append((f"{r} vs scripted", [_f((a.get("roles") or {}).get(r), 1, True) for a in aggs]))
+        rows.append((f"{r} vs scripted", [ci_text((a.get("roles_ci") or {}).get(r)) if a.get("roles_ci")
+                                          else _f((a.get("roles") or {}).get(r), 1, True) for a in aggs]))
     return heads, rows
 
 
+def _cards(ev: dict) -> list[dict]:
+    return (ev.get("scorecard") or {}).get("runs") or []
+
+
+def _versions(ev: dict, what: str) -> set:
+    cards = [c for c in _cards(ev) if c.get("total")]
+    if what == "code":
+        return {(c.get("code") or {}).get("commit") for c in cards} - {None}
+    return {c.get("prompts") for c in cards} - {None}
+
+
+def paired(base: dict, other: dict) -> dict:
+    """`other` against `base` on the units both scored (config + seed): per unit other's value vs scripted minus
+    base's (the shared hand-over's difficulty cancels), a stats.verdict over those differences for the city score,
+    population and each department, the units it won, the detectable difference at these repeats (the replay noise
+    pooled over both evals), and what makes the two less comparable: units only one side has, a unit whose hand-over
+    differs (other warm-up code), different code commits or system prompts."""
+    ua, ub = unit_values(_cards(base)), unit_values(_cards(other))
+    shared = [k for k in ua if k in ub]
+    diff = lambda f: [None if f(ub[k]) is None or f(ua[k]) is None else f(ub[k]) - f(ua[k]) for k in shared]
+    rnd = lambda v, d=3: None if v is None else {k: (x if k in ("n", "call") else _r(x, d)) for k, x in v.items()}
+    roles = [r for r in dict.fromkeys(r for k in shared for r in ua[k]["roles"]) if any(r in ub[k]["roles"] for k in shared)]
+    city = diff(lambda u: u["city"])
+    noise = S.pooled_sd([u["values"] for u in [*ua.values(), *ub.values()]])
+    ka = min((ua[k]["runs"] for k in shared), default=1)
+    kb = min((ub[k]["runs"] for k in shared), default=1)
+    mde = S.mde(noise["sd"], len(shared), 2 / (1 / ka + 1 / kb)) if noise and len(shared) >= 2 else None
+    return {"base": base["name"], "other": other["name"], "units": shared,
+            "only_base": [k for k in ua if k not in ub], "only_other": [k for k in ub if k not in ua],
+            "city": rnd(S.verdict(city)), "population": rnd(S.verdict(diff(lambda u: u["population"])), 1),
+            "teamwork": rnd(S.verdict(diff(lambda u: u["teamwork"])), 1),
+            "roles": {r: rnd(S.verdict(diff(lambda u: u["roles"].get(r)))) for r in roles},
+            "wins": sum(d > 0 for d in city if d is not None), "repeats": [ka, kb],
+            "noise": None if not noise else _r(noise["sd"]), "mde": _r(mde, 2),
+            "handover_differs": [k for k in shared if ua[k]["handover"] is not None and ub[k]["handover"] is not None
+                                 and abs(ua[k]["handover"] - ub[k]["handover"]) > 0.05],
+            "code_differs": _versions(base, "code") != _versions(other, "code"),
+            "prompts_differ": _versions(base, "prompts") != _versions(other, "prompts")}
+
+
+def verdict_text(p: dict) -> list[str]:
+    """A paired comparison in words: the verdict, the departments, the caveats."""
+    a, b, v, n = p["base"], p["other"], p["city"], len(p["units"])
+    ci = lambda x, d=1: f"{_f(x['mean'], d, True)} (95% CI {_f(x['lo'], d, True)} to {_f(x['hi'], d, True)})"
+    if not v or v["n"] < 2:
+        L = [f"{b} vs {a}: only {n} shared unit{'s' if n != 1 else ''}, no verdict"
+             + (f" ({_f(v['mean'], 1, True)} on it)" if v else "") + "."]
+    elif v["call"] == "unclear":
+        L = [f"{b} vs {a}: no clear difference: {ci(v)} on {n} shared units, {b} ahead on {p['wins']}."
+             + (f" Differences under ~{p['mde']:.1f} can't be seen on this suite at these repeats." if p["mde"]
+                else " Run both with --repeats 2 or more to learn how small a difference this suite can see.")]
+    else:
+        L = [f"{b} vs {a}: {b} is {v['call'].upper()}: {ci(v)} on {n} shared units, {b} ahead on {p['wins']}."]
+    if v and v["n"] >= 2:
+        pop = p["population"]
+        if pop:
+            L.append(f"- population: {ci(pop, 0)}, {pop['call']}")
+        if p["teamwork"]:
+            L.append(f"- Teamwork: {ci(p['teamwork'])}, {p['teamwork']['call']}")
+        for r, x in p["roles"].items():
+            if x and x["n"] >= 2:
+                L.append(f"- {r}: {ci(x)}, {x['call']}")
+    if p["handover_differs"]:
+        L.append(f"- WARNING: the hand-over differs on {', '.join(p['handover_differs'])}: the warm-up changed between "
+                 f"the evals, so they didn't start from the same cities and don't compare")
+    if p["only_base"] or p["only_other"]:
+        L.append("- left out (only one eval has them): " + ", ".join(
+            [*(f"{k} ({a})" for k in p["only_base"]), *(f"{k} ({b})" for k in p["only_other"])]))
+    if p["code_differs"] or p["prompts_differ"]:
+        L.append("- note: different " + " and ".join(x for x, on in (("code commits", p["code_differs"]),
+                                                                    ("system prompts", p["prompts_differ"])) if on)
+                 + ": fine when comparing models, but the difference is not the model's alone")
+    return L
+
+
 def compare(evs: list[dict]) -> str:
+    """Several evals' aggregates side by side, then each against the first, paired by unit."""
     heads, rows = compare_rows(evs)
     w0 = max(len(k) for k, _ in rows)
     ws = [max(len(h), *(len(v[i]) for _, v in rows)) for i, h in enumerate(heads)]
@@ -1103,6 +1302,8 @@ def compare(evs: list[dict]) -> str:
     out.append("-" * len(out[0]))
     for k, vals in rows:
         out.append(k.ljust(w0) + "  " + "  ".join(v.rjust(w) for v, w in zip(vals, ws)))
+    for ev in evs[1:]:
+        out += ["", *verdict_text(paired(evs[0], ev))]
     return "\n".join(out)
 
 
@@ -1118,6 +1319,8 @@ def list_evals(runs_dir: str | Path) -> list[dict]:
         if not isinstance(ev, dict) or "runs" not in ev:
             continue
         sc = ev.get("scorecard") or {}
+        if sc.get("aggregate"):
+            sc = {**sc, "aggregate": aggregate_of(ev)}
         runs = [{"run_id": r["run_id"], "config": r.get("config"), "name": r.get("name"), "seed": r.get("seed"),
                  "region": r.get("region"), "status": run_status(rd, r) if r.get("run_id") else r.get("status")}
                 for r in ev["runs"]]
@@ -1128,5 +1331,6 @@ def list_evals(runs_dir: str | Path) -> list[dict]:
                     "provider": ev.get("provider"), "suite": {k: (ev.get("suite") or {}).get(k)
                                                               for k in ("name", "file", "description")},
                     "created": ev.get("created"), "status": st, "adopted": bool(ev.get("adopted")),
-                    "runs": runs, "aggregate": sc.get("aggregate"), "by_config": sc.get("by_config")})
+                    "runs": runs, "aggregate": sc.get("aggregate"), "by_config": sc.get("by_config"),
+                    "units": unit_values(sc.get("runs") or [])})
     return out

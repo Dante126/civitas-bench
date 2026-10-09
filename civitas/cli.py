@@ -124,7 +124,7 @@ def cmd_eval(args):
             print(f"wrote {ev['dir']}")
             return
         ev = E.plan(suite, model=args.model, provider=args.provider, agents=args.agent, sets=args.set,
-                    name=args.name, runs_dir=args.runs_dir, workers=args.workers)
+                    name=args.name, runs_dir=args.runs_dir, workers=args.workers, repeats=args.repeats)
         if args.dry_run:
             errs = E.check(ev)
             print(E.dry_run_text(ev, errs))
@@ -144,8 +144,8 @@ def _eval_done(ev: dict) -> None:
     from .bench import evals as E
     a = (ev.get("scorecard") or {}).get("aggregate") or {}
     print(f"[eval {ev['name']}] {ev['status']}: {a.get('finished', 0)} of {a.get('runs', 0)} runs finished; "
-          f"city vs scripted {E.plus_minus(a.get('city_delta') or {})}, beats scripted "
-          f"{a.get('beats_scripted', 0)} of {a.get('scored', 0)}")
+          f"city vs scripted {E.ci_text(a.get('city_delta'))}, beats scripted "
+          f"{a.get('beats_scripted', 0)} of {a.get('n_units', 0)} units")
     print(f"scorecard: {Path(ev['dir']) / E.CARD}")
     if ev["status"] != "finished":
         print(f"rerun what didn't finish: civitas eval --resume {ev['dir']}")
@@ -304,11 +304,14 @@ def main(argv=None):
     sp.add_argument("--set", action="append", default=[], help="override a value in every run, e.g. game.months=102")
     sp.add_argument("--workers", type=int, default=None, help="runs at once (default: the suite's [eval].workers)")
     sp.add_argument("--name", default=None, help="the eval's name (default: the model): runs/eval_<name>_<time>/")
+    sp.add_argument("--repeats", type=int, default=None, help="play each config + seed this many times (default: "
+                                                              "the suite's repeats, 1): measures the replay noise")
     sp.add_argument("--dry-run", action="store_true", help="print the plan, its estimated tokens and time, and "
                                                            "whether it would start; run nothing")
     sp.add_argument("--resume", metavar="EVAL_DIR", default=None, help="rerun an eval's unfinished or failed runs")
     sp.add_argument("--report", metavar="EVAL_DIR", default=None, help="rebuild an eval's scorecard from its runs")
-    sp.add_argument("--compare", metavar="EVAL_DIR", nargs="+", default=None, help="several evals side by side")
+    sp.add_argument("--compare", metavar="EVAL_DIR", nargs="+", default=None,
+                    help="several evals side by side, each against the first paired by config + seed")
     sp.add_argument("--adopt", metavar="RUN_ID", nargs="+", default=None,
                     help="make an eval (with -s and --name) of runs that exist already, without rerunning them")
     sp.add_argument("--runs-dir", default="runs")
