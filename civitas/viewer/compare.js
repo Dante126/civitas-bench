@@ -191,7 +191,28 @@ export function drawCharts(root, cols, { yard = true } = {}) {
 // ---------------------------------------------------------------- evals (civitas eval, /api/evals)
 // one column per eval (a model on a suite) with the aggregate of its scorecard (civitas/bench/evals.py): the city
 // score against the scripted yardstick from the same hand-over, departments, Teamwork, failures and tokens
-const pm = (a, d = 1) => !a || a.mean == null ? "—" : (d ? signed(d) : signedInt)(a.mean) + (a.std != null ? `<span class="muted"> ± ${d ? a.std.toFixed(d) : Math.round(a.std).toLocaleString()}</span>` : "");
+// mean with its 95% interval over the units ([lo, hi], bench/evals.py), or ± std from an eval saved before them
+const pm = (a, d = 1) => {
+  if (!a || a.mean == null) return "—";
+  const f = d ? signed(d) : signedInt;
+  if (a.lo != null) return f(a.mean) + `<span class="muted"> [${f(a.lo)}, ${f(a.hi)}]</span>`;
+  return f(a.mean) + (a.std != null ? `<span class="muted"> ± ${d ? a.std.toFixed(d) : Math.round(a.std).toLocaleString()}</span>` : "");
+};
+// Student's t, two-sided 95%, by degrees of freedom: a copy of bench/stats.py T975 (keep them in step)
+const T975 = { 1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 25: 2.060, 30: 2.042, 40: 2.021, 60: 2.000, 120: 1.980 };
+const t975 = (df) => df > 120 ? 1.96 : T975[Math.max(...Object.keys(T975).map(Number).filter(k => k <= df))];
+// an eval against the first column, paired by unit (config + seed; evals.paired): the mean difference of the city
+// score vs scripted and its 95% t-interval, "better" / "worse" when the interval misses 0 (bench/stats.py verdict)
+export function pairedCity(base, other) {
+  const ua = base.units || {}, ub = other.units || {};
+  const d = Object.keys(ua).filter(k => k in ub && ua[k].city != null && ub[k].city != null).map(k => ub[k].city - ua[k].city);
+  if (!d.length) return null;
+  const n = d.length, mean = d.reduce((a, b) => a + b, 0) / n;
+  if (n < 2) return { n, mean, call: "unclear" };
+  const sd = Math.sqrt(d.reduce((a, x) => a + (x - mean) ** 2, 0) / (n - 1)), half = t975(n - 1) * sd / Math.sqrt(n);
+  const lo = mean - half, hi = mean + half;
+  return { n, mean, lo, hi, call: lo > 0 ? "better" : hi < 0 ? "worse" : "unclear" };
+}
 const mfmt = (v) => Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(2) + "M" : kfmt(v);
 export const evalLabel = (e) => `${e.name || e.dir}`;
 const evalDate = (e) => e.created ? new Date(e.created * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
@@ -207,8 +228,14 @@ export function evalsTableHTML(evals, { roleColor = () => "#ccc" } = {}) {
     ["runs scored / planned", e => A(e).scored, (v, e) => v == null ? "—" : `${v} / ${A(e).runs}`, 0, "runs finished with a scripted yardstick, of the eval's runs"],
     ["status", e => e.status, (v, e) => `<span class="pill ${esc(v)}">${esc(v)}</span>${e.adopted ? ` <span class="muted small">adopted</span>` : ""}`, 0],
     ["Against the scripted yardstick"],
-    ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "the run's city score change since the hand-over minus the scripted agents' change from the same hand-over; mean ± std over the runs (a region run counts once, by its region score)"],
-    ["beats scripted", e => A(e).scored ? A(e).beats_scripted / A(e).scored : null, (v, e) => v == null ? "—" : `${A(e).beats_scripted} of ${A(e).scored}`, 1],
+    ["units × repeats", e => A(e).n_units, (v, e) => v == null ? "—" : `${v} × ${(A(e).repeats || []).join("/") || "—"}`, 0, "a unit is a config and seed; repeats replay the same hand-over"],
+    ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "the run's city score change since the hand-over minus the scripted agents' change from the same hand-over; mean over the units (each the mean of its repeats; a region run counts once, by its region score) with its 95% interval"],
+    ...(evals.length > 1 ? [[`vs ${evalLabel(evals[0])}`, (e, i) => i ? pairedCity(evals[0], e) : null, (v, e, i) => !i ? `<span class="muted">baseline</span>` : !v ? `<span class="muted">no shared units</span>`
+      : `<span style="color:${v.call === "better" ? "var(--ok)" : v.call === "worse" ? "var(--bad)" : "var(--muted)"}">${signed(1)(v.mean)}${v.lo != null ? ` [${signed(1)(v.lo)}, ${signed(1)(v.hi)}]` : ""} · ${v.call === "unclear" ? "no clear difference" : v.call}</span>`, 0,
+      "the city score vs scripted against the first column, paired by config + seed: the mean difference and its 95% interval over the shared units; better / worse when the interval misses 0 (civitas eval --compare gives departments too)"]] : []),
+    ["beats scripted", e => { const n = A(e).n_units ?? A(e).scored; return n ? A(e).beats_scripted / n : null; }, (v, e) => v == null ? "—" : `${A(e).beats_scripted} of ${A(e).n_units ?? A(e).scored}`, 1, "units whose mean is above the scripted yardstick"],
+    ["replay noise", e => (A(e).noise || {}).sd, (v) => v == null ? `<span class="muted">needs repeats</span>` : v.toFixed(1), 0, "how much the city score vs scripted varies between runs of the same model on the same seed (pooled std within units)"],
+    ["detectable difference", e => A(e).mde ? A(e).mde[String(Math.max(...(A(e).repeats || [1])))] : null, (v, e) => v == null ? "—" : `~${v.toFixed(1)}<span class="muted"> at ${Math.max(...(A(e).repeats || [1]))} repeat(s)</span>`, -1, "the smallest gap to another eval on these units that a paired comparison finds 80% of the time, from the replay noise (a lower bound)"],
     ["city change since hand-over", e => A(e).city_change, signed(1), 1, "the model's own change (mean)"],
     ["scripted change", e => A(e).yard_change, signed(1), 0, "the scripted agents' change from the same hand-over (mean)"],
     ["population vs scripted", e => (A(e).population_delta || {}).mean, (v, e) => pm(A(e).population_delta, 0), 1],
@@ -230,12 +257,12 @@ export function evalsTableHTML(evals, { roleColor = () => "#ccc" } = {}) {
       <div class="cmp-sub">${esc(evalDate(e))} · <button class="cmp-open" data-load-eval="${esc(e.dir)}" title="Compare this eval's runs">its runs</button></div></th>`).join("")}</tr>`;
   const body = R.map(([label, get, fmt, dir, tip, role]) => {
     if (!get) return `<tr class="cmp-g"><td colspan="${evals.length + 1}">${esc(label)}</td></tr>`;
-    const vals = evals.map(e => { try { return get(e); } catch { return null; } });
+    const vals = evals.map((e, i) => { try { return get(e, i); } catch { return null; } });
     const nums = vals.filter(v => typeof v === "number" && isFinite(v));
     const best = dir && nums.length > 1 && new Set(nums).size > 1 ? (dir > 0 ? Math.max(...nums) : Math.min(...nums)) : null;
     const lab = role ? `<span class="cmp-role" style="--c:${roleColor(role)}">${esc(label)}</span>` : esc(label);
     return `<tr><td${tip ? ` title="${esc(tip)}"` : ""}>${lab}${tip ? ` <span class="muted">ⓘ</span>` : ""}</td>${vals.map((v, i) =>
-      `<td class="${best != null && v === best ? "best" : ""}">${fmt(v, evals[i])}</td>`).join("")}</tr>`;
+      `<td class="${best != null && v === best ? "best" : ""}">${fmt(v, evals[i], i)}</td>`).join("")}</tr>`;
   }).join("");
   return `<table class="cmp-t">${head}${body}</table>`;
 }

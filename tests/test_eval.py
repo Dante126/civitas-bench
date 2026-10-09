@@ -178,8 +178,8 @@ def _config(port: int, region: bool = False) -> str:
 
 @pytest.fixture(scope="module")
 def evaluated(tmp_path_factory):
-    """One eval of a cheap suite (a single city, seeds 0-1, and a region, seed 0; 8 months of which 6 warm-up),
-    played in subprocesses against the fake model."""
+    """One eval of a cheap suite (a single city, seed 0 played twice, and a region, seed 0; 8 months of which 6
+    warm-up), played in subprocesses against the fake model."""
     os.environ[KEY_ENV] = "sk-fake"
     srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeLLM)
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
@@ -189,7 +189,7 @@ def evaluated(tmp_path_factory):
     (base / "region.toml").write_text(_config(port, region=True))
     (base / "suite.toml").write_text(
         'name = "tiny"\ndescription = "two late cities and a late region"\n[eval]\nworkers = 3\ncaffeinate = false\n'
-        f'[eval.prices]\nfake = [1.0, 2.0]\n[[runs]]\nconfig = "{base / "city.toml"}"\nseeds = [0, 1]\nminutes = 0.1\n'
+        f'[eval.prices]\nfake = [1.0, 2.0]\n[[runs]]\nconfig = "{base / "city.toml"}"\nseeds = [0]\nrepeats = 2\nminutes = 0.1\n'
         f'prompt_tokens = 1000\ncompletion_tokens = 100\n[[runs]]\nconfig = "{base / "region.toml"}"\nseeds = [0]\n')
     runs = base / "runs"
     lines = []
@@ -216,8 +216,14 @@ def test_an_eval_end_to_end(evaluated):
         assert (runs / "_logs" / f"{r['run_id']}.log").exists() and r["returncode"] == 0
         meta = json.loads((rd / "meta.json").read_text())
         assert set(meta["agents"].values()) == {"fleet:fake"}
+    assert [(r["seed"], r["repeat"]) for r in saved["runs"]] == [(0, 1), (0, 2), (0, 1)]
+    assert "_eval_city_s0_r1_fake-v1" in saved["runs"][0]["run_id"] and "_s0_r2_" in saved["runs"][1]["run_id"]
+    assert saved["runs"][2]["run_id"].endswith("_eval_region_s0_fake-v1")         # one repeat: no _r in the id
     a = saved["scorecard"]["aggregate"]
-    assert a["runs"] == a["finished"] == a["scored"] == 3 and a["city_delta"]["std"] is not None
+    assert a["runs"] == a["finished"] == a["scored"] == 3 and a["n_units"] == 2 and a["repeats"] == [1, 2]
+    assert a["city_delta"]["n"] == 2 and a["city_delta"]["lo"] is not None and len(a["city_delta"]["values"]) == 3
+    assert a["noise"] == {"sd": 0.0, "df": 1} and a["mde"]["1"] == 0.0      # the fake model plays every repeat alike
+    assert set(a["units"]) == {"eval_city s0", "eval_region s0"} and a["units"]["eval_city s0"]["runs"] == 2
     assert a["tokens"]["turns"] == 8 + 8 + 16                          # one acting month (6) after the warm-up
     assert a["tokens"]["prompt"] >= 50 * 32 and a["usd"] > 0 and a["calls"]["turns"] == 32
     assert set(saved["scorecard"]["by_config"]) == {"eval_city", "eval_region"}
@@ -229,9 +235,10 @@ def test_an_eval_end_to_end(evaluated):
         assert t["delta"]["city"] == pytest.approx(t["change"]["city"] - t["yard_change"]["city"], abs=1e-3)
         assert c["yardstick_matches"] is True and set(t["role_delta"]) >= {"mayor", "education"}
     card = (d / E.CARD).read_text()
-    assert "# Eval fake-v1: fake on tiny" in card and "| city score vs scripted (mean ± std) |" in card
+    assert "# Eval fake-v1: fake on tiny" in card and "| city score vs scripted (mean, 95% CI) |" in card
+    assert "| units (config + seed) x repeats | 2 x 1/2 |" in card and "| eval_city s0 r2 |" in card
     assert "**eval_region s0 (region)**" in card and "| · north |" in card and "cost at the suite's prices" in card
-    assert any(x.startswith("[eval fake-v1] finished: eval_city s0") for x in evaluated["lines"])
+    assert any(x.startswith("[eval fake-v1] finished: eval_city s0 r1") for x in evaluated["lines"])
 
 
 @pytest.mark.slow
@@ -278,16 +285,22 @@ def test_report_adopt_and_compare(evaluated, capsys):
     assert len(adopted) == 1
     a2 = json.loads((adopted[0] / E.FILE).read_text())
     assert a2["adopted"] and a2["model"] == "fake" and [r["run_id"] for r in a2["runs"]] == ids[:2]
+    assert [(r["repeat"], r["repeats"]) for r in a2["runs"]] == [(1, 2), (2, 2)]      # one unit, played twice
     assert all(r["code"] and r["code"]["inferred"] for r in a2["runs"])
     one = json.loads((Path(ev["dir"]) / E.FILE).read_text())["scorecard"]["by_config"]["eval_city"]
     assert a2["scorecard"]["aggregate"]["city_delta"] == one["city_delta"]
+    with pytest.raises(SystemExit, match="given twice"):
+        cli.main(["eval", "-s", str(evaluated["base"] / "suite.toml"), "--adopt", ids[0], ids[0], "--name", "x",
+                  "--runs-dir", str(runs)])
     with pytest.raises(SystemExit, match="isn't in suite"):
         cli.main(["eval", "-s", str(SUITE), "--adopt", ids[0], "--name", "x", "--runs-dir", str(runs)])
     cli.main(["eval", "--compare", ev["dir"], str(adopted[0])])
     table = capsys.readouterr().out
     head = table.splitlines()[0]
-    assert "fake-v1" in head and "again" in head and "city score vs scripted (mean ± std)" in table
+    assert "fake-v1" in head and "again" in head and "city score vs scripted (mean, 95% CI)" in table
     assert "beats scripted" in table and "education vs scripted" in table
+    assert "again vs fake-v1: only 1 shared unit, no verdict" in table
+    assert "left out (only one eval has them): eval_region s0 (fake-v1)" in table
 
 
 @pytest.mark.slow
@@ -301,6 +314,7 @@ def test_api_evals(evaluated):
         assert mine["model"] == "fake" and mine["suite"]["name"] == "tiny" and len(mine["runs"]) == 3
         assert all(r["status"] == "finished" for r in mine["runs"]) and mine["aggregate"]["scored"] == 3
         assert mine["dir"].startswith("eval_fake-v1_") and set(mine["by_config"]) == {"eval_city", "eval_region"}
+        assert set(mine["units"]) == {"eval_city s0", "eval_region s0"} and mine["aggregate"]["n_units"] == 2
         runs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs"))
         assert runs and not any(r["run_id"].startswith("eval_") for r in runs)      # eval folders aren't runs
         board = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/leaderboard"))
