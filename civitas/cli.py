@@ -44,7 +44,7 @@ def _hub(args):
 
 def _linger(args, out: dict) -> None:
     if args.serve and not args.exit:
-        print(f"Run {'paused' if out.get('paused') else 'finished'}. Viewer still running; Ctrl+C to quit.")
+        print(f"Run {'paused' if out.get('paused') else 'stopped' if out.get('stopped') else 'finished'}. Viewer still running; Ctrl+C to quit.")
         try:
             while True:
                 time.sleep(3600)

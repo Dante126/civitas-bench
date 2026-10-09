@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 from pathlib import Path
 
 try:
@@ -45,6 +46,11 @@ def load_config(path: str | Path | None) -> dict:
 
 
 def _coerce(v: str):
+    if v[:1] in ("[", "{"):                     # --set 'game.cities=["north","south","east"]'
+        try:
+            return json.loads(v)
+        except ValueError:
+            pass
     for t in (int, float):
         try:
             return t(v)

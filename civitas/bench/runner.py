@@ -17,6 +17,8 @@ from ..config import agent_spec, apply_cli_overrides, build_agents, game_config,
 from ..core.env import make_env
 from ..fleet.config import fleet_agent_config, fleet_agents, fleet_version, playbook_versions, session_months
 from ..fleet.report import fleet_report, turn_row
+from . import control as C
+from . import live as L
 from . import session as S
 from . import yardstick as Y
 
@@ -132,6 +134,7 @@ def _resume_cmd(run: dict) -> str:
 def _pause(run: dict) -> dict:
     """End the session at its boundary: checkpoint, editable playbooks, PAUSED marker, resume instructions."""
     env, d, s = run["env"], run["log"].dir, run["sessions"][-1]
+    _close_live(run)
     s.update(status="paused", end_month=env.world.month, ended=time.time())
     _save_sessions(run)
     run["log"].close()
@@ -275,13 +278,13 @@ def _warmup_summary(run: dict, final_city: float, final_pop: int) -> dict:
 
 def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None,
                 verbose: bool = True, log_observations: bool = True, run_id: str | None = None,
-                sessions: bool = True, yardstick: bool = True) -> dict:
+                sessions: bool = True, yardstick: bool = True, live: bool = True) -> dict:
     """Play a run to the end and return its summary. A supervised fleet run with `[fleet].session_months` stops
     at the first session boundary instead and returns `{"paused": True, ...}` (`sessions=False` plays through);
     `resume_episode` continues it. With `[game].warmup_months = N` the warm-up line-up (`config.warmup_config`) plays
     months 0..N-1 and the configured agents the rest of the same game (`_hand_over`); its sessions start at N, and at
     the end (unless `yardstick=False`) the scripted yardstick from the same start goes to yardstick.json
-    (bench/yardstick.py)."""
+    (bench/yardstick.py). `live` writes the live feed (bench/live.py: live.jsonl, live_frame.json; off in bench)."""
     warm = warmup_months(cfg)
     game = game_config(cfg, seed)
     scoring = scoring_config(cfg, game)
@@ -292,7 +295,7 @@ def run_episode(cfg: dict, seed: int, runs_dir: str | Path = "runs", *, hub=None
     log = RunLogger(Path(runs_dir) / run_id)
     run = {"cfg": cfg, "seed": seed, "run_id": run_id, "env": env, "agents": agents, "log": log, "hub": hub,
            "verbose": verbose, "log_observations": log_observations, "sessions_on": sessions, "sessions": [],
-           "yardstick": yardstick,
+           "yardstick": yardstick, "live": L.LiveLog(log.dir, env) if live else None,
            "prompt_ref": {}, "wall_s": 0.0, "city_scores": [], "fleet_rows": [],
            "settings": {"game": dataclasses.asdict(game), "scoring": dataclasses.asdict(scoring)},
            "stats": {r: _new_stats() for r in env.roles}, "warm_agents": warm_agents,
@@ -346,6 +349,7 @@ def resume_episode(run: str | Path, config: str | Path | None = None, *, runs_di
            "warmup": state.get("warmup"), "warm_agents": None,      # a pause comes after the warm-up
            "cfg": cfg, "env": env, "agents": S.restore_agents(state["agents"], cfg, env, hub),
            "log": RunLogger(d), "hub": hub, "verbose": verbose, "sessions_on": True, "yardstick": yardstick}
+    run["live"] = L.LiveLog(d, env)
     _fleet_settings(run)
     _open_session(run, previous=state, config_file=source)
     _save_sessions(run)
@@ -381,6 +385,59 @@ def _fleet_version(run: dict) -> str | None:
     return hashlib.sha1("|".join(map(str, seq)).encode()).hexdigest()[:12]
 
 
+def _live(run: dict, kind: str, role: str, **data) -> None:
+    if run.get("live"):
+        run["live"].emit(kind, role, **data)
+
+
+def _live_turn(run: dict, role: str, agent, decision, results: list[dict]) -> None:
+    """The turn's end on the live feed; the actions and messages first of an agent that didn't report its own (a
+    fleet agent's ToolBox reports each call as it runs)."""
+    if not run.get("live"):
+        return
+    fleet = getattr(agent, "kind", "") == "fleet"
+    for r in results[len(decision.executed):]:
+        a = dict(r.get("action") or {})
+        L.emit_result(run["live"], role, str(a.pop("type", "?")), a, r)
+    if not fleet:
+        for m in decision.messages:
+            L.emit_result(run["live"], role, "send_message", {"to": m.get("to", "all"), "text": m.get("text", "")},
+                          {"ok": True}, action=False)
+    done = [r for r in results if r.get("ok")]
+    _live(run, "done", role, actions=len(done), failed=len(results) - len(done),
+          spent=round(sum(r.get("cost") or 0 for r in done), 2),
+          report=L._clip(str(decision.thinking or ""), L.TEXT_CHARS))
+
+
+def _close_live(run: dict) -> None:
+    if run.get("live"):
+        run["live"].close()
+        run["live"] = None
+
+
+def _hold(run: dict, role: str | None) -> bool:
+    """The viewer's Pause / Stop (bench/control.py) before `role`'s turn: wait while paused; True = stop now."""
+    stop, held = C.wait(run["log"].dir, run["env"].world.month, role)
+    run["held_s"] = run.get("held_s", 0.0) + held
+    if held and run["verbose"]:
+        print(f"[{run['run_id']}] resumed at month {run['env'].world.month} after {held:.0f} s paused")
+    return stop
+
+
+def _stopped(run: dict, t0: float) -> dict:
+    """Stopped from the viewer: the logs so far stay, STOPPED marks the run, no summary."""
+    run["wall_s"] += time.time() - t0 - run.pop("held_s", 0.0)
+    if run["sessions"]:
+        run["sessions"][-1].update(status="stopped", end_month=run["env"].world.month, ended=time.time())
+        _save_sessions(run)
+    run["log"].close()
+    _close_live(run)
+    C.mark_stopped(run["log"].dir)
+    if run["verbose"]:
+        print(f"[{run['run_id']}] stopped at month {run['env'].world.month}")
+    return {"run_id": run["run_id"], "stopped": True, "month": run["env"].world.month}
+
+
 def _play(run: dict) -> dict:
     """Months until the end of the game (-> summary) or of the session (-> `_pause`)."""
     cfg, env, stats, log, hub = run["cfg"], run["env"], run["stats"], run["log"], run["hub"]
@@ -395,12 +452,18 @@ def _play(run: dict) -> dict:
         agents = run["warm_agents"] if warming else run["agents"]
         pending = []
         acting = [r for r in env.roles if env.acts_this_month(r)]
+        if _hold(run, acting[0] if acting else None):
+            return _stopped(run, t0)
         # simultaneous mode: everybody sees the same start-of-month state, then all decisions apply in turn order
         early = {r: env.observe(r) for r in acting} if game.simultaneous else {}
-        for role in acting:
+        for i, role in enumerate(acting):
+            if i and _hold(run, role):
+                return _stopped(run, t0)
             obs = early.get(role) or env.observe(role)
+            _live(run, "turn", role, agent=agents[role].describe(), **({"warmup": True} if warming else {}))
             decision = agents[role].act(obs)
             results = env.apply(role, decision)
+            _live_turn(run, role, agents[role], decision, results)
             st = stats[role]
             st["turns"] += 1
             st["actions"] += len(results)
@@ -442,6 +505,8 @@ def _play(run: dict) -> dict:
         city_scores.append(info["scores"]["city"])
         frame = env.frame(turns=info["turns"], scores=info["scores"])
         log.frame(frame)
+        if run.get("live"):
+            run["live"].month(env.world.month)
         if hub is not None:
             hub.latest_frame = frame
         m = info["metrics"]
@@ -449,10 +514,12 @@ def _play(run: dict) -> dict:
             print(f"  month {m['month']:>3}: pop {m['population']:>6}  treasury {m['treasury']:>10,.0f}  "
                   f"happy {m['happiness']:.2f}  scores " + " ".join(f"{k}={v:.1f}" for k, v in info["scores"].items()))
         if run["session_months"] and not env.done and env.world.month - start >= run["session_months"]:
-            run["wall_s"] += time.time() - t0
+            run["wall_s"] += time.time() - t0 - run.pop("held_s", 0.0)
             return _pause(run)
 
-    run["wall_s"] += time.time() - t0
+    run["wall_s"] += time.time() - t0 - run.pop("held_s", 0.0)
+    C.clear(log.dir)                                     # a pause asked for after the last turn
+    _close_live(run)
     agents = run["agents"]
     fv = _fleet_version(run)
     final = env.final_metrics()
@@ -550,7 +617,7 @@ def _yardstick(run: dict, summary: dict) -> dict | None:
 
 def _run_one(args):
     cfg, seed, runs_dir, verbose = args
-    return run_episode(cfg, seed, runs_dir, verbose=verbose, sessions=False, yardstick=False)
+    return run_episode(cfg, seed, runs_dir, verbose=verbose, sessions=False, yardstick=False, live=False)
 
 
 def run_benchmark(cfg: dict, seeds: list[int], runs_dir="runs", workers: int = 1, verbose=True) -> dict:

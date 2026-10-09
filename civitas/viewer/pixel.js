@@ -6,11 +6,14 @@
 import { TW, TH, ZS, hash, rotQ, project, paint, fillPoly, toCanvas, Builder, mix, rgb } from "./sprites.js";
 import * as R from "./recipes.js";
 import { LifeSim } from "./lifesim.js";
+import { seasonAt } from "./seasons.js";
 import { OVERLAY_BY_ID, OVERLAY_RAMPS, DISTRICT_COLORS, SPECIALS } from "./scene.js";
 
 const MARGIN = 12;                                  // decorative land around the playable map (as in scene.js)
 const ZOOMS = [0.125, 0.25, 0.5, 1, 2, 3, 4];
 const Z_HALF = ZOOMS.indexOf(0.5), Z_ONE = ZOOMS.indexOf(1);
+const Z_MIN = ZOOMS[0], Z_MAX = ZOOMS[ZOOMS.length - 1];
+const WHEEL_ZOOM = 0.0012, PINCH_ZOOM = 0.01, LINE_ZOOM = 0.04, KEY_ZOOM = 1.25, ZOOM_EASE_S = 0.08;   // zoom is continuous: a wheel notch ~11%, eased
 const BUS_COLORS = ["#e07bd8", "#4aa3ff", "#ffb454", "#5fd38d", "#ff6b5e", "#f5d547"];
 const NATIVE_SIZE = ">";
 const BUILD_MS = 1600, DUST_MS = 900;
@@ -30,7 +33,7 @@ export class PixelScene {
   constructor(container, { onHover, onClick } = {}) {
     this.container = container; this.onHover = onHover; this.onClick = onClick;
     this.overlay = "none"; this.night = false; this.quality = "high";
-    this.rot = 0; this.zi = Z_ONE; this.cam = { x: 0, y: 0 }; this.camAnim = null;
+    this.rot = 0; this.z = this.zt = 1; this.zAnchor = null; this.cam = { x: 0, y: 0 }; this.camAnim = null;
     this.frame = null; this.meta = null; this.active = true;
     this.cache = new Map(); this.anims = new Map(); this.dust = []; this.hover = -1; this.selected = -1; this.hl = null;
     this.cv = document.createElement("canvas");
@@ -38,6 +41,16 @@ export class PixelScene {
     this.cv.style.imageRendering = "pixelated";
     container.appendChild(this.cv);
     this.g = this.cv.getContext("2d");
+    // The browser can wipe GPU-backed canvases: the sprites, the baked ground and the distant view come back
+    // transparent (a GPU reset, a hidden tab's memory reclaimed), sometimes without any event. Repaint them all on a
+    // restore event, and _checkWiped reads a few back every second in case none comes. A sprite-sized sentinel
+    // catches a reset that only reaches the offscreen sprite canvases.
+    this._sentinel = toCanvas(new Uint32Array(64 * 96), 64, 96);
+    for (const cv of [this.cv, this._sentinel]) {
+      cv.addEventListener?.("contextlost", () => console.warn("pixel view: canvas context lost"));
+      cv.addEventListener?.("contextrestored", () => this._restored("context restored"));
+    }
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) this._wipeT = 0; });   // check on return
     this.life = new LifeSim(this);
     this.waterFrame = 0; this._lastWater = 0; this._autoT = 0;
     this._bind();
@@ -77,14 +90,14 @@ export class PixelScene {
     const [x, y] = rotQ(u, v, (4 - this.rot) & 3);
     return [x + this.cxm, y + this.cym];
   }
-  get scale() { return ZOOMS[this.zi] * this.dpr; }
+  get scale() { return this.z * this.dpr; }
   tileToScreen(x, y, z = 0) {                       // a tile's centre -> CSS pixels in the view (app.js beams layer)
-    const r = this.cv.getBoundingClientRect(), s = ZOOMS[this.zi];
+    const r = this.cv.getBoundingClientRect(), s = this.z;
     const [ox, oy] = this.world(this.cam.x, this.cam.y), [wx, wy] = this.world(x, y, z);
     return [(wx - ox) * s + r.width / 2, (wy - oy) * s + r.height / 2];
   }
   _screenToWorld(cx, cy) {
-    const r = this.cv.getBoundingClientRect(), s = ZOOMS[this.zi];
+    const r = this.cv.getBoundingClientRect(), s = this.z;
     const [ox, oy] = this.world(this.cam.x, this.cam.y);
     return [ox + (cx - r.left - r.width / 2) / s, oy + (cy - r.top - r.height / 2) / s];
   }
@@ -131,13 +144,33 @@ export class PixelScene {
   setRegion(r) { this.region = r && r.meta && r.frame && r.frame.cities ? r : null; }
 
   // ------------------------------------------------------------ sprite cache
+  _restored(why) {
+    if (why) console.warn(`pixel view: ${why}, repainting the sprites`);
+    this.cache.clear(); this._dirty = true; this._farKey = null;
+  }
+  _checkWiped(now) {                                 // a few drawn sprites and the ground read back: empty = wiped
+    if (now - (this._wipeT || 0) < 1000 || !this.objects.length || !this.ground) return;
+    this._wipeT = now;
+    const g = this._probe || (this._probe = Object.assign(document.createElement("canvas"), { width: 1, height: 1 }).getContext("2d", { willReadFrequently: true }));
+    const empty = (cv, x, y) => { g.clearRect(0, 0, 1, 1); g.drawImage(cv, x, y, 1, 1, 0, 0, 1, 1); return g.getImageData(0, 0, 1, 1).data[3] === 0; };
+    const wiped = [];
+    for (let k = 0; k < 3; k++) {
+      const s = this.objects[Math.floor(Math.random() * this.objects.length)].s;
+      if (s._px === undefined) s._px = s.alpha.indexOf(1);
+      if (s._px >= 0 && empty(s.canvas, s._px % s.w, Math.floor(s._px / s.w))) { wiped.push("sprites"); break; }
+    }
+    const [cx, cy] = this.world(this.cxm, this.cym);  // the map's centre tile is always drawn
+    if (empty(this.ground, Math.round(cx - this.gx0), Math.round(cy - this.gy0))) wiped.push("ground");
+    if (wiped.length) this._restored(`${wiped.join(" and ")} found wiped`);
+  }
   _sprite(key, build, o = {}) {
-    const full = `${key}|${this.rot}|${this.night ? 1 : 0}|${this.season || ""}`;
+    const season = o.season === undefined ? this.season : o.season;
+    const full = `${key}|${this.rot}|${this.night ? 1 : 0}|${season || ""}`;
     let s = this.cache.get(full);
     if (s === undefined) {
       const b = new Builder();
       if (build(b) === false || !b.groups.length) s = null;
-      else s = paint(b, { rot: o.rot ?? this.rot, night: this.night, season: this.season, outline: o.outline ?? true });
+      else s = paint(b, { rot: o.rot ?? this.rot, night: this.night, season, outline: o.outline ?? true });
       this.cache.set(full, s);
       if (this.cache.size > 6000) this.cache.clear();
     }
@@ -201,10 +234,12 @@ export class PixelScene {
     if (b < 0.29) return { kind: "field", crop: "plough", dir, v };
     return { kind: "grass", v, flowers: b > 0.86 };
   }
-  _groundSprite(p, frameNo = 0) {
-    const q = { ...p, season: this.season, frame: p.anim ? frameNo : 0 };
+  // the season a tile of this city shows now: the frame's, or a neighbour's while a boundary sweeps by (seasons.js)
+  _seasonAt(x, y) { return seasonAt(this.frame && this.frame.month, x, y, this.season); }
+  _groundSprite(p, frameNo = 0, season = this.season) {
+    const q = { ...p, season, frame: p.anim ? frameNo : 0 };
     delete q.anim;
-    return this._sprite("g" + JSON.stringify(q), (b) => { b.groups = R.ground(q).groups; }, { outline: false });
+    return this._sprite("g" + JSON.stringify(q), (b) => { b.groups = R.ground(q).groups; }, { outline: false, season });
   }
   _clipDiamond(s) {                                 // keep only the tile's own z=0 diamond: for re-drawing animated water
     if (s._clip) return s._clip;
@@ -241,10 +276,10 @@ export class PixelScene {
     const flooded = new Set(f.flooded || []);
     this.waterTiles = [];
     for (const [x, y] of this._tiles()) {
-      const p = this._groundParams(x, y), s = this._groundSprite(p, this.waterFrame);
+      const season = this._seasonAt(x, y), p = this._groundParams(x, y), s = this._groundSprite(p, this.waterFrame, season);
       const [px, py] = this.world(x, y);
       if (s) g.drawImage(s.canvas, px - s.ox - x0, py - s.oy - y0);
-      if (p.anim && !on) this.waterTiles.push({ p, px, py });
+      if (p.anim && !on) this.waterTiles.push({ p, px, py, season });
       const inside = x >= 0 && y >= 0 && x < W && y < H, i = inside ? y * W + x : -1;
       if (on) {
         const c = inside ? this._overlayColor(i) : null;
@@ -261,8 +296,8 @@ export class PixelScene {
   _animateWater() {                                  // palette-cycle style shimmer: redraw river tiles every few ticks
     if (!this.ground || !this.waterTiles || !this.waterTiles.length) return;
     const g = this.ground.getContext("2d");
-    for (const { p, px, py } of this.waterTiles) {
-      const s = this._groundSprite(p, this.waterFrame);
+    for (const { p, px, py, season } of this.waterTiles) {
+      const s = this._groundSprite(p, this.waterFrame, season);
       if (s) g.drawImage(this._clipDiamond(s), px - s.ox - this.gx0, py - s.oy - this.gy0);
     }
   }
@@ -297,9 +332,9 @@ export class PixelScene {
     if (wet(x, y + 1)) return 0; if (wet(x - 1, y)) return 1; if (wet(x, y - 1)) return 2; if (wet(x + 1, y)) return 3;
     return this._facing(x, y, i, C);
   }
-  _objParams(x, y, C = this.city) {
+  _objParams(x, y, C = this.city, season = this.season) {
     const f = C.f, W = C.W, H = C.H, inside = x >= 0 && y >= 0 && x < W && y < H, i = inside ? y * W + x : -1;
-    const ch = C.ch(x, y), season = this.season, near = C === this.city;
+    const ch = C.ch(x, y), near = C === this.city;
     if (inside && C.part.has(i)) return null;
     if (inside && "RCIOM".includes(ch) && +f.levels[i] > 0) {
       const c = { ch, lv: +f.levels[i], vr: f.variant ? +f.variant[i] : 0, dn: f.density ? +f.density[i] : 1, v: Math.floor(hash(i, 5) * 8),
@@ -337,10 +372,10 @@ export class PixelScene {
       if (rs !== 2 && rs !== 3 && hh >= 0.23) return null;
       return { key: `w|${v}|${rs}`, build: (b) => R.wild(b, v, hh, h3, season, rs) };
     }
-    return this._countryObj(x, y);
+    return this._countryObj(x, y, season);
   }
-  _countryObj(x, y) {                               // woods, lone trees and farms outside the cities
-    const season = this.season, n = this._noise(x, y), [b0] = this._parcel(x, y), seed = this._tileSeed(x, y), h1 = hash(seed, 1), v = Math.floor(hash(seed, 6) * 32);
+  _countryObj(x, y, season = this.season) {         // woods, lone trees and farms outside the cities
+    const n = this._noise(x, y), [b0] = this._parcel(x, y), seed = this._tileSeed(x, y), h1 = hash(seed, 1), v = Math.floor(hash(seed, 6) * 32);
     if (n > 0.6) {                                   // forest, denser towards its heart
       if (h1 < 0.55 + (n - 0.6) * 3) { const k = Math.min(3, 1 + Math.floor((n - 0.6) * 12 + h1 * 1.5)); return { key: `wd|${v}|${k}`, build: (b) => R.woods(b, v, k, season) }; }
     } else if (n > 0.52 && h1 < 0.25) return { key: `wd|${v}|1`, build: (b) => R.woods(b, v, 1, season) };   // forest edge
@@ -355,9 +390,9 @@ export class PixelScene {
     const objs = [];
     this.lamps = [];
     for (const [x, y] of this._tiles()) {
-      const p = this._objParams(x, y);
+      const season = this._seasonAt(x, y), p = this._objParams(x, y, this.city, season);
       if (!p) continue;
-      const s = this._sprite(p.key, p.build);
+      const s = this._sprite(p.key, p.build, { season });
       if (!s) continue;
       const fw = p.fw || 1, fh = p.fh || 1, cx = x + (fw - 1) / 2, cy = y + (fh - 1) / 2;
       const inside = x >= 0 && y >= 0 && x < W && y < this.H, i = inside ? y * W + x : -1;
@@ -711,20 +746,20 @@ export class PixelScene {
   }
 
   // ------------------------------------------------------------ camera
-  _clampZoom(z) { return Math.max(0, Math.min(ZOOMS.length - 1, z)); }
   resetView(anim = true) {
     if (!this.W) return;
     const r = this.cv.getBoundingClientRect(), span = (this.W + this.H) * TW / 2;
     let zi = 0;
     for (let k = ZOOMS.length - 1; k >= 0; k--) if (span * ZOOMS[k] <= Math.max(320, r.width) * 1.05) { zi = k; break; }
-    this.zi = Math.max(Z_HALF, zi);
+    this._zoomTo(ZOOMS[Math.max(Z_HALF, zi)], null, null, anim);
     this._goto(this.cxm, this.cym, anim);
   }
   topView() {                                        // zoom right out over the whole region
     const b = this.farBounds, r = this.cv.getBoundingClientRect();
     const span = b ? (b[2] - b[0] + b[3] - b[1]) * TW / 2 * 0.8 : (this.W + this.H) * TW;
-    this.zi = 0;
-    for (let k = Z_ONE; k >= 0; k--) if (span * ZOOMS[k] <= Math.max(320, r.width)) { this.zi = k; break; }
+    let zi = 0;
+    for (let k = Z_ONE; k >= 0; k--) if (span * ZOOMS[k] <= Math.max(320, r.width)) { zi = k; break; }
+    this._zoomTo(ZOOMS[zi]);
     this._goto(b ? (b[0] + b[2] - 1) / 2 : this.cxm, b ? (b[1] + b[3] - 1) / 2 : this.cym, true);
   }
   flyTo(x, y) { this._goto(x, y, true); }
@@ -733,7 +768,7 @@ export class PixelScene {
     else { this.cam.x = x; this.cam.y = y; this.camAnim = null; }
   }
   panBy(dx, dz) {                                    // dx right, dz up the screen, a tenth of the view per step
-    const r = this.cv.getBoundingClientRect(), s = ZOOMS[this.zi];
+    const r = this.cv.getBoundingClientRect(), s = this.z;
     const [ox, oy] = this.world(this.cam.x, this.cam.y);
     const [x, y] = this.toMap(ox + dx * r.width * 0.1 / s, oy - dz * r.height * 0.1 / s);
     this.cam.x = x; this.cam.y = y; this.camAnim = null;
@@ -742,23 +777,34 @@ export class PixelScene {
     this.rot = (this.rot + (a > 0 ? 1 : 3)) & 3;
     this._dirty = true;
   }
-  zoomBy(f, cx, cy) {
-    const zi = this._clampZoom(this.zi + (f < 1 ? 1 : -1));
-    if (zi === this.zi) return;
-    if (cx != null) {                                // keep the point under the cursor in place
-      const [wx, wy] = this._screenToWorld(cx, cy);
-      const [mx, my] = this.toMap(wx, wy);
-      const k = ZOOMS[this.zi] / ZOOMS[zi];
-      this.cam.x = mx + (this.cam.x - mx) * k; this.cam.y = my + (this.cam.y - my) * k;
+  zoomBy(f, cx, cy) { this._zoomTo(this.zt * (f < 1 ? KEY_ZOOM : 1 / KEY_ZOOM), cx, cy); }   // keys: f < 1 zooms in
+  // the zoom eases to `z` (_easeZoom, every frame); with a cursor point, the map under it stays put
+  _zoomTo(z, cx = null, cy = null, anim = true) {
+    this.zt = Math.max(Z_MIN, Math.min(Z_MAX, z));
+    if (cx != null) {
+      const [mx, my] = this.toMap(...this._screenToWorld(cx, cy));
+      this.zAnchor = { cx, cy, mx, my }; this.camAnim = null;
+    } else this.zAnchor = null;
+    if (!anim) this.z = this.zt;
+  }
+  _easeZoom(dt) {
+    if (this.z !== this.zt) {
+      const z = this.z + (this.zt - this.z) * (1 - Math.exp(-dt / ZOOM_EASE_S));
+      this.z = Math.abs(this.zt - z) < this.zt * 1e-3 ? this.zt : z;
     }
-    this.zi = zi;
+    const a = this.zAnchor;
+    if (a) {                                         // the anchor's map point back under its screen point
+      const r = this.cv.getBoundingClientRect(), [ax, ay] = this.world(a.mx, a.my);
+      [this.cam.x, this.cam.y] = this.toMap(ax - (a.cx - r.left - r.width / 2) / this.z, ay - (a.cy - r.top - r.height / 2) / this.z);
+    }
+    if (this.z === this.zt) this.zAnchor = null;
   }
   setAutoRotate(on) { this.autoRotate = on; this._autoT = performance.now(); }
   setNight(on) { if (this.night !== on) { this.night = on; this._dirty = true; } }
   setQuality(q) { this.quality = q; }
   cameraFootprint() {
     const r = this.cv.getBoundingClientRect(), [fx, fy] = rotQ(-1, -1, (4 - this.rot) & 3);
-    return { x: this.cam.x, y: this.cam.y, angle: Math.atan2(fx, fy), dist: r.width / (TW * ZOOMS[this.zi]) * 1.2 };
+    return { x: this.cam.x, y: this.cam.y, angle: Math.atan2(fx, fy), dist: r.width / (TW * this.z) * 1.2 };
   }
   screenshot() { this._draw(); return this.cv.toDataURL("image/png"); }
   setActive(on) {
@@ -800,13 +846,14 @@ export class PixelScene {
     el.addEventListener("pointerdown", (e) => {
       down = { x: e.clientX, y: e.clientY, cx: this.cam.x, cy: this.cam.y, moved: false, b: e.button };
       el.setPointerCapture(e.pointerId); this.camAnim = null;
+      if (this.zAnchor) { this.z = this.zt; this._easeZoom(0); }   // a drag starts from the zoom it was heading to
     });
     el.addEventListener("pointermove", (e) => {
       if (down) {
         const dx = e.clientX - down.x, dy = e.clientY - down.y;
         if (Math.hypot(dx, dy) > 4) down.moved = true;
         if (down.moved) {                          // drag to scroll, like OpenTTD
-          const s = ZOOMS[this.zi], [ox, oy] = this.world(down.cx, down.cy);
+          const s = this.z, [ox, oy] = this.world(down.cx, down.cy);
           const [x, y] = this.toMap(ox - dx / s, oy - dy / s);
           this.cam.x = x; this.cam.y = y;
           el.style.cursor = "grabbing";
@@ -823,8 +870,8 @@ export class PixelScene {
     el.addEventListener("pointerleave", () => { this.setHover(-1); this.onHover && this.onHover(-1); });
     el.addEventListener("wheel", (e) => {
       e.preventDefault();
-      this._wheel = (this._wheel || 0) + e.deltaY;
-      if (Math.abs(this._wheel) >= 60) { this.zoomBy(this._wheel < 0 ? 0.85 : 1.18, e.clientX, e.clientY); this._wheel = 0; }
+      const k = e.ctrlKey ? PINCH_ZOOM : e.deltaMode === 1 ? LINE_ZOOM : WHEEL_ZOOM;   // a trackpad pinch sends ctrl + small deltas
+      this._zoomTo(this.zt * Math.exp(-Math.max(-300, Math.min(300, e.deltaY)) * k), e.clientX, e.clientY);
     }, { passive: false });
     this._pollHover = () => {
       if (!pending) return;
@@ -850,10 +897,12 @@ export class PixelScene {
       this.cam.x = a.fx + (a.tx - a.fx) * e; this.cam.y = a.fy + (a.ty - a.fy) * e;
       if (k >= 1) this.camAnim = null;
     }
+    this._easeZoom(dt);
     if (this.autoRotate && now - this._autoT > 6000) { this._autoT = now; this.rotateBy(1); }
     if (this.frame && this.overlay === "none") this.life.step(dt);
     if (this.frame && now - this._lastWater > 280) { this._lastWater = now; this.waterFrame = (this.waterFrame + 1) & 3; if (!this._dirty) this._animateWater(); }
     this._draw(now);
+    if (this.frame && !this._dirty) this._checkWiped(now);
     this._pollHover && this._pollHover();
     this._raf = requestAnimationFrame(() => this._loop());
   }
@@ -1002,7 +1051,7 @@ export class PixelScene {
     });
   }
   _people(g, t) {
-    if (this.quality === "low" || this.overlay !== "none" || ZOOMS[this.zi] < 1) return;
+    if (this.quality === "low" || this.overlay !== "none" || this.z < 1) return;
     const L = this.life;
     L.people.forEach((p, n) => {
       const q = L.person(p, t, n), [px, py] = this.world(q.x, q.y);

@@ -4,6 +4,9 @@ Endpoints
   GET  /api/runs                     list runs with status (running / finished / stopped / incomplete)
   GET  /api/runs/<id>/meta|summary   run metadata / final summary
   GET  /api/runs/<id>/frames?since=N replay frames from index N
+  GET  /api/runs/<id>/live?offset=B  the live feed (bench/live.py) from byte B (-1: its tail): {offset, events,
+                                     status, held}; each agent's turns, model calls and tool calls as they happen
+  GET  /api/runs/<id>/liveframe      the city mid-month after the latest builds (live_frame.json), else null
   GET  /api/runs/<id>/turns?month=M  every agent turn of month M: prompt / briefing, reasoning, reply (+ a
                                      fleet turn's tool-call summary under "trace"; "warmup": true on a warm-up turn)
   GET  /api/runs/<id>/trace?month=M&role=R   one fleet turn's tool calls in order, each with its outcome
@@ -18,12 +21,18 @@ Endpoints
   GET  /api/compare?runs=a,b,c       runs side by side (bench/compare.py), each warm-up run's yardstick included
   GET  /api/evals                    model evals (civitas eval, bench/evals.py): each eval folder's model, suite, runs
                                      and the aggregate of its scorecard
+  GET  /api/version                  a stamp of the viewer's files: an open page offers a reload when it changes
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
+  GET  /api/launch                   what the New run dialog offers: maps, models, defaults, which API keys are set
   GET  /api/processes                runs started from the browser
-  POST /api/launch                   {config, seed, months?, act_every?, agents: {role: "kind[:provider/model]"}}
-  POST /api/stop                     {run_id}
-  POST /api/resume                   {run_id}: continue a "paused" supervised run with its playbooks.toml
+  POST /api/launch                   {map: city|two|three, seed, months, act_every, agents: {role: spec}}: every role's
+                                     "kind[:provider/model]" over configs/fleet_trinity.toml's settings; or the older
+                                     {config, seed, months?, act_every?, agents?: {role: spec}} over a config file
+  POST /api/pause                    {run_id}: hold a running game before its next turn (bench/control.py)
+  POST /api/resume                   {run_id}: resume a held game, or continue a "paused" supervised run with its
+                                     playbooks.toml
+  POST /api/stop                     {run_id}: end a running or held game (STOPPED, no summary)
   GET  /api/live/turn?role=R         remote agents (only with `civitas run --serve`)
   POST /api/live/act
 """
@@ -46,6 +55,13 @@ STALE_AFTER_S = 45 * 60      # a run with no new frame for this long is "incompl
 # kind[:provider/model], as `--agent role=...` takes it; fleet without a model keeps the config's
 AGENT_SPEC = re.compile(r"^(scripted|noop|random|(llm|fleet)(:[A-Za-z0-9._/-]+)?)$")
 from .core.roles import ROLES as ROLE_SPECS, TURN_ORDER as ROLES  # noqa: E402
+from .bench import control, live  # noqa: E402
+
+# the New run dialog (POST /api/launch with `map`): a map, a length and a team over one config's settings
+LAUNCH_BASE = "fleet_trinity.toml"          # [fleet] playbooks and limits, [providers], max actions, scoring
+MAPS = {"city": [], "two": ["north", "south"], "three": ["north", "south", "east"]}   # [] = one city
+MODELS = ["arcee/trinity-large-thinking", "arcee/trinity-large-v1", "arcee/trinity-mini"]
+KEYS = {"arcee": "ARCEE_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
 
 ACTIONS = {a for spec in ROLE_SPECS.values() for a in spec["actions"]}   # fleet tools that run a game action
 # how the runner writes a trajectory record's first keys; a line that doesn't start like this is parsed whole
@@ -274,6 +290,16 @@ def yardstick_data(d: Path, compute: bool = True) -> dict:
     return {"missing": True, "computing": True, "started": _YARDSTICKS[str(d)]["started"]}
 
 
+def viewer_version() -> str:
+    """A stamp of the viewer's files (newest change and count)."""
+    files = [p.stat().st_mtime_ns for p in VIEWER_DIR.rglob("*") if p.is_file()]
+    return f"{max(files, default=0)}-{len(files)}"
+
+
+def _has_key(env_var: str) -> bool:
+    return bool(os.environ.get(env_var))            # the cli loads ./.env before `civitas serve` starts
+
+
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
     """The run's folder, only when it sits directly in `runs_dir` once resolved (no "..", ".", "a/b", links out)."""
     d = (runs_dir / run_id).resolve()
@@ -331,7 +357,57 @@ class Launcher:
                         "region": bool(cfg["game"].get("region"))})
         return out
 
+    def options(self) -> dict:
+        """What the New run dialog offers. `keys`: whether each provider's API key is set for the runs it starts."""
+        from .config import load_config
+        from .fleet.config import fleet_agent_config
+        path = self.configs_dir / LAUNCH_BASE
+        cfg = load_config(path) if path.is_file() else {"game": {}, "fleet": {}}
+        try:
+            fc = fleet_agent_config(cfg, "mayor")
+            fleet = {"model": f"{fc.provider}/{fc.model}", "max_steps": fc.max_steps}
+        except ValueError:
+            fleet = {"model": MODELS[0], "max_steps": 20}
+        models = MODELS if fleet["model"] in MODELS else [fleet["model"], *MODELS]
+        return {"base": LAUNCH_BASE if path.is_file() else None, "roles": ROLES, "maps": MAPS, "models": models,
+                "fleet": fleet, "months": 24, "act_every": cfg["game"].get("act_every", 3),
+                "keys": {p: _has_key(k) for p, k in KEYS.items()}}
+
+    def compose(self, body: dict) -> tuple[str, list[str]]:
+        """The New run dialog's run: `civitas run` on LAUNCH_BASE with the map, length and every role's agent."""
+        path = (self.configs_dir / LAUNCH_BASE).resolve()
+        if not path.is_file():
+            raise ValueError(f"no {LAUNCH_BASE} in {self.configs_dir}")
+        cities = MAPS.get(str(body.get("map")))
+        if cities is None:
+            raise ValueError(f"unknown map {body.get('map')!r} ({' | '.join(MAPS)})")
+        seed, months, every = int(body.get("seed", 0)), int(body.get("months", 24)), int(body.get("act_every", 3))
+        if not (1 <= months <= 600 and 1 <= every <= 12 and seed >= 0):
+            raise ValueError("months must be 1-600, act_every 1-12, seed 0 or more")
+        agents = body.get("agents") or {}
+        specs = {r: str(agents.get(r) or "") for r in ROLES}
+        bad = [f"{r}={v!r}" for r, v in specs.items() if not AGENT_SPEC.match(v)]
+        if bad:
+            raise ValueError(f"every role needs an agent (scripted | fleet[:provider/model] | llm[:provider/model]): "
+                             f"{', '.join(bad)}")
+        kinds = {v for v in specs.values()}
+        team = "scripted" if kinds == {"scripted"} else \
+            (next(iter(kinds)).partition(":")[2].rpartition("/")[2] or "fleet") if len(kinds) == 1 else "mixed"
+        name = re.sub(r"[^A-Za-z0-9_.-]", "", f"{'city' if not cities else f'region{len(cities)}'}_{team}")[:40]
+        run_id = f"{time.strftime('%Y%m%d-%H%M%S')}_{name}_s{seed}_ui"
+        cmd = [sys.executable, "-m", "civitas.cli", "run", "-c", str(path), "--seed", str(seed),
+               "--runs-dir", str(self.runs_dir), "--run-id", run_id, "--set", f"name={name}",
+               "--set", f"game.months={months}", "--set", f"game.act_every={every}"]
+        if cities:
+            cmd += ["--set", "game.region=true", "--set", f"game.cities={json.dumps(cities, separators=(',', ':'))}"]
+        for r, v in specs.items():
+            cmd += ["--agent", f"{r}={v}"]
+        return run_id, cmd
+
     def launch(self, body: dict) -> dict:
+        if "map" in body:
+            run_id, cmd = self.compose(body)
+            return self._start(run_id, cmd)
         cfg_file = str(body.get("config", "baseline.toml"))
         path = (self.configs_dir / cfg_file).resolve()
         if path.parent != self.configs_dir.resolve() or not path.is_file():
@@ -351,6 +427,9 @@ class Launcher:
         for key, conv in (("months", int), ("act_every", int)):
             if body.get(key) not in (None, ""):
                 cmd += ["--set", f"game.{key}={conv(body[key])}"]
+        return self._start(run_id, cmd)
+
+    def _start(self, run_id: str, cmd: list[str]) -> dict:
         logs = self.runs_dir / "_logs"
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / f"{run_id}.log"
@@ -362,19 +441,34 @@ class Launcher:
         return {"run_id": run_id, "pid": proc.pid}
 
     def stop(self, run_id: str) -> bool:
+        """End a game: one this server started at once, any other unfinished one at its next turn (STOP)."""
         with self.lock:
             p = self.procs.get(run_id)
-        if not p or p["proc"].poll() is not None:
+        d = run_folder(self.runs_dir, run_id)
+        if p and p["proc"].poll() is None:
+            p["proc"].terminate()
+            if d is not None:
+                control.mark_stopped(d)
+            return True
+        if d is None or (d / "summary.json").exists() or (d / control.STOPPED).exists() or (d / "PAUSED").exists():
             return False
-        p["proc"].terminate()
-        d = self.runs_dir / run_id
-        if d.is_dir():
-            (d / "STOPPED").write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+        control.stop(d)
+        return True
+
+    def pause(self, run_id: str) -> bool:
+        """Hold an unfinished game before its next turn."""
+        d = run_folder(self.runs_dir, run_id)
+        if d is None or any((d / m).exists() for m in ("summary.json", control.STOPPED, "PAUSED")):
+            return False
+        control.pause(d)
         return True
 
     def resume(self, run_id: str) -> dict:
-        """`civitas resume <run_id>`: the next session of a paused run, with the playbooks in its playbooks.toml."""
+        """Release a held game (bench/control.py), or `civitas resume <run_id>`: the next session of a paused
+        supervised run, with the playbooks in its playbooks.toml."""
         d = run_folder(self.runs_dir, run_id)
+        if d is not None and control.release(d):
+            return {"run_id": d.name, "held": False}
         if d is None or not (d / "PAUSED").exists():
             raise ValueError(f"no paused run {run_id!r}")
         run_id = d.name
@@ -530,6 +624,16 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                         return self._json(collab_data(d, city))
                     if parts[3] == "yardstick":     # the scripted agents from the same hand-over (a warm-up run)
                         return self._json(yardstick_data(d, compute=launcher is not None))
+                    if parts[3] == "live":          # what the agents are doing now (bench/live.py)
+                        off = int(q.get("offset", ["-1"])[0])
+                        return self._json({**live.read_events(d, off), "status": self._status(d),
+                                           "held": control.held(d)})
+                    if parts[3] == "liveframe":     # the city mid-month, after the latest builds
+                        f = d / live.FRAME
+                        try:
+                            return self._json(json.loads(f.read_text()))
+                        except (OSError, ValueError):
+                            return self._json(None)
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
                         frames = []
@@ -538,7 +642,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                                 if i >= since and line.endswith("\n"):
                                     frames.append(json.loads(line))
                         return self._json({"since": since, "frames": frames, "status": self._status(d),
-                                           "finished": (d / "summary.json").exists()})
+                                           "finished": (d / "summary.json").exists(),
+                                           "held": control.held(d), "control": launcher is not None})
                 if parts[1:] == ["compare"]:        # runs side by side (Compare view): ?runs=a,b,c
                     ids = [x for x in ",".join(q.get("runs", [])).split(",") if x][:COMPARE_MAX]
                     out, missing = [], []
@@ -555,8 +660,14 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                 if parts[1:] == ["leaderboard"]:
                     from .bench.runner import leaderboard
                     return self._json(leaderboard(runs_dir))
+                if parts[1:] == ["version"]:       # changes when a viewer file does: open pages offer a reload
+                    return self._json({"viewer": viewer_version()})
                 if parts[1:] == ["configs"]:
                     return self._json(launcher.configs() if launcher else [])
+                if parts[1:] == ["launch"]:
+                    if launcher is None:
+                        return self._json({"error": "launching is disabled"}, 403)
+                    return self._json(launcher.options())
                 if parts[1:] == ["processes"]:
                     return self._json(launcher.status() if launcher else [])
                 if parts[1] == "live":
@@ -582,8 +693,9 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                     if launcher is None:
                         return self._json({"ok": False, "error": "launching is disabled"}, 403)
                     return self._json({"ok": True, **launcher.launch(body)})
-                if path == "/api/stop":
-                    ok = bool(launcher and launcher.stop(str(body.get("run_id", ""))))
+                if path in ("/api/stop", "/api/pause"):
+                    act = launcher and (launcher.stop if path == "/api/stop" else launcher.pause)
+                    ok = bool(act and act(str(body.get("run_id", ""))))
                     return self._json({"ok": ok}, 200 if ok else 404)
                 if path == "/api/resume":
                     if launcher is None:
@@ -606,6 +718,16 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                 return "paused"
             if (d / "STOPPED").exists():
                 return "stopped"
+            if control.held(d) is not None:         # waiting on the viewer's Resume (fresh heartbeat)
+                return "held"
+            if control.pausing(d) and self._alive(d):
+                return "pausing"
+            return self._running_status(d)
+
+        def _alive(self, d: Path) -> bool:
+            return self._running_status(d) == "running"
+
+        def _running_status(self, d: Path) -> str:
             if launcher:
                 running = launcher.is_running(d.name)
                 if running is not None:

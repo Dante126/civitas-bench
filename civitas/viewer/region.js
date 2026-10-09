@@ -20,6 +20,8 @@ export class RegionMap {
     canvas.addEventListener("mouseleave", () => { this.hover = null; });
     canvas.addEventListener("click", (e) => { const c = this._cityAt(e); if (c && this.onPick) this.onPick(c); });
     this._loop = this._loop.bind(this);
+    // a GPU reset wipes the cached base layer with the canvas (pixel.js:_restored): paint it again
+    canvas.addEventListener("contextrestored", () => { if (this.meta) this.base = this._paintBase(); });
   }
 
   set(frame, meta, current) {

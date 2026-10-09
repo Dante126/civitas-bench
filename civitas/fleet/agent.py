@@ -11,6 +11,7 @@ import json
 import re
 
 from ..agents.base import Agent
+from ..bench import live
 from ..agents.llm_client import ChatClient, ProviderConfig
 from ..core.decision import Decision
 from ..core.region import RegionEnv
@@ -190,6 +191,7 @@ class ToolAgent(Agent):
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         nudged, cuts, error, reason, latency, step, recovered = False, 0, None, "max_steps", 0.0, 0, 0
         while len(trace) < cfg.max_steps:
+            live.emit(env, role, "think", step=step)
             try:
                 out = self.client.chat(cfg.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
                                        extra={**cfg.extra_body, "tools": tools})
@@ -209,6 +211,9 @@ class ToolAgent(Agent):
             from_text = not raw_calls
             if from_text:
                 raw_calls = _recover(out)
+            said = (out.get("content") or "").strip() or (out.get("reasoning") or "").strip()
+            live.emit(env, role, "reply", step=step, text=live._clip(said, live.TEXT_CHARS),
+                      latency_s=round(out.get("latency_s") or 0.0, 1), finish=finish)
             pairs = [_norm_call(c, step, i) for i, c in enumerate(raw_calls)]
             calls, raws = [c for c, _ in pairs], [r for _, r in pairs]
             messages.append({"role": "assistant", "content": out.get("content") or ("" if calls else "(no reply)"),

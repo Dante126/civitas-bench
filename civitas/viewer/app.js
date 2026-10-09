@@ -78,7 +78,11 @@ async function refreshRuns() {
   renderRunMenu();
   $("empty").hidden = S.runs.length > 0;
 }
-function statusPill(st) { return `<span class="pill ${st}">${st}</span>`; }
+// a game still playing: running, pausing (a pause asked for, landing before the next turn) or held (paused live)
+const LIVE = ["running", "pausing", "held"];
+const isLive = (st = S.status) => LIVE.includes(st);
+const statusText = (st) => st === "held" ? "paused" : st;
+function statusPill(st) { return `<span class="pill ${st}">${statusText(st)}</span>`; }
 function renderRunMenu() {
   $("runMenu").innerHTML = S.runs.length ? S.runs.map(r => `
     <div class="item ${r.run_id === S.runId ? "cur" : ""}" data-run="${esc(r.run_id)}">
@@ -123,7 +127,7 @@ function switchCity(c) {
 }
 
 async function openRun(id, { month = null } = {}) {
-  stop(); clearInterval(S.poll);
+  stop(); clearInterval(S.poll); liveReset();
   S.runId = id; S.frames = []; S.raw = []; S.idx = 0; S.selected = -1; $("inspector").hidden = true;
   S.collab = null; S.collabErr = null; S.teamPick = null; collabAt = 0;
   S.rcollab = null; S.rcollabErr = null; S.regionPick = null; rcollabAt = 0;
@@ -137,13 +141,13 @@ async function openRun(id, { month = null } = {}) {
   S.yard = null; S.yardState = null;
   await fetchFrames(true);
   loadYard();
-  S.idx = month != null ? Math.min(month, S.frames.length - 1) : (S.status === "running" ? S.frames.length - 1 : S.frames.length - 1);
+  S.idx = month != null ? Math.min(month, S.frames.length - 1) : S.frames.length - 1;
   S.poll = setInterval(() => fetchFrames(false), 2000);
   store.set("lastRun", id);
   history.replaceState(null, "", `?run=${encodeURIComponent(id)}`);
   renderRunMenu();
   render(null, false);
-  if (S.status !== "running" && S.frames.length > 1 && month == null) {
+  if (!isLive() && S.frames.length > 1 && month == null) {
     toast(`Loaded <b>${esc(S.meta.name)}</b> (${S.frames.length - 1} months). Press <kbd>Space</kbd> to replay from the start or scrub the timeline.`);
   }
 }
@@ -160,17 +164,19 @@ async function fetchFrames(first) {
   }
   S.raw.push(...d.frames);
   S.frames.push(...d.frames.map(f => cityFrame(f, S.city)));
-  const prevStatus = S.status; S.status = d.status;
-  $("followWrap").hidden = d.status !== "running";
-  $("statusPill").className = "pill " + d.status; $("statusPill").textContent = d.status;
+  const prevStatus = S.status; S.status = d.status; S.held = d.held; S.control = d.control;
+  $("followWrap").hidden = !isLive(d.status);
+  $("statusPill").className = "pill " + d.status; $("statusPill").textContent = statusText(d.status);
+  renderRunCtl();
   $("slider").max = Math.max(1, S.meta.months || S.frames.length - 1);    // the whole game, like the track; go() stops at the latest
   if (d.frames.length) loadProblems();          // the timeline's problem marks; refetched as a live run grows
   if (d.frames.length) loadCollab();
-  if (d.status !== "running") clearInterval(S.poll);
-  if (prevStatus === "running" && d.status !== "running" && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); loadYard(); }
+  if (!isLive(d.status)) { clearInterval(S.poll); S.poll = null; }
+  liveSync();
+  if (isLive(prevStatus) && !isLive(d.status) && !first) { toast(`Run ${esc(d.status)}.`); refreshRuns(); loadYard(); }
   if (!first && d.frames.length) {
     drawTrackMarks();
-    if (S.follow && wasEnd && !S.playing) { const p = S.idx; S.idx = S.frames.length - 1; render(S.frames[p], S.idx === p + 1); }
+    if (S.follow && wasEnd && !S.playing) { const p = S.idx; S.idx = S.frames.length - 1; render(S.shown && S.shown.live ? S.shown : S.frames[p], S.idx === p + 1); }
     else renderCharts();
   }
 }
@@ -184,7 +190,7 @@ function stop() { S.playing = false; clearTimeout(S.timer); setPlayIcon(false); 
 function tick() {
   if (!S.playing) return;
   if (S.idx < S.frames.length - 1) { const p = S.frames[S.idx]; S.idx++; render(p, true); }
-  else if (S.status !== "running") { stop(); return; }
+  else if (!isLive()) { stop(); return; }
   S.timer = setTimeout(tick, +$("speed").value);
 }
 function go(i, animate = false) {
@@ -198,7 +204,8 @@ function go(i, animate = false) {
 // ================================================================ render
 function render(prev, animate) {
   if (!S.frames.length) return;
-  const f = S.frames[S.idx];
+  const f = liveShown() || S.frames[S.idx];
+  S.shown = f;
   S.anim = !!animate;
   if (scene.setRegion) scene.setRegion(S.metaRaw && S.metaRaw.region ? { meta: S.metaRaw, frame: S.raw[S.idx], city: S.city } : null);
   scene.setFrame(f, prev, { animate });
@@ -272,7 +279,7 @@ async function loadYard() {
   S.yardState = "loading";
   const ys = await waitYardstick(id);
   if (S.runId !== id) return;
-  S.yard = ys; S.yardState = ys ? null : S.status === "running" ? "written when the run ends" : "not available";
+  S.yard = ys; S.yardState = ys ? null : isLive() ? "written when the run ends" : "not available";
   if (S.frames.length) renderHero(S.frames[S.idx]);
 }
 function alertsOf(m) {
@@ -681,7 +688,7 @@ function updateBeams() {
 function setBeams(on) { store.set("beams", on); toggleBtn("vBeams", on); updateBeams(); }
 async function loadCollab(force = false) {
   const id = S.runId;
-  if (!id || (!force && S.status === "running" && Date.now() - collabAt < 6000 && S.collab)) return;
+  if (!id || (!force && isLive() && Date.now() - collabAt < 6000 && S.collab)) return;
   collabAt = Date.now();
   if (S.metaRaw && S.metaRaw.region && (!force || !S.rcollab)) loadRegionCollab();
   let d;
@@ -777,8 +784,8 @@ function renderTeam() {
       <button data-v="city" class="${regionTeam() ? "" : "on"}">${esc(S.city)}</button><button data-v="region" class="${regionTeam() ? "on" : ""}">Region</button></div>`);
     $("tabTools").querySelectorAll(".teamseg button").forEach(b => b.onclick = () => setTeamView(b.dataset.v));
   }
-  if (!$("teamExpand")) $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the full-screen Team view">⤢ Expand</button>`);
-  $("teamExpand").onclick = openTeamView;
+  if (!$("teamExpand")) $("tabTools").insertAdjacentHTML("beforeend", `<button class="btn" id="teamExpand" title="Open the Team view in its own window over the city (M)">⧉ Pop out</button>`);
+  $("teamExpand").onclick = () => openTeamView();
   if (regionTeam()) { renderRegionTeam(body); return; }
   if (teamRGraph) { teamRGraph.destroy(); teamRGraph = null; }
   if (!S.collab) {
@@ -802,11 +809,55 @@ function renderTeam() {
   bindThreads($("teamList")); bindHandoffs($("teamList")); bindRegionList($("teamList"));
   const un = $("teamList").querySelector(".unpick"); if (un) un.onclick = (e) => { e.preventDefault(); teamGraph.selected = null; onTeamPick(null); };
 }
-function openTeamView() {
-  $("teamModal").hidden = false;
+// ---------------------------------------------------------------- the Team window (floating, #teamModal)
+// opened from the toolbar (M) or the Team tab; where it sits, its size, full screen and the side panel are remembered
+const TEAMWIN_KEY = "teamWin";
+function teamWinPlace() {
+  const w = $("teamModal"), st = store.get(TEAMWIN_KEY, {}) || {}, vw = window.innerWidth, vh = window.innerHeight;
+  const W = Math.min(st.w || Math.round(vw * 0.55), vw - 16), H = Math.min(st.h || Math.round(vh * 0.62), vh - 16);
+  const L = Math.max(8, Math.min(st.x ?? Math.round((vw - W) / 2), vw - W - 8)), T = Math.max(8, Math.min(st.y ?? Math.round((vh - H) / 2), vh - H - 8));
+  Object.assign(w.style, { left: L + "px", top: T + "px", width: W + "px", height: H + "px" });
+  w.classList.toggle("max", !!st.max); w.classList.toggle("noside", st.side === false);
+  toggleBtn("teamWinSide", st.side !== false);
+}
+function teamWinSave(patch = {}) {
+  const w = $("teamModal"), st = store.get(TEAMWIN_KEY, {}) || {};
+  if (!w.classList.contains("max")) Object.assign(st, { x: w.offsetLeft, y: w.offsetTop, w: w.offsetWidth, h: w.offsetHeight });
+  store.set(TEAMWIN_KEY, { ...st, ...patch });
+}
+function openTeamView(toggle = false) {
+  if (toggle && !$("teamModal").hidden) { closeTeamView(); return; }
+  if ($("teamModal").hidden) teamWinPlace();
+  $("teamModal").hidden = false; toggleBtn("vTeam", true);
   bigCanvas();
   S.anim = false; updateTeamView();
 }
+function closeTeamView() { $("teamModal").hidden = true; toggleBtn("vTeam", false); updateTeamView(); }
+(function teamWinWire() {
+  const w = $("teamModal"), head = $("teamWinHead");
+  let drag = null;
+  head.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button") || w.classList.contains("max")) return;
+    drag = { x: e.clientX - w.offsetLeft, y: e.clientY - w.offsetTop }; head.setPointerCapture(e.pointerId);
+  });
+  head.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const x = Math.max(8 - w.offsetWidth + 80, Math.min(e.clientX - drag.x, window.innerWidth - 80));
+    const y = Math.max(8, Math.min(e.clientY - drag.y, window.innerHeight - 40));
+    w.style.left = x + "px"; w.style.top = y + "px";
+  });
+  head.addEventListener("pointerup", () => { if (drag) { drag = null; teamWinSave(); } });
+  head.addEventListener("dblclick", (e) => { if (!e.target.closest("button")) $("teamWinMax").click(); });
+  new ResizeObserver(() => {                       // a narrow window stacks the details under the graph
+    if (w.hidden) return;
+    w.classList.toggle("narrow", w.offsetWidth < 720);
+    if (!w.classList.contains("max") && !drag) teamWinSave();
+  }).observe(w);
+  $("teamWinMax").onclick = () => { const m = !w.classList.contains("max"); w.classList.toggle("max", m); teamWinSave({ max: m }); };
+  $("teamWinSide").onclick = () => { const on = w.classList.contains("noside"); w.classList.toggle("noside", !on); toggleBtn("teamWinSide", on); teamWinSave({ side: on }); };
+  $("teamWinClose").onclick = closeTeamView;
+  $("vTeam").onclick = () => openTeamView(true);
+})();
 // the full-screen view shows the department graph or, in the Region view, the region graph (one canvas each)
 function bigCanvas() {
   const reg = regionTeam(), open = !$("teamModal").hidden;
@@ -1361,7 +1412,7 @@ async function renderRunsTab() {
       ${Object.keys(r.roles).map(k => `<td>${r.roles[k].mean.toFixed(0)}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}
     <h4 style="margin-top:14px">All runs <span class="muted small" style="text-transform:none;letter-spacing:0">· tick runs to compare them</span></h4>
     ${S.runs.map(r => `<div class="runrow" data-run="${esc(r.run_id)}"><span class="ellipsis"><label class="cmpbox" title="Pick for the Compare view"><input type="checkbox" data-cmp="${esc(r.run_id)}" ${S.cmp.ids.includes(r.run_id) ? "checked" : ""}></label><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
-      <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b> ` : ""}<span class="pill ${r.status}">${r.status}</span></span><span class="sig">${esc(r.signature || "")}</span></div>`).join("")}`;
+      <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b> ` : ""}${statusPill(r.status)}</span><span class="sig">${esc(r.signature || "")}</span></div>`).join("")}`;
   body.querySelectorAll(".runrow").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop && !e.target.closest(".cmpbox")) openRun(el.dataset.run); });
   body.querySelectorAll("[data-cmp]").forEach(b => b.onchange = () => {
     if (b.checked) b.checked = cmpAdd(b.dataset.cmp); else cmpRemove(b.dataset.cmp);
@@ -1582,9 +1633,15 @@ function tileTitle(t) {
   const extra = ["RM".includes(up) && t.variant ? WEALTH[t.variant] : "", t.density != null && "RCOM".includes(up) ? (t.density ? "high density" : "low density") : ""].filter(Boolean).join(", ");
   return `${NAMES[t.ch]} · ${kind} (L${t.lvl})${extra ? " · " + extra : ""}`;
 }
+// the hover tooltip is off unless the toolbar's ⓘ turns it on (remembered); clicking a tile still opens the inspector
+let hoverInfo = store.get("hoverInfo", false);
+function setHoverInfo(on) {
+  hoverInfo = on; store.set("hoverInfo", on); toggleBtn("vInfo", on); $("vInfo").setAttribute("aria-pressed", String(on));
+  if (!on) $("tooltip").hidden = true;
+}
 function showTooltip(tile, ev) {
   const tip = $("tooltip");
-  if (tile < 0 || !S.frames.length || !ev) { tip.hidden = true; return; }
+  if (!hoverInfo || tile < 0 || !S.frames.length || !ev) { tip.hidden = true; return; }
   const t = tileInfo(tile);
   tip.innerHTML = `<b>${esc(tileTitle(t))}</b> <span class="muted">(${t.x}, ${t.y})</span><br>pollution ${t.pol}/9 · land value ${t.lv}/9${t.zone ? ` · ${t.pw ? "⚡" : "<span style='color:var(--bad)'>no power</span>"} ${t.wt ? "💧" : "<span style='color:var(--bad)'>no water</span>"}` : ""}`;
   tip.hidden = false;
@@ -1630,7 +1687,7 @@ const MINI = { ".": "#7fb069", "~": "#3d8fd1", "=": "#b8b3a8", "#": "#3d4148", H
   r: "#b4c98a", c: "#a8bfd8", i: "#d8c9a0", o: "#c9c2e6", R: "#43a85a", C: "#3f7fd6", I: "#d99a2b", O: "#7d86bd", u: "#9fd3c7", z: "#6a6a6a" };
 function drawMinimap() {
   if (!S.frames.length) return;
-  const cv = $("minimap"), g = cv.getContext("2d"), f = S.frames[S.idx], W = S.meta.width, H = S.meta.height, s = cv.width / Math.max(W, H);
+  const cv = $("minimap"), g = cv.getContext("2d"), f = S.shown || S.frames[S.idx], W = S.meta.width, H = S.meta.height, s = cv.width / Math.max(W, H);
   g.fillStyle = "#111"; g.fillRect(0, 0, cv.width, cv.height);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = y * W + x, ch = f.tiles[i];
@@ -1768,61 +1825,80 @@ function setQuality(q) { store.set("quality", q); scene.setQuality(q); $("vQuali
 function setDocks(l, r) { app.classList.toggle("hide-left", !l); app.classList.toggle("hide-right", !r); store.set("docks", [l, r]); setTimeout(() => { drawTrackMarks(); if (S.tab === "charts") renderCharts(); }, 300); }
 
 // ================================================================ launch modal
+// POST /api/launch with a map: the map, length and team over the server's fleet settings (GET /api/launch: maps,
+// models, defaults, API keys); every role's agent is sent, per role only under "Mix per role"
+const LAUNCH_KINDS = ["fleet", "scripted", "llm"];
+const MODEL_OK = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+let L = null;                                 // the dialog's choices, remembered in localStorage
 async function openLaunch() {
-  try { S.configs = (await api("/api/configs")).filter(c => !c.remote && !c.error); } catch (e) { toast("Launching needs `civitas serve` from the project folder: " + esc(e.message), true); return; }
-  if (!S.configs.length) { toast("No configs found. Run `civitas serve` from the project folder (it reads configs/*.toml).", true); return; }
-  const sel = $("lConfig");
-  sel.innerHTML = S.configs.map(c => `<option value="${esc(c.file)}">${esc(c.name)} (${esc(c.file)})</option>`).join("");
-  const last = store.get("lastConfig", "baseline.toml");
-  if (S.configs.some(c => c.file === last)) sel.value = last;
-  fillLaunch();
+  try { S.launch = await api("/api/launch"); } catch (e) { toast("Launching needs `civitas serve` from the project folder: " + esc(e.message), true); return; }
+  const o = S.launch, saved = store.get("launch", {}) || {};
+  L = { map: "city", months: o.months, every: o.act_every, team: "model", model: o.fleet.model, ...saved, roles: {} };
+  if (!(L.map in o.maps)) L.map = "city";
+  for (const r of o.roles) L.roles[r] = { kind: "fleet", model: "", ...((saved.roles || {})[r] || {}) };   // "" = the team's model
+  $("lModel").innerHTML = o.models.map(m => `<option value="${esc(m)}">${esc(m.split("/").pop())}</option>`).join("") + `<option value="other">other…</option>`;
+  renderLaunch();
   $("launchModal").hidden = false;
 }
-// launcher: the config's own agent per role; only roles the user changes are sent as overrides
-const DEFAULT_MODEL = "arcee/trinity-large-thinking";
-const MODEL_KINDS = ["llm", "fleet"];
-function roleDefault(a, kind) {          // provider/model shown for `kind` in a role whose config entry is `a`
-  if (kind === a.kind && a.model) return `${a.provider || "arcee"}/${a.model}`;
-  if (kind === "fleet" && a.fleet) return `${a.fleet.provider || "arcee"}/${a.fleet.model}`;
-  return DEFAULT_MODEL;
+function segPick(id, value, pick) {
+  $(id).querySelectorAll("button").forEach(b => { b.classList.toggle("on", b.dataset.v === String(value)); b.onclick = () => { pick(b.dataset.v); renderLaunch(); }; });
 }
-function fillLaunch() {
-  const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
-  $("lDoc").textContent = c.doc || "";
-  $("lMonths").placeholder = c.months; $("lAct").placeholder = c.act_every;
-  const kinds = ["scripted", "llm", ...(c.region ? [] : ["fleet"]), "noop", "random"];   // fleets are single-city
-  $("lAgents").innerHTML = Object.keys(c.agents).map(r => {
-    const a = c.agents[r], opts = kinds.includes(a.kind) ? kinds : [a.kind, ...kinds];
-    return `<div class="ar" style="--c:${roleColor(r)}"><b>${r}</b>
-      <select data-role="${r}">${opts.map(k => `<option ${k === a.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
-      <input data-model="${r}" placeholder="provider/model" value="${esc(roleDefault(a, a.kind))}" ${MODEL_KINDS.includes(a.kind) ? "" : "disabled"}></div>`;
-  }).join("");
-  $("lAgents").querySelectorAll("select").forEach(s => s.onchange = () => {
-    const i = $("lAgents").querySelector(`[data-model=${s.dataset.role}]`);
-    i.disabled = !MODEL_KINDS.includes(s.value); i.value = roleDefault(c.agents[s.dataset.role], s.value); estimate(); });
-  $("lAgents").querySelectorAll("input").forEach(i => i.oninput = estimate);
+function renderLaunch() {
+  const o = S.launch;
+  segPick("lMap", L.map, v => (L.map = v));
+  segPick("lLen", L.months, v => (L.months = +v));
+  segPick("lEvery", L.every, v => (L.every = +v));
+  segPick("lTeam", L.team, v => (L.team = v));
+  $("lMonths").value = L.months;
+  const other = !o.models.includes(L.model);
+  $("lModel").value = other ? "other" : L.model;
+  $("lModelOther").hidden = !other; if (other && document.activeElement !== $("lModelOther")) $("lModelOther").value = L.model;
+  $("lModelRow").hidden = L.team === "scripted";
+  $("lModelKey").textContent = L.team === "custom" ? "Default" : "Model";
+  $("lAgents").hidden = L.team !== "custom";
+  if (L.team === "custom") {
+    $("lAgents").innerHTML = o.roles.map(r => { const a = L.roles[r];
+      return `<div class="ar" style="--c:${roleColor(r)}"><b>${r}</b>
+        <select data-role="${r}">${LAUNCH_KINDS.map(k => `<option value="${k}" ${k === a.kind ? "selected" : ""}>${k === "llm" ? "llm (single call)" : k}</option>`).join("")}</select>
+        <input data-model="${r}" placeholder="${esc(L.model)}" value="${esc(a.model)}" ${a.kind === "scripted" ? "disabled" : ""}></div>`; }).join("");
+    $("lAgents").querySelectorAll("select").forEach(el => el.onchange = () => { L.roles[el.dataset.role].kind = el.value; renderLaunch(); });
+    $("lAgents").querySelectorAll("input").forEach(el => el.oninput = () => { L.roles[el.dataset.model].model = el.value.trim(); estimate(); });
+  }
   estimate();
 }
-function estimate() {
-  const c = S.configs.find(x => x.file === $("lConfig").value); if (!c) return;
-  const months = +$("lMonths").value || c.months, every = +$("lAct").value || c.act_every, turns = Math.ceil(months / every);
-  const sel = [...$("lAgents").querySelectorAll("select")];
-  const llm = sel.filter(s => s.value === "llm").length, fleet = sel.filter(s => s.value === "fleet");
-  const steps = Math.max(0, ...fleet.map(s => (c.agents[s.dataset.role].fleet || {}).max_steps || 20));
-  const parts = [llm ? `≈ ${turns * llm} LLM calls` : "",
-    fleet.length ? `${turns * fleet.length} fleet turns (up to ${steps} model calls each)` : ""].filter(Boolean);
-  $("lCost").textContent = parts.length ? parts.join(" + ") : "no LLM calls · finishes in seconds";
+function launchSpecs() {                      // role -> "kind[:provider/model]", as `--agent role=...` takes it
+  const out = {};
+  for (const r of S.launch.roles) {
+    const a = L.team === "custom" ? L.roles[r] : { kind: L.team === "scripted" ? "scripted" : "fleet", model: "" };
+    out[r] = a.kind === "scripted" ? "scripted" : `${a.kind}:${a.model || L.model}`;
+  }
+  return out;
 }
+function fmtDur(s) { return s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(s < 36000 ? 1 : 0)} h`; }
+function estimate() {
+  if (!L) return;
+  const o = S.launch, specs = Object.values(launchSpecs()), cities = Math.max(1, o.maps[L.map].length);
+  const turns = Math.ceil(L.months / L.every) * cities;
+  const fleet = specs.filter(v => v.startsWith("fleet")).length, llm = specs.filter(v => v.startsWith("llm")).length;
+  const parts = [fleet ? `${turns * fleet} fleet turns (up to ${o.fleet.max_steps} model calls each)` : "", llm ? `${turns * llm} LLM calls` : ""].filter(Boolean);
+  const secs = turns * fleet * 60 + turns * llm * 20;          // roughly a minute per fleet turn, turns play one at a time
+  $("lCost").textContent = parts.length ? `${parts.join(" + ")} · roughly ${fmtDur(secs)}` : `no model calls · done in ${cities > 1 ? "about a minute" : "seconds"}`;
+  const models = specs.filter(v => v !== "scripted").map(v => v.split(":")[1]);
+  const bad = models.find(m => !MODEL_OK.test(m));
+  const missing = [...new Set(models.map(m => m.includes("/") ? m.split("/")[0] : "arcee"))].filter(p => o.keys[p] === false);
+  const note = bad === "" ? "Name the model: provider/model, e.g. openrouter/qwen/qwen3-32b."
+    : bad != null ? `"${bad}" is not a model name (provider/model: letters, digits, . _ - /).`
+    : missing.length ? `No ${missing.map(p => p.toUpperCase() + "_API_KEY").join(" / ")} on the server: model agents would fail. Put it in .env and restart civitas serve.`
+    : L.team === "scripted" ? "The hand-written baseline agents in every department: a quick, free reference game." : "";
+  $("lNote").textContent = note; $("lNote").className = "lnote small" + (bad != null || missing.length ? " warn" : "");
+  $("lGo").disabled = bad != null || !(L.months >= 1 && L.months <= 600);
+}
+$("lModel").onchange = () => { L.model = $("lModel").value === "other" ? $("lModelOther").value.trim() : $("lModel").value; renderLaunch(); if (!$("lModelOther").hidden) $("lModelOther").focus(); };
+$("lModelOther").oninput = () => { L.model = $("lModelOther").value.trim(); renderLaunch(); };
+$("lMonths").oninput = () => { L.months = Math.round(+$("lMonths").value) || 0; segPick("lLen", L.months, v => (L.months = +v)); estimate(); };
 async function launch() {
-  const c = S.configs.find(x => x.file === $("lConfig").value), agents = {};
-  $("lAgents").querySelectorAll("select").forEach(s => {
-    const r = s.dataset.role, a = c.agents[r], m = $("lAgents").querySelector(`[data-model=${r}]`).value.trim();
-    const modelChanged = MODEL_KINDS.includes(s.value) && m && m !== roleDefault(a, s.value);
-    if (s.value === a.kind && !modelChanged) return;           // untouched: the config decides
-    agents[r] = s.value === "llm" ? `llm:${m || DEFAULT_MODEL}` : s.value === "fleet" && modelChanged ? `fleet:${m}` : s.value;
-  });
-  const body = { config: $("lConfig").value, seed: +$("lSeed").value || 0, months: $("lMonths").value, act_every: $("lAct").value, agents };
-  store.set("lastConfig", body.config);
+  const body = { map: L.map, seed: Math.max(0, Math.round(+$("lSeed").value) || 0), months: L.months, act_every: L.every, agents: launchSpecs() };
+  store.set("launch", L);
   $("lGo").disabled = true;
   try {
     const r = await api("/api/launch", body);
@@ -1840,6 +1916,154 @@ async function launch() {
   $("lGo").disabled = false;
 }
 
+// ================================================================ live feed (GET /api/runs/<id>/live, bench/live.py)
+// while a run is playing: each agent's turn, model calls and tool calls as they happen, and the city after each
+// build (liveframe) drawn at the live edge of the timeline until the month's own frame arrives
+const LIVE_POLL_MS = 1000, LIVE_KEEP = 250;
+function liveReset() {
+  clearTimeout(S.live && S.live.timer);
+  S.live = { offset: -1, events: [], frameN: 0, frame: null, timer: null, runId: S.runId, busy: false };
+  $("liveFeed").hidden = true; $("lvList").innerHTML = "";
+}
+function liveSync() {                          // start or stop polling with the run's status
+  if (!S.live || S.live.runId !== S.runId) liveReset();
+  const on = isLive();
+  $("liveFeed").hidden = !on;
+  if (on && !S.live.timer) livePoll();
+  if (!on && S.live.timer) { clearTimeout(S.live.timer); S.live.timer = null; S.live.frame = null; }
+}
+async function livePoll() {
+  const L0 = S.live; if (!L0 || L0.runId !== S.runId) return;
+  L0.timer = setTimeout(livePoll, LIVE_POLL_MS);
+  if (L0.busy) return;
+  L0.busy = true;
+  try {
+    const d = await api(`/api/runs/${encodeURIComponent(L0.runId)}/live?offset=${L0.offset}`);
+    if (S.live !== L0) return;
+    L0.offset = d.offset; S.held = d.held;
+    const fresh = d.events.filter(e => e.kind !== "frame");
+    const frameN = Math.max(L0.frameN, ...d.events.filter(e => e.kind === "frame").map(e => e.n));
+    L0.events.push(...fresh); if (L0.events.length > LIVE_KEEP) L0.events.splice(0, L0.events.length - LIVE_KEEP);
+    if (fresh.length) renderLiveFeed(fresh.length);
+    else renderLiveHead();
+    if (d.events.some(e => e.kind === "month")) { L0.frame = null; fetchFrames(false); }
+    if (frameN > L0.frameN) {
+      L0.frameN = frameN;
+      const lf = await api(`/api/runs/${encodeURIComponent(L0.runId)}/liveframe`);
+      if (S.live === L0 && lf && lf.live >= (L0.frame ? L0.frame.live : 0)) { L0.frame = lf; renderLive(); }
+    }
+  } catch { /* the next poll retries */ }
+  finally { L0.busy = false; }
+}
+// the live frame for the current city, when the playhead sits on the latest month and follows the live run
+function liveShown() {
+  const lf = S.live && S.live.runId === S.runId && S.live.frame;
+  if (!lf || !isLive() || !S.frames.length || S.idx !== S.frames.length - 1 || !$("follow").checked) return null;
+  if (lf.month !== S.frames[S.idx].month) return null;
+  const f = cityFrame(lf, S.city);
+  return f.live ? f : { ...f, live: lf.live };
+}
+function renderLive() {                        // the city after the latest builds; the right dock stays put
+  const f = liveShown(); if (!f) return;
+  const prev = S.shown; S.shown = f;
+  scene.setFrame(f, prev, { animate: !!prev && !S.playing });
+  renderScores(f); renderKpis(f); renderDemand(f); renderUtil(f); renderServices(f); renderMoney(f); drawMinimap();
+  if (S.selected >= 0) renderInspector(S.selected);
+}
+const lvRole = (r) => String(r || "").split(".").pop();
+const lvName = (r) => { const p = String(r || "").split("."); return p.length > 1 ? `${p[0].slice(0, 1).toUpperCase()} ${p[1]}` : p[0]; };
+// the arguments come from the model: coordinates are drawn only as finite numbers, everything else escaped
+const lvNum = (v) => v != null && v !== "" && Number.isFinite(+v) ? String(+v) : esc(String(v ?? "?"));
+const lvAt = (a) => {
+  if (!a || typeof a !== "object") return null;
+  const [x, y] = a.x != null ? [a.x, a.y] : [a.x1, a.y1];
+  return x != null && y != null && x !== "" && y !== "" && Number.isFinite(+x) && Number.isFinite(+y) ? [+x, +y] : null;
+};
+function lvArgs(tool, a) {
+  if (!a || typeof a !== "object") return a ? esc(String(a)) : "";
+  if (tool === "send_message") return `→ ${esc(String(a.to || "all"))}: “${esc(String(a.text || ""))}”`;
+  const parts = [];
+  if (a.x1 != null) parts.push(`(${lvNum(a.x1)},${lvNum(a.y1)})→(${lvNum(a.x2)},${lvNum(a.y2)})`); else if (a.x != null) parts.push(`(${lvNum(a.x)},${lvNum(a.y)})`);
+  for (const [k, v] of Object.entries(a)) {
+    if (["x", "y", "x1", "y1", "x2", "y2", "confirm", "report", "reason"].includes(k) || v == null || v === "") continue;
+    parts.push(typeof v === "object" ? esc(JSON.stringify(v)).slice(0, 60) : esc(String(v)));
+  }
+  return parts.join(" ");
+}
+function lvRow(e) {
+  const who = `<span class="who">${esc(lvName(e.role))}</span>`, c = `style="--c:${roleColor(lvRole(e.role))}"`;
+  if (e.kind === "month") return `<div class="lv-ev month">month ${e.month - 1} simulated · month ${e.month} starts</div>`;
+  if (e.kind === "turn") return `<div class="lv-ev turn" ${c}>${who}<span class="what">${e.warmup ? "warm-up turn" : "turn starts"} · <span class="muted">${esc(e.agent || "")}</span></span><span class="res">month ${e.month}</span></div>`;
+  if (e.kind === "reply") return e.text ? `<div class="lv-ev say" ${c} title="${esc(e.text)}">${who}<span class="what">${esc(e.text)}</span><span class="res">${e.latency_s ? e.latency_s + " s" : ""}</span></div>` : "";
+  if (e.kind === "done") return `<div class="lv-ev done" ${c} title="${esc(e.report || "")}">${who}<span class="what">done · ${e.actions} action${e.actions === 1 ? "" : "s"}${e.failed ? `, ${e.failed} failed` : ""}${e.report ? ` · ${esc(e.report)}` : ""}</span><span class="res">${e.spent ? fmt$(e.spent) : ""}</span></div>`;
+  if (e.kind !== "call") return "";
+  const at = lvAt(e.args), note = e.error || e.message || "";
+  const msg = e.tool === "send_message", look = !e.action && !msg;
+  const cls = msg ? "msg" : look ? "look" : e.refused ? "refused" : e.ok ? "ok" : "bad";
+  const res = look ? (e.ok ? "" : "✗") : msg ? "" : e.refused ? `refused` : e.ok ? `✓${e.cost ? " " + fmt$(e.cost) : ""}` : "✗";
+  return `<div class="lv-ev ${cls}${at ? " at" : ""}" ${c} ${at ? `data-at="${at.join(",")}" data-city="${esc(String(e.role).includes(".") ? e.role.split(".")[0] : "")}"` : ""} title="${esc(note)}">${who}<span class="what"><code>${esc(e.tool)}</code> ${lvArgs(e.tool, e.args)}</span><span class="res">${res}</span></div>`;
+}
+function renderLiveHead() {
+  const L0 = S.live, ev = L0.events, h = S.held;
+  let now = "";
+  if (S.status === "held" && h) now = `<b>Paused</b> · month ${h.month}${h.role ? ` · before <span class="who" style="--c:${roleColor(lvRole(h.role))}">${esc(lvName(h.role))}</span>` : ""}`;
+  else {
+    const last = [...ev].reverse().find(e => ["turn", "done", "month", "think", "reply", "call"].includes(e.kind));
+    if (!last) now = "Waiting for the first turn…";
+    else if (last.kind === "month") now = `Month ${last.month} begins…`;
+    else if (last.kind === "done") now = `<span class="who" style="--c:${roleColor(lvRole(last.role))}">${esc(lvName(last.role))}</span> done · <span class="muted">month ${last.month}, next turn or the month's simulation…</span>`;
+    else {
+      const r = last.role, step = [...ev].reverse().find(e => e.role === r && (e.kind === "think" || e.kind === "reply"));
+      const doing = last.kind === "think" ? `thinking${step ? ` · step ${step.step + 1}` : ""}…` : last.kind === "reply" ? "acting…" : last.kind === "call" ? `${esc(last.tool)}…` : "starting…";
+      now = `<span class="who" style="--c:${roleColor(lvRole(r))}">${esc(lvName(r))}</span> · ${doing} <span class="muted">month ${last.month}</span>`;
+    }
+    if (S.status === "pausing") now += ` · <span class="muted">pausing after this turn</span>`;
+  }
+  $("lvNow").innerHTML = now;
+  $("liveFeed").classList.toggle("paused", S.status === "held");
+}
+function renderLiveFeed(nNew = 0) {
+  const list = $("lvList"), atEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 30;
+  const ev = S.live.events.filter((e, i, a) => !(e.kind === "month" && a.slice(i + 1).find(x => x.kind !== "frame")?.kind === "month"));   // months without turns: the latest only
+  const rows = ev.map(lvRow).filter(Boolean);
+  list.innerHTML = rows.join("");
+  const items = list.children;
+  for (let i = Math.max(0, items.length - nNew); i < items.length; i++) items[i].classList.add("fresh");
+  if (atEnd || nNew === rows.length) list.scrollTop = list.scrollHeight;
+  list.querySelectorAll("[data-at]").forEach(el => el.onclick = () => {
+    const [x, y] = el.dataset.at.split(",").map(Number), c = el.dataset.city;
+    if (c && S.metaRaw && S.metaRaw.region && c !== S.city) switchCity(c);
+    scene.flyTo(x, y);
+  });
+  renderLiveHead();
+}
+$("lvHead").onclick = () => { const f = !$("liveFeed").classList.contains("folded"); $("liveFeed").classList.toggle("folded", f); store.set("liveFolded", f); };
+if (store.get("liveFolded", false)) $("liveFeed").classList.add("folded");
+
+// ================================================================ live run controls (POST /api/pause | resume | stop)
+function renderRunCtl() {
+  const st = S.status, h = S.held;
+  $("runCtl").hidden = !S.control || !(isLive(st) || st === "paused");
+  $("ctlPause").hidden = st !== "running";
+  $("ctlResume").hidden = !["pausing", "held", "paused"].includes(st);
+  $("ctlResume").textContent = st === "pausing" ? "▶ Keep playing" : "▶ Resume";
+  $("ctlStop").hidden = st === "paused";             // a supervised run between sessions has no process to stop
+  $("statusPill").title = st === "held" && h ? `paused at month ${h.month}${h.role ? `, before ${h.role.replace(".", " ")}'s turn` : ""}`
+    : st === "pausing" ? "pausing: the turn in progress finishes first" : st === "paused" ? "between sessions of a supervised run: Resume plays the next one" : "";
+}
+async function runCtl(action) {
+  const id = S.runId;
+  if (action === "stop" && !confirm(`Stop ${S.meta.name} here? What was played stays; the run gets no final score.`)) return;
+  try { await api(`/api/${action}`, { run_id: id }); } catch (e) { toast(`Could not ${action} the run: ${esc(e.message)}`, true); return; }
+  if (id !== S.runId) return;
+  if (!S.poll) S.poll = setInterval(() => fetchFrames(false), 2000);   // a resumed supervised run plays again
+  await fetchFrames(false);
+  toast(action === "pause" ? "Pausing before the next agent's turn…" : action === "resume" ? "Resumed." : "Stopping…");
+}
+$("ctlPause").onclick = () => runCtl("pause");
+$("ctlResume").onclick = () => runCtl("resume");
+$("ctlStop").onclick = () => runCtl("stop");
+
 // ================================================================ wiring
 $("runBtn").onclick = (e) => { e.stopPropagation(); $("runMenu").hidden = !$("runMenu").hidden; if (!$("runMenu").hidden) refreshRuns(); };
 $("lineupBtn").onclick = (e) => { e.stopPropagation(); $("lineupMenu").hidden = !$("lineupMenu").hidden; };
@@ -1851,7 +2075,7 @@ $("helpBtn").onclick = () => ($("helpModal").hidden = false);
 $("regionBtn").onclick = openRegionMap;
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => { b.closest(".modal").hidden = true; updateTeamView(); });
 document.querySelectorAll(".modal").forEach(m => m.onclick = (e) => { if (e.target === m) m.hidden = true; });
-$("lConfig").onchange = fillLaunch; $("lMonths").oninput = estimate; $("lAct").oninput = estimate; $("lGo").onclick = launch;
+$("lGo").onclick = launch;
 document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => { S.tab = b.dataset.tab; store.set("tab", S.tab); $("moreMenu").hidden = true; renderTab(); });
 $("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("moreMenu").hidden; };
 $("compareBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); };
@@ -1866,6 +2090,7 @@ $("vNight").onclick = () => setNight(!$("vNight").classList.contains("on"));
 $("vBeams").onclick = () => setBeams(!beamsOn());
 toggleBtn("vBeams", beamsOn());
 $("vQuality").onclick = () => setQuality(scene.quality === "low" ? "high" : "low");
+$("vInfo").onclick = () => setHoverInfo(!hoverInfo); setHoverInfo(hoverInfo);
 $("vShot").onclick = () => { const a = document.createElement("a"); a.href = scene.screenshot(); a.download = `civitas_${S.runId || "city"}_m${S.frames[S.idx]?.month ?? 0}.png`; a.click(); };
 $("vFull").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
 $("vLeft").onclick = () => setDocks(app.classList.contains("hide-left"), !app.classList.contains("hide-right"));
@@ -1881,7 +2106,7 @@ setInterval(drawMinimap, 250);
 document.addEventListener("keydown", (e) => {
   const tag = e.target.tagName;
   if ((tag === "INPUT" && e.target.type !== "range") || tag === "SELECT" || tag === "TEXTAREA") return;
-  if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); $("runMenu").hidden = true; $("lineupMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
+  if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); if (!$("teamModal").hidden) closeTeamView(); $("runMenu").hidden = true; $("lineupMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
   if (!$("launchModal").hidden || !$("helpModal").hidden) return;
   const k = e.key;
   const map = {
@@ -1892,14 +2117,17 @@ document.addEventListener("keydown", (e) => {
     ArrowUp: () => scene.panBy(0, 1), ArrowDown: () => scene.panBy(0, -1),
     q: () => scene.rotateBy(0.15), e: () => scene.rotateBy(-0.15), "+": () => scene.zoomBy(0.85), "=": () => scene.zoomBy(0.85), "-": () => scene.zoomBy(1.18),
     "0": () => scene.resetView(), t: () => scene.topView(), o: () => $("vRotate").click(), n: () => $("vNight").click(), g: () => $("vQuality").click(),
-    p: () => $("vShot").click(), f: () => $("vFull").click(), l: () => { $("follow").checked = !$("follow").checked; $("follow").onchange({ target: $("follow") }); },
+    i: () => $("vInfo").click(), p: () => $("vShot").click(), f: () => $("vFull").click(), l: () => { $("follow").checked = !$("follow").checked; $("follow").onchange({ target: $("follow") }); },
     "[": () => $("vLeft").click(), "]": () => $("vRight").click(), r: () => $("runBtn").click(), "?": () => ($("helpModal").hidden = false),
     v: () => $("layerBtn").click(), x: () => $("vMode").click(), b: () => $("vBeams").click(), c: () => openCompare(),
+    m: () => openTeamView(true),
   };
   OVERLAYS.slice(0, 9).forEach((o, k) => { map[String(k + 1)] = () => setOverlay(o.id); });
   const fn = map[k] || map[k.toLowerCase()];
   if (fn) { e.preventDefault(); fn(); }
 });
+// a GPU reset (display sleep, GPU memory pressure) wipes canvases drawn once per frame: draw them again
+for (const id of ["minimap", "trackMarks"]) $(id).addEventListener("contextrestored", () => { drawMinimap(); drawTrackMarks(); });
 window.addEventListener("resize", () => { drawTrackMarks(); if (!$("compareModal").hidden) renderCompare(); if (S.tab === "charts") renderCharts(); if (S.tab === "money") renderMoneyTab(); });
 
 // ================================================================ boot
@@ -1910,8 +2138,19 @@ window.addEventListener("resize", () => { drawTrackMarks(); if (!$("compareModal
   $("vMode").textContent = viewMode === "3d" ? "3D" : "PX";
   await refreshRuns();
   const want = new URLSearchParams(location.search).get("run") || store.get("lastRun", null);
-  const pickRun = S.runs.find(x => x.run_id === want) || S.runs.find(x => x.status === "running") || S.runs[0];
+  const pickRun = S.runs.find(x => x.run_id === want) || S.runs.find(x => isLive(x.status)) || S.runs[0];
   if (pickRun) await openRun(pickRun.run_id);
   else renderTab();
   window.__civitas = { S, get scene() { return scene; }, setView, go, openRun };      // handy for debugging from the console
+  watchViewer();
 })();
+// a page left open across a viewer update runs the old code: offer a reload when the served files change
+async function watchViewer() {
+  let first = null;
+  const check = async () => {
+    try { const v = (await api("/api/version")).viewer; if (first == null) first = v; else if (v !== first) { $("updateBar").hidden = false; return; } } catch { /* next time */ }
+    setTimeout(check, 20000);
+  };
+  check();
+}
+$("updateReload").onclick = () => location.reload();

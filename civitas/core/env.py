@@ -193,7 +193,9 @@ class CivitasEnv:
         return {"grid": grid, "vector": vec}
 
     # -------------------------------------------------------------- replay
-    def frame(self, turns: list[dict] | None = None, scores: dict | None = None) -> dict:
+    def frame(self, turns: list[dict] | None = None, scores: dict | None = None, live: bool = False) -> dict:
+        """The month's frame for the viewer; `live`: the city mid-month for the live feed (bench/live.py), with
+        today's metrics and without the report-only `needs`."""
         w = self.world
         q = lambda a: "".join(str(int(v)) for v in np.clip(a * 9.999, 0, 9).astype(int).ravel())
         f = {
@@ -212,7 +214,7 @@ class CivitasEnv:
             "bus_lines": [{"id": l["id"], "stops": [list(p) for p in l["stops"]]} for l in w.bus_lines],
             "metro_lines": [{"id": l["id"], "stations": [list(p) for p in l["stations"]]} for l in w.metro_lines],
             "burning": list(w.burning),
-            "metrics": w.history[-1] if w.history else w.metrics(),
+            "metrics": w.history[-1] if w.history and not live else w.metrics(),
             "scores": scores or self.last_scores,
             "events": list(w.last_events),
             "turns": [{k: v for k, v in t.items() if k != "meta"} for t in (turns or [])],
@@ -226,7 +228,7 @@ class CivitasEnv:
         }
         # with fleet agents, the department needs the mayor sees this month (FleetState.needs; report-only: the
         # collaboration score's money aim). A region frame nests it per city
-        needs = self.fleet.needs(self) if self.fleet is not None else None
+        needs = self.fleet.needs(self) if self.fleet is not None and not live else None
         if needs:
             f["needs"] = needs
         return f

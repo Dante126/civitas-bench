@@ -2,6 +2,7 @@
 import * as THREE from "./vendor/three-bundle.min.js";
 import { OrbitControls } from "./vendor/three-bundle.min.js";
 import { Life } from "./life.js";
+import { seasonAt } from "./seasons.js";
 import { tierAnnexes, tierRank, facilityTier } from "./recipes.js";
 
 const MARGIN = 12;                       // decorative land around the playable map
@@ -16,6 +17,8 @@ const hash = (i, k = 0) => {                      // integer hash -> [0, 1), no 
 };
 const col = (h) => new THREE.Color(h);
 const SNOW = new THREE.Color("#eef3f6");
+const AUTUMN_LEAVES = ["#d9822b", "#c0392b", "#e0a526", "#8d6e3f"].map(c => new THREE.Color(c));
+const WINTER_LEAVES = ["#dfe6ea", "#c9d3d8", "#e8eef1", "#b8c4c9"].map(c => new THREE.Color(c));
 const SIGNS = ["#e53935", "#fdd835", "#1e88e5", "#43a047", "#8e24aa", "#fb8c00"].map(c => new THREE.Color(c));
 const FLOWERS = ["#f06292", "#fff176", "#ba68c8", "#ffffff", "#ff8a65", "#64b5f6"].map(c => new THREE.Color(c));
 const lerpC = (a, b, t) => a.clone().lerp(b, t);
@@ -86,29 +89,39 @@ export const DISTRICT_COLORS = ["#9aa19a", "#e07bd8", "#4aa3ff", "#ffb454", "#5f
 const layerStr = (f, o) => o.src ? o.src(f) : (f.layers && f.layers[o.layer]);
 
 // ------------------------------------------------------------ textures
+// A GPU reset (display sleep, GPU memory pressure) wipes the texture canvases, and three.js restores the WebGL context
+// but uploads them blank (black towers, no smoke). Each canvas texture keeps its painter and is painted again then.
+const PAINTED = [];
+function painted(paint, ...sizes) {
+  const cvs = sizes.map(([w, h]) => Object.assign(document.createElement("canvas"), { width: w, height: h }));
+  const item = { paint: () => paint(...cvs.map(c => c.getContext("2d"))), texs: cvs.map(c => new THREE.CanvasTexture(c)) };
+  item.paint(); PAINTED.push(item);
+  return item.texs;
+}
+function repaintTextures() { for (const p of PAINTED) { p.paint(); for (const t of p.texs) t.needsUpdate = true; } }
 function windowTextures(seed, cols = 4, rows = 8) {
-  const W = 64, H = 128, a = document.createElement("canvas"), b = document.createElement("canvas");
-  a.width = b.width = W; a.height = b.height = H;
-  const g = a.getContext("2d"), e = b.getContext("2d");
-  g.fillStyle = "#e9e9e9"; g.fillRect(0, 0, W, H);
-  e.fillStyle = "#000"; e.fillRect(0, 0, W, H);
-  const cw = W / cols, rh = H / rows;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const x = c * cw + cw * 0.2, y = r * rh + rh * 0.22, w = cw * 0.6, h = rh * 0.56;
-    g.fillStyle = "#5d6b7a"; g.fillRect(x, y, w, h);
-    const lit = hash(seed * 97 + r * 13 + c, 3);
-    if (lit > 0.35) { e.fillStyle = lit > 0.8 ? "#fff3c4" : "#ffcf7a"; e.fillRect(x, y, w, h); }
-  }
-  const map = new THREE.CanvasTexture(a), emi = new THREE.CanvasTexture(b);
+  const W = 64, H = 128;
+  const [map, emi] = painted((g, e) => {
+    g.fillStyle = "#e9e9e9"; g.fillRect(0, 0, W, H);
+    e.fillStyle = "#000"; e.fillRect(0, 0, W, H);
+    const cw = W / cols, rh = H / rows;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const x = c * cw + cw * 0.2, y = r * rh + rh * 0.22, w = cw * 0.6, h = rh * 0.56;
+      g.fillStyle = "#5d6b7a"; g.fillRect(x, y, w, h);
+      const lit = hash(seed * 97 + r * 13 + c, 3);
+      if (lit > 0.35) { e.fillStyle = lit > 0.8 ? "#fff3c4" : "#ffcf7a"; e.fillRect(x, y, w, h); }
+    }
+  }, [W, H], [W, H]);
   for (const t of [map, emi]) { t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; }
   return { map, emi };
 }
 function softDot() {
-  const c = document.createElement("canvas"); c.width = c.height = 64;
-  const g = c.getContext("2d"), gr = g.createRadialGradient(32, 32, 2, 32, 32, 30);
-  gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(1, "rgba(255,255,255,0)");
-  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  const [t] = painted((g) => {
+    const gr = g.createRadialGradient(32, 32, 2, 32, 32, 30);
+    gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  }, [64, 64]);
+  t.colorSpace = THREE.SRGBColorSpace; return t;
 }
 
 // ----------------------------------------------------- instanced parts
@@ -182,6 +195,8 @@ export class CityScene {
     r.shadowMap.enabled = true; r.shadowMap.type = THREE.PCFShadowMap;
     r.toneMapping = THREE.ACESFilmicToneMapping; r.toneMappingExposure = 1.05;
     container.appendChild(r.domElement);
+    // after three.js's own handler: the canvas textures and the environment come back blank from a GPU reset
+    r.domElement.addEventListener("webglcontextrestored", () => { repaintTextures(); if (this._sky) this._bakeEnvironment(); });
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 600);
@@ -224,9 +239,13 @@ export class CityScene {
     sky.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
     const sun = new THREE.Mesh(new THREE.SphereGeometry(3, 16, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color(6, 5.6, 5) }));
     sun.position.set(-25, 35, 18); sky.add(sun);
-    const pm = new THREE.PMREMGenerator(this.renderer);
-    this.scene.environment = pm.fromScene(sky, 0.02).texture;
+    this._sky = sky;
+    this._bakeEnvironment();
     this.scene.environmentIntensity = 0.55;
+  }
+  _bakeEnvironment() {                               // the sky's reflections, a GPU render target: baked again on restore
+    const pm = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pm.fromScene(this._sky, 0.02).texture;
     pm.dispose();
   }
 
@@ -412,10 +431,12 @@ export class CityScene {
     const now = performance.now(), W = this.W, H = this.H, T = frame.tiles, L = frame.levels;
     this.windDir = frame.wind || [1, 0];
     const season = frame.season || null;
-    this.leafPalette = season === "autumn" ? ["#d9822b", "#c0392b", "#e0a526", "#8d6e3f"].map(col)
-      : season === "winter" ? ["#dfe6ea", "#c9d3d8", "#e8eef1", "#b8c4c9"].map(col) : P.leaves;
-    const tint = (c) => season === "winter" ? lerpC(c, SNOW, 0.62) : season === "autumn" ? lerpC(c, col("#c2a257"), 0.28)
-      : season === "summer" ? lerpC(c, col("#c9c46a"), 0.12) : c;
+    // each tile shows its own season while a boundary sweeps across the city (seasons.js, as in the pixel view)
+    const leavesOf = (s) => s === "autumn" ? AUTUMN_LEAVES : s === "winter" ? WINTER_LEAVES : P.leaves;
+    const tintOf = (s) => (c) => s === "winter" ? lerpC(c, SNOW, 0.62) : s === "autumn" ? lerpC(c, col("#c2a257"), 0.28)
+      : s === "summer" ? lerpC(c, col("#c9c46a"), 0.12) : c;
+    const tint = tintOf(season), tintOf0 = tint;
+    this.leafPalette = leavesOf(season);
     if (this.outerGround) this.outerGround.material.color.copy(tint(P.grassOuter));
     for (const h of this.hills || []) h.mat.color.copy(season === "winter" ? lerpC(h.base, SNOW, 0.55) : tint(h.base));
     const hist = frame.layers && frame.layers.historic;
@@ -429,6 +450,8 @@ export class CityScene {
       const inside = x >= 0 && y >= 0 && x < W && y < H, i = inside ? y * W + x : -1;
       const ch = inside ? T[i] : this._outerChar(frame, x, y);
       const X = this.wx(x), Z = this.wz(y), h1 = hash(inside ? i : 50000 + (y + 50) * 997 + x, 1);
+      const sea = seasonAt(frame.month, x, y, season), tint = sea === season ? tintOf0 : tintOf(sea);
+      this.leafPalette = leavesOf(sea);
       const water = ch === "~" || ch === "=" || ch === "Y";
       if (water) {
         Pt.bed.add(i, X, 0, Z, 1, 1, 1, 0, P.bed);
@@ -443,7 +466,7 @@ export class CityScene {
         else if ("RCIOM".includes(ch)) c = P.lotDev[ch];
         else if (inside && this.meta.resources && this.meta.resources[i] === "1") c = lerpC(P.grass[Math.floor(h1 * 4)], col("#a9c96a"), 0.5);
         else if (inside) c = lerpC(P.grass[Math.floor(h1 * 4)], col("#6f9e4f"), 0.5 * this._patch(x, y));
-        else c = this._fieldColor(x, y, h1);
+        else c = this._fieldColor(x, y, h1, sea);
         if (ch === "." || ch === "P") c = tint(c);
         Pt.land.add(i, X, 0, Z, 1, 1, 1, 0, c);
         const wet = (dx, dy) => { const xx = x + dx, yy = y + dy;
@@ -460,7 +483,7 @@ export class CityScene {
           continue;
         }
         if (ch === "#") { Pt.dash.add(-1, X, 0.001, Z, 0.3, 0.012, 0.05, 0, P.asphalt.clone().offsetHSL(0, 0, 0.5)); }
-        else if (ch === ".") this._outskirts(x, y, X, Z, h1, season);
+        else if (ch === ".") this._outskirts(x, y, X, Z, h1, sea);
         continue;
       }
       const g = grew(i), lv = +L[i], hh = hash(i, 2), h3 = hash(i, 3), rot = (Math.floor(hh * 4)) * Math.PI / 2;
@@ -497,7 +520,7 @@ export class CityScene {
         if (rs === 2) { for (let k = 0; k < 2; k++) this._tree(i, X + (hash(i, 50 + k) - 0.5) * 0.7, Z + (hash(i, 55 + k) - 0.5) * 0.7, 0.6 + 0.4 * hash(i, 58 + k), false); }
         else if (rs === 3 && hh < 0.5) Pt.crown.add(i, X + (h3 - 0.5) * 0.4, -0.05, Z + (hh - 0.25) * 0.8, 0.28, 0.2, 0.24, hh * 6, col("#8d8d8d"));
         else if (rs === 4 && hh < 0.35) Pt.podium.add(i, X, 0, Z, 0.5, 0.012, 0.4, hh * 6, col("#3e3530"));
-        else this._wild(i, X, Z, hh, h3, season);
+        else this._wild(i, X, Z, hh, h3, sea);
       } else if (lv > 0 && "RCIOM".includes(ch)) {
         this._building(ch, lv, i, X, Z, hh, h3, rot, g, frame.variant ? +frame.variant[i] : 0, frame.density ? +frame.density[i] : 1);
         if (hist && +hist[i] >= 5) {                 // listed historic building: a gold plaque by the door
@@ -505,6 +528,7 @@ export class CityScene {
         }
       }
     }
+    this.leafPalette = leavesOf(season);              // the city's own season for what comes after the tile loop
     for (const t of frame.flooded || []) {            // floodwater over the flooded bank this month
       const x = t % W, y = Math.floor(t / W);
       Pt.water.add(t, this.wx(x), 0.06, this.wz(y), 1, 1, 1, 0, lerpC(P.water, P.dirty, 0.45));
@@ -549,14 +573,13 @@ export class CityScene {
     }
   }
 
-  _fieldColor(x, y, h1) {                            // the countryside around the map: fields, meadows, woods
+  _fieldColor(x, y, h1, season = this.frame && this.frame.season) {   // the countryside around the map: fields, meadows, woods
     const b = hash(Math.floor((x + 100) / 5) * 131 + Math.floor((y + 100) / 5), 70);
     const base = P.grass[Math.floor(h1 * 4)];
     let c = base;
     if (b < 0.3) c = (Math.floor((y + 100) / 1) % 2) ? col("#c9b458") : col("#9fb34f");        // crop stripes
     else if (b < 0.45) c = col("#b89a5a");                                                     // ploughed field
     else if (b < 0.6) c = col("#5f8f45");                                                      // woods floor
-    const season = this.frame && this.frame.season;
     if (season === "winter") c = lerpC(c, SNOW, 0.7);
     else if (season === "autumn") c = lerpC(c, col("#c2a257"), 0.25);
     return lerpC(c, P.grassOuter, 0.15);

@@ -736,13 +736,14 @@ class RegionEnv:
             {r: info["truncated"] for r in self.roles}, {r: {"scores": info["scores"]} for r in self.roles}
 
     # ------------------------------------------------------------- replay
-    def frame(self, turns: list[dict] | None = None, scores: dict | None = None) -> dict:
+    def frame(self, turns: list[dict] | None = None, scores: dict | None = None, live: bool = False) -> dict:
         by_city = {c: [dict(t, role=split_role(t["role"])[1]) for t in (turns or []) if t["role"].startswith(c + ".")]
                    for c in self.cities}
         sc = scores or self.last_scores
         cities = {}
         for c, e in self.envs.items():
-            f = e.frame(turns=by_city[c], scores={k.split(".", 1)[1]: v for k, v in sc.items() if k.startswith(c + ".")})
+            f = e.frame(turns=by_city[c], scores={k.split(".", 1)[1]: v for k, v in sc.items() if k.startswith(c + ".")},
+                        live=live)
             f.pop("council", None)
             cities[c] = f
         month = self.month

@@ -75,10 +75,19 @@ Everything happens in the browser from here. You can:
   power, water, sewage, river pollution, traffic, bus coverage, police/fire/clinic/school
   cover, crime, fire risk, health, garbage, soil pollution, historic buildings, business
   profit, affordability, natural resources, flood risk and districts.
-- **Launch runs** with **＋ New run**: pick a config, seed, length and each role's agent
-  (scripted, LLM with any model, fleet, noop or random); each role starts at the config's own
-  agent and only the roles you change are overridden. Stop runs from the Runs tab, which also
-  holds the leaderboard.
+- **Launch runs** with **＋ New run**: pick the map (one city, or two / three cities on one river), the
+  seed, the length, how often agents act and the team: an AI fleet on one model, the scripted baselines,
+  or a mix per role (fleet, scripted or the single-call `llm` agent, each on its own model). The run uses
+  `configs/fleet_trinity.toml`'s fleet settings and playbooks. Other setups (remote agents, warm-ups,
+  eval suites) stay on the command line.
+- **Watch a run live.** While a game plays, a feed over the city shows whose turn it is and what that agent is
+  doing: each model step, look-up, build and message with its outcome and cost, as it happens. The map and the
+  left dock update after each build, not just once a month. Click a build to fly there; fold the feed from its
+  header. Runs write it to `live.jsonl` (and the city mid-month to `live_frame.json`); `bench` runs don't.
+- **Pause, resume or stop a live run** from the top bar. A pause lands before the next agent's turn
+  (a fleet turn in progress finishes first), the game then plays on exactly as it would have, and the
+  wait doesn't count in its wall time. Stop ends the game where it is, with no final score. The Runs tab
+  also stops runs and holds the leaderboard.
 - **Browse the Charts tab**: population, scores, money, happiness and approval, demand,
   jobs, pollution, commute and traffic, trade, service coverage, crime and health,
   education.

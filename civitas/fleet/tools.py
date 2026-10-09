@@ -19,6 +19,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
+from ..bench import live
 from ..bench.collab import BUILDS, MONEY, TEXT_CHARS, _amount as asked_amount, _tiles as text_tiles, action_tile, \
     answer, is_request, replies
 from ..core.actions import (NO_DENSITY, OWNED_STRUCTS, POWER_LINES, REZONE_COST, SCHOOL_KINDS, SEWAGE_LINES,
@@ -3686,6 +3687,12 @@ class ToolBox:
         return [t.schema() for t in self.tools.values()]
 
     def call(self, name: str, arguments: str | dict | None = None) -> dict:
+        """Run one tool call (`_call`) and report it to the game's live feed (bench/live.py), if it has one."""
+        res = self._call(name, arguments)
+        live.call(self.env, self.role, name, arguments, res, name in ALL_ACTIONS)
+        return res
+
+    def _call(self, name: str, arguments: str | dict | None = None) -> dict:
         """Run one tool call. An identical repeat (same tool, same arguments after coercion) of a look-up returns
         the earlier result marked "repeat", and one of an action that failed is refused ("refused": "repeat")
         without running, as is one of any call with bad arguments or an unknown tool (same arguments as sent),
