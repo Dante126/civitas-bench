@@ -269,6 +269,20 @@ police -3.7, fire -2.4, education -4.5 (−7.9 to −1.0),
 Teamwork 84.4, 0.24 failed actions and 0.23 refusals per turn, 52k tokens per model turn, 11.6M tokens in all. Its
 runs came from four commits of the same day (the fleet configs' `fleet_version` is the same in all).
 
+**Calibration** (`trinity-large-cal`, 2026-10-09: `eval_late` with `--repeats 3`, 15 runs, 36.5M tokens, ~70 min):
+the **replay noise is 0.4 points** (std of one model on one seed), against a **seed spread of 2.5**. Repeats of a
+seed agree closely (s0: +4.4 / +4.2 / +3.4; s1: −0.5 / −0.8 / −1.5), while seeds differ a lot (s0 about +4, s1 about
+−0.9). City score vs scripted +1.6 (95% CI −1.6 to +4.8): beating scripted is still not clear of seed luck on 5
+units. Departments that are: mayor +3.6 (+1.9 to +5.2), utilities −0.9 (−1.7 to −0.2), education −4.8 (−9.6 to
+−0.0); police −4.6 (−5.5 to −3.8) in the single cities. Paired against `trinity-large-v1` (same model, older code):
+no clear difference, +0.2 (−1.4 to +1.7). The paired differences vary more than replay noise explains (std about 1.2
+against about 0.5), so code or model changes move seeds differently: the detectable-difference line (~1.0 at 1 repeat
+here) is a lower bound, and **more seeds help more than repeats**. Hence `configs/eval_singles.toml`, the checkpoint
+eval: `fleet_smoke_late` seeds 0-7, one run each, ~12M tokens (as `eval_late`), ~12 min with 8 workers; seeds 0-2
+pair with `eval_late` evals. Region runs cost 2.5x a single city per unit and two region seeds give intervals too wide
+to use, so `eval_late` is for milestones. Seeds 0-9 all reach a working city at the hand-over (scripted fleet at
+month 96: 66.7 ± 2.4, about 6,100 residents, none bankrupt).
+
 ---
 
 ## How it works

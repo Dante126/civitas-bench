@@ -1,0 +1,25 @@
+# Eval suite (civitas eval -s configs/eval_singles.toml --model M): the checkpoint eval. Eight single-city late starts,
+# one run each: scripted agents play months 0-95, the model's fleet months 96-107, scored against the scripted yardstick
+# from the same hand-over. About the tokens of eval_late.toml, but with more units for the money: the calibration eval
+# (trinity-large-cal, 2026-10-09: eval_late x 3 repeats) measured a replay noise of 0.4 points against a seed spread of
+# 2.5, so seeds, not repeats, decide how small a difference an eval can see, and a region run costs 2.5x a single city
+# for one unit. Seeds 0-2 are eval_late's, so --compare pairs them with eval_late evals too. Use eval_late (regions
+# included) for milestones.
+# Not a run config: the launcher (civitas serve) leaves suite files out.
+name = "singles"
+description = "late starts: eight single cities (32 model turns each), one run per seed"
+
+[eval]
+workers = 8                 # runs at once: they wait on the API, not the CPU
+caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
+reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+
+[eval.prices]
+
+# Per run: the reference wall time and tokens (trinity-large-thinking, eval trinity-large-cal's single cities).
+[[runs]]
+config = "configs/fleet_smoke_late.toml"
+seeds = "0-7"
+minutes = 11.7
+prompt_tokens = 1_350_000
+completion_tokens = 155_000
