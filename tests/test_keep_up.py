@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from civitas.agents.scripted import SCRIPTED
+from civitas.agents.scripted import SCRIPTED_V1   # the cities these tests were written on (civitas-v1 mayor)
 from civitas.core.env import CivitasEnv, GameConfig
 from civitas.fleet import tools as T
 from civitas.fleet.briefing import briefing
@@ -22,7 +22,7 @@ def short_env():
     """Seed 0 after 48 scripted months (about 6,500 residents) with every police station and clinic but the first
     removed and the services recomputed: police and health coverage far under the goal, every department at $0."""
     env = CivitasEnv(GameConfig(seed=0, months=60))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(48):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))

@@ -22,7 +22,9 @@ def test_the_shipped_registry():
     assert {"trinity-large-thinking", "trinity-mini"} <= set(reg)
     late = load_config(ROOT / "configs/fleet_smoke_late.toml")["fleet"]
     for e in reg.values():
-        assert e.provider == "arcee" and e.temperature == late["temperature"] and e.max_tokens == late["max_tokens"]
+        assert e.max_tokens == late["max_tokens"]
+        if e.provider != "anthropic":                  # Anthropic's compatible endpoint: temperature left out
+            assert e.provider == "arcee" and e.temperature == late["temperature"]
         assert M.validate(e.key, {k: v for k, v in e.to_dict().items() if k != "key"}) == []
     text = M.REGISTRY.read_text()
     assert text.startswith("# Model registry") and text == M.render(reg, M.registry_providers())   # canonical

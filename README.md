@@ -162,17 +162,42 @@ civitas yardstick <run_id>     # a warm-up run's scripted yardstick (written by 
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
 
-Baseline reference (all scripted, seeds 0–4): **city 77.5 ± 1.5**, mayor 88.1, planning
-68.4, utilities 89.4, transport 75.9, police 74.9, fire 85.7, health 86.6, education 83.2,
-population ≈ 14.5k, no bankruptcies, ~4–5 s per game (seeds 5–9: city 75.9 ± 0.8). `noop` and
-`random` line-ups score 0. Building tiers changed these numbers. Just before tiers were
-added, the same baseline scored city 78.1 ± 1.8 with population ≈ 14.7k.
-Acting every 3 months, as the fleet configs do, the same agents reach city 68.8 ± 2.0 and
-population ≈ 7.3k; `configs/fleet_scripted.toml` plays them through the fleet tools and
-scores exactly that (see [Agent fleets](#agent-fleets), "Scripted fleet").
+Baseline reference (all scripted, seeds 0–4, civitas-v2): **city 76.8 ± 2.0**, mayor 88.1,
+planning 67.7, utilities 89.5, transport 73.5, police 77.5, fire 88.4, health 87.8, education
+87.9, population ≈ 13.8k, no bankruptcies, ~4–5 s per game (seeds 5–9: city 76.0 ± 2.1). `noop`
+and `random` line-ups score 0. Acting every 3 months, as the fleet configs do, the same agents
+reach city 69.8 ± 1.9 and population ≈ 7.8k; `configs/fleet_scripted.toml` plays them through
+the fleet tools and scores exactly that (see [Agent fleets](#agent-fleets), "Scripted fleet").
+
+**civitas-v2 benchmark change** (the scripted mayor and the mayor's score; the sim is unchanged):
+
+- The mayor's *deployment* term (spending against the money departments hold idle) averages the
+  department funds over the scoring window instead of reading the final month only
+  (`scoring.py:_deployment`), so money taken back in the last month no longer counts as never held.
+- The scripted mayor reclaims idle department money (`agents/scripted.py:ScriptedMayor`): a service
+  keeps its working balance until its first building, then twice what it spent over the last 6 months
+  ($1,000 to its usual balance) and asks for a build it can't pay; an ask a department was fully
+  funded for and sat on (scripted planning held $20k for a casino through the last years of seed 0)
+  goes unfunded while it repeats it; and money well above a department's working balance and twice its
+  recent spending is taken back before any loan or top-up. Idle department money over the last 12
+  months fell from ~$34k to ~$19k (monthly) and ~$30k to ~$17k (every 3 months). Planning keeps its
+  $7,000 working balance: the scripted planner sizes its roads, zones, parks and plazas by its budget,
+  and holding it to twice its spending cost 7 city points.
+- Reference numbers before (civitas-v1) and after:
+
+| scripted, 120 months | v1 city | v1 population | v2 city | v2 population |
+|---|---:|---:|---:|---:|
+| `baseline.toml` seeds 0–4 | 77.5 ± 1.5 | 14,466 | 76.8 ± 2.0 | 13,786 |
+| `baseline.toml` seeds 5–9 | 75.9 ± 0.8 | | 76.0 ± 2.1 | 13,172 |
+| `fleet_scripted.toml` seeds 0–4 | 68.8 ± 2.0 | 7,341 | 69.8 ± 1.9 | 7,786 |
+| `region.toml` seeds 0–2 | 77.2 ± 1.3 | 29,159 | 76.9 ± 1.8 | 28,479 |
+| `region_trio.toml` seeds 0–2 | 77.1 ± 1.0 | 42,004 | 75.8 ± 0.5 | 39,444 |
+
+Building tiers changed these numbers too. Just before tiers were added, the same baseline scored city
+78.1 ± 1.8 with population ≈ 14.7k.
 The scripted agents leave obvious room: they never use districts, mixed use, historic
-listings or soil clean-up, rarely use policies or funding levels, build services by simple
-coverage rules and hoard money late in the game. In a region the scripted mayors make the
+listings or soil clean-up, rarely use policies or funding levels and build services by simple
+coverage rules. In a region the scripted mayors make the
 neighbour deals their observation names (see [Region mode](#region-mode-cities-that-trade-and-specialise)).
 
 Useful switches in `[game]` (or `--set game.X=...`):
@@ -256,7 +281,9 @@ civitas env check | civitas env list | civitas env freeze civitas-v2   # environ
   key, id or a model without tool calls fails here, for a few hundred tokens). `--dry-run` skips it and runs the env
   check; `eval.json` records `env` (name, fingerprint, match, drift), `model_entry` and `preflight`.
 - **Leaderboard**: per version, the latest finished, non-drifted eval of each model, ranked by its score vs the
-  scripted yardstick (95% interval), with the final city score, departments, tokens, cost and the paired verdict
+  scripted yardstick (95% interval) and its population / quality split (rows' `pop_term` / `quality`; an eval saved
+  before the split gets it from its run cards), with the final city score, Teamwork, failed actions and refusals per
+  model turn (`failed_per_turn` / `refused_per_turn`), departments, tokens, cost and the paired verdict
   against the suite's `baseline_model` (trinity-large-thinking). Evals of other versions, drifted, unfinished or
   superseded are listed as not ranked, with the reason. The viewer's Evals page (Models, Evals, Leaderboard) drives
   all of this from `civitas serve`. Stopping an eval (SIGTERM / SIGHUP to `civitas eval`, or Ctrl+C) stops its runs.
@@ -274,10 +301,15 @@ too. `--adopt` takes several runs of one unit as its repeats.
 
 **The scorecard.** Per run: the city score at hand-over, its change by the end, the yardstick's change from the same
 hand-over and their difference, **vs scripted** (above 0: the model added more than the scripted baseline would
-have); the same for population; Teamwork (`fleet/report.py:run_collaboration`); failed actions and refusals per turn
+have), split into the **population term** (half the city score is 50 x sqrt(population / target): the run's gain in
+it minus the yardstick's from the same hand-over, `evals.card_split` with `scoring.population_term`) and the
+**quality terms** (the rest: happiness, finances, services, environment, jobs, safety, health, education, and the
+penalties), so a model that only grew the city faster shows as population; the same for population; Teamwork
+(`fleet/report.py:run_collaboration`); failed actions and refusals per turn
 (`fleet_report.json`); model turns and tokens (prompt + completion, from `trajectories.jsonl`); wall time. A region
 run has a line for the region and one per city. Then, over the runs (a region counts once, by its region score):
-city score vs scripted as mean ± std, "beats scripted on N of M", population vs scripted, each department's final
+city score vs scripted as mean ± std with its population / quality split, "beats scripted on N of M", population
+vs scripted, each department's final
 score minus the yardstick's, Teamwork, failures per turn, tokens per model turn and in all, run time; for all runs
 and per config. A Versions table gives each run's `fleet_version`, a hash of its logged system prompts and the code
 commit (adopted runs: the last commit before the run started, inferred from git).
@@ -321,6 +353,16 @@ eval: `fleet_smoke_late` seeds 0-7, one run each, ~12M tokens (as `eval_late`), 
 pair with `eval_late` evals. Region runs cost 2.5x a single city per unit and two region seeds give intervals too wide
 to use, so `eval_late` is for milestones. Seeds 0-9 all reach a working city at the hand-over (scripted fleet at
 month 96: 66.7 ± 2.4, about 6,100 residents, none bankrupt).
+
+**civitas-v2's suite** (`configs/eval_v2.toml`; `eval_singles.toml` stays civitas-v1's frozen suite): the same late
+starts on seeds 0, 4, 5, 11, 12, 16, 18 and 20. v1's seeds 1 and 6 handed over in a recession (industrial jobs from
+~1,300 to 0 in months 84-92, unemployment ~45%), which the scripted yardstick recovers from by itself, so "vs
+scripted" there measured the recovery. With v2's scripted mayor the warm-up of seeds 0-23 was scanned for shocks in
+months 84-96: a recession under way or ended within 6 months, a flood, industrial jobs falling over 30%,
+unemployment over 10%, population falling over 5%. 15 seeds had one (14 a recession; seed 2 a flood at month 85
+that cost 37% of its population; seeds 13 and 15 a recession starting at months 91 and 94). Of the 9 clean ones,
+seed 3 (the largest hand-over city) is left out: hand-over population 6,246 on average (all 24 seeds 5,890, v1's
+seeds 0-7 6,302), city score 67.2 ± 2.3.
 
 ---
 
@@ -541,7 +583,7 @@ water, sewage and service buildings) also takes a `tier` (see [Building tiers](#
 | score | built from |
 |---|---|
 | **city** | ½ population (√ of pop / 30k) + ½ quality: happiness, finances, power/water/sewage coverage, environment, employment, safety, health, education. Quality counts only once the city has people; bankruptcy halves the total, a lost recall election cuts it by a quarter. |
-| **mayor** | revenue, solvency, net worth, happiness, approval, and how much of the money given to departments actually got spent |
+| **mayor** | revenue, solvency, net worth, happiness, approval, and how much of the money given to departments actually got spent (spending over the last 12 months against the department funds held idle, averaged over those months) |
 | **planning** | growth, share of zoned land that developed, demand balance, land value, road efficiency, employment |
 | **utilities** | power, water and sewage coverage, spare capacity in the 10–60% range, cost efficiency, clean-energy share (solar, wind, nuclear), pollution near homes, water quality, river quality |
 | **transport** | commute time, share of congested road, bus share of trips, cost per resident |
@@ -613,6 +655,8 @@ Each city is scored on its own; the region score is their average.
 | `region.toml` seeds 0–7, with deals | 76.76 ± 1.05 | 28,434 | 18 / 22 |
 | `region_trio.toml` seeds 0–2, before deals | 76.13 ± 0.78 | 40,755 | 0 / 0 |
 | `region_trio.toml` seeds 0–2, with deals | 77.10 ± 1.00 | 42,004 | 51 / 67 |
+| civitas-v2 (the scripted mayor reclaims idle money): `region.toml` seeds 0–2 | 76.86 ± 1.83 | 28,479 | |
+| civitas-v2: `region_trio.toml` seeds 0–2 | 75.75 ± 0.46 | 39,444 | |
 | `region.toml` seeds 0–2, deal checks | 77.35 ± 1.14 | 29,429 | 21 / 24 |
 | `region.toml` seeds 0–7, deal checks | 76.84 ± 1.10 | 28,660 | 18 / 22 |
 | `region_trio.toml` seeds 0–2, deal checks | 76.40 ± 0.15 | 41,525 | 41 / 48 |
@@ -1610,19 +1654,24 @@ Departments block, the to-spend and to-fund lines, the money results, earned con
 the loan guard) and the reserve and extra-building guards added after smoke v20 changed
 only what the fleet reads. The scripted baseline (77.5 ± 1.5), the
 fleet reference below (68.8 ± 2.0, 7,341 residents) and the region games score exactly as
-before. On seeds 0–4, at both cadences, no guard refused a scripted call and nothing was
-overridden. Before the flood exception, the reserve guard met the monthly games of seeds 3
+before (civitas-v1 numbers). On seeds 0–4, at both cadences, no guard refused a scripted call and
+nothing was overridden in civitas-v1; from civitas-v2 the scripted mayor takes idle money back and the
+take-back guard refuses 4–9 of its 8–14 take-backs per game (every 3 months, seeds 0–4: what the guard keeps,
+twice 3 months' spending or the dearest ready first building, differs from the policy's working balance), each
+confirmed at once as the policy means it, so the two still play turn for turn alike. Before the flood exception, the reserve guard met the monthly games of seeds 3
 and 4 three times, each time on the policy's $3,000 for fire before a flood. On seed
 0 the scripted mayor's longest briefing is 4,577 characters (4,474 before; 4,397 before the
 review fixes named first buildings ahead of cheaper sites and what first/supply may use).
 
 | seeds 0–4, 120 months | city | population | mayor | planning | utilities | transport | police | fire | health | education |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| monthly: `baseline.toml`, or `fleet_scripted.toml --set game.act_every=1` | 77.5 ± 1.5 | 14,466 | 88.1 | 68.4 | 89.4 | 75.9 | 74.9 | 85.7 | 86.6 | 83.2 |
-| every 3 months: `fleet_scripted.toml`, or `baseline.toml --set game.act_every=3` | 68.8 ± 2.0 | 7,341 | 86.3 | 64.5 | 91.4 | 89.7 | 77.2 | 83.8 | 86.5 | 86.0 |
+| monthly: `baseline.toml`, or `fleet_scripted.toml --set game.act_every=1` | 76.8 ± 2.0 | 13,786 | 88.1 | 67.7 | 89.5 | 73.5 | 77.5 | 88.4 | 87.8 | 87.9 |
+| every 3 months: `fleet_scripted.toml`, or `baseline.toml --set game.act_every=3` | 69.8 ± 1.9 | 7,786 | 87.8 | 64.0 | 91.1 | 88.5 | 81.7 | 88.3 | 88.2 | 84.9 |
+| civitas-v1, monthly | 77.5 ± 1.5 | 14,466 | 88.1 | 68.4 | 89.4 | 75.9 | 74.9 | 85.7 | 86.6 | 83.2 |
+| civitas-v1, every 3 months | 68.8 ± 2.0 | 7,341 | 86.3 | 64.5 | 91.4 | 89.7 | 77.2 | 83.8 | 86.5 | 86.0 |
 
-So compare a fleet with 68.8, not the monthly 77.5. The 8.7 points are the quarterly
-cadence, since the scripted policies do about a month's work per turn:
+So compare a fleet with 69.8, not the monthly 76.8. The 7.0 points are the quarterly
+cadence, since the scripted policies do about a month's work per turn (the notes below are civitas-v1's runs):
 
 - **Planning** lays about one road and up to three zone strips per type a turn. It built 18
   road segments and 157 zone strips instead of 46 and 311, and spent $12.5k instead of $31k.

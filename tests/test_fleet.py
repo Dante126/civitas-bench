@@ -187,7 +187,7 @@ import json
 
 import numpy as np
 
-from civitas.agents.scripted import SCRIPTED
+from civitas.agents.scripted import SCRIPTED_V1   # the cities these tests were written on (civitas-v1 mayor)
 from civitas.core.roles import ROLES, TURN_ORDER
 from civitas.fleet.memory import DEPARTMENTS
 from civitas.fleet.tools import SITE_PURPOSES, SITE_UNLOCKS, ToolBox, free_bank
@@ -197,7 +197,7 @@ from civitas.sim import catalog as C
 @pytest.fixture(scope="module")
 def grown_env():
     env = CivitasEnv(GameConfig(seed=0, months=24))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(24):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -686,7 +686,7 @@ def test_empty_site_lists_say_whether_land_or_need_is_missing():
     res = ToolBox(env, "transport").call("find_sites", {"purpose": "bus_stops"})
     assert res["sites"] == [] and "below 1,500 residents" in res["note"]
     env = CivitasEnv(GameConfig(seed=0, months=12))    # residents, but every roadside tile taken
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(6):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -722,7 +722,7 @@ def test_empty_site_lists_say_whether_land_or_roads_block_them():
     assert apply_action(env.world, "planning", {"type": "build_road", "x1": 19, "y1": 24, "x2": 38, "y2": 24}).ok
     assert blocked("utilities") == []                            # across the river: free bank lots by the road
     env = CivitasEnv(GameConfig(seed=0, months=12))              # residents, then every roadside tile taken
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(6):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -916,7 +916,7 @@ def test_a_mature_city_with_the_lots_near_homes_taken():
     with 22% of children and teenagers under 0.3 coverage."""
     from civitas.fleet.tools import role_obs, site_lists
     env = CivitasEnv(GameConfig(seed=0, months=120))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(120):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -1123,7 +1123,7 @@ def test_the_mayor_map_overview_fallback_lists_what_its_briefing_leaves_out(grow
 def env72():
     """Scripted seed 0 at month 72 of a 120-month game (about 2 s)."""
     env = CivitasEnv(GameConfig(seed=0, months=120))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(72):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -2753,7 +2753,7 @@ def _words(text: str) -> int:
 @pytest.fixture(scope="module")
 def env12():
     env = CivitasEnv(GameConfig(seed=0, months=24))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(12):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -3325,7 +3325,7 @@ def test_no_bus_stops_before_1500_residents():
     from civitas.fleet.tools import SITE_MIN_POP, SITE_NOTES
     from civitas.core.observation import build_observation
     env = CivitasEnv(GameConfig(seed=0, months=24))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(3):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -3659,7 +3659,7 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
     _bridge_and_take_the_bank(env)                     # the road reaches the river, its bank lots zoned
     assert land(env) == [head + "utilities (sewage outlet: a free riverbank lot)" + tail]
     env = CivitasEnv(GameConfig(seed=0, months=12))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(6):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -6026,7 +6026,7 @@ def test_transit_estimate_is_what_traffic_computes():
     Scripted seed 0, month 100, with a metro line and the fare at $1 (not the $2 default)."""
     import civitas.fleet.tools as T
     env = CivitasEnv(GameConfig(seed=0, months=120))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(100):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
