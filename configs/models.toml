@@ -18,6 +18,27 @@ temperature = "default"
 max_tokens = 16000
 notes = "via Anthropic OpenAI-compatible endpoint; thinking adaptive (on by default); temperature omitted (non-default values 400)"
 
+[models.deepseek-v4-flash]
+provider = "arcee"
+id = "deepseek/deepseek-v4-flash-latest"
+temperature = 0.4
+max_tokens = 16000
+notes = "served on the Arcee API"
+
+[models."glm-5.3-flash"]
+provider = "arcee"
+id = "zai-org/glm-5.3-flash"
+temperature = 0.4
+max_tokens = 16000
+notes = "served on the Arcee API"
+
+[models.kimi-k3]
+provider = "arcee"
+id = "moonshotai/kimi-k3"
+temperature = 0.4
+max_tokens = 16000
+notes = "served on the Arcee API"
+
 [models.trinity-large-thinking]
 provider = "arcee"
 temperature = 0.4
