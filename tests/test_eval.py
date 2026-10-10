@@ -560,3 +560,86 @@ except KeyboardInterrupt:
         for p in pids:
             if p and E._alive(p):
                 os.killpg(p, 9)
+
+
+# ------------------------------------------------------------------ the environment on resume and during the eval
+def _env_eval(tmp_path, monkeypatch, **env):
+    """A saved, interrupted eval of fleet_smoke_late on environment tiny-v1 (no run started)."""
+    from civitas.bench import envs as V
+    monkeypatch.setenv("ARCEE_API_KEY", "sk-test")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    suite = tmp_path / "s.toml"
+    suite.write_text(f'name = "tiny"\n[eval]\nenv = "tiny-v1"\ncaffeinate = false\n[[runs]]\n'
+                     f'config = "{ROOT}/configs/fleet_smoke_late.toml"\nseeds = [0, 1]\n')
+    ev = E.plan(E.load_suite(suite), model="trinity-mini", runs_dir=tmp_path / "runs", sets=["game.act_every=3"],
+                name="envy", stamp="T", workers=1)
+    ev["env"] = {"name": "tiny-v1", "fingerprint": "f" * 16, "match": True, "diff": [], "frozen": True,
+                 "drift": False, "allow_drift": False, "code": V.code_info(), **env}
+    ev["status"] = "interrupted"
+    E.save(ev)
+    return ev
+
+
+def _recheck(match=True, env="tiny-v1", seen=None):
+    from civitas.bench import envs as V
+
+    def check(s, **kw):
+        if seen is not None:
+            seen.append(kw)
+        if match is None:
+            raise RuntimeError("probe blew up")
+        return {"env": env, "frozen": True, "match": match, "diff": [] if match else ["model"],
+                "fingerprint": ("f" if match else "e") * 16, "frozen_fingerprint": "f" * 16,
+                "probe": {"seconds": 1.0, "cached": True, "code": V.code_info()}}
+    return check
+
+
+def test_resume_rechecks_the_environment(tmp_path, monkeypatch):
+    from civitas.bench import envs as V
+    ev = _env_eval(tmp_path, monkeypatch)
+    started = []
+    monkeypatch.setattr(E, "execute", lambda ev, **kw: started.append(ev) or ev)
+    seen = []
+    out = E.resume(ev["dir"], verbose=False, env_check=_recheck(seen=seen))
+    assert len(started) == 1 and seen[0]["sets"] == ["game.act_every=3"] and seen[0]["agents"] == []
+    assert Path(seen[0]["cache_dir"]) == tmp_path / "runs" / "_cache"
+    r = out["env"]["resumes"][-1]
+    assert r["ok"] and r["match"] and not out["env"]["drift"] and out["env"]["run_code"] == V.code_state()
+    # the code changed since: refused, and the refused check is in eval.json
+    for check, why in ((_recheck(match=False), "no longer matches environment tiny-v1 (changed: model)"),
+                       (_recheck(env="other-v2"), "the suite now names environment 'other-v2'"),
+                       (_recheck(match=None), "the environment probe failed (RuntimeError: probe blew up)")):
+        with pytest.raises(E.EvalError) as err:
+            E.resume(ev["dir"], verbose=False, env_check=check)
+        assert str(err.value).startswith("can't resume: ") and why in str(err.value)
+        saved = E.load(ev["dir"])
+        assert saved["env"]["resumes"][-1]["ok"] is False and not saved["env"]["drift"]
+    assert len(started) == 1 and len(E.load(ev["dir"])["env"]["resumes"]) == 3   # the first pass wasn't saved here
+    # an eval started with --allow-drift resumes as drifted
+    ev = _env_eval(tmp_path / "b", monkeypatch, allow_drift=True)
+    lines = []
+    out = E.resume(ev["dir"], verbose=True, out=lines.append, env_check=_recheck(match=False))
+    assert out["env"]["drift"] and out["env"]["resumes"][-1]["drift"]
+    assert "resumed on other code" in out["env"]["drift_reason"] and any("resuming as drifted" in x for x in lines)
+    # an eval on no version: no check
+    ev = _env_eval(tmp_path / "c", monkeypatch, name=None)
+    out = E.resume(ev["dir"], verbose=False, env_check=_recheck(match=None))
+    assert "resumes" not in out["env"]
+
+
+def test_a_code_change_during_the_eval_marks_it_drifted(tmp_path, monkeypatch):
+    from civitas.bench import envs as V
+    monkeypatch.setattr(E, "command", lambda ev, r: [sys.executable, "-c", "pass"])
+    monkeypatch.setattr(E, "finish", lambda ev: ev)
+    monkeypatch.setattr(E, "POLL_S", 0.05)
+    ev = _env_eval(tmp_path / "a", monkeypatch)            # workers 1: the second run starts after the first ends
+    ev = E.execute(ev, verbose=False)
+    assert not ev["env"]["drift"] and "code_changed" not in ev["env"]
+    ev = _env_eval(tmp_path / "b", monkeypatch)
+    now = iter([V.code_state(), "other:edited"])
+    monkeypatch.setattr(V, "code_state", lambda root=V.ROOT: next(now))
+    ev = E.execute(ev, verbose=False)
+    e = E.load(ev["dir"])["env"]
+    assert e["drift"] and e["drift_reason"] == "code changed during the eval"
+    assert e["code_changed"]["before_run"] == ev["runs"][1]["run_id"] and e["code_changed"]["now"] == "other:edited"
+    assert all(r["status"] != "pending" for r in ev["runs"])                     # the eval went on

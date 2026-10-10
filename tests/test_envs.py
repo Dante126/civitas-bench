@@ -1,6 +1,7 @@
-"""Environment versions (bench/envs.py): the probe is deterministic (twice, and in a fresh process), a balance or
-briefing change moves the part it touches while model keys move nothing, the cache, freeze / check / list / diff,
-and tagging that never fails a freeze. A tiny suite (10 months, 6 of them warm-up) keeps it fast; no model is
+"""Environment versions (bench/envs.py): the probe is deterministic (twice, and in a fresh process with another hash
+seed), a balance, briefing or model-only change moves the part it touches while model keys move nothing, the canned
+model is never a real client, one process per seed, the cache, freeze / check / list / diff, and tagging that never
+fails a freeze. A tiny suite (10 months, 6 of them warm-up) keeps it fast; no model is
 called and no tag is written to the repository."""
 import json
 import os
@@ -37,13 +38,14 @@ def test_the_probe_is_deterministic(suite, probed):
     key = f"{ROOT}/configs/fleet_smoke_late.toml:0"
     assert set(p["parts"]["seeds"]) == {key, key[:-1] + "1"} and set(p["parts"]["seeds"][key]) == set(V.SEED_PARTS)
     assert p["seeds"][key]["turns"] == 16 and p["seeds"][key]["months"] == 10   # 8 roles at month 6 and 9
+    assert p["seeds"][key]["model_turns"] == 8 and len(p["parts"]["seeds"][key]["model"]) == 16  # one ToolAgent turn each
     assert p["code"]["commit"] and not p["cached"]
     again = V.probe(suite, workers=0, cache=False, sets=SETS)
     assert again["parts"] == p["parts"] and again["fingerprint"] == p["fingerprint"]
     code = (f"from civitas.bench import envs as V; print(V.probe({str(suite)!r}, workers=1, cache=False, "
             f"sets={SETS!r})['fingerprint'])")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
-                         env={**os.environ, "PYTHONPATH": str(ROOT)}, cwd=ROOT)
+                         env={**os.environ, "PYTHONPATH": str(ROOT), "PYTHONHASHSEED": "12345"}, cwd=ROOT)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip().splitlines()[-1] == p["fingerprint"]          # a fresh process and a process pool
 
@@ -67,6 +69,47 @@ def test_a_briefing_change_moves_the_briefings(suite, probed, monkeypatch):
     monkeypatch.setattr(scripted, "briefing", lambda *a, **k: real(*a, **k) + "\n(reworded)")
     p = V.probe(suite, workers=0, cache=False, sets=SETS)
     assert V.diff(probed, p) == ["briefings"]
+
+
+def test_a_model_only_change_moves_the_model_part(suite, probed, monkeypatch):
+    """What only a model-backed agent meets (ToolAgent's nudges, the model's ToolBox flags) moves `model` alone."""
+    from civitas.fleet import agent
+    from civitas.fleet.tools import ToolBox
+    monkeypatch.setattr(agent, "NUDGE", agent.NUDGE + " (reworded)")
+    assert V.diff(probed, V.probe(suite, workers=0, cache=False, sets=SETS)) == ["model"]
+    monkeypatch.undo()
+    real = ToolBox._next_refresh
+    monkeypatch.setattr(ToolBox, "_next_refresh", lambda self, used: real(self, used) + " (reworded)")
+    assert V.diff(probed, V.probe(suite, workers=0, cache=False, sets=SETS)) == ["model"]
+
+
+def test_the_canned_model_is_never_a_real_client(monkeypatch):
+    import hashlib
+    from civitas.agents.llm_client import ChatClient, LLMError
+    from civitas.fleet.agent import ToolAgent
+    monkeypatch.delenv(V.NO_MODEL["api_key_env"], raising=False)
+    a = ToolAgent("police", provider=V.no_provider())
+    with pytest.raises(LLMError, match="is not set"):                 # refused before any connection
+        a.client.chat("m", [{"role": "user", "content": "hi"}])
+    canned = V.CannedClient(a, list, hashlib.sha256())
+    with pytest.raises(RuntimeError, match="isn't the agent's client"):  # not installed as the client: refuses
+        canned.chat("m", [])
+    a.client = canned
+    assert not isinstance(canned, ChatClient)
+    assert canned.chat("m", [])["tool_calls"] == [] and canned.chat("m", [])["finish_reason"] == "length"
+    assert canned.chat("m", [])["content"] == V.CANNED_DONE           # an empty script: the turn ends
+
+
+def test_one_process_per_seed():
+    pids = V._isolated_map(V._pid, list(range(4)), 2)
+    assert len(set(pids)) == 4 and os.getpid() not in pids
+
+
+def test_code_state():
+    st = V.code_state()
+    info = V.code_info()
+    assert isinstance(st, str) and st == V.state_of(info) == f"{info['commit']}:{info['diff_hash']}"
+    assert V.state_of(None) == V.state_of({"commit": None}) == "nogit"
 
 
 def test_the_cache(suite, tmp_path):

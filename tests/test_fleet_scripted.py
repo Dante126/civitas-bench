@@ -299,10 +299,10 @@ def test_a_map_too_big_for_map_overview_falls_back_to_the_observation_map():
     a = _agent("planning", env)
     assert "scale" in ToolBox(env, "planning").call("map_overview")               # downsampled
     turn = _Turn(ToolBox(env, "planning"), 20)
-    view = a._view(turn)
+    view = a._view(turn.call)
     assert view["map"] == env.world.ascii_map() and [c["tool"] for c in turn.trace] == ["map_overview"]
     small = _agent("planning")
-    assert small._view(_Turn(ToolBox(small.env, "planning"), 20))["map"] == small.env.world.ascii_map()
+    assert small._view(_Turn(ToolBox(small.env, "planning"), 20).call)["map"] == small.env.world.ascii_map()
 
 
 def test_region_games_are_refused():

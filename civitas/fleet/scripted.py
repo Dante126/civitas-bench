@@ -41,6 +41,7 @@ PRIORITIES = {           # what each scripted department does (agents/scripted.p
     "health": "landfill first, clinics to 80% coverage, deathcare; a hospital from 5,000",
     "education": "schools to 90% enrolment; a library from 2,500, a university from 6,000",
 }
+CONFIRMED = ("duplicate", "take_back", "reserve", "loan", "bus_line")   # refusals the policy means: repeated
 PLAN_NOTES = ("Budgets are working balances: each turn departments below theirs are topped up, most urgent first, "
               "from the treasury above the reserve. Ask with a dollar amount to raise yours.")
 
@@ -118,8 +119,7 @@ class ScriptedFleetAgent(Agent):
         box = ToolBox(env, role)
         turn = _Turn(box, self.cfg.max_steps)
         brief = briefing(env, role, mode=self.cfg.mode)
-        view = self._view(turn)
-        d = self.policy.act(view)
+        d = self.decide(turn.call)
         if role == "mayor":
             self._plan(turn)
         self._actions(turn, d.actions)
@@ -139,7 +139,12 @@ class ScriptedFleetAgent(Agent):
                     "latency_s": 0.0}
         return out
 
-    def _view(self, turn: _Turn) -> dict:
+    def decide(self, look) -> Decision:
+        """The policy's decision on this turn's view (`_view`); `look(name)` runs a look-up tool and returns its
+        result (None when it can't run): `_Turn.call` here, a scratch ToolBox's in bench/envs.py's model probe."""
+        return self.policy.act(self._view(look))
+
+    def _view(self, look) -> dict:
         """The policy's observation: role_obs, with the map from map_overview and the council from get_messages
         where the policy reads them (as env.observe gives them to the scripted baselines). A map too big for one
         tool result comes downsampled (48x48 always fits); the policies parse single tiles, so they then read the
@@ -148,17 +153,23 @@ class ScriptedFleetAgent(Agent):
         view = role_obs(env, role)
         view["max_actions"] = env.cfg.max_actions_per_turn
         if role in MAP_ROLES:
-            res = turn.call("map_overview") or {}
+            res = look("map_overview") or {}
             full = res.get("ok") and "scale" not in res
             view["map"] = "\n".join(res["map"]) if full else env.world.ascii_map()
         if role == "mayor":
-            res = turn.call("get_messages") or {}
+            res = look("get_messages") or {}
             view["council"] = res.get("messages", [])
         return view
 
     def _plan(self, turn: _Turn) -> None:
-        """The mayor's plan update: the policy's working balances as budget targets (goals, notes and a priority
-        per department with the first plan; a department that lost its target gets 0), when the budgets changed."""
+        args = self.plan_args()
+        if args:
+            turn.call("update_plan", args)
+
+    def plan_args(self) -> dict:
+        """The mayor's plan update (after `decide`): the policy's working balances as budget targets (goals, notes
+        and a priority per department with the first plan; a department that lost its target gets 0), when the
+        budgets changed; {} for no update."""
         env, fleet = self.env, FleetState.of(self.env)
         targets = {d: round(float(v), 2) for d, v in getattr(self.policy, "targets", {}).items() if d in DEPARTMENTS}
         budgets = {**{d: 0.0 for d, v in fleet.plan["budgets"].items() if v and d not in targets}, **targets}
@@ -168,8 +179,7 @@ class ScriptedFleetAgent(Agent):
                     "priorities": {d: PRIORITIES[d] for d in DEPARTMENTS if d in env.roles and d in PRIORITIES}}
         if any(fleet.plan["budgets"].get(d) != v for d, v in budgets.items()):
             args["budgets"] = budgets
-        if args:
-            turn.call("update_plan", args)
+        return args
 
     def _actions(self, turn: _Turn, actions: list[dict]) -> None:
         """Each action as its own tool call, in the policy's order, until the turn's successful-action cap. A money
@@ -187,7 +197,7 @@ class ScriptedFleetAgent(Agent):
             res = turn.call(name, args)
             if res is None:
                 break
-            if res.get("refused") in ("duplicate", "take_back", "reserve", "loan", "bus_line"):     # the policy means it
+            if res.get("refused") in CONFIRMED:                                            # the policy means it
                 turn.call(name, {**args, "confirm": True})
 
     def _memory(self, turn: _Turn) -> None:

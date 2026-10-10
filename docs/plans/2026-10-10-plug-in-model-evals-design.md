@@ -45,7 +45,10 @@ no model, ~10 s for 8 seeds in parallel) and hashes, per part:
 - `config`: the suite and each entry's effective config with the model keys removed;
 - `prompts` / `tools`: each role's system prompt and tool schemas;
 - per seed: `briefings` and `results` (the briefing text and tool results the scripted fleet sees after the
-  hand-over) and `metrics` (the monthly metrics).
+  hand-over) and `metrics` (the monthly metrics);
+- per seed: `model`, what only a model-backed agent meets (ToolAgent's loop and its ToolBox flags): on a copy of the
+  city at the hand-over each fleet role plays one real ToolAgent turn against a canned client (no network) that
+  replies without a tool call, then cut at max_tokens, then with the scripted department's calls and end_turn.
 
 Refactors and comments leave it unchanged; a sim, briefing, tool or config change moves the part it touches. A probe
 is cached per code state (commit + diff hash).

@@ -594,10 +594,29 @@ def restore_signals(old: dict) -> None:
             pass
 
 
+def code_drift(ev: dict, r: dict) -> bool:
+    """Before run `r` starts (later runs start later when workers < runs): the code state (envs.code_state) against
+    the one the eval's environment check ran on (`env.code` from prepare, `env.run_code` after a resume's check).
+    A change marks the eval drifted (`env.drift`, `drift_reason` "code changed during the eval", `code_changed`),
+    never ranked, without stopping it. True when this call found the change."""
+    e = ev.get("env") or {}
+    if not e.get("name") or e.get("code_changed") or not (e.get("run_code") or (e.get("code") or {}).get("commit")):
+        return False
+    from . import envs as V
+    was = e.get("run_code") or V.state_of(e["code"])
+    now = V.code_state()
+    if now == was:
+        return False
+    e.update(drift=True, drift_reason="code changed during the eval",
+             code_changed={"at": time.time(), "before_run": r.get("run_id"), "was": was, "now": now})
+    return True
+
+
 def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
     """Run every run of `ev` whose status isn't finished, `ev["workers"]` at a time, saving eval.json as they start
-    and end; then the scorecard (eval.json `scorecard`, scorecard.md). Ctrl+C, SIGTERM or SIGHUP stops the runs
-    (status "interrupted", `stopped_by` for a signal; `civitas eval --resume <dir>` reruns them)."""
+    and end; then the scorecard (eval.json `scorecard`, scorecard.md). Before each run starts, `code_drift` compares
+    the code with the environment check's. Ctrl+C, SIGTERM or SIGHUP stops the runs (status "interrupted",
+    `stopped_by` for a signal; `civitas eval --resume <dir>` reruns them)."""
     runs_dir = Path(ev["runs_dir"])
     todo = [r for r in ev["runs"] if run_status(runs_dir, r) != "finished"]
     for r in ev["runs"]:
@@ -637,6 +656,9 @@ def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
                     out(f"[eval {ev['name']}] {line}")
             while queue and len(running) < max(1, int(ev["workers"])):
                 r = queue.pop(0)
+                if code_drift(ev, r) and verbose:
+                    out(f"[eval {ev['name']}] the code changed since the environment check: recorded as drifted "
+                        f"(never ranked); the runs go on")
                 proc, log = _start(ev, r, runs_dir)
                 running[r["run_id"]] = (proc, r)
                 save(ev)
@@ -675,9 +697,60 @@ def finish(ev: dict) -> dict:
     return ev
 
 
-def resume(eval_dir: str | Path, *, workers: int | None = None, verbose: bool = True, out=print) -> dict:
+def resume_env(ev: dict, *, env_check=None, probe_workers: int = 8) -> dict | None:
+    """A resume's environment check: for an eval on a version (`env.name`), envs.check again with the eval's own
+    agents / sets (probe cache runs_dir/_cache), recorded in `env.resumes`. A mismatch (or a failed probe, or a suite
+    that now names another version) raises EvalError (eval.json saved with the record) unless the eval was
+    drift-allowed (`env.allow_drift`, or drifted already): then it goes on, drifted. On a pass the code state it
+    checked becomes `env.run_code`, what `code_drift` compares the later runs with. None without a version."""
+    e = ev.get("env") or {}
+    name = e.get("name")
+    if not name:
+        return None
+    from . import envs as V
+    allowed = bool(e.get("allow_drift") or e.get("drift"))
+    rec: dict = {"at": time.time()}
+    try:
+        s = load_suite(suite_path((ev.get("suite") or {}).get("file")))
+        c = (env_check or V.check)(s, agents=list(ev.get("agents") or []), sets=list(ev.get("sets") or []),
+                                   workers=probe_workers, cache_dir=Path(ev["runs_dir"]) / "_cache")
+        pr = c.get("probe") or {}
+        rec.update(env=c["env"], fingerprint=c["fingerprint"], match=c["match"], diff=c.get("diff") or [],
+                   cached=pr.get("cached"), probe_seconds=pr.get("seconds"),
+                   code=V.state_of(pr["code"]) if pr.get("code") else V.code_state())
+        if c["env"] != name:
+            why = f"the suite now names environment {c['env']!r}, the eval runs on {name}"
+        elif c["match"] is not True:
+            why = (f"the code no longer matches environment {name} (changed: {', '.join(rec['diff']) or '?'})"
+                   if c.get("frozen") else f"environment {name} isn't frozen here")
+        else:
+            why = None
+    except Exception as x:                          # e.g. the suite file is gone: can't tell, so it doesn't pass
+        rec.update(match=None, error=f"{type(x).__name__}: {x}", code=V.code_state())
+        why = f"the environment probe failed ({rec['error']})"
+    rec["ok"] = why is None
+    e.setdefault("resumes", []).append(rec)
+    ev["env"] = e
+    if why is None:
+        e["run_code"] = rec["code"]
+        return rec
+    rec["why"] = why
+    if not allowed:
+        save(ev)
+        raise EvalError(f"can't resume: {why}. Resume on the code the eval started on (commit "
+                        f"{(e.get('code') or {}).get('commit') or '?'}), or start a new eval; an eval started with "
+                        f"--allow-drift resumes as drifted")
+    e.update(drift=True, run_code=rec["code"])
+    e.setdefault("drift_reason", f"resumed on other code: {why}")
+    rec["drift"] = True
+    return rec
+
+
+def resume(eval_dir: str | Path, *, workers: int | None = None, verbose: bool = True, out=print,
+           env_check=None, probe_workers: int = 8) -> dict:
     """Rerun an eval's runs that didn't finish: each under a new run id (`<id>_a2`, ...; the old folder stays), after
-    the same checks as a new eval. EvalError while it still runs."""
+    the same checks as a new eval and the environment's (`resume_env`). EvalError while it still runs, or for code
+    that no longer matches the eval's version. `env_check` replaces envs.check (tests)."""
     ev = load(eval_dir)
     live = [r["run_id"] for r in ev["runs"] if r.get("status") == "running" and _alive(r.get("pid"))]
     if (ev.get("status") == "running" and _alive(ev.get("pid")) and ev.get("pid") != os.getpid()) or live:
@@ -686,6 +759,10 @@ def resume(eval_dir: str | Path, *, workers: int | None = None, verbose: bool = 
     errs = check(ev)
     if errs:
         raise EvalError("can't resume:\n  - " + "\n  - ".join(errs))
+    rec = resume_env(ev, env_check=env_check, probe_workers=probe_workers)
+    if rec and verbose:
+        out(f"[eval {ev['name']}] environment {ev['env']['name']}: "
+            + ("matches" if rec["ok"] else f"{rec['why']}: resuming as drifted (never ranked)"))
     runs_dir = Path(ev["runs_dir"])
     for r in ev["runs"]:
         st = run_status(runs_dir, r)
@@ -1478,6 +1555,7 @@ def prepare(model: str | None, *, suite=None, name: str | None = None, allow_dri
             ev["env"] = _env_record(c, allow_drift, errors)
         except Exception as e:                       # e.g. a config the game refuses: say so, don't crash
             ev["env"] = _env_record(None, allow_drift, errors, name=s.env, failure=f"{type(e).__name__}: {e}")
+        ev["env"]["allow_drift"] = bool(allow_drift)          # a resume on changed code goes on only then
     else:
         ev["env"] = _env_record(None, allow_drift, errors)
     # the preflight

@@ -241,12 +241,17 @@ civitas env check | civitas env list | civitas env freeze civitas-v2   # environ
   Keys live in `./.env`. A model not in the registry still works with `-s` and `--provider` as before.
 - **Environment versions** (`civitas/bench/envs.py`): a suite's `[eval] env = "civitas-v1"` names the frozen
   fingerprint in `configs/envs/civitas-v1.json` (git tag `env/civitas-v1`). The fingerprint is behavioural: a probe
-  replays every suite seed with the scripted fleet (the yardstick's line-up, no model, ~11 s for 8 seeds in parallel,
+  replays every suite seed with the scripted fleet (the yardstick's line-up, no model, ~12 s for 8 seeds in parallel,
   cached per code state in `runs/_cache/`) and hashes the config without model keys, the fleet's system prompts and
-  tool schemas, and per seed the briefings and tool results after the hand-over and every month's metrics. A refactor
-  leaves it alone; a sim, briefing, tool or config change moves the part it touches (`civitas env check` names it).
-  An eval on code that no longer matches is refused unless `--allow-drift` (then recorded as drifted and never
-  ranked); bumping is deliberate: freeze a new version and re-evaluate the reference models.
+  tool schemas, and per seed the briefings and tool results after the hand-over, every month's metrics, and a
+  `model` part: what only a model-backed agent meets (the tool loop's nudges, the end_turn and money-ask refusals,
+  refreshed Next lines). For it, on a copy of the city at the hand-over, every fleet role plays one real tool-loop
+  turn against a canned stand-in model (no network): a reply without a tool call, one cut at the token limit, the
+  scripted department's actions one call at a time, end_turn. A refactor leaves the fingerprint alone; a sim,
+  briefing, tool or config change moves the part it touches (`civitas env check` names it). An eval on code that no
+  longer matches is refused unless `--allow-drift` (then recorded as drifted and never ranked); `--resume` checks
+  again (refused on a mismatch unless the eval allowed drift), and code that changes while an eval runs marks it
+  drifted. Bumping is deliberate: freeze a new version and re-evaluate the reference models.
 - **Preflight**: before any run, one real request with two fleet tool schemas must come back as a tool call (a wrong
   key, id or a model without tool calls fails here, for a few hundred tokens). `--dry-run` skips it and runs the env
   check; `eval.json` records `env` (name, fingerprint, match, drift), `model_entry` and `preflight`.

@@ -99,11 +99,13 @@ def _mark(env, city: str | None, scores: dict) -> dict:
     return {"city": scores.get(key), "population": _pop(env, city)}
 
 
-def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bool = False) -> dict:
+def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bool = False,
+         on_handover=None) -> dict:
     """Play `cfg` (a warm-up config) from month 0 with the yardstick line-up, no logs. Returns the yardstick record
     (see the module doc). ValueError without a warm-up; ModelAgentError for a line-up that could call a model.
     `hook(env, role, obs, decision, results)` runs after each turn is applied, only reading (bench/envs.py's probe);
-    `keep_env` puts the finished env on the record as `env` (not JSON)."""
+    `on_handover(env, agents)` runs once at the hand-over, before that month's turns, only reading (the probe's model
+    part plays on a deep copy); `keep_env` puts the finished env on the record as `env` (not JSON)."""
     n = warmup_months(cfg)
     if not n:
         raise ValueError("a yardstick needs a warm-up run ([game].warmup_months > 0)")
@@ -138,6 +140,8 @@ def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bo
             hand = {"month": env.world.month, **_mark(env, None, env.last_scores), "scores": dict(env.last_scores)}
             hand_city = {c: _mark(env, c, env.last_scores) for c in cities}
             record(env.last_scores)
+            if on_handover is not None:
+                on_handover(env, agents)
         acting = [r for r in env.roles if env.acts_this_month(r)]
         early = {r: env.observe(r) for r in acting} if game.simultaneous else {}
         for r in acting:
