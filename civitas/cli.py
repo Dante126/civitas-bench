@@ -136,7 +136,7 @@ def cmd_eval(args):
         ev = E.prepare(args.model, suite=args.suite, name=args.name, allow_drift=args.allow_drift,
                        workers=args.workers, runs_dir=args.runs_dir, provider=args.provider, agents=args.agent,
                        sets=args.set, repeats=args.repeats, stamp=args.stamp, dry_run=args.dry_run,
-                       preflight=not args.no_preflight)
+                       preflight=not args.no_preflight, preflight_result=_preflight_result(args.preflight_result))
         if args.dry_run:
             print(E.dry_run_text(ev, ev["errors"]))
             print()
@@ -154,6 +154,19 @@ def cmd_eval(args):
         sys.exit(f"civitas eval: {e}")
     except KeyboardInterrupt:
         sys.exit(130)
+
+
+def _preflight_result(text: str | None) -> dict | None:
+    """--preflight-result: a passed preflight as JSON (the viewer's, so the eval records it instead of 'skipped')."""
+    if not text:
+        return None
+    try:
+        pf = json.loads(text)
+    except ValueError:
+        sys.exit("civitas eval: --preflight-result must be a preflight record as JSON")
+    if not isinstance(pf, dict) or pf.get("ok") is not True:
+        sys.exit("civitas eval: --preflight-result must be a preflight that passed")
+    return pf
 
 
 def _eval_done(ev: dict) -> None:
@@ -406,6 +419,9 @@ def main(argv=None):
                          "recorded as drifted and never ranked)")
     sp.add_argument("--no-preflight", action="store_true",
                     help="skip the one-request check that the model answers with a tool call")
+    sp.add_argument("--preflight-result", default=None, metavar="JSON",
+                    help="a preflight that already passed for this model, as JSON: recorded as the eval's and no "
+                         "request is sent (the viewer's cached preflight)")
     sp.add_argument("--stamp", default=None, help="the eval folder's time stamp (runs/eval_<name>_<stamp>; the "
                                                   "viewer names the folder before it starts the eval)")
     sp.add_argument("--leaderboard", action="store_true",

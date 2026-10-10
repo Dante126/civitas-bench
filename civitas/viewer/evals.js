@@ -123,12 +123,15 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
   }
   async function loadSuites() { if (P.suites) return P.suites; const r = await req("/api/evals/suites"); P.suites = r.ok ? r.data : []; return P.suites; }
 
+  // a job that ended before writing eval.json (e.g. the eval's own check refused): it never started, whether or not
+  // its folder was named in advance (a stamped eval knows it from the start)
+  const failedStart = (j) => !!j && !j.running && !j.eval_json;
   // the evals still going: jobs this server started (until their folder is listed) and evals whose process lives
   function running() {
     const out = [], seen = new Set();
     for (const j of P.jobs) {
-      if (!j.running && j.eval_dir) continue;
-      if (!j.running && Date.now() / 1000 - j.started > 600) continue;   // a failed start, shown for ten minutes
+      if (!j.running && !failedStart(j)) continue;                       // ended after planning: listed as an eval
+      if (failedStart(j) && Date.now() / 1000 - j.started > 600) continue;   // a failed start, shown for ten minutes
       out.push({ ref: j.eval_dir || j.job, job: j, name: j.job, model: j.model });
       if (j.eval_dir) seen.add(j.eval_dir);
     }
@@ -144,7 +147,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
       if (!shown()) return;
       const live = running();
       if (P.tab === "evals" || live.length) {
-        const before = new Set(live.map(x => x.ref));
+        const before = new Set(live.filter(x => !failedStart(x.job)).map(x => x.ref));   // a failed start stays put
         if (Date.now() - P.lastList > 15000 || !live.length) await loadEvals();
         else { await loadProgress(); const jb = await req("/api/evals/jobs"); if (jb.ok) P.jobs = jb.data; }
         const after = new Set(running().map(x => x.ref));
@@ -163,10 +166,12 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     let st;
     if (!e) st = `<span class="ev-st muted">…</span>`;
     else if (e.computing) st = `<span class="ev-st busy"><span class="ev-spin"></span>checking… <span class="muted small">the scripted fleet replays every suite seed (~10–20 s)</span></span>`;
+    else if (e.unavailable_readonly) st = `<span class="ev-st muted" title="The probe runs only in a civitas serve with launching on">not checked (read-only)</span>`;
     else if (e.error) st = `<span class="ev-st bad" title="${esc(e.error)}">${e.unavailable ? "" : "check failed: "}${esc(e.error)}</span>`;
     else if (!e.frozen || !e.env) st = `<span class="ev-st warn">no version frozen</span>`;
     else if (e.match) st = `<span class="ev-st ok">✓ matches</span>`;
     else st = `<span class="ev-st warn" title="This code plays a different game from the frozen version: evals now are recorded as drifted and not ranked">⚠ changed: ${esc((e.diff || []).join(", ") || "?")}</span>`;
+    if (e && e.stale && !e.computing) st += ` <span class="muted small" title="The code changed since this check; a read-only server doesn't probe again">(checked on older code)</span>`;
     const fp = e && e.fingerprint ? `<span class="muted small mono" title="this code's fingerprint">${esc(String(e.fingerprint).slice(0, 10))}</span>` : "";
     el.innerHTML = `<span class="ev-env-k">Environment</span><b class="ev-env-v">${esc((e && e.env) || "—")}</b>${st}
       ${e && e.suite ? `<span class="muted small">suite ${esc(e.suite)}</span>` : ""}${fp}<div class="grow"></div>
@@ -221,7 +226,8 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
         <label>Key <span class="ev-hint">the name in evals and on the leaderboard</span><input id="mfKey" value="${v("key")}" ${m ? "readonly" : ""} placeholder="e.g. gpt-5" autocomplete="off" spellcheck="false"></label>
         <label>Provider<select id="mfProv">${provs.map(p => `<option ${(m ? m.provider : "arcee") === p ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></label>
         <label class="ev-wide">Served id <span class="ev-hint">the id the API takes, when it differs from the key</span><input id="mfId" value="${v("id")}" placeholder="e.g. openai/gpt-5 on OpenRouter" autocomplete="off" spellcheck="false"></label>
-        <label>Temperature <span class="ev-hint">blank: the suite's</span><input id="mfTemp" type="number" step="0.05" min="0" max="2" value="${v("temperature")}"></label>
+        <label>Temperature <span class="ev-hint">blank: the suite's</span><input id="mfTemp" type="number" step="0.05" min="0" max="2" value="${m && m.temperature !== "default" ? v("temperature") : ""}" ${m && m.temperature === "default" ? "disabled" : ""}></label>
+        <label class="ev-check small" title="Send no temperature at all: the provider's own (OpenAI's reasoning models refuse any other)"><input type="checkbox" id="mfTempDef" ${m && m.temperature === "default" ? "checked" : ""}> Provider default temperature <span class="ev-hint">send none</span></label>
         <label>Max tokens <span class="ev-hint">per reply</span><input id="mfMax" type="number" step="1" min="1" value="${v("max_tokens")}"></label>
         <label class="ev-wide">extra_body <span class="ev-hint">JSON object sent with every request, e.g. {"reasoning": {"effort": "high"}}</span><textarea id="mfExtra" rows="3" spellcheck="false" placeholder="{}">${extra}</textarea></label>
         <label class="ev-wide">Notes<input id="mfNotes" value="${v("notes")}" autocomplete="off"></label>
@@ -235,6 +241,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
         try { const o = JSON.parse(t); if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error("not an object"); $("mfExtra").classList.remove("bad-input"); return o; }
         catch (e) { $("mfExtra").classList.add("bad-input"); return null; }
       };
+      $("mfTempDef").onchange = () => { $("mfTemp").disabled = $("mfTempDef").checked; };
       $("mfExtra").oninput = () => { $("mfErr").textContent = check() === null ? "extra_body must be a JSON object, e.g. {\"top_p\": 0.9}" : ""; };
       $("mfGo").onclick = async () => {
         const key = $("mfKey").value.trim(), extra = check();
@@ -242,7 +249,8 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
         if (extra === null) { $("mfErr").textContent = "extra_body must be a JSON object."; return; }
         const fields = { provider: $("mfProv").value };
         const id = $("mfId").value.trim(); if (id && id !== key) fields.id = id;
-        const t = $("mfTemp").value.trim(); if (t !== "") fields.temperature = Number(t);
+        const t = $("mfTemp").value.trim();
+        if ($("mfTempDef").checked) fields.temperature = "default"; else if (t !== "") fields.temperature = Number(t);
         const mx = $("mfMax").value.trim(); if (mx !== "") fields.max_tokens = Math.round(Number(mx));
         if (Object.keys(extra).length) fields.extra_body = extra;
         const notes = $("mfNotes").value.trim(); if (notes) fields.notes = notes;
@@ -262,7 +270,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     let allow = false, plan = null, busy = false;
     const draw = (s) => {
       const box = s.querySelector("#evPlan");
-      if (busy) { box.innerHTML = `<div class="ev-st busy"><span class="ev-spin"></span>Checking: one preflight request to the model, and the environment probe…</div>`; }
+      if (busy) { box.innerHTML = `<div class="ev-st busy"><span class="ev-spin"></span>Checking: the preflight (one request to the model, unless one passed in the last 10 minutes) and the environment probe…</div>`; }
       else if (!plan) box.innerHTML = "";
       else if (plan.error) box.innerHTML = `<div class="small bad">${esc(plan.error)}</div>`;
       else {
@@ -284,9 +292,11 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
       }
       s.querySelector("#evGo").disabled = busy || !plan || !!plan.error || plan.errors.length > 0;
     };
-    const check = async (s) => {
+    // a preflight that passed in the last 10 minutes is reused by the server (no paid request per suite change or
+    // drift toggle); "Check again" asks the model again
+    const check = async (s, fresh = false) => {
       busy = true; plan = null; draw(s);
-      const r = await req("/api/evals/plan", { model: m.key, suite, allow_drift: allow });
+      const r = await req("/api/evals/plan", { model: m.key, suite, allow_drift: allow, ...(fresh ? { fresh_preflight: true } : {}) });
       busy = false; plan = r.ok ? r.data : { error: errText(r) }; draw(s);
     };
     sheet(`<div class="modal-head"><h3>Evaluate ${esc(m.key)}</h3><button class="btn icon" data-sheet-close aria-label="Close">✕</button></div>
@@ -294,7 +304,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
       <div id="evPlan" class="ev-plan"></div>
       <div class="modal-foot"><button class="btn" id="evRe">↻ Check again</button><div class="grow"></div><button class="btn" data-sheet-close>Cancel</button><button class="btn primary" id="evGo" disabled>Start eval ▸</button></div>`, (s) => {
       s.querySelector("#evSuite").onchange = (e) => { suite = e.target.value; allow = false; check(s); };
-      s.querySelector("#evRe").onclick = () => check(s);
+      s.querySelector("#evRe").onclick = () => check(s, true);
       s.querySelector("#evGo").onclick = async () => {
         const b = s.querySelector("#evGo"); b.disabled = true; b.textContent = "Starting…";
         const r = await req("/api/evals/start", { model: m.key, suite, allow_drift: allow });
@@ -308,7 +318,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
   }
 
   const pfHTML = (pf) => `<div class="ev-pf">${(pf.steps || []).map(st => `<div class="ev-step ${st.ok ? "ok" : "bad"}"><span class="st">${st.ok ? "✓" : "✗"}</span><b>${esc(st.name)}</b><span class="muted">${esc(st.detail || "")}</span></div>`).join("")}
-    ${pf.error ? `<div class="small bad">${esc(pf.error)}</div>` : ""}${pf.seconds != null ? `<div class="muted small">${pf.ok ? "passed" : "failed"} in ${Number(pf.seconds).toFixed(1)} s${pf.served_id ? ` · served id ${esc(pf.served_id)}` : ""}</div>` : ""}</div>`;
+    ${pf.error ? `<div class="small bad">${esc(pf.error)}</div>` : ""}${pf.seconds != null ? `<div class="muted small">${pf.ok ? "passed" : "failed"} in ${Number(pf.seconds).toFixed(1)} s${pf.served_id ? ` · served id ${esc(pf.served_id)}` : ""}${pf.cached ? ` · reused from ${pf.checked ? esc(when(pf.checked)) : "earlier"} (no new request; Check again asks again)` : ""}</div>` : ""}</div>`;
 
   // ------------------------------------------------ tab: Models
   function modelsHTML() {
@@ -380,8 +390,8 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
   const ciText = (a) => !a || a.mean == null ? "—" : `${sgn(a.mean)}${a.lo != null ? ` [${sgn(a.lo)}, ${sgn(a.hi)}]` : a.std != null ? ` ± ${a.std.toFixed(1)}` : ""}`;
   function runningHTML(x) {
     const p = P.progress[x.ref] || {}, j = x.job;
-    const starting = j && !j.eval_dir;
-    if (starting && !j.running) return `<div class="ev-run"><div class="ev-run-h"><b>${esc(x.name)}</b><span class="pill failed">failed to start</span></div><div class="small bad">${esc(j.error || "the eval process ended")}</div></div>`;
+    if (failedStart(j)) return `<div class="ev-run"><div class="ev-run-h"><b>${esc(x.name)}</b><span class="muted small">${esc(x.model || "")}</span><div class="grow"></div><span class="pill failed">failed to start</span></div><div class="small bad" style="white-space:pre-wrap">${esc(j.error || p.error || "the eval process ended before planning its runs")}</div></div>`;
+    const starting = j && !j.eval_json;
     const total = p.total || 0, done = p.finished || 0, failed = p.failed || 0;
     const pct = total ? 100 * done / total : 0, fpct = total ? 100 * failed / total : 0;
     const chips = (p.runs || []).map(r => `<span class="ev-chip s-${esc(r.status)}" title="${esc(r.run_id)}: ${esc(r.status)}">s${esc(r.seed)}${r.months ? ` <span class="muted">${r.month ?? 0}/${r.months}</span>` : ""}</span>`).join("");

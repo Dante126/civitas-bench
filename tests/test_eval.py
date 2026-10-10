@@ -381,6 +381,15 @@ def test_prepare_from_the_registry(tmp_path, fake_llm):
     assert any("isn't frozen" in e for e in ev["errors"])
     ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(), dry_run=True)
     assert ev["errors"] == [] and ev["preflight"]["skipped"] == "dry run: no model call"
+    # a preflight that passed earlier (the viewer's cache, --preflight-result): recorded as this eval's, no request
+    before = FakeLLM.calls
+    passed = {"ok": True, "model": "fake-model", "seconds": 0.3, "steps": [{"name": "key", "ok": True, "detail": "k"}],
+              "error": None}
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(), preflight=False,
+                   preflight_result=passed)
+    assert ev["errors"] == [] and FakeLLM.calls == before
+    assert ev["preflight"]["ok"] and ev["preflight"]["cached"] and not ev["preflight"].get("skipped")
+    assert "passed earlier (cached)" in "\n".join(E.prepare_text(ev))
     # a failed preflight refuses
     os.environ.pop(KEY_ENV)
     ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub())
@@ -491,12 +500,14 @@ def test_leaderboard(tmp_path):
     assert lb["env"] == "tiny-v1" and lb["envs"] == ["civitas-v0", "tiny-v1"] and lb["baseline"] == "base"
     assert [r["model"] for r in lb["rows"]] == ["m2", "base"] and [r["rank"] for r in lb["rows"]] == [1, 2]
     top, base = lb["rows"]
-    assert Path(top["eval_dir"]).name == "eval_m2-new" and top["n_units"] == 5
+    assert top["eval_dir"] == "eval_m2-new" and top["n_units"] == 5      # the folder name, as list_evals' "dir"
+    listed = {e["dir"] for e in E.list_evals(runs)}                      # (the Evals tab joins verdicts on it)
+    assert {r["eval_dir"] for r in lb["rows"]} <= listed and {s["eval_dir"] for s in lb["skipped"]} <= listed
     assert top["vs_yardstick"]["mean"] == pytest.approx(1.44) and top["vs_yardstick"]["lo"] is not None
     assert top["score"]["mean"] == pytest.approx(61.44) and top["departments"]["mayor"] == pytest.approx(0.72)
     assert top["tokens"] == 5 * 1100 and top["verdict"].startswith("m2-new vs base1: m2-new is BETTER")
     assert top["paired"]["wins"] == 5 and base["baseline"] and base["verdict"] is None
-    why = {Path(s["eval_dir"]).name: s["reason"] for s in lb["skipped"]}
+    why = {s["eval_dir"]: s["reason"] for s in lb["skipped"]}
     assert why["eval_m2-old"].startswith("superseded by a newer eval of m2") and why["eval_drift"].startswith("drifted")
     assert why["eval_other"] == "environment civitas-v0, not tiny-v1" and "no environment" in why["eval_noenv"]
     assert why["eval_live"] == "not finished (stopped)" and "eval_base1" not in why

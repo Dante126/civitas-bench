@@ -26,17 +26,27 @@ Endpoints
   GET  /api/models                   registry entries + key_status + latest {eval_dir, score} on the current version,
                                      providers [{name, env, set, builtin}], can_edit
   POST /api/models | /api/models/delete | /api/models/preflight   {key, fields} save (400 {errors}) | {key} | {key}
+                                     (preflight: always a fresh request; a pass is cached for plan / start)
   POST /api/keys                     {env, value}: writes NAME_API_KEY to ./.env; the value is never sent back
-  GET  /api/env[?refresh=1]          envs.check() of the default suite, probed in a background thread per code state:
-                                     {"computing": true} until done
+  GET  /api/env[?refresh=1]          envs.check() of the default suite, probed in a background thread per code state
+                                     (envs.code_state()): {"computing": true} until done. Launching off: never
+                                     probes (the last result, else {"unavailable_readonly": true}); refresh needs
+                                     what a POST here needs (403 otherwise)
   GET  /api/envs                     frozen versions;  POST /api/env/freeze {name}
   GET  /api/evals/suites             eval suites in configs/
-  POST /api/evals/plan               {model, suite?, allow_drift?}: prepare() without starting (runs, estimates, env,
-                                     preflight, errors)
-  POST /api/evals/start              same body: prepare(), then a background `civitas eval` in its own process group;
+  POST /api/evals/plan               {model, suite?, allow_drift?, fresh_preflight?}: prepare() without starting
+                                     (runs, estimates, env, preflight, errors). A preflight that passed for the model
+                                     (and its registry entry) in the last 10 minutes is reused, `cached`, unless
+                                     fresh_preflight (the dialog's Check again)
+  POST /api/evals/start              same body: prepare() (reusing that preflight), then a background `civitas eval`
+                                     in its own process group, handed the preflight to record (--preflight-result);
                                      {eval_dir (null until its folder appears), job}; 400 {errors}
-  GET  /api/evals/progress?dir=D     progress() of an eval folder, or of a job by name while it starts
-  GET  /api/evals/jobs               evals started from this server;  POST /api/evals/stop {dir}: SIGINT to its group
+  GET  /api/evals/progress?dir=D     progress() of an eval folder, or of a job by name or folder: "starting" until
+                                     its eval.json exists, "failed" (error: the log's tail) when it ended before
+  GET  /api/evals/jobs               evals started from this server (eval_json, error / log_tail once ended without
+                                     one);  POST /api/evals/stop {dir}: SIGINT to its group; an eval this server
+                                     didn't start only when eval.json's pid is a live `civitas ... eval` process (and
+                                     its runs' pids `civitas ... run`), else 409 {error}
   GET  /api/evals/leaderboard?env=   leaderboard();  GET /api/evals/scorecard?dir=D  {markdown}
   GET  /api/version                  a stamp of the viewer's files: an open page offers a reload when it changes
   GET  /api/leaderboard              finished runs grouped by agent line-up
@@ -660,9 +670,36 @@ def code_state(root: Path = ROOT) -> str:
     return state
 
 
+_ENV_CODE: dict = {}
+
+
+def env_code_state() -> str:
+    """The code state an environment probe is cached on: envs.code_state() (HEAD, the diff and the untracked files
+    under civitas/ and configs/, the key envs' own probe cache uses), else this module's `code_state` (HEAD and the
+    diff) while bench/envs.py has no such function; trusted for CODE_STATE_S."""
+    now = time.time()
+    if _ENV_CODE.get("at", 0) > now - CODE_STATE_S:
+        return _ENV_CODE["state"]
+    try:
+        fn = getattr(track("envs"), "code_state", None)
+    except Unavailable:
+        fn = None
+    state = None
+    if callable(fn):
+        try:
+            state = str(fn())
+        except Exception:               # git missing or broken: the server's own key
+            state = None
+    state = state or code_state()
+    _ENV_CODE.update(at=now, state=state)
+    return state
+
+
 class EnvCheck:
     """envs.check() of the default suite, probed in a background thread (the scripted fleet replays every seed, ~10-20
-    s) and kept per code state: `get()` answers {"computing": true} until it is done; refresh probes again."""
+    s) and kept per code state (`env_code_state`): `get()` answers {"computing": true} until it is done; refresh
+    probes again. `get(start=False)` (launching off) never starts a probe: the last result, else
+    {"unavailable_readonly": true}."""
 
     def __init__(self, configs_dir: Path, runs_dir: Path | None = None):
         self.configs_dir = configs_dir
@@ -676,12 +713,16 @@ class EnvCheck:
     def suite(self) -> Path:
         return default_suite(self.configs_dir)
 
-    def get(self, refresh: bool = False) -> dict:
+    def get(self, refresh: bool = False, start: bool = True) -> dict:
         envs = track("envs")
-        key = code_state()
+        key = env_code_state()
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 return {"computing": True, "started": self.started}
+            if not start:                   # read-only: a probe costs the server's CPU
+                if self.result is not None:
+                    return self.result if self.key == key else {**self.result, "stale": True}
+                return {"unavailable_readonly": True, "suite": self.suite().name}
             if not refresh and self.key == key and self.result is not None:
                 return self.result
             self.started = time.time()
@@ -706,7 +747,7 @@ class EnvCheck:
     def probe(self) -> dict | None:
         """The last probe, when it was of the code as it is now (freeze reuses it instead of probing again)."""
         with self.lock:
-            fresh = self.key == code_state() and self.result is not None and "error" not in self.result
+            fresh = self.key == env_code_state() and self.result is not None and "error" not in self.result
         return getattr(self, "_probe", None) if fresh else None
 
     def forget(self) -> None:
@@ -714,41 +755,138 @@ class EnvCheck:
             self.key = self.result = None
 
 
+PREFLIGHT_TTL_S = 600.0     # a passing preflight is reused this long (per model and registry entry)
+
+
+class PreflightCache:
+    """Passing preflights per model for PREFLIGHT_TTL_S, so the Evaluate dialog's plan (opened, suite changed, drift
+    toggled) and Start reuse one instead of each paying for a request. Keyed on the model key, its registry entry and
+    its provider's registry table (an edit asks again); a model outside the registry also on the suite, whose config
+    then sets its sampling. "Check again" and Test ask again and refresh it."""
+
+    def __init__(self, ttl: float = PREFLIGHT_TTL_S):
+        self.ttl = ttl
+        self.lock = threading.Lock()
+        self.items: dict[str, tuple[float, dict]] = {}
+
+    @staticmethod
+    def key(model: str, suite=None) -> str | None:
+        try:
+            M = track("models")
+            entry = M.load_registry().get(model)
+            prov = (M.registry_providers() or {}).get(entry.provider) if entry is not None else None
+            d = entry.to_dict() if entry is not None else None
+        except Unavailable:
+            d = prov = None
+        except Exception:               # a registry it can't read: no reuse
+            return None
+        return json.dumps([model, d, prov, None if d is not None else str(suite or "")], sort_keys=True, default=str)
+
+    def get(self, model: str, suite=None) -> dict | None:
+        """The passing preflight of `model` from the last PREFLIGHT_TTL_S, as {..., "cached": true, "checked": t}."""
+        k = self.key(model, suite)
+        if k is None:
+            return None
+        with self.lock:
+            hit = self.items.get(k)
+            if hit is not None and time.time() - hit[0] < self.ttl:
+                return {**hit[1], "cached": True, "checked": hit[0]}
+            self.items.pop(k, None)
+        return None
+
+    def put(self, model: str, result, suite=None) -> None:
+        """Keep a preflight that passed just now (a skipped, failed or reused one isn't kept)."""
+        if not isinstance(result, dict) or result.get("ok") is not True or result.get("skipped") \
+                or result.get("cached"):
+            return
+        k = self.key(model, suite)
+        if k is not None:
+            with self.lock:
+                self.items[k] = (time.time(), dict(result))
+
+
+def process_command(pid: int) -> str | None:
+    """The command line of process `pid` (`ps -o command=`), None when it isn't running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass                            # someone else's process: ps still says what it is
+    except OSError:
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def civitas_process(pid, verb: str) -> str | None:
+    """Why `pid` isn't a live `civitas ... <verb>` process this server may signal (None: it is). An eval.json's
+    pids may be stale and taken by an unrelated process since."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"no process id ({pid!r})"
+    if pid <= 1:
+        return f"no process id ({pid})"
+    cmd = process_command(pid)
+    if cmd is None:
+        return f"process {pid} isn't running"
+    words = cmd.split()
+    if not any("civitas" in w for w in words) or verb not in words:
+        return f"process {pid} isn't a `civitas {verb}` process ({cmd[:120]}): left alone"
+    return None
+
+
 class EvalJobs:
     """`civitas eval` processes started from the Evals page, each in its own process group (its runs are stopped
     with it). The eval's folder is stamped by the eval process when it plans, so a job is known by its name until
     a new runs/eval_<name>_* folder appears (`resolve`)."""
 
-    def __init__(self, runs_dir: Path, configs_dir: Path):
+    def __init__(self, runs_dir: Path, configs_dir: Path, preflights: PreflightCache | None = None):
         self.runs_dir = runs_dir
         self.configs_dir = configs_dir
+        self.preflights = preflights or PreflightCache()
         self.jobs: dict[str, dict] = {}
         self.lock = threading.Lock()
 
     def _folders(self, name: str) -> set[str]:
         return {p.name for p in self.runs_dir.glob(f"eval_{name}_*") if p.is_dir()}
 
-    def command(self, model: str, suite: Path | None, allow_drift: bool, name: str, stamp: str | None = None
-                ) -> list[str]:
+    def command(self, model: str, suite: Path | None, allow_drift: bool, name: str, stamp: str | None = None,
+                preflight: dict | None = None) -> list[str]:
         """The eval process: prepare()'s name and stamp, so it writes the folder prepare() planned, and no second
-        preflight (prepare() ran it; the probe is cached)."""
+        preflight (prepare() ran it, or reused a cached one: passed on to be recorded; the probe is cached)."""
         cmd = [sys.executable, "-m", "civitas.cli", "eval", "--model", model, "--name", name,
                "--runs-dir", str(self.runs_dir)]
         if stamp:
             cmd += ["--stamp", stamp, "--no-preflight"]
+            if isinstance(preflight, dict) and preflight.get("ok") is True:
+                cmd += ["--preflight-result", json.dumps(preflight, separators=(",", ":"), default=str)]
         if suite is not None:
             cmd += ["-s", str(suite)]
         if allow_drift:
             cmd.append("--allow-drift")
         return cmd
 
-    def prepare(self, body: dict) -> tuple[dict, Path | None]:
+    def prepare(self, body: dict, fresh: bool = False) -> tuple[dict, Path | None]:
+        """prepare() of the body's model and suite. Its preflight is the cached passing one when there is one (no
+        request), unless `fresh`; a new passing preflight is cached."""
         model = str(body.get("model") or "").strip()
         if not model or len(model) > 200:
             raise ValueError("name a model")
         suite = suite_path(self.configs_dir, body.get("suite"))
+        cached = None if fresh else self.preflights.get(model, suite)
+        kw = {"preflight": False, "preflight_result": cached} if cached else {"preflight": True}
         ev = evals_fn("prepare")(model, suite=None if suite is None else str(suite),
-                                 allow_drift=bool(body.get("allow_drift")), runs_dir=str(self.runs_dir))
+                                 allow_drift=bool(body.get("allow_drift")), runs_dir=str(self.runs_dir), **kw)
+        if cached:
+            if (ev.get("preflight") or {}).get("skipped"):      # a prepare() that doesn't take preflight_result
+                ev["preflight"] = cached
+        else:
+            self.preflights.put(model, ev.get("preflight"), suite)
         return ev, suite
 
     def start(self, body: dict) -> dict:
@@ -764,7 +902,8 @@ class EvalJobs:
             if old is not None and old["proc"].poll() is None:
                 raise ValueError(f"an eval named {name} is already running from this page")
             before = self._folders(name)
-            cmd = self.command(model, suite, bool(body.get("allow_drift")), name, ev.get("stamp"))
+            cmd = self.command(model, suite, bool(body.get("allow_drift")), name, ev.get("stamp"),
+                               preflight=ev.get("preflight"))
             if sys.platform == "darwin" and shutil.which("caffeinate") and cmd[:1] != ["caffeinate"]:
                 cmd = ["caffeinate", "-dims", *cmd]          # the Mac sleeps during long evals otherwise
             logs = self.runs_dir / "_logs"
@@ -804,16 +943,28 @@ class EvalJobs:
                     return name, job
         return None
 
+    @staticmethod
+    def log_tail(job: dict, lines: int = 8, chars: int = 1200) -> str:
+        try:
+            text = [x.rstrip() for x in job["log"].read_text(errors="replace").splitlines() if x.strip()]
+        except OSError:
+            return ""
+        return "\n".join(text[-lines:])[-chars:]
+
     def state(self, name: str, job: dict) -> dict:
+        """The job as the page shows it. `eval_json`: its folder has eval.json (the eval planned and started); a job
+        that ended without one failed to start, and its log's tail is the `error` (e.g. the eval's own refusal)."""
         rc = job["proc"].poll()
-        out = {"job": name, "model": job["model"], "eval_dir": self.resolve(name), "started": job["started"],
+        d = self.resolve(name)
+        has = d is not None and (self.runs_dir / d / "eval.json").is_file()
+        out = {"job": name, "model": job["model"], "eval_dir": d, "started": job["started"], "eval_json": has,
                "running": rc is None, "returncode": rc, "stopping": job["stopping"]}
-        if rc not in (None, 0):
-            try:
-                lines = [x for x in job["log"].read_text().strip().splitlines() if x.strip()]
-            except OSError:
-                lines = []
-            out["error"] = lines[-1][:400] if lines else f"exit code {rc}"
+        if job.get("stop_skipped"):
+            out["stop_skipped"] = list(job["stop_skipped"])
+        if rc is not None and (rc != 0 or not has):
+            tail = self.log_tail(job)
+            out["log_tail"] = tail
+            out["error"] = tail or (f"exit code {rc}" if rc else "the eval process ended without writing eval.json")
         return out
 
     def status(self) -> list[dict]:
@@ -821,31 +972,34 @@ class EvalJobs:
             items = list(self.jobs.items())
         return sorted((self.state(n, j) for n, j in items), key=lambda r: -r["started"])
 
-    def stop(self, ref: str) -> bool:
+    def stop(self, ref: str) -> tuple[bool, str | None]:
         """SIGINT to the eval's process group (the eval stops its runs and records them interrupted), SIGTERM then
-        SIGKILL if it hasn't ended within STOP_GRACE_S; an eval this server didn't start: SIGINT to its pid."""
+        SIGKILL if it hasn't ended within STOP_GRACE_S; an eval this server didn't start: SIGINT to eval.json's pid,
+        only when that is a live `civitas ... eval` process (`civitas_process`). (stopped, why not)."""
         import signal
         hit = self.job_of(ref)
         if hit is None:
             d = (self.runs_dir / ref).resolve()
             if d.parent != self.runs_dir.resolve() or not ref.startswith("eval_"):
-                return False
+                return False, f"no eval {ref!r}"
             try:
                 ev = json.loads((d / "eval.json").read_text())
-                pid = int(ev.get("pid") or 0)
             except (OSError, ValueError, TypeError):
-                return False
-            if ev.get("status") != "running" or pid <= 0:
-                return False
+                return False, f"no eval {ref!r}"
+            if ev.get("status") != "running":
+                return False, f"{ref} isn't running"
+            why = civitas_process(ev.get("pid"), "eval")
+            if why:
+                return False, f"not stopped: {why}"
             try:
-                os.kill(pid, signal.SIGINT)
-            except OSError:
-                return False
-            return True
+                os.kill(int(ev["pid"]), signal.SIGINT)
+            except OSError as e:
+                return False, f"not stopped: {e}"
+            return True, None
         name, job = hit
         proc = job["proc"]
         if proc.poll() is not None:
-            return False
+            return False, f"{name} has ended already"
         job["stopping"] = True
         try:
             os.killpg(proc.pid, signal.SIGINT)
@@ -864,24 +1018,43 @@ class EvalJobs:
                         pass
             self._stop_runs(name)
         threading.Thread(target=escalate, daemon=True).start()
-        return True
+        return True, None
 
-    def _stop_runs(self, name: str) -> None:
-        """Runs the eval left running (each in its own session) once it has ended: SIGTERM to their groups."""
+    def _stop_runs(self, name: str) -> list[str]:
+        """Runs the eval left running (each in its own session) once it has ended: SIGTERM to their groups, only
+        for a pid that is a live `civitas ... run` process leading its own group (eval.json's pids may be stale).
+        The ones left alone are kept on the job as `stop_skipped` (and returned)."""
         import signal
+        skipped: list[str] = []
         d = self.resolve(name)
         if d is None:
-            return
+            return skipped
         try:
             ev = json.loads((self.runs_dir / d / "eval.json").read_text())
         except (OSError, ValueError):
-            return
+            return skipped
         for r in ev.get("runs") or []:
             if r.get("status") == "running" and r.get("pid"):
+                try:
+                    pid = int(r["pid"])
+                    if process_command(pid) is None:
+                        continue                    # it has ended: nothing to stop
+                    why = civitas_process(pid, "run")
+                    if why is None and os.getpgid(pid) != pid:
+                        why = f"process {pid} doesn't lead its own process group: left alone"
+                except (OSError, ValueError, TypeError):
+                    continue
+                if why:
+                    skipped.append(f"{r.get('run_id') or '?'}: {why}")
+                    continue
                 try:
                     os.killpg(int(r["pid"]), signal.SIGTERM)
                 except (OSError, ValueError):
                     pass
+        with self.lock:
+            if name in self.jobs:
+                self.jobs[name]["stop_skipped"] = skipped
+        return skipped
 
 
 def eval_folder(runs_dir: Path, name: str) -> Path | None:
@@ -1202,11 +1375,13 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                                  "latest": latest.get(e.key) or latest.get(e.served_id)})
                 return self._json({"models": rows, "providers": providers(M), "env": env_name,
                                    "can_edit": launcher is not None and is_local(self.client_address[0])})
-            if parts == ["env"]:
+            if parts == ["env"]:                    # a probe costs the server's CPU: only with launching on
                 refresh = arg("refresh", "0") not in ("", "0", "false")
-                if refresh and launcher is None:
-                    refresh = False                 # a probe costs the server's CPU: only with launching on
-                return self._json(envcheck.get(refresh=refresh))
+                if refresh:                         # a GET any page could send: this computer's viewer only
+                    refusal = self._write_refusal()
+                    if refusal:
+                        return self._json({"error": refusal}, 403)
+                return self._json(envcheck.get(refresh=refresh, start=launcher is not None))
             if parts == ["envs"]:
                 return self._json(track("envs").list_envs())
             if parts == ["evals", "leaderboard"]:
@@ -1220,11 +1395,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                 hit = jobs.job_of(ref) if jobs else None
                 if hit is not None:                 # an eval started from this page: by its name until it has a folder
                     st = jobs.state(*hit)
-                    if st["eval_dir"] is None:
-                        return self._json({**st, "status": "starting" if st["running"] else
-                                           ("failed" if st.get("error") else "stopped"),
+                    d = eval_folder(runs_dir, st["eval_dir"]) if st["eval_dir"] else None
+                    if d is None or not (d / "eval.json").is_file():    # starting, or it ended before planning
+                        return self._json({**st, "status": "starting" if st["running"] else "failed",
                                            "total": None, "finished": 0, "tokens": 0, "eta_s": None, "runs": []})
-                    d = eval_folder(runs_dir, st["eval_dir"])
                     return self._json({**evals_fn("progress")(str(d)), **st})
                 d = eval_folder(runs_dir, ref)
                 if d is None or not (d / "eval.json").exists():
@@ -1260,7 +1434,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                 e = M.load_registry().get(str(body.get("key") or ""))
                 if e is None:
                     return self._json({"ok": False, "error": f"no model {body.get('key')!r} in the registry"}, 404)
-                return self._json(M.preflight(e))
+                res = M.preflight(e)                # Test: always a fresh request; a pass is reused by plan / start
+                if jobs is not None:
+                    jobs.preflights.put(e.key, res)
+                return self._json(res)
             if path == "/api/keys":                 # the value is written to ./.env and never sent back
                 env, value = str(body.get("env") or ""), body.get("value")
                 if not KEY_VAR.match(env):
@@ -1282,7 +1459,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                 envcheck.forget()
                 return self._json({"ok": True, "env": env})
             if path == "/api/evals/plan":           # prepare() without starting: the Evaluate dialog's numbers
-                ev, _ = jobs.prepare(body)
+                ev, _ = jobs.prepare(body, fresh=bool(body.get("fresh_preflight")))
                 return self._json(plan_summary(ev))
             if path == "/api/evals/start":
                 out = jobs.start(body)
@@ -1290,8 +1467,9 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                     return self._json({"ok": False, **out}, 400)
                 return self._json({"ok": True, **out})
             if path == "/api/evals/stop":
-                ok = jobs.stop(str(body.get("dir") or ""))
-                return self._json({"ok": ok}, 200 if ok else 404)
+                ok, why = jobs.stop(str(body.get("dir") or ""))
+                code = 200 if ok else 409 if why and why.startswith("not stopped") else 404
+                return self._json({"ok": ok, **({"error": why} if why else {})}, code)
             return self._json({"error": "not found"}, 404)
 
         def _status(self, d: Path) -> str:
