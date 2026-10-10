@@ -335,6 +335,10 @@ class Launcher:
 
     def configs(self) -> list[dict]:
         from .bench.evals import is_suite
+        try:
+            from .bench.models import is_registry
+        except ImportError:                         # pragma: no cover
+            def is_registry(cfg): return False
         from .config import load_config
         from .fleet.config import fleet_agent_config
         out = []
@@ -346,7 +350,7 @@ class Launcher:
             except Exception as e:  # pragma: no cover
                 out.append({"file": p.name, "error": str(e)})
                 continue
-            if is_suite(cfg):                       # an eval suite (civitas eval -s), not a run config
+            if is_suite(cfg) or is_registry(cfg):  # an eval suite (civitas eval -s) or configs/models.toml
                 continue
             agents = {}
             for r in ROLES:
@@ -536,6 +540,7 @@ class Launcher:
 ENV_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 KEY_VAR = re.compile(r"^[A-Z][A-Z0-9_]*_API_KEY$")
 LOCAL = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+LAUNCHER_POSTS = ("/api/launch", "/api/stop", "/api/pause", "/api/resume")   # a browser on this computer: cross_site
 CODE_STATE_S = 5.0          # how long a code state (commit + diff) is trusted before git is asked again
 START_WAIT_S = 3.0          # how long /api/evals/start waits for the eval's folder before answering with its job
 STOP_GRACE_S = 20.0         # after Stop's SIGINT, how long the eval may take to stop its runs before SIGTERM
@@ -568,6 +573,27 @@ def evals_fn(name: str):
 
 def is_local(host: str) -> bool:
     return host in LOCAL
+
+
+LOOPBACK_NAMES = {"127.0.0.1", "::1", "localhost"}
+
+
+def loopback_name(netloc: str | None) -> bool:
+    """A Host header / Origin netloc naming this computer by a loopback name (any port). A DNS-rebinding page
+    sends its own domain in both Host and Origin, so matching the two isn't enough."""
+    host = (urlparse("//" + (netloc or "")).hostname or "").rstrip(".").lower()
+    return host in LOOPBACK_NAMES
+
+
+def cross_site(headers) -> str | None:
+    """Why a browser request is refused as another site's (None: it isn't): Host must be a loopback name and an
+    Origin, when sent, a loopback origin."""
+    if not loopback_name(headers.get("Host")):
+        return "refused: open the viewer as http://127.0.0.1 or http://localhost to change anything"
+    origin = headers.get("Origin")
+    if origin and (origin == "null" or not loopback_name(urlparse(origin).netloc)):
+        return "refused: the request came from another site"
+    return None
 
 
 def default_suite(configs_dir: Path) -> Path:
@@ -638,8 +664,9 @@ class EnvCheck:
     """envs.check() of the default suite, probed in a background thread (the scripted fleet replays every seed, ~10-20
     s) and kept per code state: `get()` answers {"computing": true} until it is done; refresh probes again."""
 
-    def __init__(self, configs_dir: Path):
+    def __init__(self, configs_dir: Path, runs_dir: Path | None = None):
         self.configs_dir = configs_dir
+        self.cache_dir = None if runs_dir is None else Path(runs_dir) / "_cache"   # shared with prepare()'s probes
         self.lock = threading.Lock()
         self.key = None
         self.result: dict | None = None
@@ -665,7 +692,7 @@ class EnvCheck:
     def _run(self, envs, key: str) -> None:
         suite = self.suite()
         try:
-            res = envs.check(str(suite))
+            res = envs.check(str(suite), **({"cache_dir": self.cache_dir} if self.cache_dir else {}))
             out = {k: v for k, v in res.items() if k != "probe"}
             probe = res.get("probe") or {}
             out.update(suite=suite.name, code=key, checked=time.time(), seconds=probe.get("seconds"))
@@ -701,9 +728,14 @@ class EvalJobs:
     def _folders(self, name: str) -> set[str]:
         return {p.name for p in self.runs_dir.glob(f"eval_{name}_*") if p.is_dir()}
 
-    def command(self, model: str, suite: Path | None, allow_drift: bool, name: str) -> list[str]:
+    def command(self, model: str, suite: Path | None, allow_drift: bool, name: str, stamp: str | None = None
+                ) -> list[str]:
+        """The eval process: prepare()'s name and stamp, so it writes the folder prepare() planned, and no second
+        preflight (prepare() ran it; the probe is cached)."""
         cmd = [sys.executable, "-m", "civitas.cli", "eval", "--model", model, "--name", name,
                "--runs-dir", str(self.runs_dir)]
+        if stamp:
+            cmd += ["--stamp", stamp, "--no-preflight"]
         if suite is not None:
             cmd += ["-s", str(suite)]
         if allow_drift:
@@ -732,7 +764,7 @@ class EvalJobs:
             if old is not None and old["proc"].poll() is None:
                 raise ValueError(f"an eval named {name} is already running from this page")
             before = self._folders(name)
-            cmd = self.command(model, suite, bool(body.get("allow_drift")), name)
+            cmd = self.command(model, suite, bool(body.get("allow_drift")), name, ev.get("stamp"))
             if sys.platform == "darwin" and shutil.which("caffeinate") and cmd[:1] != ["caffeinate"]:
                 cmd = ["caffeinate", "-dims", *cmd]          # the Mac sleeps during long evals otherwise
             logs = self.runs_dir / "_logs"
@@ -743,8 +775,9 @@ class EvalJobs:
             with open(log, "w") as fh:                       # the child keeps its own handle
                 proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=os.getcwd(), env=env,
                                         start_new_session=True)
-            self.jobs[name] = {"proc": proc, "log": log, "started": time.time(), "before": before, "dir": None,
-                               "model": model, "stopping": False}
+            self.jobs[name] = {"proc": proc, "log": log, "started": time.time(), "before": before,
+                               "model": model, "stopping": False,
+                               "dir": Path(ev["dir"]).name if ev.get("stamp") and ev.get("dir") else None}
         end = time.time() + START_WAIT_S
         while time.time() < end and self.resolve(name) is None and proc.poll() is None:
             time.sleep(0.1)
@@ -912,7 +945,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                  envcheck: EnvCheck | None = None, jobs: EvalJobs | None = None):
     index = TurnIndex()
     configs_dir = launcher.configs_dir if launcher is not None else Path(configs_dir).resolve()
-    envcheck = envcheck or EnvCheck(configs_dir)
+    envcheck = envcheck or EnvCheck(configs_dir, runs_dir)
     jobs = jobs or (EvalJobs(runs_dir.resolve(), configs_dir) if launcher is not None else None)
 
     class Handler(SimpleHTTPRequestHandler):
@@ -1094,6 +1127,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
             except json.JSONDecodeError:
                 return self._json({"ok": False, "error": "body must be JSON"}, 400)
             try:
+                if path in LAUNCHER_POSTS and is_local(self.client_address[0]):
+                    refusal = cross_site(self.headers)
+                    if refusal:
+                        return self._json({"ok": False, "error": refusal}, 403)
                 if path == "/api/launch":
                     if launcher is None:
                         return self._json({"ok": False, "error": "launching is disabled"}, 403)
@@ -1130,15 +1167,12 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
         # ------------------------------------------------------------------------------------ the Evals page
         def _write_refusal(self) -> str | None:
             """Why this request may not write (None: it may): the launcher must be on, the client this computer,
-            and a browser's Origin, when it sends one, this server (no other site posting to localhost)."""
+            Host a loopback name and a browser's Origin, when it sends one, a loopback origin (cross_site)."""
             if launcher is None:
                 return "editing is disabled: start `civitas serve` with launching allowed"
             if not is_local(self.client_address[0]):
                 return "editing is allowed from this computer only"
-            origin = self.headers.get("Origin")
-            if origin and urlparse(origin).netloc != (self.headers.get("Host") or ""):
-                return "refused: the request came from another site"
-            return None
+            return cross_site(self.headers)
 
         def _latest(self, env_name: str | None) -> tuple[dict, str | None]:
             """model -> its leaderboard row on `env_name` as {eval_dir, score, interval, city, env}."""
@@ -1318,7 +1352,7 @@ def serve(runs_dir: str | Path = "runs", port: int = 8765, hub=None, background:
     runs_dir = Path(runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
     launcher = Launcher(runs_dir.resolve(), Path(configs_dir).resolve()) if allow_launch else None
-    envcheck = EnvCheck(Path(configs_dir).resolve())
+    envcheck = EnvCheck(Path(configs_dir).resolve(), runs_dir.resolve())
     jobs = EvalJobs(runs_dir.resolve(), Path(configs_dir).resolve()) if allow_launch else None
     httpd = ThreadingHTTPServer((host, port), make_handler(runs_dir, hub, launcher, configs_dir, envcheck, jobs))
     httpd.launcher, httpd.envcheck, httpd.jobs = launcher, envcheck, jobs     # evals keep running when it stops

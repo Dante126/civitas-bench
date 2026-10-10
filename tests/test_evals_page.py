@@ -96,7 +96,7 @@ def fake_envs(calls, delay=0.3):
     probe = {"fingerprint": "0123456789abcdef", "parts": {"config": "a", "prompts": "b", "tools": "c", "seeds": {}},
              "code": {"commit": "x", "dirty": False, "diff_hash": "y"}, "seconds": delay}
 
-    def check(suite, *, probe_result=None):
+    def check(suite, *, probe_result=None, cache_dir=None):
         calls.append(("check", suite))
         time.sleep(delay)
         return {"env": "civitas-v1", "frozen": True, "match": False, "diff": ["briefings", "results"],
@@ -266,6 +266,14 @@ def test_writes_need_the_launcher_and_this_computer(tmp_path, fakes, monkeypatch
         code, text = _post(base, "/api/keys", {"env": "ARCEE_API_KEY", "value": SECRET},
                            headers={"Origin": "http://evil.example"})
         assert code == 403 and "another site" in text
+        # DNS rebinding: a page on rebind.example resolving to 127.0.0.1 sends its own name as Host and Origin
+        port = base.rsplit(":", 1)[1]
+        rebind = {"Host": f"rebind.example:{port}", "Origin": f"http://rebind.example:{port}"}
+        for path, body in [*posts, ("/api/launch", {"map": "city"}), ("/api/stop", {"run_id": "x"})]:
+            code, text = _post(base, path, body, headers=rebind)
+            assert code == 403, (path, text)
+        assert _post(base, "/api/keys", {"env": "ARCEE_API_KEY", "value": SECRET},
+                     headers={"Origin": "null"})[0] == 403
         monkeypatch.setattr(server, "is_local", lambda host: False)
         assert _get(base, "/api/models")[1]["can_edit"] is False
         for path, body in posts:
@@ -394,7 +402,7 @@ def test_start_launches_the_eval_and_stop_ends_its_process_group(tmp_path, fakes
     script.write_text(CHILD)
     seen = []
 
-    def command(self, model, suite, allow_drift, name):
+    def command(self, model, suite, allow_drift, name, stamp=None):
         seen.append((model, suite, allow_drift, name, self.command.__wrapped__(self, model, suite, allow_drift, name)))
         return [sys.executable, str(script), str(self.runs_dir), str(pids)]
     command.__wrapped__ = server.EvalJobs.command
@@ -407,6 +415,10 @@ def test_start_launches_the_eval_and_stop_ends_its_process_group(tmp_path, fakes
         real = seen[0][4]
         assert real[1:6] == ["-m", "civitas.cli", "eval", "--model", "gpt-5"] and "--allow-drift" in real
         assert real[real.index("--name") + 1] == "gpt-5" and "-s" not in real
+        assert "--stamp" not in real                            # the fake prepare() plans no stamp
+        stamped = command.__wrapped__(server.EvalJobs(tmp_path, tmp_path), "gpt-5", None, False, "gpt-5",
+                                          "20261010-120000")
+        assert stamped[-3:] == ["--stamp", "20261010-120000", "--no-preflight"]  # prepare()'s folder, one preflight
         assert _wait(lambda: _get(base, "/api/evals/progress?dir=gpt-5")[1].get("eval_dir"))
         code, d = _get(base, "/api/evals/progress?dir=gpt-5")
         assert d["eval_dir"] == "eval_gpt-5_20261010-120001" and d["total"] == 4 and d["running"] is True
