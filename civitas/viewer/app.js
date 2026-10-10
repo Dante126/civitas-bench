@@ -5,6 +5,7 @@ import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
 import { CollabGraph, BeamLayer, RegionGraph, cityColor, dealState, dealPaid, dealEnd, cityTally, RES_C } from "./collab.js";
 import { RUN_COLORS, COMPARE_MAX, columns, tableHTML, chartsHTML, legendHTML, drawCharts, evalsTableHTML, evalLabel } from "./compare.js";
+import { initEvals } from "./evals.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -2080,6 +2081,11 @@ document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () 
 $("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("moreMenu").hidden; };
 $("compareBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); };
 $("evalsBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "evals"; store.set("cmpMode", "evals"); openCompare(); };
+// the Evals page (evals.js); "Compare runs" on an eval opens its runs in the Compare view
+const evalsPage = initEvals({ toast, onCompareEval: async (dir) => {
+  S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); await loadEvals(); cmpLoadEval(dir);
+} });
+$("evalsTopBtn").onclick = () => evalsPage.open();
 document.addEventListener("click", (e) => { if (!e.target.closest(".tabmore")) $("moreMenu").hidden = true; });
 buildLayerMenu();
 $("layerBtn").onclick = (e) => { e.stopPropagation(); $("layerMenu").hidden = !$("layerMenu").hidden; };
@@ -2107,7 +2113,7 @@ document.addEventListener("keydown", (e) => {
   const tag = e.target.tagName;
   if ((tag === "INPUT" && e.target.type !== "range") || tag === "SELECT" || tag === "TEXTAREA") return;
   if (e.key === "Escape") { document.querySelectorAll(".modal").forEach(m => m.hidden = true); if (!$("teamModal").hidden) closeTeamView(); $("runMenu").hidden = true; $("lineupMenu").hidden = true; $("layerMenu").hidden = true; select(-1); scene.highlightRect(null); return; }
-  if (!$("launchModal").hidden || !$("helpModal").hidden) return;
+  if (!$("launchModal").hidden || !$("helpModal").hidden || !$("evalsModal").hidden) return;
   const k = e.key;
   const map = {
     " ": () => (S.playing ? stop() : play()),

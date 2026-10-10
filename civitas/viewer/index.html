@@ -32,6 +32,7 @@
     </div>
     <div class="grow"></div>
     <button id="regionBtn" class="btn" title="Region map" hidden>🗺 Region map</button>
+    <button id="evalsTopBtn" class="btn" title="Model evals: add a model, evaluate it, read the leaderboard">Evals</button>
     <button id="newRunBtn" class="btn primary" title="Launch a new run">＋ New run</button>
     <button id="helpBtn" class="btn icon" title="Shortcuts (?)">?</button>
   </header>
@@ -203,6 +204,17 @@
       <div class="modal-head"><h3>Compare runs <span id="cmpCount" class="muted small"></span></h3><button class="btn icon" data-close>✕</button></div>
       <div id="cmpTools" class="cmp-tools"></div>
       <div id="cmpBody" class="cmp-body"></div>
+    </div>
+  </div>
+  <!-- the Evals page (evals.js): models, environment version, running and finished evals, leaderboard -->
+  <div id="evalsModal" class="modal" hidden>
+    <div class="modal-card glass evals-card">
+      <div class="modal-head"><h3>Model evals</h3>
+        <div class="seg ev-tabs" id="evTabs" role="tablist"><button data-t="models" role="tab">Models</button><button data-t="evals" role="tab">Evals</button><button data-t="board" role="tab">Leaderboard</button></div>
+        <button class="btn icon" data-close aria-label="Close">✕</button></div>
+      <div id="evEnv" class="ev-env"></div>
+      <div id="evBody" class="ev-body"></div>
+      <div id="evSheet" class="ev-sheet" hidden></div>
     </div>
   </div>
   <div id="toasts"></div>
