@@ -86,7 +86,7 @@ class LLMAgent(Agent):
     kind = "llm"
 
     def __init__(self, role: str, *, model: str, provider: ProviderConfig | None = None,
-                 temperature: float = 0.4, max_tokens: int = 12000, history_turns: int = 0,
+                 temperature: float | None = 0.4, max_tokens: int = 12000, history_turns: int = 0,
                  months: int = 120, target_pop: int = 30000, max_actions: int = 8,
                  extra_body: dict | None = None, city: str | None = None, **kw):
         super().__init__(role, **kw)

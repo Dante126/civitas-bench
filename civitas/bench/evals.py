@@ -1440,14 +1440,16 @@ def prepare(model: str | None, *, suite=None, name: str | None = None, allow_dri
             workers: int | None = None, runs_dir: str | Path = "runs", provider: str | None = None,
             agents: list[str] = (), sets: list[str] = (), repeats: int | None = None, stamp: str | None = None,
             dry_run: bool = False, preflight: bool = True, registry=None, probe_workers: int = 8,
-            env_check=None) -> dict:
+            env_check=None, preflight_result: dict | None = None) -> dict:
     """The eval of `model` before it starts: its registry entry (bench/models.py) as run overrides (else the plain
     --model / --provider path), `plan()`, `check()`, the environment check against the suite's `[eval].env`
     (bench/envs.py; a probe, cached per code state) and a preflight (one real request with fleet tools; skipped in a
     dry run, with `preflight=False`, or once something already refuses). Returns the eval record with
     `model_entry`, `preflight`, `env` ({name, fingerprint, match, diff, drift, ...}) and `errors` (empty: it may
     start). Nothing is written. `stamp` fixes the folder (`runs/eval_<name>_<stamp>`) so a caller can name it before
-    a child process starts it (`civitas eval --stamp`). `env_check` replaces envs.check (tests)."""
+    a child process starts it (`civitas eval --stamp`). `env_check` replaces envs.check (tests). `preflight_result`
+    is a preflight that already passed for this model (the viewer's cache, `civitas eval --preflight-result`): it is
+    recorded as this eval's, `cached` true, and no request is sent (a dry run still records none)."""
     from . import envs as V
     from . import models as M
     s = load_suite(suite_path(suite))
@@ -1481,6 +1483,13 @@ def prepare(model: str | None, *, suite=None, name: str | None = None, allow_dri
     else:
         ev["env"] = _env_record(None, allow_drift, errors)
     # the preflight
+    if preflight_result is not None and not dry_run:
+        ev["preflight"] = {**preflight_result, "cached": preflight_result.get("cached") or True}
+        if not ev["preflight"].get("ok"):
+            errors.append(f"preflight failed: {ev['preflight'].get('error')} (one request with the fleet's "
+                          f"tools must come back as a tool call)")
+        ev["errors"] = list(dict.fromkeys(errors))
+        return ev
     skip = ("dry run: no model call" if dry_run else "turned off (--no-preflight)" if not preflight
             else "the eval would refuse to start anyway" if errors
             else "several models in one eval" if ev.get("model") in (None, "mixed") else None)
@@ -1519,7 +1528,8 @@ def prepare_text(ev: dict) -> list[str]:
     if pf.get("skipped"):
         pline = f"Preflight: skipped ({pf['skipped']})."
     elif pf.get("ok"):
-        pline = f"Preflight: ok in {pf.get('seconds')} s (" + "; ".join(x["detail"] for x in pf["steps"]) + ")."
+        pline = (f"Preflight: ok in {pf.get('seconds')} s (" + "; ".join(x["detail"] for x in pf.get("steps") or [])
+                 + ")" + (", passed earlier (cached)" if pf.get("cached") else "") + ".")
     else:
         pline = f"Preflight: FAILED: {pf.get('error')}."
     if not e.get("name"):
@@ -1678,7 +1688,8 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
     """Per environment version (default: the default suite's), the latest finished, non-drifted eval of each model
     ranked by its score vs the scripted yardstick: {"env", "envs", "baseline", "rows": [...], "skipped": [{"eval_dir",
     "reason"}]}. Each row: model, eval_dir, created, n_units, vs_yardstick / score ({mean, lo, hi}), departments,
-    tokens, cost, and the paired verdict against the baseline model's eval on the same version."""
+    tokens, cost, and the paired verdict against the baseline model's eval on the same version. `eval_dir` (rows and
+    skipped) is the folder's name, as list_evals' "dir" and the server's ?dir= take it."""
     evs = _evals_in(runs_dir)
     envs = sorted({(e.get("env") or {}).get("name") for e in evs} - {None})
     d_env, d_base = _default_env()
@@ -1699,11 +1710,12 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
                else f"not finished ({st})" if st != "finished" else
                "no scored runs" if not a.get("scored") else None)
         if why:
-            skipped.append({"eval_dir": ev["dir"], "name": ev.get("name"), "model": model_key(ev), "reason": why})
+            skipped.append({"eval_dir": Path(ev["dir"]).name, "name": ev.get("name"), "model": model_key(ev),
+                            "reason": why})
             continue
         k = model_key(ev)
         if k in latest:
-            skipped.append({"eval_dir": latest[k]["dir"], "name": latest[k].get("name"), "model": k,
+            skipped.append({"eval_dir": Path(latest[k]["dir"]).name, "name": latest[k].get("name"), "model": k,
                             "reason": f"superseded by a newer eval of {k} ({Path(ev['dir']).name})"})
         latest[k] = ev
     bases = [ev["suite"].get("baseline_model") for ev in latest.values() if (ev.get("suite") or {}).get("baseline_model")]
@@ -1720,7 +1732,8 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
         a = aggregate_of(ev)
         cd = a.get("city_delta") or {}
         p = paired(base_ev, ev) if base_ev is not None and ev is not base_ev else None
-        rows.append({"model": k, "eval_dir": ev["dir"], "name": ev.get("name"), "created": ev.get("created"),
+        rows.append({"model": k, "eval_dir": Path(ev["dir"]).name, "name": ev.get("name"),
+                     "created": ev.get("created"),
                      "n_units": a.get("n_units"), "provider": ev.get("provider"),
                      "vs_yardstick": {x: cd.get(x) for x in ("mean", "lo", "hi")},
                      "score": {x: v for x, v in _final_ci(ev).items() if x in ("mean", "lo", "hi")},

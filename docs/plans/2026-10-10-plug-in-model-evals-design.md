@@ -17,6 +17,7 @@ max_tokens = 16000
 [models.gpt-5]
 provider = "openai"
 id = "gpt-5"                 # the served id when it differs from the key
+temperature = "default"      # send no temperature: reasoning models take only their own
 extra_body = {}
 notes = "..."
 [providers.together]         # a provider not built in
@@ -27,6 +28,9 @@ api_key_env = "TOGETHER_API_KEY"
 - Model keys: `provider`, `id`, `temperature`, `max_tokens`, `extra_body`, `notes`. Environment keys (the compute
   budget, equal for every model: `max_steps`, `turn_tokens`, `act_every`, `max_actions_per_turn`, playbooks) are
   refused in an entry.
+- `temperature` is a number, unset (the suite config's, 0.4), or `"default"`: the request then carries no
+  temperature at all (`fleet.temperature=default`; the fleet config reads it as None and the client leaves the key
+  out, preflight too), since OpenAI's reasoning models refuse any temperature but their own.
 - Built-in providers gain `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`, sends `max_completion_tokens`)
   and `anthropic` (`https://api.anthropic.com/v1/`, `ANTHROPIC_API_KEY`). `ProviderConfig.max_tokens_field` names
   the token-limit field.

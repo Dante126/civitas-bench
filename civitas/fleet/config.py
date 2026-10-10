@@ -2,7 +2,8 @@
 
 A run config's `[fleet]` table holds fleet-wide settings (`playbook` is the fleet playbook) and every
 `[agents.<role>]` with `kind = "fleet"` can override any of them (its `playbook` is the role's playbook; its
-`extra_body` replaces `[fleet].extra_body` as a whole). `[fleet].session_months` is run-wide: a supervised run
+`extra_body` replaces `[fleet].extra_body` as a whole; `temperature = "default"` sends no temperature, the
+provider's own, which OpenAI's reasoning models require). `[fleet].session_months` is run-wide: a supervised run
 pauses after that many months (see `bench/session.py`).
 """
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field, fields
+
+from ..agents.llm_client import temperature_of
 
 MODES = ("autonomous", "supervised")
 
@@ -24,7 +27,7 @@ class FleetAgentConfig:
     max_steps: int = 20              # tool calls per turn
     max_tokens: int = 16000          # per model call
     turn_tokens: int = 80000         # per turn
-    temperature: float = 0.4
+    temperature: float | None = 0.4  # None (`temperature = "default"`): the request carries none
     extra_body: dict = field(default_factory=dict)
 
 
@@ -50,7 +53,10 @@ def fleet_agent_config(cfg: dict, role: str) -> FleetAgentConfig:
         setattr(out, k, int(getattr(out, k)))
         if getattr(out, k) < 1:
             raise ValueError(f"agents.{role}: fleet {k} must be at least 1, got {getattr(out, k)}")
-    out.temperature = float(out.temperature)
+    try:
+        out.temperature = temperature_of(out.temperature)
+    except ValueError as e:
+        raise ValueError(f"agents.{role}: fleet {e}") from None
     out.extra_body = dict(out.extra_body or {})
     if out.mode not in MODES:
         raise ValueError(f"agents.{role}: fleet mode must be one of {', '.join(MODES)}, got {out.mode!r}")

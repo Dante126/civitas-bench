@@ -10,6 +10,7 @@ max_tokens = 16000
 [models.gpt-5]
 provider = "openai"
 id = "gpt-5"                     # the served id when it differs from the key
+temperature = "default"          # send no temperature (OpenAI's reasoning models take only their own)
 
 [providers.together]             # a provider not built in (config.DEFAULT_PROVIDERS)
 base_url = "https://api.together.xyz/v1"
@@ -42,7 +43,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
-from ..agents.llm_client import ChatClient, ProviderConfig
+from ..agents.llm_client import DEFAULT_TEMPERATURE, ChatClient, ProviderConfig, temperature_of
 
 ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = ROOT / "configs/models.toml"
@@ -57,7 +58,8 @@ PREFLIGHT_TOOLS = ("end_turn", "inspect")
 HEADER = """\
 # Model registry: the models `civitas eval --model <key>` and the viewer's Evals page evaluate.
 # Machine-written (the viewer rewrites it: entries sorted, comments other than this header dropped); hand edits are
-# fine. Model keys only: provider, id (the served id when it differs from the key), temperature, max_tokens,
+# fine. Model keys only: provider, id (the served id when it differs from the key), temperature (a number, or
+# "default" to send none: the provider's own, which OpenAI's reasoning models require), max_tokens,
 # extra_body (an inline table sent with every request), notes. The compute budget (max_steps, turn_tokens, act_every,
 # ...) is the environment's, the same for every model, and is refused here. A provider that isn't built in (arcee,
 # openrouter, ollama, openai, anthropic) gets a [providers.<name>] table (base_url, api_key_env). API keys go in ./.env.
@@ -77,7 +79,7 @@ class ModelEntry:
     key: str
     provider: str = "arcee"
     id: str | None = None               # served id; None = key
-    temperature: float | None = None    # None = the suite config's
+    temperature: float | str | None = None    # None = the suite config's; "default" = send none (the provider's)
     max_tokens: int | None = None
     extra_body: dict = field(default_factory=dict)
     notes: str = ""
@@ -110,7 +112,7 @@ def _path(path) -> Path:
 def _data(path=None) -> dict:
     p = _path(path)
     try:
-        return tomllib.loads(p.read_text())
+        return tomllib.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except tomllib.TOMLDecodeError as e:
@@ -127,10 +129,19 @@ def _clean(fields: dict) -> dict:
     return {k: v for k, v in fields.items() if v is not None and v != "" and not (k == "extra_body" and v == {})}
 
 
+def _is_default(v) -> bool:
+    return isinstance(v, str) and v.strip().lower() == DEFAULT_TEMPERATURE
+
+
+def _temperature(v) -> float | str | None:
+    """An entry's temperature: None (unset), "default" (send none) or a float."""
+    return None if v is None else DEFAULT_TEMPERATURE if _is_default(v) else float(v)
+
+
 def _entry(key: str, fields: dict) -> ModelEntry:
     f = _clean(fields)
     return ModelEntry(key=key, provider=str(f.get("provider", "arcee")), id=f.get("id"),
-                      temperature=None if f.get("temperature") is None else float(f["temperature"]),
+                      temperature=_temperature(f.get("temperature")),
                       max_tokens=None if f.get("max_tokens") is None else int(f["max_tokens"]),
                       extra_body=dict(f.get("extra_body") or {}), notes=str(f.get("notes") or ""))
 
@@ -200,8 +211,10 @@ def validate(key: str, fields: dict, path=None) -> list[str]:
                     f"table (base_url, api_key_env) to {_path(path).name}")
     if "id" in f and (not isinstance(f["id"], str) or not f["id"].strip() or any(c.isspace() for c in f["id"])):
         errs.append(f"id must be the served model id (text without spaces), got {f['id']!r}")
-    if "temperature" in f and not (_num(f["temperature"]) and 0 <= f["temperature"] <= 2):
-        errs.append(f"temperature must be a number from 0 to 2, got {f['temperature']!r}")
+    if "temperature" in f and not (_is_default(f["temperature"]) or
+                                   (_num(f["temperature"]) and 0 <= f["temperature"] <= 2)):
+        errs.append(f"temperature must be a number from 0 to 2, or \"default\" to send none (the provider's own), "
+                    f"got {f['temperature']!r}")
     if "max_tokens" in f and not (isinstance(f["max_tokens"], int) and not isinstance(f["max_tokens"], bool)
                                   and 1 <= f["max_tokens"] <= 1_000_000):
         errs.append(f"max_tokens must be a whole number from 1 to 1,000,000, got {f['max_tokens']!r}")
@@ -224,8 +237,15 @@ def validate(key: str, fields: dict, path=None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------------- write
+def _str(s: str) -> str:
+    """A TOML basic string. JSON's escapes are TOML's, but JSON writes a character beyond U+FFFF as a surrogate pair
+    of \\u escapes, which TOML refuses: so non-ASCII stays as it is (control characters are still escaped, and DEL,
+    which JSON leaves raw and TOML doesn't take)."""
+    return json.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 def _key(k: str) -> str:
-    return k if BARE.match(k) else json.dumps(k)
+    return k if BARE.match(k) else _str(k)
 
 
 def _toml(v) -> str:
@@ -239,7 +259,7 @@ def _toml(v) -> str:
             raise ValueError(f"{v} can't be written")
         return repr(v)
     if isinstance(v, str):
-        return json.dumps(v)
+        return _str(v)
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml(x) for x in v) + "]"
     if isinstance(v, dict):
@@ -266,7 +286,7 @@ def _write(path, models: dict[str, ModelEntry], provs: dict[str, dict]) -> None:
     text = render(models, provs)
     tomllib.loads(text)                               # never write a file the registry can't read back
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -431,7 +451,7 @@ def preflight(entry: ModelEntry, path=None, *, provider: ProviderConfig | None =
         res = ChatClient(pc).chat(entry.served_id,
                                   [{"role": "system", "content": PREFLIGHT_SYSTEM},
                                    {"role": "user", "content": PREFLIGHT_USER}],
-                                  temperature=0.4 if entry.temperature is None else entry.temperature,
+                                  temperature=0.4 if entry.temperature is None else temperature_of(entry.temperature),
                                   max_tokens=max_tokens or PREFLIGHT_TOKENS,
                                   extra={**(entry.extra_body or {}), "tools": tools})
     except Exception as e:                              # a failed step, never an exception

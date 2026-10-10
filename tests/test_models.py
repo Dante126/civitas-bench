@@ -208,3 +208,40 @@ def test_chat_client_token_field(fake):
     pc = M.provider_of(M.load_registry(fake)["fake-model"], fake)
     ChatClient(ProviderConfig(**{**pc.__dict__, "max_tokens_field": "max_tokens"})).chat("m", [], max_tokens=7)
     assert Fake.bodies[-1]["max_tokens"] == 7 and "max_completion_tokens" not in Fake.bodies[-1]
+
+
+def test_temperature_default_sends_none(fake):
+    """`temperature = "default"`: no temperature key in any request (OpenAI's reasoning models refuse one), through
+    the registry, the run overrides, the fleet config, the client and the preflight."""
+    Fake.mode = "tool"
+    assert M.validate("o", {"provider": "openai", "temperature": "default"}) == []
+    assert M.validate("o", {"provider": "openai", "temperature": "warm"})
+    e = M.save_entry("reasoner", {"provider": "fake", "id": "o-mini", "temperature": "default"}, fake)
+    assert e.temperature == "default" and 'temperature = "default"' in fake.read_text()
+    assert M.load_registry(fake)["reasoner"].to_dict()["temperature"] == "default"
+    out = M.preflight(M.load_registry(fake)["reasoner"], fake)
+    assert out["ok"] and "temperature" not in Fake.bodies[-1]
+    out = M.preflight(M.load_registry(fake)["fake-model"], fake)      # unset: the suite's 0.4, as before
+    assert out["ok"] and Fake.bodies[-1]["temperature"] == 0.4
+    _, sets = M.eval_overrides(e, path=fake)
+    assert "fleet.temperature=default" in sets
+    cfg = apply_cli_overrides(load_config(ROOT / "configs/fleet_smoke_late.toml"), [], sets)
+    assert fleet_agent_config(cfg, "mayor").temperature is None
+    with pytest.raises(ValueError, match="temperature"):
+        fleet_agent_config(apply_cli_overrides(cfg, [], ["fleet.temperature=warm"]), "mayor")
+    pc = M.provider_of(e, fake)
+    ChatClient(pc).chat("m", [], temperature=None, max_tokens=5)
+    assert "temperature" not in Fake.bodies[-1]
+    ChatClient(pc).chat("m", [], temperature=0.3, max_tokens=5)
+    assert Fake.bodies[-1]["temperature"] == 0.3
+
+
+def test_non_bmp_text_round_trips(tmp_path):
+    """An emoji in notes or extra_body: JSON's ensure_ascii writes a surrogate pair of escapes, which TOML refuses."""
+    p = tmp_path / "models.toml"
+    e = M.save_entry("rocket", {"provider": "arcee", "notes": "fast 🚀 «ok»\ttab\x7fdel",
+                                "extra_body": {"tag 🚀": "🚀"}}, p)
+    text = p.read_text(encoding="utf-8")
+    assert "🚀" in text and "\\ud83d" not in text and "\x7f" not in text
+    back = M.load_registry(p)["rocket"]
+    assert back == e and back.notes == "fast 🚀 «ok»\ttab\x7fdel" and back.extra_body == {"tag 🚀": "🚀"}

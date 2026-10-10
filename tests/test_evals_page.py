@@ -5,6 +5,7 @@ called, no game is played."""
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -131,9 +132,19 @@ def fakes(monkeypatch):
     monkeypatch.setattr(E, "leaderboard", lambda env=None, runs_dir="runs": {**LB, "env": env or LB["env"]},
                         raising=False)
 
-    def prepare(model, *, suite=None, name=None, allow_drift=False, workers=None, runs_dir="runs"):
+    def prepare(model, *, suite=None, name=None, allow_drift=False, workers=None, runs_dir="runs", preflight=True,
+                preflight_result=None):
         calls.append(("prepare", model, suite, allow_drift))
         errors = [] if model != "bad" else ["preflight failed: 401 Unauthorized"]
+        if preflight_result is not None:                     # as evals.prepare: recorded, no request
+            pf = {**preflight_result, "cached": preflight_result.get("cached") or True}
+        elif preflight and not errors:
+            calls.append(("preflight", model))               # the paid request
+            pf = {"ok": True, "model": model, "seconds": 0.5, "steps": [{"name": "tool_call", "ok": True,
+                                                                         "detail": "called end_turn"}], "error": None}
+        else:
+            pf = {"ok": None, "skipped": "turned off (--no-preflight)" if not preflight else "refused anyway",
+                  "model": model, "steps": [], "error": None}
         return {"name": f"{model}", "dir": f"{runs_dir}/eval_{model}_20261010-120000", "workers": 2,
                 "suite": {"name": "singles", "reference_model": "trinity-large-thinking"},
                 "prices": {model: [1.0, 4.0]}, "model": model,
@@ -141,7 +152,7 @@ def fakes(monkeypatch):
                                                                  "completion_tokens": 100_000}} for s in range(4)],
                 "env": {"name": "civitas-v1", "fingerprint": "0123456789abcdef", "match": True, "diff": [],
                         "drift": False},
-                "preflight": {"ok": True, "steps": []}, "model_entry": None, "errors": errors}
+                "preflight": pf, "model_entry": None, "errors": errors}
     monkeypatch.setattr(E, "prepare", prepare, raising=False)
 
     def progress(eval_dir):
@@ -151,6 +162,7 @@ def fakes(monkeypatch):
                 "runs": [{"run_id": "r0", "seed": 0, "status": "finished", "month": 107, "months": 108}]}
     monkeypatch.setattr(E, "progress", progress, raising=False)
     monkeypatch.setattr(server, "_CODE", {})
+    monkeypatch.setattr(server, "_ENV_CODE", {})
     return calls
 
 
@@ -402,7 +414,7 @@ def test_start_launches_the_eval_and_stop_ends_its_process_group(tmp_path, fakes
     script.write_text(CHILD)
     seen = []
 
-    def command(self, model, suite, allow_drift, name, stamp=None):
+    def command(self, model, suite, allow_drift, name, stamp=None, preflight=None):
         seen.append((model, suite, allow_drift, name, self.command.__wrapped__(self, model, suite, allow_drift, name)))
         return [sys.executable, str(script), str(self.runs_dir), str(pids)]
     command.__wrapped__ = server.EvalJobs.command
@@ -419,6 +431,13 @@ def test_start_launches_the_eval_and_stop_ends_its_process_group(tmp_path, fakes
         stamped = command.__wrapped__(server.EvalJobs(tmp_path, tmp_path), "gpt-5", None, False, "gpt-5",
                                           "20261010-120000")
         assert stamped[-3:] == ["--stamp", "20261010-120000", "--no-preflight"]  # prepare()'s folder, one preflight
+        passed = {"ok": True, "steps": [], "seconds": 0.5}
+        handed = command.__wrapped__(server.EvalJobs(tmp_path, tmp_path), "gpt-5", None, False, "gpt-5",
+                                     "20261010-120000", preflight=passed)
+        assert handed[-2] == "--preflight-result" and json.loads(handed[-1]) == passed    # recorded by the eval
+        assert "--preflight-result" not in command.__wrapped__(server.EvalJobs(tmp_path, tmp_path), "gpt-5", None,
+                                                               False, "gpt-5", "20261010-120000",
+                                                               preflight={"ok": None, "skipped": "x"})
         assert _wait(lambda: _get(base, "/api/evals/progress?dir=gpt-5")[1].get("eval_dir"))
         code, d = _get(base, "/api/evals/progress?dir=gpt-5")
         assert d["eval_dir"] == "eval_gpt-5_20261010-120001" and d["total"] == 4 and d["running"] is True
@@ -441,3 +460,199 @@ def test_start_launches_the_eval_and_stop_ends_its_process_group(tmp_path, fakes
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+
+
+FAILING_CHILD = r"""
+import sys, time
+time.sleep(1.0)
+print("[eval gpt-5] checking the environment")
+print("civitas eval: refusing to start the eval:")
+print("  - the code no longer matches environment civitas-v1 (changed: briefings)")
+sys.exit(1)
+"""
+
+
+def test_an_eval_that_ends_before_its_eval_json_failed_to_start(tmp_path, fakes, monkeypatch):
+    """A stamped eval's folder is named before the child creates it: progress says "starting" (not a 500) and, once
+    the child exits without writing eval.json (its own check refused), "failed" with the log's tail."""
+    script = tmp_path / "fail.py"
+    script.write_text(FAILING_CHILD)
+    plain = E.prepare
+
+    def stamped(model, **kw):               # as the real prepare(): a stamp and the folder it names
+        return {**plain(model, **kw), "stamp": "20261010-130000",
+                "dir": f"{kw['runs_dir']}/eval_{model}_20261010-130000"}
+    monkeypatch.setattr(E, "prepare", stamped)
+    monkeypatch.setattr(server.EvalJobs, "command", lambda self, *a, **k: [sys.executable, str(script)])
+    folder = "eval_gpt-5_20261010-130000"
+    httpd, base = _server(tmp_path)
+    try:
+        code, text = _post(base, "/api/evals/start", {"model": "gpt-5"})
+        assert code == 200 and json.loads(text)["eval_dir"] == folder, text     # known before the folder exists
+        for ref in ("gpt-5", folder):
+            code, d = _get(base, f"/api/evals/progress?dir={ref}")
+            assert code == 200 and d["status"] == "starting" and d["eval_json"] is False and d["running"], d
+        assert _wait(lambda: not _get(base, "/api/evals/jobs")[1][0]["running"])
+        job = _get(base, "/api/evals/jobs")[1][0]
+        assert job["eval_dir"] == folder and job["eval_json"] is False and job["returncode"] == 1
+        assert "refusing to start" in job["error"] and "no longer matches" in job["error"]
+        assert "no longer matches" in job["log_tail"]
+        for ref in ("gpt-5", folder):
+            code, d = _get(base, f"/api/evals/progress?dir={ref}")
+            assert code == 200 and d["status"] == "failed" and "no longer matches" in d["error"], d
+        assert not [c for c in fakes if c[0] == "progress"]                    # never read a missing eval.json
+    finally:
+        httpd.shutdown()
+
+
+def test_a_passing_preflight_is_reused_for_ten_minutes(tmp_path, fakes, monkeypatch):
+    handed = []
+
+    def command(self, model, suite, allow_drift, name, stamp=None, preflight=None):
+        handed.append(preflight)
+        return [sys.executable, "-c", "pass"]
+    monkeypatch.setattr(server.EvalJobs, "command", command)
+    paid = lambda: len([c for c in fakes if c[0] == "preflight"])
+    plan = lambda body: json.loads(_post(base, "/api/evals/plan", body)[1])
+    httpd, base = _server(tmp_path)
+    try:
+        p = plan({"model": "gpt-5"})
+        assert paid() == 1 and p["preflight"]["ok"] and not p["preflight"].get("cached")
+        # the dialog again, another suite, the drift toggle: no new request
+        for body in ({"model": "gpt-5"}, {"model": "gpt-5", "allow_drift": True},
+                     {"model": "gpt-5", "suite": "eval_singles.toml"}):
+            p = plan(body)
+            assert p["preflight"]["ok"] and p["preflight"]["cached"] and p["preflight"]["checked"], p
+        assert paid() == 1
+        code, text = _post(base, "/api/evals/start", {"model": "gpt-5"})
+        assert code == 200 and paid() == 1, text
+        assert handed[-1]["ok"] and handed[-1]["cached"] and not handed[-1].get("skipped")   # the eval records it
+        # Check again: a fresh request, which is then the cached one
+        p = plan({"model": "gpt-5", "fresh_preflight": True})
+        assert paid() == 2 and not p["preflight"].get("cached")
+        assert plan({"model": "gpt-5"})["preflight"]["cached"] and paid() == 2
+        # Test: always a request; plan then reuses it
+        assert json.loads(_post(base, "/api/models/preflight", {"key": "trinity-large-thinking"})[1])["ok"]
+        assert json.loads(_post(base, "/api/models/preflight", {"key": "trinity-large-thinking"})[1])["ok"]
+        assert paid() == 4
+        assert plan({"model": "trinity-large-thinking"})["preflight"]["cached"] and paid() == 4
+        # an edited registry entry asks again
+        assert _post(base, "/api/models", {"key": "gpt-5", "fields": {"provider": "openai", "notes": "edited"}})[0] \
+            == 200
+        assert not plan({"model": "gpt-5"})["preflight"].get("cached") and paid() == 5
+        # ten minutes later
+        httpd.jobs.preflights.ttl = 0
+        assert not plan({"model": "gpt-5"})["preflight"].get("cached") and paid() == 6
+        # a refused plan (no preflight) keeps nothing
+        assert plan({"model": "bad"})["errors"] and paid() == 6
+        assert httpd.jobs.preflights.get("bad") is None
+    finally:
+        httpd.shutdown()
+
+
+def _write_eval(runs: Path, name: str, pid, runs_list=()):
+    d = runs / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "eval.json").write_text(json.dumps({"name": name, "runs": list(runs_list), "status": "running", "pid": pid}))
+    return d
+
+
+def test_stop_signals_only_live_civitas_processes(tmp_path, fakes):
+    runs = tmp_path / "runs"
+    sleeper = subprocess.Popen(["sleep", "30"])
+    evalish = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "civitas.cli", "eval"])
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    httpd, base = _server(tmp_path)
+    try:
+        _write_eval(runs, "eval_other_1", sleeper.pid)              # a stale pid now held by something else
+        code, text = _post(base, "/api/evals/stop", {"dir": "eval_other_1"})
+        assert code == 409 and "isn't a `civitas eval` process" in json.loads(text)["error"], text
+        time.sleep(0.3)
+        assert sleeper.poll() is None
+        _write_eval(runs, "eval_other_2", gone.pid)
+        code, text = _post(base, "/api/evals/stop", {"dir": "eval_other_2"})
+        assert code == 409 and "isn't running" in json.loads(text)["error"]
+        _write_eval(runs, "eval_other_3", evalish.pid)
+        assert _wait(lambda: server.civitas_process(evalish.pid, "eval") is None)
+        code, text = _post(base, "/api/evals/stop", {"dir": "eval_other_3"})
+        assert code == 200, text
+        assert evalish.wait(10) != 0                                 # SIGINT
+    finally:
+        httpd.shutdown()
+        for p in (sleeper, evalish):
+            p.kill()
+            p.wait()
+
+
+def test_stop_runs_leaves_pids_that_are_not_civitas_runs(tmp_path):
+    runs = tmp_path / "runs"
+    other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    run = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "civitas.cli", "run"],
+                           start_new_session=True)
+    _write_eval(runs, "eval_n_1", 0, [{"run_id": "r0", "status": "running", "pid": other.pid},
+                                      {"run_id": "r1", "status": "running", "pid": run.pid},
+                                      {"run_id": "r2", "status": "finished", "pid": 1}])
+    jobs = server.EvalJobs(runs, tmp_path)
+    jobs.jobs["n"] = {"proc": other, "dir": "eval_n_1", "before": set(), "model": "m", "stopping": True,
+                      "started": time.time(), "log": tmp_path / "n.log"}
+    try:
+        assert _wait(lambda: server.civitas_process(run.pid, "run") is None)
+        skipped = jobs._stop_runs("n")
+        assert run.wait(10) == -signal.SIGTERM
+        assert other.poll() is None and len(skipped) == 1 and skipped[0].startswith("r0: ")
+        assert "civitas run" in skipped[0]
+        assert jobs.state("n", jobs.jobs["n"])["stop_skipped"] == skipped
+    finally:
+        for p in (other, run):
+            p.kill()
+            p.wait()
+
+
+def _get_h(base, path, headers):
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(base + path, headers=headers))
+        return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_env_check_never_probes_read_only_and_refresh_needs_this_computer(tmp_path, fakes, monkeypatch):
+    checks = lambda: [c for c in fakes if c[0] == "check"]
+    httpd, base = _server(tmp_path, allow_launch=False)
+    try:
+        code, d = _get(base, "/api/env")
+        assert code == 200 and d["unavailable_readonly"] and "computing" not in d
+        assert _get(base, "/api/env?refresh=1")[0] == 403
+        time.sleep(0.2)
+        assert not checks()
+    finally:
+        httpd.shutdown()
+    httpd, base = _server(tmp_path)
+    try:
+        port = base.rsplit(":", 1)[1]
+        assert _get_h(base, "/api/env?refresh=1", {"Host": f"rebind.example:{port}"})[0] == 403   # DNS rebinding
+        assert _get_h(base, "/api/env?refresh=1", {"Origin": "http://evil.example"})[0] == 403
+        monkeypatch.setattr(server, "is_local", lambda host: False)
+        assert _get(base, "/api/env?refresh=1")[0] == 403
+        time.sleep(0.2)
+        assert not checks()
+    finally:
+        httpd.shutdown()
+
+
+def test_env_check_keys_on_envs_code_state(fakes, monkeypatch):
+    assert server.env_code_state() == server.code_state()          # envs without code_state(): the server's own
+    monkeypatch.setattr(sys.modules["civitas.bench.envs"], "code_state", lambda root=None: "head:untracked",
+                        raising=False)
+    monkeypatch.setattr(server, "_ENV_CODE", {})
+    assert server.env_code_state() == "head:untracked"
+
+
+def test_cli_preflight_result():
+    from civitas import cli
+    assert cli._preflight_result(None) is None
+    assert cli._preflight_result('{"ok": true, "steps": []}') == {"ok": True, "steps": []}
+    for bad in ("nope", '{"ok": false}', "[1]"):
+        with pytest.raises(SystemExit):
+            cli._preflight_result(bad)
