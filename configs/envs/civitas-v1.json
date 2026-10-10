@@ -1,0 +1,62 @@
+{
+  "name": "civitas-v1",
+  "fingerprint": "b839e90bb58a0f76",
+  "created": 1791660011.498976,
+  "created_iso": "2026-10-10T12:20:11-0700",
+  "commit": "774d8e712d05",
+  "dirty": false,
+  "suite": "configs/eval_singles.toml",
+  "suite_name": "singles",
+  "probe_version": 1,
+  "probe_seconds": 11.36,
+  "agents": [],
+  "sets": [],
+  "parts": {
+    "config": "24ef31956e26ab49",
+    "prompts": "d80908ffcc7f2308",
+    "tools": "4cf42829ee281c72",
+    "seeds": {
+      "configs/fleet_smoke_late.toml:0": {
+        "briefings": "023345a24f3ec8fe",
+        "results": "97457c09001b87bf",
+        "metrics": "9d0bd1e876337c4f"
+      },
+      "configs/fleet_smoke_late.toml:1": {
+        "briefings": "123878ee9243895e",
+        "results": "3837bb150e820c4d",
+        "metrics": "915a80762fc2f942"
+      },
+      "configs/fleet_smoke_late.toml:2": {
+        "briefings": "e68771072ef56dcb",
+        "results": "a987b852304d9859",
+        "metrics": "4e9618bde02b4fc0"
+      },
+      "configs/fleet_smoke_late.toml:3": {
+        "briefings": "6ade97fd6bf31b2a",
+        "results": "db80c24bc7290ef8",
+        "metrics": "be4f075496697f74"
+      },
+      "configs/fleet_smoke_late.toml:4": {
+        "briefings": "ec30be19262af2cf",
+        "results": "97463402cfe3d893",
+        "metrics": "7d1d4e6bf7fabd40"
+      },
+      "configs/fleet_smoke_late.toml:5": {
+        "briefings": "7488818f267ff898",
+        "results": "f4a75a1dc3a1fdc0",
+        "metrics": "26b0410382428037"
+      },
+      "configs/fleet_smoke_late.toml:6": {
+        "briefings": "de6c6cf3a65ce67c",
+        "results": "1862846fec79eaaa",
+        "metrics": "fb820147a3530c2e"
+      },
+      "configs/fleet_smoke_late.toml:7": {
+        "briefings": "95ee9c4a611a8503",
+        "results": "5c638d12b13e7d8f",
+        "metrics": "46a1f949b26c1c82"
+      }
+    }
+  },
+  "tag": "env/civitas-v1"
+}
