@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from .agents.base import NoopAgent, RandomAgent
 from .agents.llm import LLMAgent
-from .agents.llm_client import ProviderConfig
+from .agents.llm_client import ProviderConfig, temperature_of
 from .agents.remote import RemoteAgent
 from .agents.scripted import SCRIPTED
 from .bench.scoring import ScoringConfig
@@ -26,6 +26,9 @@ DEFAULT_PROVIDERS = {
     "arcee": {"base_url": "https://api.arcee.ai/api/v1", "api_key_env": "ARCEE_API_KEY"},
     "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
     "ollama": {"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+    "openai": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY",
+               "max_tokens_field": "max_completion_tokens"},
+    "anthropic": {"base_url": "https://api.anthropic.com/v1/", "api_key_env": "ANTHROPIC_API_KEY"},  # OpenAI-compatible
 }
 
 
@@ -185,7 +188,7 @@ def build_agents(cfg: dict, roles: list[str], game: GameConfig, scoring: Scoring
                 raise ValueError(f"agents.{role}: llm agents need a 'model'")
             agents[role] = LLMAgent(
                 base, model=spec.pop("model"), provider=prov, city=city,
-                temperature=float(spec.pop("temperature", 0.4)),
+                temperature=temperature_of(spec.pop("temperature", 0.4)),
                 max_tokens=int(spec.pop("max_tokens", 12000)),
                 history_turns=int(spec.pop("history_turns", 0)),
                 extra_body=spec.pop("extra_body", None),

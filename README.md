@@ -222,6 +222,45 @@ civitas eval -s configs/eval_late.toml --adopt <run_id> ... --name x    # an eva
   provider, overrides, the code commit, each run's id, command, status and attempts, and the scorecard data) and
   `scorecard.md`.
 
+**Plug-in evals: the registry, environment versions, the leaderboard.** The everyday form is just a model key:
+
+```bash
+civitas models                                   # the registry (configs/models.toml) and whether each API key is set
+civitas eval --model trinity-mini --dry-run      # the default suite (configs/eval_singles.toml): plan + env check
+civitas eval --model trinity-mini                # env check, preflight, the 8 runs, the scorecard
+civitas eval --leaderboard [--env civitas-v1]    # ranked evals of one version; writes runs/leaderboard_<env>.md
+civitas env check | civitas env list | civitas env freeze civitas-v2   # environment versions
+```
+
+- **Registry** (`configs/models.toml`, `civitas/bench/models.py`): one `[models.<key>]` per model with only model
+  keys (`provider`, `id` when the served id differs from the key, `temperature`, `max_tokens`, `extra_body`, `notes`).
+  The compute budget (`max_steps`, `turn_tokens`, `act_every`, `max_actions_per_turn`, playbooks, `mode`) is the
+  environment's, equal for every model, and refused in an entry. Built-in providers: arcee, openrouter, ollama,
+  openai (sends `max_completion_tokens`) and anthropic (its OpenAI-compatible endpoint); any other gets a
+  `[providers.<name>]` table there (`base_url`, `api_key_env`), passed to each run as `--set providers.<name>.*`.
+  Keys live in `./.env`. A model not in the registry still works with `-s` and `--provider` as before.
+- **Environment versions** (`civitas/bench/envs.py`): a suite's `[eval] env = "civitas-v1"` names the frozen
+  fingerprint in `configs/envs/civitas-v1.json` (git tag `env/civitas-v1`). The fingerprint is behavioural: a probe
+  replays every suite seed with the scripted fleet (the yardstick's line-up, no model, ~12 s for 8 seeds in parallel,
+  cached per code state in `runs/_cache/`) and hashes the config without model keys, the fleet's system prompts and
+  tool schemas, and per seed the briefings and tool results after the hand-over, every month's metrics, and a
+  `model` part: what only a model-backed agent meets (the tool loop's nudges, the end_turn and money-ask refusals,
+  refreshed Next lines). For it, on a copy of the city at the hand-over, every fleet role plays one real tool-loop
+  turn against a canned stand-in model (no network): a reply without a tool call, one cut at the token limit, the
+  scripted department's actions one call at a time, end_turn. A refactor leaves the fingerprint alone; a sim,
+  briefing, tool or config change moves the part it touches (`civitas env check` names it). An eval on code that no
+  longer matches is refused unless `--allow-drift` (then recorded as drifted and never ranked); `--resume` checks
+  again (refused on a mismatch unless the eval allowed drift), and code that changes while an eval runs marks it
+  drifted. Bumping is deliberate: freeze a new version and re-evaluate the reference models.
+- **Preflight**: before any run, one real request with two fleet tool schemas must come back as a tool call (a wrong
+  key, id or a model without tool calls fails here, for a few hundred tokens). `--dry-run` skips it and runs the env
+  check; `eval.json` records `env` (name, fingerprint, match, drift), `model_entry` and `preflight`.
+- **Leaderboard**: per version, the latest finished, non-drifted eval of each model, ranked by its score vs the
+  scripted yardstick (95% interval), with the final city score, departments, tokens, cost and the paired verdict
+  against the suite's `baseline_model` (trinity-large-thinking). Evals of other versions, drifted, unfinished or
+  superseded are listed as not ranked, with the reason. The viewer's Evals page (Models, Evals, Leaderboard) drives
+  all of this from `civitas serve`. Stopping an eval (SIGTERM / SIGHUP to `civitas eval`, or Ctrl+C) stops its runs.
+
 **Units, repeats and intervals.** A **unit** is a config and seed. Its warm-up is scripted and deterministic, so
 every run of a unit starts from the same city, and the model's temperature makes the runs differ after it.
 `repeats = K` on a `[[runs]]` entry, `[eval] repeats` or `--repeats K` plays each unit K times (run ids end in

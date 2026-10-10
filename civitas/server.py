@@ -21,6 +21,33 @@ Endpoints
   GET  /api/compare?runs=a,b,c       runs side by side (bench/compare.py), each warm-up run's yardstick included
   GET  /api/evals                    model evals (civitas eval, bench/evals.py): each eval folder's model, suite, runs
                                      and the aggregate of its scorecard
+  The Evals page (bench/models.py registry, bench/envs.py versions, bench/evals.py; 501 while a module is missing).
+  Every POST here needs the launcher and a request from this computer (no other site's Origin):
+  GET  /api/models                   registry entries + key_status + latest {eval_dir, score} on the current version,
+                                     providers [{name, env, set, builtin}], can_edit
+  POST /api/models | /api/models/delete | /api/models/preflight   {key, fields} save (400 {errors}) | {key} | {key}
+                                     (preflight: always a fresh request; a pass is cached for plan / start)
+  POST /api/keys                     {env, value}: writes NAME_API_KEY to ./.env; the value is never sent back
+  GET  /api/env[?refresh=1]          envs.check() of the default suite, probed in a background thread per code state
+                                     (envs.code_state()): {"computing": true} until done. Launching off: never
+                                     probes (the last result, else {"unavailable_readonly": true}); refresh needs
+                                     what a POST here needs (403 otherwise)
+  GET  /api/envs                     frozen versions;  POST /api/env/freeze {name}
+  GET  /api/evals/suites             eval suites in configs/
+  POST /api/evals/plan               {model, suite?, allow_drift?, fresh_preflight?}: prepare() without starting
+                                     (runs, estimates, env, preflight, errors). A preflight that passed for the model
+                                     (and its registry entry) in the last 10 minutes is reused, `cached`, unless
+                                     fresh_preflight (the dialog's Check again)
+  POST /api/evals/start              same body: prepare() (reusing that preflight), then a background `civitas eval`
+                                     in its own process group, handed the preflight to record (--preflight-result);
+                                     {eval_dir (null until its folder appears), job}; 400 {errors}
+  GET  /api/evals/progress?dir=D     progress() of an eval folder, or of a job by name or folder: "starting" until
+                                     its eval.json exists, "failed" (error: the log's tail) when it ended before
+  GET  /api/evals/jobs               evals started from this server (eval_json, error / log_tail once ended without
+                                     one);  POST /api/evals/stop {dir}: SIGINT to its group; an eval this server
+                                     didn't start only when eval.json's pid is a live `civitas ... eval` process (and
+                                     its runs' pids `civitas ... run`), else 409 {error}
+  GET  /api/evals/leaderboard?env=   leaderboard();  GET /api/evals/scorecard?dir=D  {markdown}
   GET  /api/version                  a stamp of the viewer's files: an open page offers a reload when it changes
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
@@ -60,8 +87,9 @@ from .bench import control, live  # noqa: E402
 # the New run dialog (POST /api/launch with `map`): a map, a length and a team over one config's settings
 LAUNCH_BASE = "fleet_trinity.toml"          # [fleet] playbooks and limits, [providers], max actions, scoring
 MAPS = {"city": [], "two": ["north", "south"], "three": ["north", "south", "east"]}   # [] = one city
-MODELS = ["arcee/trinity-large-thinking", "arcee/trinity-large-v1", "arcee/trinity-mini"]
+MODELS = ["arcee/trinity-large-thinking", "arcee/trinity-large-v1", "arcee/trinity-mini"]   # without a registry
 KEYS = {"arcee": "ARCEE_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+ROOT = Path(__file__).resolve().parents[1]          # the checkout this package runs from
 
 ACTIONS = {a for spec in ROLE_SPECS.values() for a in spec["actions"]}   # fleet tools that run a game action
 # how the runner writes a trajectory record's first keys; a line that doesn't start like this is parsed whole
@@ -317,6 +345,10 @@ class Launcher:
 
     def configs(self) -> list[dict]:
         from .bench.evals import is_suite
+        try:
+            from .bench.models import is_registry
+        except ImportError:                         # pragma: no cover
+            def is_registry(cfg): return False
         from .config import load_config
         from .fleet.config import fleet_agent_config
         out = []
@@ -328,7 +360,7 @@ class Launcher:
             except Exception as e:  # pragma: no cover
                 out.append({"file": p.name, "error": str(e)})
                 continue
-            if is_suite(cfg):                       # an eval suite (civitas eval -s), not a run config
+            if is_suite(cfg) or is_registry(cfg):  # an eval suite (civitas eval -s) or configs/models.toml
                 continue
             agents = {}
             for r in ROLES:
@@ -363,15 +395,16 @@ class Launcher:
         from .fleet.config import fleet_agent_config
         path = self.configs_dir / LAUNCH_BASE
         cfg = load_config(path) if path.is_file() else {"game": {}, "fleet": {}}
+        listed, keys = launch_models()
         try:
             fc = fleet_agent_config(cfg, "mayor")
             fleet = {"model": f"{fc.provider}/{fc.model}", "max_steps": fc.max_steps}
         except ValueError:
-            fleet = {"model": MODELS[0], "max_steps": 20}
-        models = MODELS if fleet["model"] in MODELS else [fleet["model"], *MODELS]
+            fleet = {"model": listed[0], "max_steps": 20}
+        models = listed if fleet["model"] in listed else [fleet["model"], *listed]
         return {"base": LAUNCH_BASE if path.is_file() else None, "roles": ROLES, "maps": MAPS, "models": models,
                 "fleet": fleet, "months": 24, "act_every": cfg["game"].get("act_every", 3),
-                "keys": {p: _has_key(k) for p, k in KEYS.items()}}
+                "keys": {p: _has_key(k) for p, k in keys.items()}}
 
     def compose(self, body: dict) -> tuple[str, list[str]]:
         """The New run dialog's run: `civitas run` on LAUNCH_BASE with the map, length and every role's agent."""
@@ -511,8 +544,582 @@ class Launcher:
         return bool(p and p["proc"].poll() not in (None, 0))
 
 
-def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
+# ---------------------------------------------------------------------------------------------------- the Evals page
+# the model registry (bench/models.py), environment versions (bench/envs.py) and evals (bench/evals.py) from the
+# viewer: GET reads work without the launcher; every write needs it and a request from this computer (`writable`)
+ENV_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+KEY_VAR = re.compile(r"^[A-Z][A-Z0-9_]*_API_KEY$")
+LOCAL = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+LAUNCHER_POSTS = ("/api/launch", "/api/stop", "/api/pause", "/api/resume")   # a browser on this computer: cross_site
+CODE_STATE_S = 5.0          # how long a code state (commit + diff) is trusted before git is asked again
+START_WAIT_S = 3.0          # how long /api/evals/start waits for the eval's folder before answering with its job
+STOP_GRACE_S = 20.0         # after Stop's SIGINT, how long the eval may take to stop its runs before SIGTERM
+EVALS_POSTS = {"/api/models", "/api/models/delete", "/api/models/preflight", "/api/keys", "/api/env/freeze",
+               "/api/evals/plan", "/api/evals/start", "/api/evals/stop"}
+
+
+class Unavailable(RuntimeError):
+    """A track of the Evals page that isn't installed (bench/models.py, bench/envs.py or an evals.py function)."""
+
+
+def track(name: str):
+    """civitas.bench.<name> (models / envs / evals), Unavailable when the module isn't there."""
+    import importlib
+    full = f"{__package__}.bench.{name}"
+    try:
+        return importlib.import_module(full)
+    except ModuleNotFoundError as e:
+        if e.name == full:
+            raise Unavailable(f"bench/{name}.py is not in this checkout") from None
+        raise
+
+
+def evals_fn(name: str):
+    fn = getattr(track("evals"), name, None)
+    if fn is None:
+        raise Unavailable(f"bench/evals.py has no {name}() in this checkout")
+    return fn
+
+
+def is_local(host: str) -> bool:
+    return host in LOCAL
+
+
+LOOPBACK_NAMES = {"127.0.0.1", "::1", "localhost"}
+
+
+def loopback_name(netloc: str | None) -> bool:
+    """A Host header / Origin netloc naming this computer by a loopback name (any port). A DNS-rebinding page
+    sends its own domain in both Host and Origin, so matching the two isn't enough."""
+    host = (urlparse("//" + (netloc or "")).hostname or "").rstrip(".").lower()
+    return host in LOOPBACK_NAMES
+
+
+def cross_site(headers) -> str | None:
+    """Why a browser request is refused as another site's (None: it isn't): Host must be a loopback name and an
+    Origin, when sent, a loopback origin."""
+    if not loopback_name(headers.get("Host")):
+        return "refused: open the viewer as http://127.0.0.1 or http://localhost to change anything"
+    origin = headers.get("Origin")
+    if origin and (origin == "null" or not loopback_name(urlparse(origin).netloc)):
+        return "refused: the request came from another site"
+    return None
+
+
+def default_suite(configs_dir: Path) -> Path:
+    """The suite an eval runs without -s: evals.DEFAULT_SUITE, looked up in the server's configs folder."""
+    name = getattr(track("evals"), "DEFAULT_SUITE", "configs/eval_singles.toml")
+    return configs_dir / Path(name).name
+
+
+def suite_path(configs_dir: Path, suite) -> Path | None:
+    """A suite file named by the browser: only a file directly in the configs folder (None: the default)."""
+    if suite in (None, ""):
+        return None
+    p = (configs_dir / Path(str(suite)).name).resolve()
+    if p.parent != configs_dir.resolve() or not p.is_file():
+        raise ValueError(f"unknown suite {suite!r}")
+    return p
+
+
+def launch_models() -> tuple[list[str], dict[str, str]]:
+    """The New run dialog's models ("provider/served id") and provider -> API key variable, from the registry
+    (configs/models.toml) and the providers; MODELS / KEYS while bench/models.py isn't there or lists nothing."""
+    try:
+        M = track("models")
+        reg = M.load_registry()
+        models = [f"{e.provider}/{e.served_id}" for e in reg.values()]
+        models = [m for m in dict.fromkeys(models) if AGENT_SPEC.match(f"fleet:{m}")]
+        keys = {p["name"]: p["env"] for p in providers(M) if p["env"]}
+    except Unavailable:
+        return MODELS, KEYS
+    except Exception:           # a broken registry file must not take the New run dialog down
+        return MODELS, KEYS
+    return models or MODELS, {**KEYS, **keys}
+
+
+def providers(M) -> list[dict]:
+    """Built-in providers (config.DEFAULT_PROVIDERS) and the registry's [providers.X]: name, key variable, set."""
+    from .config import DEFAULT_PROVIDERS
+    reg = M.registry_providers() or {}
+    out = []
+    for name in dict.fromkeys([*DEFAULT_PROVIDERS, *reg]):
+        spec = {**DEFAULT_PROVIDERS.get(name, {}), **(reg.get(name) or {})}
+        env = str(spec.get("api_key_env") or "")
+        out.append({"name": name, "env": env, "set": bool(env) and _has_key(env), "builtin": name in DEFAULT_PROVIDERS,
+                    "base_url": spec.get("base_url")})
+    return out
+
+
+_CODE: dict = {}
+
+
+def code_state(root: Path = ROOT) -> str:
+    """The code an environment probe ran on: HEAD and a hash of the diff against it (trusted for CODE_STATE_S)."""
+    import hashlib
+    now = time.time()
+    if _CODE.get("at", 0) > now - CODE_STATE_S and _CODE.get("root") == str(root):
+        return _CODE["state"]
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=10)
+        diff = subprocess.run(["git", "diff", "HEAD"], cwd=root, capture_output=True, timeout=20)
+        state = f"{head.stdout.strip() or 'nogit'}:{hashlib.sha1(diff.stdout).hexdigest()[:12]}"
+    except (OSError, subprocess.SubprocessError):
+        state = "nogit"
+    _CODE.update(at=now, root=str(root), state=state)
+    return state
+
+
+_ENV_CODE: dict = {}
+
+
+def env_code_state() -> str:
+    """The code state an environment probe is cached on: envs.code_state() (HEAD, the diff and the untracked files
+    under civitas/ and configs/, the key envs' own probe cache uses), else this module's `code_state` (HEAD and the
+    diff) while bench/envs.py has no such function; trusted for CODE_STATE_S."""
+    now = time.time()
+    if _ENV_CODE.get("at", 0) > now - CODE_STATE_S:
+        return _ENV_CODE["state"]
+    try:
+        fn = getattr(track("envs"), "code_state", None)
+    except Unavailable:
+        fn = None
+    state = None
+    if callable(fn):
+        try:
+            state = str(fn())
+        except Exception:               # git missing or broken: the server's own key
+            state = None
+    state = state or code_state()
+    _ENV_CODE.update(at=now, state=state)
+    return state
+
+
+class EnvCheck:
+    """envs.check() of the default suite, probed in a background thread (the scripted fleet replays every seed, ~10-20
+    s) and kept per code state (`env_code_state`): `get()` answers {"computing": true} until it is done; refresh
+    probes again. `get(start=False)` (launching off) never starts a probe: the last result, else
+    {"unavailable_readonly": true}."""
+
+    def __init__(self, configs_dir: Path, runs_dir: Path | None = None):
+        self.configs_dir = configs_dir
+        self.cache_dir = None if runs_dir is None else Path(runs_dir) / "_cache"   # shared with prepare()'s probes
+        self.lock = threading.Lock()
+        self.key = None
+        self.result: dict | None = None
+        self.thread: threading.Thread | None = None
+        self.started = None
+
+    def suite(self) -> Path:
+        return default_suite(self.configs_dir)
+
+    def get(self, refresh: bool = False, start: bool = True) -> dict:
+        envs = track("envs")
+        key = env_code_state()
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                return {"computing": True, "started": self.started}
+            if not start:                   # read-only: a probe costs the server's CPU
+                if self.result is not None:
+                    return self.result if self.key == key else {**self.result, "stale": True}
+                return {"unavailable_readonly": True, "suite": self.suite().name}
+            if not refresh and self.key == key and self.result is not None:
+                return self.result
+            self.started = time.time()
+            self.thread = threading.Thread(target=self._run, args=(envs, key), daemon=True)
+            self.thread.start()
+            return {"computing": True, "started": self.started}
+
+    def _run(self, envs, key: str) -> None:
+        suite = self.suite()
+        try:
+            res = envs.check(str(suite), **({"cache_dir": self.cache_dir} if self.cache_dir else {}))
+            out = {k: v for k, v in res.items() if k != "probe"}
+            probe = res.get("probe") or {}
+            out.update(suite=suite.name, code=key, checked=time.time(), seconds=probe.get("seconds"))
+            self._probe = probe
+        except Exception as e:
+            out = {"error": f"{type(e).__name__}: {e}", "suite": suite.name, "code": key, "checked": time.time()}
+            self._probe = None
+        with self.lock:
+            self.key, self.result = key, out
+
+    def probe(self) -> dict | None:
+        """The last probe, when it was of the code as it is now (freeze reuses it instead of probing again)."""
+        with self.lock:
+            fresh = self.key == env_code_state() and self.result is not None and "error" not in self.result
+        return getattr(self, "_probe", None) if fresh else None
+
+    def forget(self) -> None:
+        with self.lock:
+            self.key = self.result = None
+
+
+PREFLIGHT_TTL_S = 600.0     # a passing preflight is reused this long (per model and registry entry)
+
+
+class PreflightCache:
+    """Passing preflights per model for PREFLIGHT_TTL_S, so the Evaluate dialog's plan (opened, suite changed, drift
+    toggled) and Start reuse one instead of each paying for a request. Keyed on the model key, its registry entry and
+    its provider's registry table (an edit asks again); a model outside the registry also on the suite, whose config
+    then sets its sampling. "Check again" and Test ask again and refresh it."""
+
+    def __init__(self, ttl: float = PREFLIGHT_TTL_S):
+        self.ttl = ttl
+        self.lock = threading.Lock()
+        self.items: dict[str, tuple[float, dict]] = {}
+
+    @staticmethod
+    def key(model: str, suite=None) -> str | None:
+        try:
+            M = track("models")
+            entry = M.load_registry().get(model)
+            prov = (M.registry_providers() or {}).get(entry.provider) if entry is not None else None
+            d = entry.to_dict() if entry is not None else None
+        except Unavailable:
+            d = prov = None
+        except Exception:               # a registry it can't read: no reuse
+            return None
+        return json.dumps([model, d, prov, None if d is not None else str(suite or "")], sort_keys=True, default=str)
+
+    def get(self, model: str, suite=None) -> dict | None:
+        """The passing preflight of `model` from the last PREFLIGHT_TTL_S, as {..., "cached": true, "checked": t}."""
+        k = self.key(model, suite)
+        if k is None:
+            return None
+        with self.lock:
+            hit = self.items.get(k)
+            if hit is not None and time.time() - hit[0] < self.ttl:
+                return {**hit[1], "cached": True, "checked": hit[0]}
+            self.items.pop(k, None)
+        return None
+
+    def put(self, model: str, result, suite=None) -> None:
+        """Keep a preflight that passed just now (a skipped, failed or reused one isn't kept)."""
+        if not isinstance(result, dict) or result.get("ok") is not True or result.get("skipped") \
+                or result.get("cached"):
+            return
+        k = self.key(model, suite)
+        if k is not None:
+            with self.lock:
+                self.items[k] = (time.time(), dict(result))
+
+
+def process_command(pid: int) -> str | None:
+    """The command line of process `pid` (`ps -o command=`), None when it isn't running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass                            # someone else's process: ps still says what it is
+    except OSError:
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def civitas_process(pid, verb: str) -> str | None:
+    """Why `pid` isn't a live `civitas ... <verb>` process this server may signal (None: it is). An eval.json's
+    pids may be stale and taken by an unrelated process since."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return f"no process id ({pid!r})"
+    if pid <= 1:
+        return f"no process id ({pid})"
+    cmd = process_command(pid)
+    if cmd is None:
+        return f"process {pid} isn't running"
+    words = cmd.split()
+    if not any("civitas" in w for w in words) or verb not in words:
+        return f"process {pid} isn't a `civitas {verb}` process ({cmd[:120]}): left alone"
+    return None
+
+
+class EvalJobs:
+    """`civitas eval` processes started from the Evals page, each in its own process group (its runs are stopped
+    with it). The eval's folder is stamped by the eval process when it plans, so a job is known by its name until
+    a new runs/eval_<name>_* folder appears (`resolve`)."""
+
+    def __init__(self, runs_dir: Path, configs_dir: Path, preflights: PreflightCache | None = None):
+        self.runs_dir = runs_dir
+        self.configs_dir = configs_dir
+        self.preflights = preflights or PreflightCache()
+        self.jobs: dict[str, dict] = {}
+        self.lock = threading.Lock()
+
+    def _folders(self, name: str) -> set[str]:
+        return {p.name for p in self.runs_dir.glob(f"eval_{name}_*") if p.is_dir()}
+
+    def command(self, model: str, suite: Path | None, allow_drift: bool, name: str, stamp: str | None = None,
+                preflight: dict | None = None) -> list[str]:
+        """The eval process: prepare()'s name and stamp, so it writes the folder prepare() planned, and no second
+        preflight (prepare() ran it, or reused a cached one: passed on to be recorded; the probe is cached)."""
+        cmd = [sys.executable, "-m", "civitas.cli", "eval", "--model", model, "--name", name,
+               "--runs-dir", str(self.runs_dir)]
+        if stamp:
+            cmd += ["--stamp", stamp, "--no-preflight"]
+            if isinstance(preflight, dict) and preflight.get("ok") is True:
+                cmd += ["--preflight-result", json.dumps(preflight, separators=(",", ":"), default=str)]
+        if suite is not None:
+            cmd += ["-s", str(suite)]
+        if allow_drift:
+            cmd.append("--allow-drift")
+        return cmd
+
+    def prepare(self, body: dict, fresh: bool = False) -> tuple[dict, Path | None]:
+        """prepare() of the body's model and suite. Its preflight is the cached passing one when there is one (no
+        request), unless `fresh`; a new passing preflight is cached."""
+        model = str(body.get("model") or "").strip()
+        if not model or len(model) > 200:
+            raise ValueError("name a model")
+        suite = suite_path(self.configs_dir, body.get("suite"))
+        cached = None if fresh else self.preflights.get(model, suite)
+        kw = {"preflight": False, "preflight_result": cached} if cached else {"preflight": True}
+        ev = evals_fn("prepare")(model, suite=None if suite is None else str(suite),
+                                 allow_drift=bool(body.get("allow_drift")), runs_dir=str(self.runs_dir), **kw)
+        if cached:
+            if (ev.get("preflight") or {}).get("skipped"):      # a prepare() that doesn't take preflight_result
+                ev["preflight"] = cached
+        else:
+            self.preflights.put(model, ev.get("preflight"), suite)
+        return ev, suite
+
+    def start(self, body: dict) -> dict:
+        """prepare(); with no errors, the eval process. {"errors"} when it may not start."""
+        import shutil
+        ev, suite = self.prepare(body)
+        if ev.get("errors"):
+            return {"errors": list(ev["errors"])}
+        model = str(body.get("model")).strip()
+        name = str(ev.get("name") or model)
+        with self.lock:
+            old = self.jobs.get(name)
+            if old is not None and old["proc"].poll() is None:
+                raise ValueError(f"an eval named {name} is already running from this page")
+            before = self._folders(name)
+            cmd = self.command(model, suite, bool(body.get("allow_drift")), name, ev.get("stamp"),
+                               preflight=ev.get("preflight"))
+            if sys.platform == "darwin" and shutil.which("caffeinate") and cmd[:1] != ["caffeinate"]:
+                cmd = ["caffeinate", "-dims", *cmd]          # the Mac sleeps during long evals otherwise
+            logs = self.runs_dir / "_logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            log = logs / f"eval_{name}_{time.strftime('%Y%m%d-%H%M%S')}.log"
+            path = os.environ.get("PYTHONPATH", "")
+            env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": str(ROOT) + (os.pathsep + path if path else "")}
+            with open(log, "w") as fh:                       # the child keeps its own handle
+                proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=os.getcwd(), env=env,
+                                        start_new_session=True)
+            self.jobs[name] = {"proc": proc, "log": log, "started": time.time(), "before": before,
+                               "model": model, "stopping": False,
+                               "dir": Path(ev["dir"]).name if ev.get("stamp") and ev.get("dir") else None}
+        end = time.time() + START_WAIT_S
+        while time.time() < end and self.resolve(name) is None and proc.poll() is None:
+            time.sleep(0.1)
+        return {"eval_dir": self.resolve(name), "job": name, "pid": proc.pid}
+
+    def resolve(self, name: str) -> str | None:
+        """The folder of job `name`: the eval_<name>_* folder that appeared after it started."""
+        with self.lock:
+            job = self.jobs.get(name)
+            if job is None:
+                return None
+            if job["dir"] is None:
+                new = sorted(self._folders(name) - job["before"])
+                if new:
+                    job["dir"] = new[-1]
+            return job["dir"]
+
+    def job_of(self, ref: str) -> tuple[str, dict] | None:
+        with self.lock:
+            if ref in self.jobs:
+                return ref, self.jobs[ref]
+            for name, job in self.jobs.items():
+                if job["dir"] == ref:
+                    return name, job
+        return None
+
+    @staticmethod
+    def log_tail(job: dict, lines: int = 8, chars: int = 1200) -> str:
+        try:
+            text = [x.rstrip() for x in job["log"].read_text(errors="replace").splitlines() if x.strip()]
+        except OSError:
+            return ""
+        return "\n".join(text[-lines:])[-chars:]
+
+    def state(self, name: str, job: dict) -> dict:
+        """The job as the page shows it. `eval_json`: its folder has eval.json (the eval planned and started); a job
+        that ended without one failed to start, and its log's tail is the `error` (e.g. the eval's own refusal)."""
+        rc = job["proc"].poll()
+        d = self.resolve(name)
+        has = d is not None and (self.runs_dir / d / "eval.json").is_file()
+        out = {"job": name, "model": job["model"], "eval_dir": d, "started": job["started"], "eval_json": has,
+               "running": rc is None, "returncode": rc, "stopping": job["stopping"]}
+        if job.get("stop_skipped"):
+            out["stop_skipped"] = list(job["stop_skipped"])
+        if rc is not None and (rc != 0 or not has):
+            tail = self.log_tail(job)
+            out["log_tail"] = tail
+            out["error"] = tail or (f"exit code {rc}" if rc else "the eval process ended without writing eval.json")
+        return out
+
+    def status(self) -> list[dict]:
+        with self.lock:
+            items = list(self.jobs.items())
+        return sorted((self.state(n, j) for n, j in items), key=lambda r: -r["started"])
+
+    def stop(self, ref: str) -> tuple[bool, str | None]:
+        """SIGINT to the eval's process group (the eval stops its runs and records them interrupted), SIGTERM then
+        SIGKILL if it hasn't ended within STOP_GRACE_S; an eval this server didn't start: SIGINT to eval.json's pid,
+        only when that is a live `civitas ... eval` process (`civitas_process`). (stopped, why not)."""
+        import signal
+        hit = self.job_of(ref)
+        if hit is None:
+            d = (self.runs_dir / ref).resolve()
+            if d.parent != self.runs_dir.resolve() or not ref.startswith("eval_"):
+                return False, f"no eval {ref!r}"
+            try:
+                ev = json.loads((d / "eval.json").read_text())
+            except (OSError, ValueError, TypeError):
+                return False, f"no eval {ref!r}"
+            if ev.get("status") != "running":
+                return False, f"{ref} isn't running"
+            why = civitas_process(ev.get("pid"), "eval")
+            if why:
+                return False, f"not stopped: {why}"
+            try:
+                os.kill(int(ev["pid"]), signal.SIGINT)
+            except OSError as e:
+                return False, f"not stopped: {e}"
+            return True, None
+        name, job = hit
+        proc = job["proc"]
+        if proc.poll() is not None:
+            return False, f"{name} has ended already"
+        job["stopping"] = True
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except OSError:
+            proc.send_signal(signal.SIGINT)
+
+        def escalate():
+            for sig, wait in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, 5.0)):
+                try:
+                    proc.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, sig)
+                    except OSError:
+                        pass
+            self._stop_runs(name)
+        threading.Thread(target=escalate, daemon=True).start()
+        return True, None
+
+    def _stop_runs(self, name: str) -> list[str]:
+        """Runs the eval left running (each in its own session) once it has ended: SIGTERM to their groups, only
+        for a pid that is a live `civitas ... run` process leading its own group (eval.json's pids may be stale).
+        The ones left alone are kept on the job as `stop_skipped` (and returned)."""
+        import signal
+        skipped: list[str] = []
+        d = self.resolve(name)
+        if d is None:
+            return skipped
+        try:
+            ev = json.loads((self.runs_dir / d / "eval.json").read_text())
+        except (OSError, ValueError):
+            return skipped
+        for r in ev.get("runs") or []:
+            if r.get("status") == "running" and r.get("pid"):
+                try:
+                    pid = int(r["pid"])
+                    if process_command(pid) is None:
+                        continue                    # it has ended: nothing to stop
+                    why = civitas_process(pid, "run")
+                    if why is None and os.getpgid(pid) != pid:
+                        why = f"process {pid} doesn't lead its own process group: left alone"
+                except (OSError, ValueError, TypeError):
+                    continue
+                if why:
+                    skipped.append(f"{r.get('run_id') or '?'}: {why}")
+                    continue
+                try:
+                    os.killpg(int(r["pid"]), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+        with self.lock:
+            if name in self.jobs:
+                self.jobs[name]["stop_skipped"] = skipped
+        return skipped
+
+
+def eval_folder(runs_dir: Path, name: str) -> Path | None:
+    """An eval's folder, only an eval_* folder directly in `runs_dir`."""
+    if not str(name).startswith("eval_"):
+        return None
+    return run_folder(runs_dir, str(name))
+
+
+def suites(configs_dir: Path) -> list[dict]:
+    """The eval suites in the configs folder (files with [[runs]]): file, name, description, units and runs."""
+    E = track("evals")
+    out = []
+    default = default_suite(configs_dir).name
+    for p in sorted(configs_dir.glob("*.toml")):
+        try:
+            if "[[runs]]" not in p.read_text():
+                continue
+            s = E.load_suite(p)
+        except (OSError, ValueError) as e:
+            if "is not a suite" not in str(e):
+                out.append({"file": p.name, "error": str(e)})
+            continue
+        units = sum(len(e.seeds) for e in s.entries)
+        out.append({"file": p.name, "name": s.name, "description": s.description, "units": units,
+                    "runs": sum(len(e.seeds) * (e.repeats or s.repeats) for e in s.entries), "workers": s.workers,
+                    "env": getattr(s, "env", None), "baseline_model": getattr(s, "baseline_model", None),
+                    "default": p.name == default})
+    return out
+
+
+def plan_summary(ev: dict) -> dict:
+    """What the Evaluate dialog shows from prepare(): runs, the estimated tokens / time / cost, the environment, the
+    preflight, the errors (empty: it may start)."""
+    E = track("evals")
+    runs = ev.get("runs") or []
+    est = [r.get("estimate") or {} for r in runs]
+    total = lambda k: None if any(x.get(k) is None for x in est) or not est else sum(x[k] for x in est)
+    prompt, completion = total("prompt_tokens"), total("completion_tokens")
+    mins = [x.get("minutes") for x in est]
+    minutes = E.makespan(mins, int(ev.get("workers") or 1)) if mins and None not in mins else None
+    cost = None
+    if prompt is not None and completion is not None and hasattr(E, "_usd"):
+        try:
+            cost = E._usd(ev, prompt, completion)
+        except Exception:
+            cost = None
+    entry = ev.get("model_entry")
+    if entry is not None and hasattr(entry, "to_dict"):
+        entry = entry.to_dict()
+    return {"name": ev.get("name"), "dir": Path(str(ev.get("dir") or "")).name or None, "model": ev.get("model"),
+            "provider": ev.get("provider"), "suite": ev.get("suite"), "runs": len(runs), "workers": ev.get("workers"),
+            "units": len({(r.get("config"), r.get("seed")) for r in runs}),
+            "estimate": {"prompt_tokens": prompt, "completion_tokens": completion, "minutes": minutes, "cost": cost,
+                         "reference_model": (ev.get("suite") or {}).get("reference_model")},
+            "env": ev.get("env"), "preflight": ev.get("preflight"), "model_entry": entry,
+            "errors": list(ev.get("errors") or [])}
+
+
+def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, configs_dir: str | Path = "configs",
+                 envcheck: EnvCheck | None = None, jobs: EvalJobs | None = None):
     index = TurnIndex()
+    configs_dir = launcher.configs_dir if launcher is not None else Path(configs_dir).resolve()
+    envcheck = envcheck or EnvCheck(configs_dir, runs_dir)
+    jobs = jobs or (EvalJobs(runs_dir.resolve(), configs_dir) if launcher is not None else None)
 
     class Handler(SimpleHTTPRequestHandler):
         extensions_map = {**SimpleHTTPRequestHandler.extensions_map, ".js": "text/javascript",
@@ -657,6 +1264,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                 if parts[1:] == ["evals"]:          # model evals (civitas eval): eval_*/eval.json, newest first
                     from .bench.evals import list_evals
                     return self._json(list_evals(runs_dir))
+                if parts[1] in ("models", "env", "envs", "evals"):     # the Evals page
+                    return self._evals_page_get(parts[1:], q)
                 if parts[1:] == ["leaderboard"]:
                     from .bench.runner import leaderboard
                     return self._json(leaderboard(runs_dir))
@@ -679,6 +1288,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                         return self._json({"run_id": hub.run_id, "frame": hub.latest_frame,
                                            "waiting_for": list(hub.pending)})
                 return self._json({"error": "not found"}, 404)
+            except Unavailable as e:
+                return self._json({"error": str(e), "unavailable": True}, 501)
             except Exception as e:  # pragma: no cover
                 return self._json({"error": str(e)}, 500)
 
@@ -689,6 +1300,10 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
             except json.JSONDecodeError:
                 return self._json({"ok": False, "error": "body must be JSON"}, 400)
             try:
+                if path in LAUNCHER_POSTS and is_local(self.client_address[0]):
+                    refusal = cross_site(self.headers)
+                    if refusal:
+                        return self._json({"ok": False, "error": refusal}, 403)
                 if path == "/api/launch":
                     if launcher is None:
                         return self._json({"ok": False, "error": "launching is disabled"}, 403)
@@ -707,8 +1322,154 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None):
                     ok, msg = hub.submit(str(body.get("role", "")), str(body.get("turn_id", "")),
                                          body.get("decision") or {})
                     return self._json({"ok": ok, "message": msg}, 200 if ok else 409)
+                if path in EVALS_POSTS:
+                    if not isinstance(body, dict):
+                        return self._json({"ok": False, "error": "body must be a JSON object"}, 400)
+                    refusal = self._write_refusal()
+                    if refusal:
+                        return self._json({"ok": False, "error": refusal}, 403)
+                    return self._evals_page_post(path, body)
+            except Unavailable as e:
+                return self._json({"ok": False, "error": str(e), "unavailable": True}, 501)
             except (ValueError, TypeError) as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
+            except Exception as e:  # pragma: no cover
+                return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            return self._json({"error": "not found"}, 404)
+
+        # ------------------------------------------------------------------------------------ the Evals page
+        def _write_refusal(self) -> str | None:
+            """Why this request may not write (None: it may): the launcher must be on, the client this computer,
+            Host a loopback name and a browser's Origin, when it sends one, a loopback origin (cross_site)."""
+            if launcher is None:
+                return "editing is disabled: start `civitas serve` with launching allowed"
+            if not is_local(self.client_address[0]):
+                return "editing is allowed from this computer only"
+            return cross_site(self.headers)
+
+        def _latest(self, env_name: str | None) -> tuple[dict, str | None]:
+            """model -> its leaderboard row on `env_name` as {eval_dir, score, interval, city, env}."""
+            try:
+                lb = evals_fn("leaderboard")(env_name, runs_dir=str(runs_dir))
+            except Unavailable:
+                return {}, env_name
+            except Exception:
+                return {}, env_name
+            out = {}
+            for row in lb.get("rows") or []:
+                vs = row.get("vs_yardstick") or {}
+                out.setdefault(str(row.get("model")), {"eval_dir": row.get("eval_dir"), "score": vs.get("mean"),
+                                                      "interval": vs, "city": row.get("score"),
+                                                      "env": lb.get("env"), "verdict": row.get("verdict")})
+            return out, lb.get("env")
+
+        def _evals_page_get(self, parts: list[str], q: dict):
+            arg = lambda k, d=None: (q.get(k) or [d])[0]
+            if parts == ["models"]:
+                M = track("models")
+                cur = envcheck.result or {}
+                latest, env_name = self._latest(cur.get("env"))
+                rows = []
+                for e in M.load_registry().values():
+                    rows.append({**e.to_dict(), "key": e.key, "served_id": e.served_id, "key_status": M.key_status(e),
+                                 "latest": latest.get(e.key) or latest.get(e.served_id)})
+                return self._json({"models": rows, "providers": providers(M), "env": env_name,
+                                   "can_edit": launcher is not None and is_local(self.client_address[0])})
+            if parts == ["env"]:                    # a probe costs the server's CPU: only with launching on
+                refresh = arg("refresh", "0") not in ("", "0", "false")
+                if refresh:                         # a GET any page could send: this computer's viewer only
+                    refusal = self._write_refusal()
+                    if refusal:
+                        return self._json({"error": refusal}, 403)
+                return self._json(envcheck.get(refresh=refresh, start=launcher is not None))
+            if parts == ["envs"]:
+                return self._json(track("envs").list_envs())
+            if parts == ["evals", "leaderboard"]:
+                return self._json(evals_fn("leaderboard")(arg("env") or None, runs_dir=str(runs_dir)))
+            if parts == ["evals", "suites"]:
+                return self._json(suites(configs_dir))
+            if parts == ["evals", "jobs"]:
+                return self._json(jobs.status() if jobs else [])
+            if parts == ["evals", "progress"]:
+                ref = str(arg("dir", ""))
+                hit = jobs.job_of(ref) if jobs else None
+                if hit is not None:                 # an eval started from this page: by its name until it has a folder
+                    st = jobs.state(*hit)
+                    d = eval_folder(runs_dir, st["eval_dir"]) if st["eval_dir"] else None
+                    if d is None or not (d / "eval.json").is_file():    # starting, or it ended before planning
+                        return self._json({**st, "status": "starting" if st["running"] else "failed",
+                                           "total": None, "finished": 0, "tokens": 0, "eta_s": None, "runs": []})
+                    return self._json({**evals_fn("progress")(str(d)), **st})
+                d = eval_folder(runs_dir, ref)
+                if d is None or not (d / "eval.json").exists():
+                    return self._json({"error": f"no eval {ref!r}"}, 404)
+                return self._json({**evals_fn("progress")(str(d)), "eval_dir": d.name})
+            if parts == ["evals", "scorecard"]:
+                d = eval_folder(runs_dir, str(arg("dir", "")))
+                f = d / "scorecard.md" if d is not None else None
+                if f is None or not f.is_file():
+                    return self._json({"error": "no scorecard yet"}, 404)
+                return self._json({"eval_dir": d.name, "markdown": f.read_text()})
+            return self._json({"error": "not found"}, 404)
+
+        def _evals_page_post(self, path: str, body: dict):
+            if path == "/api/models":
+                M = track("models")
+                key, fields = str(body.get("key") or "").strip(), body.get("fields") or {}
+                if not isinstance(fields, dict):
+                    return self._json({"ok": False, "errors": ["fields must be an object"]}, 400)
+                errors = M.validate(key, fields)
+                if errors:
+                    return self._json({"ok": False, "errors": list(errors)}, 400)
+                try:
+                    e = M.save_entry(key, fields)
+                except ValueError as err:
+                    return self._json({"ok": False, "errors": [str(err)]}, 400)
+                return self._json({"ok": True, "model": {**e.to_dict(), "key": e.key}})
+            if path == "/api/models/delete":
+                ok = bool(track("models").delete_entry(str(body.get("key") or "")))
+                return self._json({"ok": ok}, 200 if ok else 404)
+            if path == "/api/models/preflight":
+                M = track("models")
+                e = M.load_registry().get(str(body.get("key") or ""))
+                if e is None:
+                    return self._json({"ok": False, "error": f"no model {body.get('key')!r} in the registry"}, 404)
+                res = M.preflight(e)                # Test: always a fresh request; a pass is reused by plan / start
+                if jobs is not None:
+                    jobs.preflights.put(e.key, res)
+                return self._json(res)
+            if path == "/api/keys":                 # the value is written to ./.env and never sent back
+                env, value = str(body.get("env") or ""), body.get("value")
+                if not KEY_VAR.match(env):
+                    return self._json({"ok": False, "error": "the variable must look like NAME_API_KEY"}, 400)
+                if not isinstance(value, str) or not value.strip() or "\n" in value or len(value) > 4096:
+                    return self._json({"ok": False, "error": "paste the key: one line of text"}, 400)
+                try:
+                    track("models").set_api_key(env, value.strip())
+                except ValueError as err:
+                    msg = str(err).replace(value.strip(), "***") if value.strip() else str(err)
+                    return self._json({"ok": False, "error": msg}, 400)
+                return self._json({"ok": True, "env": env, "set": _has_key(env)})
+            if path == "/api/env/freeze":
+                name = str(body.get("name") or "")
+                if not ENV_NAME.match(name):
+                    return self._json({"ok": False, "error": "a version name: letters, digits, . _ - (e.g. "
+                                                             "civitas-v2)"}, 400)
+                env = track("envs").freeze(name, str(envcheck.suite()), probe_result=envcheck.probe())
+                envcheck.forget()
+                return self._json({"ok": True, "env": env})
+            if path == "/api/evals/plan":           # prepare() without starting: the Evaluate dialog's numbers
+                ev, _ = jobs.prepare(body, fresh=bool(body.get("fresh_preflight")))
+                return self._json(plan_summary(ev))
+            if path == "/api/evals/start":
+                out = jobs.start(body)
+                if out.get("errors"):
+                    return self._json({"ok": False, **out}, 400)
+                return self._json({"ok": True, **out})
+            if path == "/api/evals/stop":
+                ok, why = jobs.stop(str(body.get("dir") or ""))
+                code = 200 if ok else 409 if why and why.startswith("not stopped") else 404
+                return self._json({"ok": ok, **({"error": why} if why else {})}, code)
             return self._json({"error": "not found"}, 404)
 
         def _status(self, d: Path) -> str:
@@ -769,8 +1530,10 @@ def serve(runs_dir: str | Path = "runs", port: int = 8765, hub=None, background:
     runs_dir = Path(runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
     launcher = Launcher(runs_dir.resolve(), Path(configs_dir).resolve()) if allow_launch else None
-    httpd = ThreadingHTTPServer((host, port), make_handler(runs_dir, hub, launcher))
-    httpd.launcher = launcher
+    envcheck = EnvCheck(Path(configs_dir).resolve(), runs_dir.resolve())
+    jobs = EvalJobs(runs_dir.resolve(), Path(configs_dir).resolve()) if allow_launch else None
+    httpd = ThreadingHTTPServer((host, port), make_handler(runs_dir, hub, launcher, configs_dir, envcheck, jobs))
+    httpd.launcher, httpd.envcheck, httpd.jobs = launcher, envcheck, jobs     # evals keep running when it stops
     print(f"Civitas 3D: http://{host}:{httpd.server_address[1]}/   (runs from {runs_dir.resolve()})")
     if background:
         t = threading.Thread(target=httpd.serve_forever, daemon=True)

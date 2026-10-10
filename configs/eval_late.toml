@@ -10,6 +10,8 @@ description = "late starts: three single cities (32 model turns each) and two tw
 workers = 5                 # runs at once: they wait on the API, not the CPU
 caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
 reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+baseline_model = "trinity-large-thinking"    # paired verdicts are against this model's eval
+# No env: a milestone suite, not ranked on a leaderboard (eval_singles.toml names the version, civitas-v1).
 
 # USD per million [prompt, completion] tokens by model, for the dry run's and the scorecard's cost line (optional).
 [eval.prices]

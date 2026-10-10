@@ -1,0 +1,22 @@
+# Model registry: the models `civitas eval --model <key>` and the viewer's Evals page evaluate.
+# Machine-written (the viewer rewrites it: entries sorted, comments other than this header dropped); hand edits are
+# fine. Model keys only: provider, id (the served id when it differs from the key), temperature (a number, or
+# "default" to send none: the provider's own, which OpenAI's reasoning models require), max_tokens,
+# extra_body (an inline table sent with every request), notes. The compute budget (max_steps, turn_tokens, act_every,
+# ...) is the environment's, the same for every model, and is refused here. A provider that isn't built in (arcee,
+# openrouter, ollama, openai, anthropic) gets a [providers.<name>] table (base_url, api_key_env). API keys go in ./.env.
+
+[models.trinity-large-thinking]
+provider = "arcee"
+temperature = 0.4
+max_tokens = 16000
+
+[models.trinity-large-v1]
+provider = "arcee"
+temperature = 0.4
+max_tokens = 16000
+
+[models.trinity-mini]
+provider = "arcee"
+temperature = 0.4
+max_tokens = 16000

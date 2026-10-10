@@ -25,10 +25,27 @@ class ProviderConfig:
     extra_headers: dict | None = None
     stream: bool = True           # stream the answer: long reasoning turns never go quiet on the wire
     deadline: float = 1800.0      # wall-clock limit per attempt, however the server behaves
+    max_tokens_field: str = "max_tokens"    # the request's token-limit field (OpenAI: "max_completion_tokens")
 
 
 class LLMError(RuntimeError):
     pass
+
+
+DEFAULT_TEMPERATURE = "default"      # a configured temperature meaning "send none": the provider's own default
+
+
+def temperature_of(v) -> float | None:
+    """A configured temperature: None or "default" -> None (the request then carries no temperature, as OpenAI's
+    reasoning models require), else a float."""
+    if v is None or (isinstance(v, str) and v.strip().lower() == DEFAULT_TEMPERATURE):
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"temperature must be a number or \"default\", got {v!r}")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"temperature must be a number or \"default\", got {v!r}") from None
 
 
 # Thread.join and socket timeouts wait on the monotonic clock, which stops while macOS sleeps (and
@@ -141,17 +158,20 @@ class ChatClient:
         self.p = provider
         self.api_key = os.environ.get(provider.api_key_env, "") if provider.api_key_env else ""
 
-    def chat(self, model: str, messages: list[dict], *, temperature: float = 0.4,
+    def chat(self, model: str, messages: list[dict], *, temperature: float | None = 0.4,
              max_tokens: int = 1500, extra: dict | None = None) -> dict:
         """Returns {"content", "reasoning", "tool_calls", "usage", "latency_s", "finish_reason"}.
+
+        `temperature=None` sends no temperature: the provider's default (OpenAI's reasoning models refuse others).
 
         Thinking models (e.g. trinity-large-thinking) may return their chain of
         thought in `reasoning_content` or inline as <think>...</think>.
         """
         if self.p.api_key_env and not self.api_key:
             raise LLMError(f"environment variable {self.p.api_key_env} is not set")
-        body = {"model": model, "messages": messages, "temperature": temperature,
-                "max_tokens": max_tokens, **(extra or {})}
+        body = {"model": model, "messages": messages,
+                **({} if temperature is None else {"temperature": temperature}),
+                self.p.max_tokens_field or "max_tokens": max_tokens, **(extra or {})}
         if self.p.stream:
             body.setdefault("stream", True)
             body.setdefault("stream_options", {"include_usage": True})
