@@ -17,6 +17,8 @@ env = "civitas-v1"          # the environment version (configs/envs/civitas-v1.j
 baseline_model = "trinity-large-thinking"    # the leaderboard's paired verdicts are against this model's eval
 
 [eval.prices]
+"claude-sonnet-5-5" = [2.00, 10.00]   # $ per million prompt / completion tokens (no prompt caching on the compatible endpoint)
+"claude-haiku-5-5" = [0.10, 0.50]
 
 # Per run: the reference wall time and tokens (trinity-large-thinking, eval trinity-large-cal's single cities).
 [[runs]]

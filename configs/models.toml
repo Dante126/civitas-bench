@@ -6,6 +6,18 @@
 # ...) is the environment's, the same for every model, and is refused here. A provider that isn't built in (arcee,
 # openrouter, ollama, openai, anthropic) gets a [providers.<name>] table (base_url, api_key_env). API keys go in ./.env.
 
+[models.claude-haiku-5-5]
+provider = "anthropic"
+temperature = "default"
+max_tokens = 16000
+notes = "via Anthropic OpenAI-compatible endpoint; thinking adaptive (on by default); temperature omitted (non-default values 400)"
+
+[models.claude-sonnet-5-5]
+provider = "anthropic"
+temperature = "default"
+max_tokens = 16000
+notes = "via Anthropic OpenAI-compatible endpoint; thinking adaptive (on by default); temperature omitted (non-default values 400)"
+
 [models.trinity-large-thinking]
 provider = "arcee"
 temperature = 0.4
