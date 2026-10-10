@@ -321,3 +321,242 @@ def test_api_evals(evaluated):
         assert board
     finally:
         srv.shutdown()
+
+
+# ------------------------------------------------------------------ plug-in evals: prepare, progress, leaderboard
+@pytest.fixture()
+def fake_llm(monkeypatch):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeLLM)
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    monkeypatch.setenv(KEY_ENV, "sk-fake")
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def _env_stub(match=True, frozen=True):
+    def check(s, **kw):
+        return {"env": s.env, "frozen": frozen, "match": match if frozen else None,
+                "diff": [] if match else ["briefings"], "fingerprint": "f" * 16,
+                "frozen_fingerprint": ("f" if match else "e") * 16 if frozen else None,
+                "probe": {"seconds": 1.5, "cached": False, "code": {"commit": "abc"}}}
+    return check
+
+
+def test_prepare_from_the_registry(tmp_path, fake_llm):
+    from civitas.bench import models as M
+    reg = tmp_path / "models.toml"
+    reg.write_text(f'[providers.fake]\nbase_url = "http://127.0.0.1:{fake_llm}/v1"\napi_key_env = "{KEY_ENV}"\n'
+                   f'stream = false\nmax_retries = 0\n')
+    M.save_entry("fake-model", {"provider": "fake", "id": "served-fake", "temperature": 0.2, "max_tokens": 900}, reg)
+    suite = tmp_path / "s.toml"
+    suite.write_text(f'name = "tiny"\n[eval]\nenv = "tiny-v1"\nbaseline_model = "base"\n[[runs]]\n'
+                     f'config = "{ROOT}/configs/fleet_smoke_late.toml"\nseeds = [0, 1]\n')
+    runs = tmp_path / "runs"
+    calls = FakeLLM.calls
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(), stamp="T")
+    assert ev["errors"] == [] and ev["model"] == "served-fake" and ev["provider"] == "fake"
+    assert ev["model_entry"] == {"key": "fake-model", "provider": "fake", "id": "served-fake", "temperature": 0.2,
+                                 "max_tokens": 900}
+    assert ev["preflight"]["ok"] and FakeLLM.calls == calls + 1 and E.model_key(ev) == "fake-model"
+    assert ev["env"]["name"] == "tiny-v1" and ev["env"]["match"] and not ev["env"]["drift"]
+    assert Path(ev["dir"]).name == "eval_fake-model_T" and not runs.exists()          # nothing written
+    assert ev["suite"]["env"] == "tiny-v1" and ev["suite"]["baseline_model"] == "base" and ev["sets"] == []
+    cmd = E.command(ev, ev["runs"][0])
+    for s in ("fleet.model=served-fake", "fleet.provider=fake", "fleet.temperature=0.2", "fleet.max_tokens=900",
+              f"providers.fake.base_url=http://127.0.0.1:{fake_llm}/v1", f"providers.fake.api_key_env={KEY_ENV}"):
+        assert s in cmd, s
+    cfg = E.effective(Path(ev["runs"][0]["config_path"]), ev["runs"][0]["agent_args"], ev["runs"][0]["set_args"])
+    assert set(_fleet_roles(cfg).values()) == {"served-fake"} and fleet_agent_config(cfg, "police").temperature == 0.2
+    text = "\n".join(E.prepare_text(ev))
+    assert "fake-model from the registry" in text and "Preflight: ok" in text and "tiny-v1: matches" in text
+    # the code changed since the version: refused (no preflight spent), or recorded as drifted
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(match=False))
+    assert any("no longer matches environment tiny-v1 (changed: briefings)" in e for e in ev["errors"])
+    assert ev["preflight"]["skipped"] and FakeLLM.calls == calls + 1
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(match=False),
+                   allow_drift=True)
+    assert ev["errors"] == [] and ev["env"]["drift"] and ev["preflight"]["ok"]
+    assert "recorded as drifted" in "\n".join(E.prepare_text(ev))
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(frozen=False))
+    assert any("isn't frozen" in e for e in ev["errors"])
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub(), dry_run=True)
+    assert ev["errors"] == [] and ev["preflight"]["skipped"] == "dry run: no model call"
+    # a failed preflight refuses
+    os.environ.pop(KEY_ENV)
+    ev = E.prepare("fake-model", suite=suite, registry=reg, runs_dir=runs, env_check=_env_stub())
+    assert any(KEY_ENV in e for e in ev["errors"])
+
+
+def test_prepare_without_the_registry(tmp_path, fake_llm):
+    (tmp_path / "city.toml").write_text(_config(fake_llm))
+    suite = tmp_path / "s.toml"
+    suite.write_text(f'[[runs]]\nconfig = "{tmp_path / "city.toml"}"\nseeds = [0]\n')
+    ev = E.prepare("fake", provider="fake", suite=suite, registry=tmp_path / "none.toml", runs_dir=tmp_path / "r")
+    assert ev["errors"] == [] and ev["model_entry"] is None and ev["preflight"]["ok"]
+    assert ev["env"] == {"name": None, "fingerprint": None, "frozen_fingerprint": None, "match": None, "diff": [],
+                         "frozen": None, "drift": False}
+    assert "won't be on a leaderboard" in "\n".join(E.prepare_text(ev))
+
+
+def test_dry_run_with_an_environment(tmp_path, monkeypatch, capsys):
+    from civitas.agents import llm_client
+
+    def boom(*a, **k):
+        raise AssertionError("a dry run called a model")
+    monkeypatch.setattr(llm_client.ChatClient, "chat", boom)
+    monkeypatch.setenv("ARCEE_API_KEY", "sk-test")
+    suite = tmp_path / "s.toml"
+    suite.write_text(f'name = "tiny"\n[eval]\nenv = "tiny-v1"\n[[runs]]\n'
+                     f'config = "{ROOT}/configs/fleet_smoke_late.toml"\nseeds = [0, 1]\n')
+    with pytest.raises(SystemExit) as e:
+        cli.main(["eval", "-s", str(suite), "--model", "trinity-mini", "--dry-run", "--runs-dir", str(tmp_path / "r"),
+                  "--set", "game.months=10", "--set", "game.warmup_months=6"])
+    out = capsys.readouterr().out
+    assert e.value.code == 2 and "Preflight: skipped (dry run: no model call)." in out
+    assert "Environment tiny-v1: not frozen yet" in out and "trinity-mini from the registry" in out
+    assert "--set fleet.temperature=0.4" in out and "isn't frozen" in out
+    assert not list((tmp_path / "r").glob("eval_*"))
+
+
+def test_progress(tmp_path):
+    runs = tmp_path / "runs"
+    now = time.time()
+    rs = []
+    for i, st in enumerate(("finished", "running", "pending")):
+        rid = f"run{i}"
+        rs.append({"run_id": rid, "config": "c.toml", "name": "c", "seed": i, "months": 108, "warmup": 96,
+                   "cities": [], "status": st, "pid": os.getpid() if st == "running" else None,
+                   "started": now - (600 if st == "finished" else 300) if st != "pending" else None,
+                   "ended": now - 10 if st == "finished" else None, "estimate": {"minutes": 10.0}})
+        if st != "pending":
+            (runs / rid).mkdir(parents=True)
+            usage = {"prompt_tokens": 100, "completion_tokens": 10}
+            (runs / rid / "trajectories.jsonl").write_text(
+                json.dumps({"agent": "fleet:m", "role": "mayor", "usage": usage}) + "\n"
+                + json.dumps({"agent": "fleet:scripted", "role": "mayor", "usage": usage, "warmup": True}) + "\n")
+    (runs / "run0" / "summary.json").write_text("{}")
+    (runs / "run1" / "live.jsonl").write_text("".join(json.dumps({"i": k, "month": m, "kind": "month"}) + "\n"
+                                                      for k, m in enumerate((100, 102))))
+    ev = {"name": "p", "dir": str(runs / "eval_p_T"), "runs_dir": str(runs), "status": "running", "pid": os.getpid(),
+          "started": now - 600, "workers": 1, "runs": rs, "suite": {}}
+    E.save(ev)
+    p = E.progress(ev["dir"])
+    assert (p["status"], p["total"], p["finished"], p["running"], p["pending"], p["failed"]) == \
+        ("running", 3, 1, 1, 1, 0)
+    assert p["tokens"] == 220 and [r["month"] for r in p["runs"]] == [108, 102, None]
+    assert [r["status"] for r in p["runs"]] == ["finished", "running", "pending"]
+    # 6 of 12 months in 300 s: ~300 s left on the one slot, then the pending run at the finished one's 590 s
+    assert p["eta_s"] == pytest.approx(300 + 590, abs=5)
+    rs[1]["pid"] = 999999
+    E.save({**ev, "pid": 999999})
+    p = E.progress(ev["dir"])
+    assert p["status"] == "stopped" and p["runs"][1]["status"] == "stopped" and p["failed"] == 1 and p["eta_s"] is None
+
+
+def _lb_card(seed, delta, final=60.0):
+    return {"run_id": f"r_s{seed}", "name": "late", "config": "configs/late.toml", "seed": seed, "region": False,
+            "repeat": 1, "repeats": 1, "wall_time_s": 60.0, "prompts": "p1", "code": {"commit": "abc"},
+            "status": "finished",
+            "total": {"final": final + delta, "delta": {"city": delta, "population": 100 * delta},
+                      "change": {"city": delta + 1, "population": 0}, "yard_change": {"city": 1.0, "population": 0},
+                      "at_handover": {"city": 60.0, "population": 5000}, "role_delta": {"mayor": delta / 2},
+                      "roles": {}, "teamwork": 80.0, "calls": None,
+                      "tokens": {"turns": 32, "prompt": 1000, "completion": 100}}}
+
+
+def _lb_eval(runs, label, model, deltas, created, env="tiny-v1", env_rec=None, **extra):
+    ev = {"version": 1, "name": label, "model": model, "dir": str(runs / f"eval_{label}"), "runs_dir": str(runs),
+          "created": created, "status": "finished",
+          "suite": {"name": "tiny", "file": "s.toml", "description": "", "env": env, "baseline_model": "base"},
+          "runs": [], "model_entry": {"key": model, "provider": "arcee"},
+          "env": None if env is None else {"name": env, "fingerprint": "f", "match": True, "diff": [], "drift": False,
+                                           **(env_rec or {})}, **extra}
+    cards = [_lb_card(s, d) for s, d in enumerate(deltas)]
+    ev["scorecard"] = {"runs": cards, "aggregate": E._agg(cards, ev), "by_config": {}}
+    E.save(ev)
+    return ev
+
+
+def test_leaderboard(tmp_path):
+    runs = tmp_path / "runs"
+    d = [0.5, -0.5, 1.0, 0.0, 0.2]
+    _lb_eval(runs, "base1", "base", d, 1)
+    _lb_eval(runs, "m2-old", "m2", [x - 3 for x in d], 2)
+    _lb_eval(runs, "m2-new", "m2", [x + 1 + 0.1 * i for i, x in enumerate(d)], 3)
+    _lb_eval(runs, "drift", "m3", [x + 5 for x in d], 4, env_rec={"drift": True, "match": False})
+    _lb_eval(runs, "other", "m4", d, 5, env="civitas-v0")
+    _lb_eval(runs, "noenv", "m5", d, 6, env=None)
+    _lb_eval(runs, "live", "m6", d, 7, status="running", pid=999999)
+    lb = E.leaderboard("tiny-v1", runs)
+    assert lb["env"] == "tiny-v1" and lb["envs"] == ["civitas-v0", "tiny-v1"] and lb["baseline"] == "base"
+    assert [r["model"] for r in lb["rows"]] == ["m2", "base"] and [r["rank"] for r in lb["rows"]] == [1, 2]
+    top, base = lb["rows"]
+    assert Path(top["eval_dir"]).name == "eval_m2-new" and top["n_units"] == 5
+    assert top["vs_yardstick"]["mean"] == pytest.approx(1.44) and top["vs_yardstick"]["lo"] is not None
+    assert top["score"]["mean"] == pytest.approx(61.44) and top["departments"]["mayor"] == pytest.approx(0.72)
+    assert top["tokens"] == 5 * 1100 and top["verdict"].startswith("m2-new vs base1: m2-new is BETTER")
+    assert top["paired"]["wins"] == 5 and base["baseline"] and base["verdict"] is None
+    why = {Path(s["eval_dir"]).name: s["reason"] for s in lb["skipped"]}
+    assert why["eval_m2-old"].startswith("superseded by a newer eval of m2") and why["eval_drift"].startswith("drifted")
+    assert why["eval_other"] == "environment civitas-v0, not tiny-v1" and "no environment" in why["eval_noenv"]
+    assert why["eval_live"] == "not finished (stopped)" and "eval_base1" not in why
+    md = E.leaderboard_markdown(lb)
+    assert "# Leaderboard: tiny-v1" in md and "| 1 | m2 | +1.4 (" in md and "| 2 | base |" in md
+    assert "| baseline |" in md and "## Not ranked" in md and "`civitas-v0`" in md
+    p = E.write_leaderboard(lb, runs)
+    assert p == runs / "leaderboard_tiny-v1.md" and p.read_text() == md
+    assert [r["model"] for r in E.leaderboard("civitas-v0", runs)["rows"]] == ["m4"]
+    assert E.leaderboard("civitas-v9", runs)["rows"] == []
+
+
+def test_leaderboard_cli(tmp_path, capsys):
+    runs = tmp_path / "runs"
+    _lb_eval(runs, "base1", "base", [0.5, 1.0], 1)
+    cli.main(["eval", "--leaderboard", "--env", "tiny-v1", "--runs-dir", str(runs)])
+    out = capsys.readouterr().out
+    assert "# Leaderboard: tiny-v1" in out and (runs / "leaderboard_tiny-v1.md").exists()
+
+
+def test_sigterm_stops_the_runs(tmp_path):
+    """Terminating the eval process (the viewer's Stop) stops its runs, which play in their own sessions."""
+    runs = tmp_path / "runs"
+    code = f"""
+import sys
+from pathlib import Path
+from civitas.bench import evals as E
+E.command = lambda ev, r: [sys.executable, "-c", "import time; time.sleep(120)"]
+suite = Path({str(tmp_path / 's.toml')!r})
+suite.write_text('[eval]\\ncaffeinate = false\\n[[runs]]\\nconfig = "{ROOT}/configs/fleet_smoke_late.toml"\\nseeds = [0, 1]\\n')
+ev = E.plan(E.load_suite(suite), runs_dir={str(runs)!r}, name="stop", stamp="T")
+try:
+    E.execute(ev, verbose=False)
+except KeyboardInterrupt:
+    sys.exit(130)
+"""
+    proc = subprocess.Popen([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": str(ROOT)}, cwd=ROOT)
+    f = runs / "eval_stop_T" / E.FILE
+    pids = []
+    try:
+        for _ in range(200):
+            time.sleep(0.1)
+            try:
+                saved = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            pids = [r.get("pid") for r in saved["runs"]]
+            if all(pids):
+                break
+        assert all(pids) and all(E._alive(p) for p in pids)
+        proc.terminate()
+        assert proc.wait(timeout=30) == 130
+        time.sleep(0.2)
+        assert not any(E._alive(p) for p in pids)
+        saved = json.loads(f.read_text())
+        assert saved["status"] == "interrupted" and saved["stopped_by"] == "signal 15"
+        assert [r["status"] for r in saved["runs"]] == ["interrupted", "interrupted"]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for p in pids:
+            if p and E._alive(p):
+                os.killpg(p, 9)

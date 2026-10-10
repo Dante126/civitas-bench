@@ -25,6 +25,7 @@ class ProviderConfig:
     extra_headers: dict | None = None
     stream: bool = True           # stream the answer: long reasoning turns never go quiet on the wire
     deadline: float = 1800.0      # wall-clock limit per attempt, however the server behaves
+    max_tokens_field: str = "max_tokens"    # the request's token-limit field (OpenAI: "max_completion_tokens")
 
 
 class LLMError(RuntimeError):
@@ -151,7 +152,7 @@ class ChatClient:
         if self.p.api_key_env and not self.api_key:
             raise LLMError(f"environment variable {self.p.api_key_env} is not set")
         body = {"model": model, "messages": messages, "temperature": temperature,
-                "max_tokens": max_tokens, **(extra or {})}
+                self.p.max_tokens_field or "max_tokens": max_tokens, **(extra or {})}
         if self.p.stream:
             body.setdefault("stream", True)
             body.setdefault("stream_options", {"include_usage": True})

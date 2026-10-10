@@ -1,4 +1,5 @@
-"""Command line: civitas run | resume | yardstick | eval | bench | serve | leaderboard | prompt | check-llm"""
+"""Command line: civitas run | resume | yardstick | eval | env | models | bench | serve | leaderboard | prompt |
+check-llm"""
 from __future__ import annotations
 
 import argparse
@@ -112,25 +113,41 @@ def cmd_eval(args):
             ev = E.resume(args.resume, workers=args.workers, verbose=not args.quiet)
             _eval_done(ev)
             return
-        if not args.suite:
-            sys.exit("civitas eval: give a suite with -s (e.g. -s configs/eval_late.toml), or --resume / --report / "
-                     "--compare an eval folder")
-        suite = E.load_suite(args.suite)
+        if args.leaderboard:
+            lb = E.leaderboard(args.env, args.runs_dir)
+            if args.json:
+                print(json.dumps(lb, indent=2, default=str))
+                return
+            p = E.write_leaderboard(lb, args.runs_dir)
+            print(E.leaderboard_markdown(lb))
+            print(f"wrote {p}")
+            return
         if args.adopt:
-            if not args.name:
-                sys.exit("civitas eval --adopt: name the eval with --name")
-            ev = E.adopt(args.adopt, suite, name=args.name, runs_dir=args.runs_dir)
+            if not args.suite or not args.name:
+                sys.exit("civitas eval --adopt: give the suite with -s and name the eval with --name")
+            ev = E.adopt(args.adopt, E.load_suite(args.suite), name=args.name, runs_dir=args.runs_dir)
             print((Path(ev["dir"]) / E.CARD).read_text())
             print(f"wrote {ev['dir']}")
             return
-        ev = E.plan(suite, model=args.model, provider=args.provider, agents=args.agent, sets=args.set,
-                    name=args.name, runs_dir=args.runs_dir, workers=args.workers, repeats=args.repeats)
+        if not args.suite and not args.model:
+            sys.exit(f"civitas eval: give a model with --model (a key of configs/models.toml; the suite is "
+                     f"{E.DEFAULT_SUITE} unless -s), a suite with -s, or --resume / --report / --compare / "
+                     f"--leaderboard")
+        ev = E.prepare(args.model, suite=args.suite, name=args.name, allow_drift=args.allow_drift,
+                       workers=args.workers, runs_dir=args.runs_dir, provider=args.provider, agents=args.agent,
+                       sets=args.set, repeats=args.repeats, stamp=args.stamp, dry_run=args.dry_run,
+                       preflight=not args.no_preflight)
         if args.dry_run:
-            errs = E.check(ev)
-            print(E.dry_run_text(ev, errs))
-            if errs:
+            print(E.dry_run_text(ev, ev["errors"]))
+            print()
+            print("\n".join(E.prepare_text(ev)))
+            if ev["errors"]:
                 sys.exit(2)
             return
+        if not args.quiet:
+            print("\n".join(E.prepare_text(ev)))
+        if ev["errors"]:
+            sys.exit("civitas eval: refusing to start the eval:\n  - " + "\n  - ".join(ev["errors"]))
         ev = E.start(ev, verbose=not args.quiet)
         _eval_done(ev)
     except E.EvalError as e:
@@ -149,6 +166,74 @@ def _eval_done(ev: dict) -> None:
     print(f"scorecard: {Path(ev['dir']) / E.CARD}")
     if ev["status"] != "finished":
         print(f"rerun what didn't finish: civitas eval --resume {ev['dir']}")
+
+
+def cmd_env(args):
+    """Environment versions (bench/envs.py): freeze the suite's probe as a named version, check the code against
+    the suite's version, list the versions."""
+    from datetime import datetime
+    from .bench import envs as V
+    from .bench import evals as E
+    try:
+        if args.action == "list":
+            rows = V.list_envs()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return
+            if not rows:
+                print("no environment versions yet (civitas env freeze <name>)")
+            for e in rows:
+                when = datetime.fromtimestamp(e["created"]).strftime("%Y-%m-%d %H:%M") if e.get("created") else "?"
+                print(f"{e['name']:<16} {e.get('fingerprint')}  {when}  commit {e.get('commit') or '?'}  "
+                      f"{e.get('tag') or 'untagged'}  suite {e.get('suite')}")
+            return
+        suite = E.load_suite(E.suite_path(args.suite))
+        if args.action == "freeze":
+            if not args.name:
+                sys.exit("civitas env freeze: name the version, e.g. civitas env freeze civitas-v2")
+            pr = V.probe(suite, workers=args.workers, cache=not args.no_cache)
+            rec = V.freeze(args.name, suite, tag=not args.no_tag, probe_result=pr)
+            print(f"froze {rec['name']}: fingerprint {rec['fingerprint']} (suite {suite.file}, commit "
+                  f"{rec.get('commit')}, probe {pr['seconds']} s{', cached' if pr.get('cached') else ''})")
+            print(f"wrote {V.ENVS_DIR / (rec['name'] + '.json')}; "
+                  + (f"tagged {rec['tag']}" if rec.get("tag") else f"untagged: {rec.get('untagged')}"))
+            if suite.env != rec["name"]:
+                print(f"note: {suite.file} names environment {suite.env!r}; set env = \"{rec['name']}\" in its "
+                      f"[eval] to evaluate on this version")
+            return
+        c = V.check(suite, workers=args.workers, cache=not args.no_cache)
+        if args.json:
+            print(json.dumps(c, indent=2))
+        else:
+            pr = c["probe"]
+            print(V.check_text(c) + f"  [probe {'cached' if pr.get('cached') else str(pr['seconds']) + ' s'}]")
+        if c["env"] and c["match"] is False:
+            sys.exit(1)
+    except (E.EvalError, V.EnvError) as e:
+        sys.exit(f"civitas env: {e}")
+
+
+def cmd_models(args):
+    """The model registry (configs/models.toml) with each provider's API key status."""
+    from .bench import models as M
+    try:
+        reg = M.load_registry()
+    except M.RegistryError as e:
+        sys.exit(f"civitas models: {e}")
+    rows = [{**e.to_dict(), "served_id": e.served_id, "key_status": M.key_status(e)} for e in reg.values()]
+    if args.json:
+        print(json.dumps({"models": rows, "providers": M.providers()}, indent=2))
+        return
+    if not rows:
+        print(f"no models in {M.REGISTRY}")
+    w = max([len(r["key"]) for r in rows] + [5])
+    for r in rows:
+        ks = r["key_status"]
+        key = "no key needed" if not ks["env"] else f"${ks['env']} {'set' if ks['set'] else 'NOT SET'}"
+        extra = "".join(f", {k} {r[k]}" for k in ("temperature", "max_tokens") if k in r)
+        served = f" (served id {r['served_id']})" if r["served_id"] != r["key"] else ""
+        print(f"{r['key']:<{w}}  {r['provider']}{served}{extra}; {key}" + (f"  # {r['notes']}" if r.get("notes")
+                                                                            else ""))
 
 
 def cmd_bench(args):
@@ -296,9 +381,11 @@ def main(argv=None):
 
     sp = sub.add_parser("eval", help="evaluate a model: a suite of late-start runs scored against the scripted "
                                      "yardstick, in one scorecard (see configs/eval_late.toml)")
-    sp.add_argument("--suite", "-s", default=None, help="suite file, e.g. configs/eval_late.toml")
-    sp.add_argument("--model", default=None, help="the model every fleet agent plays (sets [fleet].model and each "
-                                                  "[agents.<role>] that names its own)")
+    sp.add_argument("--suite", "-s", default=None, help="suite file (default with --model: "
+                                                        "configs/eval_singles.toml)")
+    sp.add_argument("--model", default=None, help="the model every fleet agent plays: a key of configs/models.toml "
+                                                  "(its provider and settings), else a served id with --provider "
+                                                  "(sets [fleet].model and each [agents.<role>] that names its own)")
     sp.add_argument("--provider", default=None, help="its provider ([providers.<name>], e.g. arcee)")
     sp.add_argument("--agent", action="append", default=[], help="override a role in every run, as for run")
     sp.add_argument("--set", action="append", default=[], help="override a value in every run, e.g. game.months=102")
@@ -314,9 +401,36 @@ def main(argv=None):
                     help="several evals side by side, each against the first paired by config + seed")
     sp.add_argument("--adopt", metavar="RUN_ID", nargs="+", default=None,
                     help="make an eval (with -s and --name) of runs that exist already, without rerunning them")
+    sp.add_argument("--allow-drift", action="store_true",
+                    help="start even when the code no longer matches the suite's environment version (the eval is "
+                         "recorded as drifted and never ranked)")
+    sp.add_argument("--no-preflight", action="store_true",
+                    help="skip the one-request check that the model answers with a tool call")
+    sp.add_argument("--stamp", default=None, help="the eval folder's time stamp (runs/eval_<name>_<stamp>; the "
+                                                  "viewer names the folder before it starts the eval)")
+    sp.add_argument("--leaderboard", action="store_true",
+                    help="rank the latest finished eval of each model on an environment version (writes "
+                         "runs/leaderboard_<env>.md)")
+    sp.add_argument("--env", default=None, help="with --leaderboard: the version (default: the default suite's)")
+    sp.add_argument("--json", action="store_true", help="with --leaderboard: print the record")
     sp.add_argument("--runs-dir", default="runs")
     sp.add_argument("--quiet", action="store_true")
     sp.set_defaults(fn=cmd_eval)
+
+    sp = sub.add_parser("env", help="environment versions: freeze a named fingerprint of the eval suite's game, "
+                                    "check the code against it, list them")
+    sp.add_argument("action", choices=("freeze", "check", "list"))
+    sp.add_argument("name", nargs="?", default=None, help="freeze: the new version's name, e.g. civitas-v2")
+    sp.add_argument("--suite", "-s", default=None, help="the suite (default configs/eval_singles.toml)")
+    sp.add_argument("--workers", type=int, default=8, help="seeds probed at once")
+    sp.add_argument("--no-cache", action="store_true", help="probe again even when this code state was probed")
+    sp.add_argument("--no-tag", action="store_true", help="freeze: don't tag HEAD env/<name>")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_env)
+
+    sp = sub.add_parser("models", help="the model registry (configs/models.toml) and its API keys")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_models)
 
     sp = sub.add_parser("bench", help="run several seeds and aggregate scores")
     common(sp)

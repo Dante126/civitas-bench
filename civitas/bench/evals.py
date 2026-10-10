@@ -29,6 +29,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,8 @@ class Suite:
     reference_model: str | None = None
     prices: dict = field(default_factory=dict)      # model -> [USD per million prompt tokens, per million completion]
     repeats: int = 1                    # plays of each config + seed (a unit): [eval].repeats
+    env: str | None = None              # [eval].env: the environment version it is evaluated on (bench/envs.py)
+    baseline_model: str | None = None   # [eval].baseline_model: the model the leaderboard pairs every eval with
 
 
 def _repeats(v, where: str) -> int:
@@ -117,6 +120,14 @@ def _resolve(config: str, suite_file: Path) -> Path:
     raise EvalError(f"{suite_file}: config {config!r} not found (paths are relative to the project folder)")
 
 
+def _opt_name(v, where: str) -> str | None:
+    if v is None or v == "":
+        return None
+    if not isinstance(v, str):
+        raise EvalError(f"{where} must be a name, got {v!r}")
+    return v
+
+
 def is_suite(data: dict) -> bool:
     """A TOML file read as a suite: it has `[[runs]]` entries with a `config` (the launcher leaves these out)."""
     runs = data.get("runs")
@@ -155,7 +166,9 @@ def load_suite(path: str | Path) -> Suite:
     return Suite(file=str(path), name=str(data.get("name") or p.stem), description=str(data.get("description") or ""),
                  entries=entries, workers=workers, caffeinate=bool(ev.get("caffeinate", True)),
                  reference_model=ev.get("reference_model"), prices=prices,
-                 repeats=_repeats(ev.get("repeats", 1), f"{p}: [eval]"))
+                 repeats=_repeats(ev.get("repeats", 1), f"{p}: [eval]"),
+                 env=_opt_name(ev.get("env"), f"{p}: [eval].env"),
+                 baseline_model=_opt_name(ev.get("baseline_model"), f"{p}: [eval].baseline_model"))
 
 
 # ---------------------------------------------------------------------------------------------------- plan
@@ -273,7 +286,8 @@ def plan(suite: Suite, *, model: str | None = None, provider: str | None = None,
     ev = {"version": VERSION, "name": label, "dir": str(runs_dir / f"{PREFIX}{label}_{stamp}"),
           "runs_dir": str(runs_dir), "created": time.time(), "stamp": stamp,
           "suite": {"file": suite.file, "name": suite.name, "description": suite.description,
-                    "reference_model": suite.reference_model,
+                    "reference_model": suite.reference_model, "env": suite.env,
+                    "baseline_model": suite.baseline_model,
                     "entries": [{"config": e.config, "seeds": e.seeds} for e in suite.entries]},
           "repeats": sorted({r["repeats"] for r in runs}),
           "model": eff_model, "provider": eff_prov, "agents": list(agents), "sets": list(sets),
@@ -548,10 +562,42 @@ def _tail(log: str | None) -> str:
     return lines[-1][:300] if lines else ""
 
 
+class Stopped(KeyboardInterrupt):
+    """SIGTERM / SIGHUP to the eval process (the viewer's Stop): handled as Ctrl+C, the runs stopped with it."""
+
+
+def _on_signal(signum, frame):
+    raise Stopped(f"signal {signum}")
+
+
+def trap_signals() -> dict:
+    """Make SIGTERM and SIGHUP stop the eval like Ctrl+C (its runs play in their own sessions, so a signal to this
+    process alone would leave them playing). Main thread only; returns the old handlers for `restore_signals`."""
+    old = {}
+    if threading.current_thread() is not threading.main_thread():
+        return old
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                old[sig] = signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                pass
+    return old
+
+
+def restore_signals(old: dict) -> None:
+    for sig, h in old.items():
+        try:
+            signal.signal(sig, h)
+        except (ValueError, OSError, TypeError):
+            pass
+
+
 def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
     """Run every run of `ev` whose status isn't finished, `ev["workers"]` at a time, saving eval.json as they start
-    and end; then the scorecard (eval.json `scorecard`, scorecard.md). Ctrl+C stops the runs (status
-    "interrupted"; `civitas eval --resume <dir>` reruns them)."""
+    and end; then the scorecard (eval.json `scorecard`, scorecard.md). Ctrl+C, SIGTERM or SIGHUP stops the runs
+    (status "interrupted", `stopped_by` for a signal; `civitas eval --resume <dir>` reruns them)."""
     runs_dir = Path(ev["runs_dir"])
     todo = [r for r in ev["runs"] if run_status(runs_dir, r) != "finished"]
     for r in ev["runs"]:
@@ -563,6 +609,7 @@ def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
     running: dict[str, tuple[subprocess.Popen, dict]] = {}
     queue = list(todo)
     t0 = time.time()
+    old = trap_signals()
     try:
         while queue or running:
             for rid, (proc, r) in list(running.items()):
@@ -597,14 +644,19 @@ def execute(ev: dict, *, verbose: bool = True, out=print) -> dict:
                     out(f"[eval {ev['name']}] started {run_label(r)} as {r['run_id']} (log {log})")
             if running:
                 time.sleep(POLL_S)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
+        restore_signals(old)                        # a second signal while stopping takes the default way
+        old = {}
         for proc, r in running.values():
             _stop(proc)
             r.update(status="interrupted", ended=time.time(), pid=None)
-        ev.update(status="interrupted", pid=None, ended=time.time())
+        ev.update(status="interrupted", pid=None, ended=time.time(),
+                  **({"stopped_by": str(e)} if isinstance(e, Stopped) else {}))
         save(ev)
         out(f"[eval {ev['name']}] interrupted; rerun what didn't finish with: civitas eval --resume {ev['dir']}")
         raise
+    finally:
+        restore_signals(old)
     ev["wall_time_s"] = round((ev.get("wall_time_s") or 0) + time.time() - t0, 1)
     finish(ev)
     return ev
@@ -712,7 +764,8 @@ def adopt(run_ids: list[str], suite: Suite, *, name: str, runs_dir: str | Path =
     ev = {"version": VERSION, "name": label, "dir": str(runs_dir / f"{PREFIX}{label}_{stamp}"),
           "runs_dir": str(runs_dir), "created": time.time(), "stamp": stamp, "adopted": True,
           "suite": {"file": suite.file, "name": suite.name, "description": suite.description,
-                    "reference_model": suite.reference_model,
+                    "reference_model": suite.reference_model, "env": suite.env,
+                    "baseline_model": suite.baseline_model,
                     "entries": [{"config": e.config, "seeds": e.seeds} for e in suite.entries]},
           "model": next(iter(models)) if len(models) == 1 else "mixed",
           "provider": next(iter(provs)) if len(provs) == 1 else None, "agents": [], "sets": [],
@@ -1332,5 +1385,398 @@ def list_evals(runs_dir: str | Path) -> list[dict]:
                                                               for k in ("name", "file", "description")},
                     "created": ev.get("created"), "status": st, "adopted": bool(ev.get("adopted")),
                     "runs": runs, "aggregate": sc.get("aggregate"), "by_config": sc.get("by_config"),
-                    "units": unit_values(sc.get("runs") or [])})
+                    "units": unit_values(sc.get("runs") or []), "env": ev.get("env"),
+                    "model_key": model_key(ev), "preflight": ev.get("preflight")})
     return out
+
+
+# ---------------------------------------------------------------------------------------------------- plug-in evals
+DEFAULT_SUITE = "configs/eval_singles.toml"
+
+
+def model_key(ev: dict) -> str | None:
+    """The model an eval ranks as: its registry key, else the model it played."""
+    return (ev.get("model_entry") or {}).get("key") or ev.get("model")
+
+
+def suite_path(suite=None) -> Path:
+    """The suite file (DEFAULT_SUITE without one): as given from the working folder, else in this checkout."""
+    p = Path(suite or DEFAULT_SUITE)
+    return p if p.exists() or p.is_absolute() else (ROOT / p if (ROOT / p).exists() else p)
+
+
+def _env_record(c: dict | None, allow_drift: bool, errors: list[str], *, name: str | None = None,
+                failure: str | None = None) -> dict:
+    """eval.json `env` from envs.check (or a probe failure) and the refusal it causes (appended to `errors`)."""
+    if c is None:
+        rec = {"name": name, "fingerprint": None, "frozen_fingerprint": None, "match": None, "diff": [],
+               "frozen": None, "drift": False}
+        if failure:
+            rec.update(error=failure, drift=allow_drift)
+            if not allow_drift:
+                errors.append(f"the environment probe failed ({failure}): can't tell whether the code still is "
+                              f"{name}; fix it, or pass --allow-drift (the eval is then never ranked)")
+        return rec
+    pr = c.get("probe") or {}
+    rec = {"name": c["env"], "fingerprint": c["fingerprint"], "frozen_fingerprint": c.get("frozen_fingerprint"),
+           "match": c["match"], "diff": c.get("diff") or [], "frozen": c["frozen"], "drift": False,
+           "probe_seconds": pr.get("seconds"), "cached": pr.get("cached"), "code": pr.get("code")}
+    if c["env"] and not c["frozen"]:
+        why = (f"environment {c['env']} isn't frozen (configs/envs/{c['env']}.json): freeze it with "
+               f"`civitas env freeze {c['env']} -s <suite>`")
+    elif c["env"] and not c["match"]:
+        why = (f"the code no longer matches environment {c['env']} (changed: {', '.join(rec['diff']) or '?'}): "
+               f"freeze a new version (civitas env freeze <name>) and re-evaluate the reference models")
+    else:
+        return rec
+    if allow_drift:
+        rec["drift"] = True
+    else:
+        errors.append(why + "; or pass --allow-drift (the eval is then recorded as drifted and never ranked)")
+    return rec
+
+
+def prepare(model: str | None, *, suite=None, name: str | None = None, allow_drift: bool = False,
+            workers: int | None = None, runs_dir: str | Path = "runs", provider: str | None = None,
+            agents: list[str] = (), sets: list[str] = (), repeats: int | None = None, stamp: str | None = None,
+            dry_run: bool = False, preflight: bool = True, registry=None, probe_workers: int = 8,
+            env_check=None) -> dict:
+    """The eval of `model` before it starts: its registry entry (bench/models.py) as run overrides (else the plain
+    --model / --provider path), `plan()`, `check()`, the environment check against the suite's `[eval].env`
+    (bench/envs.py; a probe, cached per code state) and a preflight (one real request with fleet tools; skipped in a
+    dry run, with `preflight=False`, or once something already refuses). Returns the eval record with
+    `model_entry`, `preflight`, `env` ({name, fingerprint, match, diff, drift, ...}) and `errors` (empty: it may
+    start). Nothing is written. `stamp` fixes the folder (`runs/eval_<name>_<stamp>`) so a caller can name it before
+    a child process starts it (`civitas eval --stamp`). `env_check` replaces envs.check (tests)."""
+    from . import envs as V
+    from . import models as M
+    s = load_suite(suite_path(suite))
+    try:
+        entry = M.load_registry(registry).get(model) if model else None
+    except M.RegistryError as e:
+        raise EvalError(f"the model registry: {e}") from None
+    if entry is not None and provider and provider != entry.provider:
+        entry = None                                 # an explicit other provider: the plain path
+    extra: list[str] = []
+    if entry is not None:
+        _, reg_sets = M.eval_overrides(entry, path=registry)
+        extra = [x for x in reg_sets if not x.startswith(("fleet.model=", "fleet.provider="))]
+        ev = plan(s, model=entry.served_id, provider=entry.provider, agents=list(agents), sets=[*sets, *extra],
+                  name=name or entry.key, runs_dir=runs_dir, workers=workers, stamp=stamp, repeats=repeats)
+        ev["sets"] = list(sets)
+    else:
+        ev = plan(s, model=model, provider=provider, agents=list(agents), sets=list(sets), name=name,
+                  runs_dir=runs_dir, workers=workers, stamp=stamp, repeats=repeats)
+    ev["model_entry"] = entry.to_dict() if entry else None
+    ev["registry_sets"] = extra
+    errors = check(ev)
+    # the environment
+    if s.env:
+        try:
+            c = (env_check or V.check)(s, agents=list(agents), sets=list(sets), workers=probe_workers,
+                                       cache_dir=Path(runs_dir) / "_cache")
+            ev["env"] = _env_record(c, allow_drift, errors)
+        except Exception as e:                       # e.g. a config the game refuses: say so, don't crash
+            ev["env"] = _env_record(None, allow_drift, errors, name=s.env, failure=f"{type(e).__name__}: {e}")
+    else:
+        ev["env"] = _env_record(None, allow_drift, errors)
+    # the preflight
+    skip = ("dry run: no model call" if dry_run else "turned off (--no-preflight)" if not preflight
+            else "the eval would refuse to start anyway" if errors
+            else "several models in one eval" if ev.get("model") in (None, "mixed") else None)
+    if skip:
+        ev["preflight"] = {"ok": None, "skipped": skip, "model": model_key(ev), "steps": [], "error": None}
+    else:
+        target, pc = entry, None
+        if target is None:
+            from ..config import provider_config
+            r0 = ev["runs"][0]
+            cfg = effective(Path(r0["config_path"]), r0["agent_args"], r0["set_args"])
+            prov = ev.get("provider") or next((x["provider"] for x in model_backed(lineup(cfg))), "arcee")
+            fc = (cfg.get("fleet") or {})
+            target = M.ModelEntry(key=str(ev["model"]), provider=prov,
+                                  temperature=fc.get("temperature"),
+                                  extra_body=dict(fc.get("extra_body") or {}))
+            try:
+                pc = provider_config(cfg, prov)
+            except ValueError as e:
+                errors.append(str(e))
+        if not errors:
+            ev["preflight"] = M.preflight(target, registry, provider=pc)
+            if not ev["preflight"]["ok"]:
+                errors.append(f"preflight failed: {ev['preflight'].get('error')} (one request with the fleet's "
+                              f"tools must come back as a tool call)")
+        else:
+            ev["preflight"] = {"ok": None, "skipped": "the eval would refuse to start anyway",
+                               "model": model_key(ev), "steps": [], "error": None}
+    ev["errors"] = list(dict.fromkeys(errors))
+    return ev
+
+
+def prepare_text(ev: dict) -> list[str]:
+    """The preflight and environment lines `civitas eval` prints before the plan or the runs."""
+    pf, e = ev.get("preflight") or {}, ev.get("env") or {}
+    if pf.get("skipped"):
+        pline = f"Preflight: skipped ({pf['skipped']})."
+    elif pf.get("ok"):
+        pline = f"Preflight: ok in {pf.get('seconds')} s (" + "; ".join(x["detail"] for x in pf["steps"]) + ")."
+    else:
+        pline = f"Preflight: FAILED: {pf.get('error')}."
+    if not e.get("name"):
+        eline = "Environment: the suite names no version ([eval].env): this eval won't be on a leaderboard."
+    elif e.get("error"):
+        eline = f"Environment {e['name']}: the probe failed ({e['error']})" + (", recorded as drifted." if e.get(
+            "drift") else ".")
+    elif not e.get("frozen"):
+        eline = f"Environment {e['name']}: not frozen yet (fingerprint {e.get('fingerprint')})" + (
+            ", recorded as drifted." if e.get("drift") else ".")
+    elif e.get("match"):
+        eline = (f"Environment {e['name']}: matches (fingerprint {e['fingerprint']}, probe "
+                 f"{'cached' if e.get('cached') else str(e.get('probe_seconds')) + ' s'}).")
+    else:
+        eline = (f"Environment {e['name']}: CHANGED ({', '.join(e.get('diff') or [])}; fingerprint "
+                 f"{e.get('fingerprint')}, frozen {e.get('frozen_fingerprint')})"
+                 + (": recorded as drifted, never ranked." if e.get("drift") else "."))
+    entry = ev.get("model_entry")
+    own = ev.get("model") or "the configs' own"
+    mline = (f"Model: {entry['key']} from the registry (provider {entry['provider']}, served id "
+             f"{entry.get('id') or entry['key']})." if entry else
+             f"Model: {own} (not in the registry: --model / --provider as given).")
+    return [mline, pline, eline]
+
+
+# ---------------------------------------------------------------------------------------------------- progress
+_TOKENS: dict[str, tuple] = {}          # trajectories.jsonl -> (size, mtime, tokens)
+
+
+def _run_tokens(d: Path, cities: list[str]) -> int:
+    p = d / "trajectories.jsonl"
+    try:
+        st = p.stat()
+    except OSError:
+        return 0
+    hit = _TOKENS.get(str(p))
+    if hit and hit[:2] == (st.st_size, st.st_mtime):
+        return hit[2]
+    t = _tokens(d, cities)[""]
+    n = t["prompt"] + t["completion"]
+    _TOKENS[str(p)] = (st.st_size, st.st_mtime, n)
+    return n
+
+
+def _tail_month(d: Path) -> int | None:
+    """The month a run is in: the last event of live.jsonl, else the last frame of frames.jsonl."""
+    for name, pat in (("live.jsonl", rb'"month":\s*(\d+)'), ("frames.jsonl", rb'"month":\s*(\d+)')):
+        p = d / name
+        try:
+            with open(p, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536))
+                tail = fh.read()
+        except OSError:
+            continue
+        lines = [x for x in tail.splitlines() if x.strip()]
+        for line in reversed(lines[-20:]):
+            m = re.search(pat, line[:200])
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def progress(eval_dir) -> dict:
+    """How far a (running) eval is, from eval.json and its run folders: {"status", "total", "finished", "running",
+    "failed", "pending", "tokens" (model tokens so far, after the warm-ups), "eta_s" (None when unknown), "runs":
+    [{"run_id", "seed", "status", "month", "months", ...}], ...}."""
+    ev = load(eval_dir)
+    rd = Path(ev["runs_dir"])
+    now = time.time()
+    rows, tokens, durs = [], 0, []
+    for r in ev["runs"]:
+        st = run_status(rd, r)
+        if st == "running" and not _alive(r.get("pid")):
+            st = "stopped"
+        d = rd / r["run_id"]
+        month = (r.get("months") if st == "finished" else _tail_month(d)) if d.exists() else None
+        tok = _run_tokens(d, list(r.get("cities") or [])) if d.exists() else 0
+        tokens += tok
+        if st == "finished" and r.get("started") and r.get("ended"):
+            durs.append(r["ended"] - r["started"])
+        rows.append({"run_id": r["run_id"], "config": r.get("config"), "name": r.get("name"), "seed": r.get("seed"),
+                     "repeat": r.get("repeat") or 1, "status": st, "month": month, "months": r.get("months"),
+                     "warmup": r.get("warmup"), "tokens": tok, "started": r.get("started"),
+                     "error": r.get("error") if st not in ("finished", "running", "pending") else None})
+    count = lambda *s: sum(x["status"] in s for x in rows)
+    status = ev.get("status")
+    if status == "running" and not _alive(ev.get("pid")):
+        status = "stopped"
+    # time left: the running runs by their months played, the pending ones at the mean finished (or estimated) run
+    est = [(r.get("estimate") or {}).get("minutes") for r in ev["runs"]]
+    typical = (statistics.fmean(durs) if durs else
+               statistics.fmean([m * 60 for m in est if m]) if any(est) else None)
+    left_running, unknown = [], False
+    for x, r in zip(rows, ev["runs"]):
+        if x["status"] != "running":
+            continue
+        elapsed = now - (r.get("started") or now)
+        w, m, total = x.get("warmup") or 0, x.get("month"), x.get("months")
+        frac = (m - w) / (total - w) if m is not None and total and total > w and m > w else 0.0
+        if frac >= 0.05:
+            left_running.append(max(0.0, elapsed * (1 - frac) / frac))
+        elif typical:
+            left_running.append(max(0.0, typical - elapsed))
+        else:
+            unknown = True
+    pending = count("pending")
+    eta = None
+    if status == "running" and not unknown and (not pending or typical):
+        slots = sorted(left_running) + [0.0] * max(0, int(ev.get("workers") or 1) - len(left_running))
+        slots = slots[:max(len(left_running), int(ev.get("workers") or 1))]
+        for _ in range(pending):
+            i = slots.index(min(slots))
+            slots[i] += typical
+        eta = round(max(slots), 1) if slots else 0.0
+    return {"dir": ev["dir"], "name": ev.get("name"), "model": model_key(ev), "status": status,
+            "total": len(rows), "finished": count("finished"), "running": count("running"),
+            "failed": count("failed", "interrupted", "stopped", "incomplete", "paused"), "pending": pending,
+            "tokens": tokens, "eta_s": eta, "started": ev.get("started"),
+            "elapsed_s": round(now - ev["started"], 1) if ev.get("started") else None,
+            "env": ev.get("env"), "runs": rows}
+
+
+# ---------------------------------------------------------------------------------------------------- leaderboard
+def _evals_in(runs_dir) -> list[dict]:
+    out = []
+    rd = Path(runs_dir)
+    for p in sorted(rd.glob(f"{PREFIX}*/{FILE}")) if rd.is_dir() else []:
+        ev = _read(p)
+        if isinstance(ev, dict) and "runs" in ev:
+            ev["dir"] = str(p.parent)
+            out.append(ev)
+    return sorted(out, key=lambda e: e.get("created") or 0)
+
+
+def _default_env() -> tuple[str | None, str | None]:
+    try:
+        s = load_suite(suite_path())
+        return s.env, s.baseline_model
+    except EvalError:
+        return None, None
+
+
+def _final_ci(ev: dict) -> dict:
+    """The final city score over units (a unit's repeats averaged): {mean, lo, hi, n}."""
+    groups: dict[str, list] = {}
+    for c in _cards(ev):
+        f = (c.get("total") or {}).get("final")
+        if f is not None and (c.get("total") or {}).get("delta"):
+            groups.setdefault(unit_key(c), []).append(f)
+    return _ci([statistics.fmean(v) for v in groups.values()])
+
+
+def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
+    """Per environment version (default: the default suite's), the latest finished, non-drifted eval of each model
+    ranked by its score vs the scripted yardstick: {"env", "envs", "baseline", "rows": [...], "skipped": [{"eval_dir",
+    "reason"}]}. Each row: model, eval_dir, created, n_units, vs_yardstick / score ({mean, lo, hi}), departments,
+    tokens, cost, and the paired verdict against the baseline model's eval on the same version."""
+    evs = _evals_in(runs_dir)
+    envs = sorted({(e.get("env") or {}).get("name") for e in evs} - {None})
+    d_env, d_base = _default_env()
+    if env is None:
+        env = d_env if d_env in envs or not envs else max(
+            (e for e in evs if (e.get("env") or {}).get("name")), key=lambda e: e.get("created") or 0)["env"]["name"]
+    skipped, latest = [], {}
+    for ev in evs:
+        e = ev.get("env") or {}
+        st = ev.get("status")
+        if st == "running" and not _alive(ev.get("pid")):
+            st = "stopped"
+        a = aggregate_of(ev) if ev.get("scorecard") else {}
+        why = (("no environment version recorded (an eval from before environment versions, or a suite without "
+                "[eval].env)") if not e.get("name") else
+               f"environment {e['name']}, not {env}" if e["name"] != env else
+               f"drifted: the code didn't match {env} (--allow-drift)" if e.get("drift") or e.get("match") is False
+               else f"not finished ({st})" if st != "finished" else
+               "no scored runs" if not a.get("scored") else None)
+        if why:
+            skipped.append({"eval_dir": ev["dir"], "name": ev.get("name"), "model": model_key(ev), "reason": why})
+            continue
+        k = model_key(ev)
+        if k in latest:
+            skipped.append({"eval_dir": latest[k]["dir"], "name": latest[k].get("name"), "model": k,
+                            "reason": f"superseded by a newer eval of {k} ({Path(ev['dir']).name})"})
+        latest[k] = ev
+    bases = [ev["suite"].get("baseline_model") for ev in latest.values() if (ev.get("suite") or {}).get("baseline_model")]
+    baseline = bases[-1] if bases else (d_base if env == d_env else None)
+    base_ev = latest.get(baseline) if baseline else None
+    frozen = None
+    try:
+        from .envs import load_env
+        frozen = load_env(env) if env else None
+    except Exception:
+        frozen = None
+    rows = []
+    for k, ev in latest.items():
+        a = aggregate_of(ev)
+        cd = a.get("city_delta") or {}
+        p = paired(base_ev, ev) if base_ev is not None and ev is not base_ev else None
+        rows.append({"model": k, "eval_dir": ev["dir"], "name": ev.get("name"), "created": ev.get("created"),
+                     "n_units": a.get("n_units"), "provider": ev.get("provider"),
+                     "vs_yardstick": {x: cd.get(x) for x in ("mean", "lo", "hi")},
+                     "score": {x: v for x, v in _final_ci(ev).items() if x in ("mean", "lo", "hi")},
+                     "departments": dict(a.get("roles") or {}),
+                     "population": {x: (a.get("population_delta") or {}).get(x) for x in ("mean", "lo", "hi")},
+                     "teamwork": a.get("teamwork"), "beats_scripted": a.get("beats_scripted"),
+                     "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"),
+                     "verdict": verdict_text(p)[0] if p else None, "paired": p,
+                     "baseline": k == baseline})
+    rows.sort(key=lambda r: (r["vs_yardstick"]["mean"] is None, -(r["vs_yardstick"]["mean"] or 0)))
+    for i, r in enumerate(rows):
+        r["rank"] = i + 1
+    return {"env": env, "envs": envs, "baseline": baseline, "fingerprint": (frozen or {}).get("fingerprint"),
+            "rows": rows, "skipped": skipped, "created": time.time()}
+
+
+def leaderboard_markdown(lb: dict) -> str:
+    """runs/leaderboard_<env>.md."""
+    L = [f"# Leaderboard: {lb.get('env') or 'no environment'}", ""]
+    L += [f"Environment `{lb.get('env')}`" + (f" (fingerprint `{lb['fingerprint']}`)" if lb.get("fingerprint") else "")
+          + ": the latest finished eval of each model whose code matched it, ranked by its city score vs the scripted "
+            "yardstick (the change since the hand-over minus the scripted agents' change from the same hand-over; "
+            "mean over units with its 95% interval). Evals of other versions are never ranked together."
+          + (f" Paired verdicts are against `{lb['baseline']}`." if lb.get("baseline") else ""), ""]
+    if not lb.get("rows"):
+        L += ["No ranked evals yet: `civitas eval --model <key>` on the suite of this version.", ""]
+    else:
+        roles = list(dict.fromkeys(r for row in lb["rows"] for r in row["departments"]))
+        L += ["| # | model | vs scripted (95% CI) | final city score | units | tokens | cost | vs baseline | eval |",
+              "|---:|---|---:|---:|---:|---:|---:|---|---|"]
+        for row in lb["rows"]:
+            v = row["vs_yardstick"]
+            verdict = "baseline" if row.get("baseline") else (row.get("verdict") or "n/a").replace("|", "/")
+            cost = "n/a" if row.get("cost") is None else "${:,.2f}".format(row["cost"])
+            score = ci_text(row["score"]).lstrip("+")
+            L.append(f"| {row['rank']} | {row['model']} | {ci_text(v)} | {score} "
+                     f"| {row.get('n_units') or 0} | {_tok(row.get('tokens'))} | {cost} | {verdict} "
+                     f"| `{Path(row['eval_dir']).name}` |")
+        if roles:
+            L += ["", "## Departments: final score vs scripted (mean)", "",
+                  "| model | " + " | ".join(roles) + " |", "|---|" + "---:|" * len(roles)]
+            for row in lb["rows"]:
+                L.append(f"| {row['model']} | " + " | ".join(_f(row["departments"].get(r), 1, True) for r in roles)
+                         + " |")
+    if lb.get("skipped"):
+        L += ["", "## Not ranked", ""]
+        L += [f"- `{Path(s['eval_dir']).name}` ({s.get('model') or '?'}): {s['reason']}" for s in lb["skipped"]]
+    others = [e for e in lb.get("envs") or [] if e != lb.get("env")]
+    if others:
+        L += ["", "Other versions with evals: " + ", ".join(f"`{e}`" for e in others)
+              + " (`civitas eval --leaderboard --env <name>`)."]
+    return "\n".join(L) + "\n"
+
+
+def write_leaderboard(lb: dict, runs_dir="runs") -> Path:
+    p = Path(runs_dir) / f"leaderboard_{_label(lb.get('env') or 'none')}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(leaderboard_markdown(lb))
+    return p
