@@ -165,7 +165,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     const e = P.env, el = $("evEnv");
     let st;
     if (!e) st = `<span class="ev-st muted">…</span>`;
-    else if (e.computing) st = `<span class="ev-st busy"><span class="ev-spin"></span>checking… <span class="muted small">the scripted fleet replays every suite seed (~10–20 s)</span></span>`;
+    else if (e.computing) st = `<span class="ev-st busy"><span class="ev-spin"></span>checking… <span class="muted small">the scripted fleet replays every suite seed (~30 s, longer while evals start)</span></span>`;
     else if (e.unavailable_readonly) st = `<span class="ev-st muted" title="The probe runs only in a civitas serve with launching on">not checked (read-only)</span>`;
     else if (e.error) st = `<span class="ev-st bad" title="${esc(e.error)}">${e.unavailable ? "" : "check failed: "}${esc(e.error)}</span>`;
     else if (!e.frozen || !e.env) st = `<span class="ev-st warn">no version frozen</span>`;
