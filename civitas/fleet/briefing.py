@@ -31,7 +31,7 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spend_lines, unclaimed_spots
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
 from .tools import Ask, _yours, keep_up_where, mayor_ask, needs_count
-from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
+from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, not_next, road_price
 from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
 from .tools import TIER_UP, enrol_text, upgrade_line
 from .tools import AHEAD_MONTHS, BANK_BUSY, RESERVE_MIN, _offers, core_fact, reserve_why, tier_name
@@ -848,6 +848,11 @@ def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
         return [f"- tier upgrade: {_yours(n.label)} ({money(b.cost)}{up}; {n.status}"
                 + (f"; {n.note}" if n.note else "") + f"): {n.call} {when}"]
     if not m.keep_ups:
+        if b is not None and b.cost is None and b.stuck:     # nothing named: no ready site adds coverage (keep_up_room)
+            if is_open():
+                return [f"- coverage estimate: {b.stuck}"]
+            return [f"- keep up with growth: {b.stuck}; ask planning for a lot or a road near ({b.gap[0]},{b.gap[1]}) "
+                    "before building another"]
         if not m.stuck:
             return []
         n = m.build.named[0]
@@ -931,7 +936,9 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     # utilities: only purposes whose supply is wanted, and the amount its supply line names. Review, fleet_scripted
     # seed 0 month 24: "a coal plant at (0,23) ($4,000) needs $2,252 more", then "cheapest: near_homes $2,200" with
     # water at 141 of 250
-    wanted = {p: pr for p, pr in prices.items() if role != "utilities" or _wanted(w, p)}
+    # (a jail with cells to spare and health's hospital aren't named by price either: tools.not_next)
+    wanted = {p: pr for p, pr in prices.items()
+              if (role != "utilities" or _wanted(w, p)) and not not_next(w, role, p, lists[p].sites)}
     purposes, low = cheapest(wanted) or cheapest(wanted, supplementary=True) or ((), None)
     more = _supply_money(supplies, funds)[2]
     # whether to ask the mayor for money (mayor_ask): for the needs line's top-up (utilities: its supply line's), or

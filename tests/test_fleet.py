@@ -786,7 +786,7 @@ def test_two_by_two_lists_say_when_no_free_block_is_left(open_env):
     """The hospital and university lists rank free 2x2 roadside blocks with need +0.01 everywhere (observation's
     size=2 site_candidates), so they go empty only for lack of a block, but read "nothing needs it right now". Review
     probe, month 60 (6,564 residents): education's keep fell from its $12,000 university to its $5,000 high school,
-    and $7,000 read idle."""
+    and $7,000 read idle (civitas-v2: a university is never a first building, so a blocked one keeps nothing)."""
     from civitas.fleet.tools import DeptMoney, _free_roadside, _why_empty, blocked_firsts, role_obs, site_lists
     env = copy.deepcopy(open_env)                      # every milestone reached
     w = env.world
@@ -800,14 +800,14 @@ def test_two_by_two_lists_say_when_no_free_block_is_left(open_env):
         assert "2x2" in lst.note and "ask planning (send_message)" in lst.note, lst.note
     assert "hospital" not in blocked_firsts(w, "health", lists["health"])       # the clinic's tier 2: an upgrade
     assert "university" not in blocked_firsts(w, "education", lists["education"])     # school enrolment short (v2)
-    w.enrollment.update(elementary=1.0, high=1.0)       # both school levels enrolled: the university's turn
-    assert "university" in blocked_firsts(w, "education", lists["education"])
-    w.school_cov[:] = w.high_cov[:] = 1.0              # schools need no lot: the university is the cheapest blocked
-    line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
-    assert "education (university: a free 2x2 lot)" in line, line
+    w.enrollment.update(elementary=1.0, high=1.0)       # both school levels enrolled: the university's turn, but it is
+    assert "university" not in blocked_firsts(w, "education", lists["education"])    # never a first building (v2)
+    w.school_cov[:] = w.high_cov[:] = 1.0              # schools need no lot: nothing of education's is blocked
+    blocked = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
+    assert not any("university" in ln for ln in blocked), blocked
     _held(env, education=(12000, 0))
     m = DeptMoney(env, "education")
-    assert (m.keep, m.idle) == (12000, 0)
+    assert m.keep < 12000 and m.idle > 0                # another building no lot is left for keeps nothing
 
 
 def _hem_homes(env, keep=(), road=True):
@@ -1477,7 +1477,7 @@ def test_keep_never_drops_below_the_needs_line(open_env, monkeypatch):
     assert (m.build.cost, m.build.dearest, m.keep, m.idle) == (8000, 8000, 8000, 0)
     n = len(real(env.world, "health", T.role_obs(env, "health"))["hospital"].sites[:MAX_SITES])
     line = next(ln for ln in briefing(env, "mayor", mark=False).splitlines() if ln.startswith("- health:"))
-    assert n and line == f"- health: funds $6,000, spent $0; needs $8,000 for its first hospital ({n} sites, $120/month)"
+    assert n and line == f"- health: funds $6,000, spent $0; needs $8,000 for a hospital ({n} sites, $120/month)"
 
 
 def _empty_lists(monkeypatch, dept: str, short: str, blocked: bool) -> None:
@@ -1507,8 +1507,8 @@ def test_money_for_a_blocked_first_building_is_not_idle(grown_env, monkeypatch):
     env = copy.deepcopy(grown_env)
     _held(env, police=(2500, 0))
     _empty_lists(monkeypatch, "police", LAND, blocked=True)
-    m = DeptMoney(env, "police")                       # keeps $4,000 for the jail, its dearest; names the station
-    assert (m.build.cost, m.build.dearest, m.keep, m.idle, m.blocked) == (None, 4000, 4000, 0, ("a police station",))
+    m = DeptMoney(env, "police")    # keeps $2,500 for the station it names (a jail only while the cells are busy)
+    assert (m.build.cost, m.build.dearest, m.keep, m.idle, m.blocked) == (None, 2500, 2500, 0, ("a police station",))
     lines = lambda: briefing(env, "mayor", mark=False).splitlines()
     line = lambda: next(ln for ln in lines() if ln.startswith("- police:"))
     assert line() == "- police: funds $2,500, spent $0; blocked: a police station"
@@ -2763,6 +2763,15 @@ def env12():
     return env
 
 
+@pytest.fixture
+def landfill_wanted(monkeypatch):
+    """env12 has a landfill and garbage at 100%: another landfill is kept up there (keep_up_room, civitas-v2) and no
+    line names it. The claim and zone-warning tests that use one as a funded building away from homes lift the gate
+    for health."""
+    import civitas.fleet.tools as T
+    monkeypatch.setattr(T, "KEEP_UP_GATED", ("police", "fire"))
+
+
 def test_system_prompt_sections_in_order():
     cfg = FleetAgentConfig(fleet_playbook="FLEET-PB: grow first", playbook="ROLE-PB: stations by homes", max_steps=17)
     for role in TURN_ORDER:
@@ -3668,13 +3677,13 @@ def test_planning_ready_sites_name_the_first_buildings_blocked_for_lack_of_land(
         env.end_month()
     _fill_roadside(env.world)                          # every roadside tile taken; pump and outlet have room
     block = _ready_sites(briefing(env, "planning", mark=False))
-    # the cheapest first buildings, all on a tie; water has room, power (81 of 111, +62 a quarter) won't in 3 months
-    line = (head + "utilities (wind turbine), police (police station), fire (fire station), health (clinic, landfill: "
-            "away from homes), education (elementary school)" + tail)
-    assert len(line) == 228
-    assert block[-4] == line and block[-2].startswith("- high density: locked")          # before the high density
-    assert block[-3] == ("- away from homes (health's landfill): leave a lot free by (40,19), the far end of "
-                         "road_extension (25,19)-(40,19), with no homes within 4 tiles")      # a dead end's extension
+    # the cheapest first buildings, all on a tie; water has room, power (81 of 111, +62 a quarter) won't in 3 months;
+    # not another landfill: garbage is covered (100%, keep_up_room), so no "away from homes" line either (its test:
+    # test_planning_blocked_line_fits_in_full_past_1000_residents)
+    line = (head + "utilities (wind turbine), police (police station), fire (fire station), health (clinic), "
+            "education (elementary school)" + tail)
+    assert len(line) == 201
+    assert block[-3] == line and block[-2].startswith("- high density: locked")          # before the high density
     import civitas.fleet.briefing as B
     B.BLOCKED_LINE_CHARS, keep = 150, B.BLOCKED_LINE_CHARS
     try:                                               # too long: the departments alone
@@ -3705,7 +3714,7 @@ def _best(env, role: str, purpose: str) -> str:
     return f"({s['x']},{s['y']})"
 
 
-def test_planning_ready_sites_name_what_funded_departments_will_build(env12):
+def test_planning_ready_sites_name_what_funded_departments_will_build(env12, landfill_wanted):
     """Smoke v14 seed 0, months 3-6: the mayor funded fire, health and education for their ready sites near homes, and
     planning, acting next, zoned those lots. Its Ready sites now name each funded department's cheapest ready first
     building and best site; the mayor's top-ups this month count."""
@@ -3735,7 +3744,7 @@ def test_planning_ready_sites_name_what_funded_departments_will_build(env12):
     assert "fire (fire station: near homes)" in briefing(env, "planning", mark=False)
 
 
-def test_planning_zone_strips_spare_funded_sites(env12):
+def test_planning_zone_strips_spare_funded_sites(env12, landfill_wanted):
     """Planning zones what it is suggested: next to "leave free (funded): fire station (20,22), clinic (20,22)" its
     best zone_R and zone_C strip was (20,20)-(21,22). Strips covering a funded site now come after those that don't,
     marked, and a failed zone's suggestions skip the site, as they skip free riverbank lots while the bank is needed."""
@@ -3972,7 +3981,7 @@ def test_riverbank_and_funded_warnings_come_once():
     assert res["message"].count("WARNING") == 1 and "riverbank lot" in res["message"], res
 
 
-def test_a_funded_building_whose_every_site_is_claimed_is_named_and_blocked(env12):
+def test_a_funded_building_whose_every_site_is_claimed_is_named_and_blocked(env12, landfill_wanted):
     """Smoke v18 seed 1, month 6: the mayor funded education's first school, but its only site (38,25) was the police
     station's too, claimed first in turn order. Planning read only "leave free (funded): police station (38,25)";
     education was on neither that line nor the blocked one (its list wasn't empty), read "no free roadside land" in
@@ -4029,7 +4038,7 @@ def test_the_leave_free_line_keeps_its_unclaimed_notes_at_its_cap():
         "leave or free one near (10,40)"]
 
 
-def test_a_zone_that_leaves_several_funded_buildings_no_site_names_a_tile_for_each(env12):
+def test_a_zone_that_leaves_several_funded_buildings_no_site_names_a_tile_for_each(env12, landfill_wanted):
     """Smoke v18 seed 1, month 9: each of planning's two high-density strips warned "that zoned the last site for
     fire's fire station near homes ($2,500 held) and health's landfill ($2,000 held): dezone one, e.g. (46,29)" (then
     police's, the clinic's and the school's), and planning dezoned exactly that tile, which seats one building. Each
@@ -4071,7 +4080,7 @@ def test_a_zone_names_each_building_a_distinct_tile_from_its_own_list(monkeypatc
         "station near homes ($2,500 held): dezone (3,3) for the police station and (5,5) for the fire station")
 
 
-def test_a_landfill_losing_its_last_site_alone_is_told_where_it_can_go(env12):
+def test_a_landfill_losing_its_last_site_alone_is_told_where_it_can_go(env12, landfill_wanted):
     """One building: a station keeps "dezone one, e.g. (x,y)" (test_zoning_the_last_site_of_a_funded_building_warns);
     a landfill's tile must be away from homes once dezoned, else it needs a lot at the town edge: smoke v18's (46,35)
     sat in a strip of new homes."""

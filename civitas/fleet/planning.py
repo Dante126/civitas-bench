@@ -33,9 +33,9 @@ from ..sim import catalog as C
 from ..sim.grid import box_sum
 from .fmt import advice, money
 from .tools import (AWAY_FROM_HOMES, BUILT_NAMES, DIRECTIONS, MAX_SITES, SiteList, Spot, _connected_roads, _empty_land,
-                    _riverbank_by_roads, _touching, _wanted, _where, claim_spots, dept_lists, edge_site, funded_sites,
-                    land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded, zone_fit_rect,
-                    zone_line, zoning_cost)
+                    _riverbank_by_roads, _touching, _wanted, _where, capped_unlinked, claim_spots, dept_lists, edge_site,
+                    funded_sites, land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded,
+                    zone_fit_rect, zone_line, zoning_cost)
 
 PARK_RADIUS = 4            # World._compute_environment: park tiles within box_sum(.., 4) raise land value,
 PARK_STEP, PARK_MAX = 0.08, 0.3   # by 8 points each, at most 30 (4 park tiles in range)
@@ -400,13 +400,16 @@ def edge_road(w) -> tuple[dict, tuple[int, int], float] | None:
 
 def link_item(w, blocked: dict[str, list[str]]) -> Item | None:
     """A road to the map edge (edge_road) while transport's first train station is blocked for want of an edge lot by a
-    road and R and C demand are capped without a link (land_blocked: tools.capped_unlinked). Seed 4 at month 96:
-    6,052 residents, no train station or harbour, no edge lot by a road."""
+    road and the city is unlinked from LINK_AHEAD of the residents R and C demand are capped at without a link
+    (land_blocked: tools.link_due). Seed 4 at month 96: 6,052 residents, no train station or harbour, no edge lot by a
+    road."""
     if "train_station" not in blocked.get("transport", ()) or (road := edge_road(w)) is None:
         return None
     args, (lx, ly), cost = road
-    return Item(f"a road to the map edge for transport's first train station (R and C demand stay capped at "
-                f"+{C.CAP_LEVEL:g} without one), then leave ({lx},{ly}) empty", cost, call("build_road", args))
+    cap = (f"R and C demand stay capped at +{C.CAP_LEVEL:g} without one" if capped_unlinked(w) else
+           f"R and C demand are capped at +{C.CAP_LEVEL:g} from {C.CAP_POP_CONNECTION:,} residents without one")
+    return Item(f"a road to the map edge for transport's first train station ({cap}), then leave ({lx},{ly}) empty",
+                cost, call("build_road", args))
 
 
 # ------------------------------------------------------------------ the Next line

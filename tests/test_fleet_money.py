@@ -972,10 +972,10 @@ def test_a_first_building_the_city_lacks_comes_before_a_cheaper_build(monkeypatc
     w.dept_funds["education"] = 3291
     m = DeptMoney(env, "education")
     assert (m.kind, m.top_up, m.keep_why) == ("first/supply", 5000 - 3291, "for its first high school")
-    short -= {"elementary", "high"}                               # both school levels enrolled: the university's turn
-    uni = T.first_build(env, "education")
-    assert [(n.what, n.have, n.first) for n in uni.named] == [("university", 0, True)] and uni.cost == 12000
-    assert (uni.dearest, uni.keep_for) == (12000, "its first university")
+    short -= {"elementary", "high"}                               # both school levels enrolled: the university's turn,
+    uni = T.first_build(env, "education")                         # never a first building (civitas-v2)
+    assert [(n.what, n.have, n.first) for n in uni.named] == [("a university", None, False)] and uni.cost == 12000
+    assert (uni.dearest, uni.keep_for) == (12000, "a university")
 
 
 def test_a_line_without_a_needs_line_says_why(monkeypatch):

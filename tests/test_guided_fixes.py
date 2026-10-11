@@ -70,12 +70,13 @@ def test_school_levels_go_by_enrolment(late):
     assert "- school: none - elementary enrolment 99% (goal 90%)" in edu
     assert "- university: none - high-school enrolment 80%: schools first (a university counts in no enrolment" in edu
     assert "high-school enrolment 80%: " in _line(edu, "- elementary enrolment 99%")       # Key metrics
-    # both school levels enrolled: the first university, a first building (v1 named it first whatever enrolment)
+    # both school levels enrolled: a university, another building, never a first one (v1 named it first whatever
+    # enrolment; test_a_university_is_never_a_first_building)
     w.enrollment.update(high=0.95)
     w.stats.update(high_coverage=0.95)
     w.refresh()
     b = first_build(env, "education")
-    assert [(n.what, n.have, n.first) for n in b.named] == [("university", 0, True)]
+    assert [(n.what, n.have, n.first) for n in b.named] == [("a university", None, False)]
     # and with a university enrolling its students, nothing to build: the line says enrolment is covered
     w.stats.update(seats_university=1500)
     w.enrollment.update(university=1.0)
@@ -261,3 +262,128 @@ def test_a_station_is_priced_another_and_only_when_it_pays(late, monkeypatch):
     w.dept_funds["transport"] = 0
     m = DeptMoney(env, "transport")
     assert (m.kind, m.top_up, m.keep) == ("another", C.TRAIN_STATION["cost"], C.TRAIN_STATION["cost"])
+
+
+# ------------------------------------------------------------------ civitas-v2 review: what biased the guided evals
+def test_a_university_is_never_a_first_building(late):
+    """eval_v2 seeds 4, 5, 12, 18, 20 at month 96: with both school levels at 90% the needs line read "needs $12k for
+    its first university", first/supply (the treasury down to $3,000, past the loan guard). A university counts in no
+    enrolment the score reads: it is "a university", another building, funded only from money above the reserve."""
+    env = copy.deepcopy(late)
+    w = env.world
+    w.stats.update(seats_university=0, high_coverage=0.95)
+    w.enrollment.update(elementary=0.99, high=0.95, university=0.0)
+    w.refresh()
+    assert not T.site_price(w, "education", "university").first and T.site_price(w, "education", "school").first
+    b = first_build(env, "education")
+    assert b.purposes == ("university",) and [(n.label, n.first) for n in b.named] == [("a university", False)]
+    w.dept_funds["education"] = 0
+    fleet = FleetState.of(env)
+    f = funding_gaps(env, fleet)
+    m = f.depts["education"]
+    assert (m.kind, m.what) == ("another", "a university") and m.keep >= b.cost
+    assert [i.kind for i in f.to_fund if i.dept == "education"] == ["another"]
+    mayor = briefing(env, "mayor", mark=False)
+    assert f"; needs {money(b.cost)} for a university (" in _line(mayor, "- education:")
+    assert "first university" not in mayor
+    ask = mayor_ask(env, fleet, "education")
+    assert ask.ok == ("education" in T.fund_cover(f)) and "first" not in ask.what
+    # another building to the guards: a top-up that leaves the treasury under the reserve is refused
+    w.treasury = T.reserve(w) + 100
+    res = ToolBox(env, "mayor").call("allocate_budget", {"department": "education", "amount": 1000})
+    assert res.get("refused") == "reserve", res
+
+
+def test_kept_up_coverage_names_no_station_nor_upgrade(late):
+    """eval_v2 seeds at month 96: "This turn: build another fire station ($2,500): your funds cover it" at 96.9% fire
+    coverage, where the best ready site added 0.00; seed 18: a $7,800 police HQ for 97 -> 98%. At KEEP_UP_GOAL or more
+    the station list reads covered, nothing is named, the mayor's to-fund line leaves the department out and its money
+    above the $1,000 floor is idle."""
+    env = copy.deepcopy(late)
+    w = env.world
+    assert first_build(env, "fire").named[0].call                  # seed 4: the fire HQ, coverage under the goal
+    w.metrics()["fire_coverage"] = 0.95
+    assert T.at_goal(w, "fire", "station")
+    lst = T.site_lists(w, "fire", T.role_obs(env, "fire"))["station"]
+    assert lst.sites and lst.short == "fire coverage 95% (goal 90%)" and not lst.blocked
+    offers = T._offers(T.role_obs(env, "fire"), "fire")
+    assert offers and T.tier_up(w, "fire", [(s["x"], s["y"]) for s in lst.sites], offers) is None
+    b = first_build(env, "fire")
+    assert b.cost is None and not b.named and b.covered.startswith("fire coverage 95% (goal 90%)")
+    w.dept_funds["fire"] = 3000
+    d = funding_gaps(env, FleetState.of(env)).depts["fire"]
+    assert d.keep == d.floor and d.needs is None
+    w.dept_funds["fire"] = 0
+    f = funding_gaps(env, FleetState.of(env))
+    d = f.depts["fire"]
+    assert d.kind == "nothing" and d.state.startswith("fire coverage 95% (goal 90%)")
+    assert "fire" not in [i.dept for i in f.to_fund]
+    assert _line(briefing(env, "mayor", mark=False), "- fire:").endswith(f"; {d.state}")
+    w.dept_funds["fire"] = 2000                         # its shelter paid for: the ask line, not "can't pay"
+    fire = briefing(env, "fire", mark=False)
+    assert "- station: none - fire coverage 95% (goal 90%)" in fire
+    assert "This turn: nothing needs building now" in _line(fire, "- no money ask to the mayor now: ")
+    assert "another fire station" not in fire
+    assert "- tier upgrade:" not in fire and "upgrade_facility {" not in fire
+
+
+def test_a_station_no_ready_site_lifts_is_not_named(late, monkeypatch):
+    """Under the goal, another station whose best ready site adds under KEEP_UP_GAIN (keep_up picks none) is not named
+    either: the list says so, and the department reads where the uncovered homes are (FirstBuild.gap); a jail, the
+    cheapest ready site left, only while the cells are busy."""
+    env = copy.deepcopy(late)
+    w = env.world
+    w.metrics()["police_coverage"] = 0.8
+    w.stats["downtown_uncovered"] = {**w.stats["downtown_uncovered"], "police": 0}     # no tier upgrade to name
+    real = T.keep_up
+    monkeypatch.setattr(T, "keep_up", lambda w_, dept, p, sites: (
+        T.KeepUp("police_coverage", 0.8, (0.8,), (), (3, 4), 0.05) if (dept, p) == ("police", "station")
+        else real(w_, dept, p, sites)))
+    lst = T.site_lists(w, "police", T.role_obs(env, "police"))["station"]
+    assert lst.sites and lst.short == "ready sites add under 1% (police coverage 80%)"
+    assert "the uncovered homes near (3,4) are out of their road reach; 5 points are lost downtown" in lst.note
+    assert not T._cells_busy(w)
+    b = first_build(env, "police")
+    assert b.cost is None and not b.named and b.gap == (3, 4) and b.covered.startswith("ready sites add under 1%")
+    w.dept_funds["police"] = 0
+    d = DeptMoney(env, "police")
+    assert d.kind in ("nothing", "blocked") and d.gap == (3, 4)
+    assert ("ask planning for a lot or a road near the uncovered homes at (3,4)"
+            in mayor_ask(env, FleetState.of(env), "police").instead)
+    assert "cheapest: jail" not in briefing(env, "police", mark=False)
+
+
+def test_the_first_link_counts_before_the_cap(late, monkeypatch):
+    """eval_v2 seed 20 at month 96: 5,932 residents, no link, a harbour ready at $10k, transport holding $5,194; the
+    needs line named avenue tiles, so the mayor read "idle $4,194 ... no top-up needed". From LINK_AHEAD of
+    CAP_POP_CONNECTION an unlinked city's first link is a first building: kept for while a bus line comes first, then
+    named before avenues."""
+    env = copy.deepcopy(late)
+    w = env.world
+    args, _, _ = P.edge_road(w)
+    w.dept_funds["planning"] += 1000
+    assert apply_action(w, "planning", {"type": "build_road", **args}).ok      # an edge lot for a train station
+    w.refresh()
+    w.metrics()["population"] = round(0.9 * C.CAP_POP_CONNECTION)
+    assert T.link_due(w) and not T.capped_unlinked(w)
+    lists = T.site_lists(w, "transport", T.role_obs(env, "transport"))
+    assert lists["train_station"].sites and not lists["train_station"].short
+    real = T.site_lists
+    monkeypatch.setattr(T, "site_lists", lambda w_, role, obs: lists if role == "transport" else real(w_, role, obs))
+    if lists["bus_stops"].sites and not lists["bus_stops"].short:              # a bus line first, the link kept for
+        b = first_build(env, "transport")
+        assert b.purposes == ("bus_stops",) and b.dearest == C.TRAIN_STATION["cost"]
+        assert b.keep_for == "its first train station"
+    for p in ("bus_stops", "congested_roads"):
+        lists[p] = lists[p]._replace(sites=[], short="nothing")
+    b = first_build(env, "transport")
+    assert b.purposes == ("train_station",)
+    assert [(n.label, n.first) for n in b.named] == [("its first train station", True)]
+    w.dept_funds["transport"] = 5000
+    d = DeptMoney(env, "transport")
+    assert (d.kind, d.idle, d.top_up) == ("first/supply", 0, C.TRAIN_STATION["cost"] - 5000)
+    # below LINK_AHEAD it is a station like any: another
+    w.metrics()["population"] = round(0.8 * C.CAP_POP_CONNECTION)
+    assert not T.link_due(w)
+    b = first_build(env, "transport")
+    assert [(n.label, n.first) for n in b.named] == [("a train station", False)]
