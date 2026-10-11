@@ -1062,6 +1062,57 @@ def _mean(vals):
     return statistics.fmean(vals) if vals else None
 
 
+# The noop reference (yardstick.json's `noop`: the run's model roles idle from the hand-over) and the normalized
+# score (model change - noop change) / (scripted change - noop change): 0 = no better than doing nothing, 1 = the
+# scripted baseline, above 1 = beyond it. Below NORM_MIN city points between scripted and noop a unit's ratio is None
+# (counted as `norm_tiny`): the replay noise of a run's change is ~0.4 (sd, eval trinity-large-cal), so over a gap
+# under 0.5 one replay alone moves the ratio by ~1, the whole noop-to-scripted range.
+NORM_MIN = 0.5
+
+
+def normalized(change, yard, noop, min_gap: float | None = None) -> tuple[float | None, bool]:
+    """(the normalized score, tiny): (change - noop) / (yard - noop); (None, True) when |yard - noop| < min_gap
+    (default NORM_MIN), (None, False) when a value is missing."""
+    if change is None or yard is None or noop is None:
+        return None, False
+    gap = float(yard) - float(noop)
+    if abs(gap) < (NORM_MIN if min_gap is None else min_gap):
+        return None, True
+    return (float(change) - float(noop)) / gap, False
+
+
+def _add_noop(u: dict, noop: dict | None) -> dict:
+    """A scorecard line's noop fields from the noop part (or its city's): `noop_change` {city, population} (None
+    without a usable noop part), `normalized` and `norm_tiny` (normalized())."""
+    nc = (noop or {}).get("change")
+    u["noop_change"] = {"city": _r(nc.get("city")), "population": nc.get("population")} if nc else None
+    v, tiny = normalized((u.get("change") or {}).get("city"), (u.get("yard_change") or {}).get("city"),
+                         (nc or {}).get("city"))
+    u["normalized"], u["norm_tiny"] = _r(v), tiny
+    return u
+
+
+def norm_summary(units: list[dict]) -> dict:
+    """The normalized score over units (unit_values rows): {n, mean, std, lo, hi} of the unit ratios (a t-interval,
+    as for every score here), `median`, `tiny` (units whose scripted - noop gap is under NORM_MIN: no ratio),
+    `missing` (units without a noop part), `min_gap`, `pooled`: the ratio of the means over every unit with a noop
+    part (stats.ratio_ci; a small gap weighs little there, so no unit is left out and the threshold doesn't move it),
+    None when the mean gap is under NORM_MIN too, and `vs_noop`: points over doing nothing (change - noop change,
+    {n, mean, std, lo, hi} over those units). In 12-month late windows the scripted agents add only ~1 point over doing
+    nothing, so per-unit ratios swing with the threshold; `pooled` and `vs_noop` are the stable summaries."""
+    vals = [u["normalized"] for u in units if u.get("normalized") is not None]
+    have = [u for u in units if u.get("noop_change") is not None and u.get("change") is not None
+            and u.get("yard_change") is not None]
+    pooled = None
+    if have and abs(statistics.fmean(u["yard_change"] - u["noop_change"] for u in have)) >= NORM_MIN:
+        p = S.ratio_ci([u["change"] - u["noop_change"] for u in have], [u["yard_change"] - u["noop_change"] for u in have])
+        pooled = None if p is None else {k: v if k == "n" else _r(v) for k, v in p.items()}
+    return {**_ci(vals), "median": _r(statistics.median(vals)) if vals else None,
+            "vs_noop": _ci([u["change"] - u["noop_change"] for u in have]),
+            "tiny": sum(bool(u.get("norm_tiny")) for u in units), "missing": len(units) - len(have),
+            "min_gap": NORM_MIN, "pooled": pooled}
+
+
 def _split(u: dict | None, target: float | None) -> dict | None:
     """A unit's city score vs scripted split into the population term and the quality terms: {population, quality}.
     The population term is scoring.population_term (50 x pop_score) at the final population less at the hand-over,
@@ -1099,7 +1150,9 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
     """One run folder's scorecard record: status, model, versions, wall time, `total` (the run; a region's region
     values: its score and population, the departments' mean over its cities, Teamwork's mean, calls and tokens
     summed) and for a region `cities` (one _unit each). A finished warm-up run without yardstick.json gets it
-    computed (scripted agents, seconds, no model calls)."""
+    computed (scripted agents, seconds, no model calls), and one without its noop part that part. Each line has
+    `noop_change` {city, population}, `normalized` and `norm_tiny` (_add_noop: None / False without a usable noop
+    part, yardstick.noop_ok); `noop_matches` is the noop part's hand-over check against the run."""
     from . import yardstick as Y
     from .compare import model_of
     d = Path(d)
@@ -1117,12 +1170,15 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
     if summ is None:
         return out
     ys = Y.read(d)
-    if ys is None and compute_yardstick and out["warmup"] and (summ.get("warmup") or {}).get("handed_over"):
-        try:
-            ys = Y.yardstick(d)
+    if (ys is None or not ys.get("noop")) and compute_yardstick and out["warmup"] \
+            and (summ.get("warmup") or {}).get("handed_over"):
+        try:                                        # the scripted part only when missing; the noop reference too
+            ys = Y.yardstick(d, scripted=ys is None)
         except Exception as e:                      # the scorecard shows the run without its yardstick
             out["yardstick_error"] = f"{type(e).__name__}: {e}"
     out["yardstick_matches"] = (ys or {}).get("matches_run")
+    nop = Y.noop_ok(ys)
+    out["noop_matches"] = ((ys or {}).get("noop") or {}).get("matches_run")
     w = summ.get("warmup") or {}
     hand = w.get("at_handover")
     hand = {"city": hand.get("city"), "population": hand.get("population")} if hand else None
@@ -1138,6 +1194,7 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
         yroles = {k: v for k, v in yscores.items() if k != "city"}
         out["total"] = _unit(scores.get("city"), fm.get("population"), hand, ys, roles, yroles,
                              _teamwork(d, None, rep.get("collaboration")), _calls(rep.get("roles")), tok[""])
+        _add_noop(out["total"], nop)
         return out
     units = {}
     yby = (ys or {}).get("by_city") or {}
@@ -1153,13 +1210,15 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
         units[c] = _unit(scores.get(pre + "city"), ((fm.get("by_city") or {}).get(c) or {}).get("population"), chand,
                          yby.get(c), roles, yroles, _teamwork(d, c, crep.get("collaboration")),
                          _calls(crep.get("roles")), tok[c])
-    names = list(dict.fromkeys(r for u in units.values() for r in u["roles"]))
+        _add_noop(units[c], ((nop or {}).get("by_city") or {}).get(c))
+    names =list(dict.fromkeys(r for u in units.values() for r in u["roles"]))
     mean_roles = {r: _mean([u["roles"].get(r) for u in units.values()]) for r in names}
     mean_yroles = {r: _mean([u["yard_roles"].get(r) for u in units.values()]) for r in names}
     calls = [u["calls"] for u in units.values() if u["calls"]]
     out["total"] = _unit(scores.get("city"), fm.get("population"), hand, ys, mean_roles, mean_yroles,
                          _r(_mean([u["teamwork"] for u in units.values()]), 1),
                          {k: sum(x[k] for x in calls) for k in CALLS} if calls else None, tok[""])
+    _add_noop(out["total"], nop)
     out["cities"] = cities
     out["by_city"] = units
     return out
@@ -1167,7 +1226,8 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
 
 def unit_values(cards: list[dict]) -> dict:
     """The scored runs grouped by unit (config + seed), in order: {unit: {runs, city, pop_term, quality, population,
-    teamwork, roles, handover, values}}, each the mean over the unit's repeats of the run's value vs scripted (a region
+    teamwork, roles, handover, values, change, yard_change, noop_change, normalized, norm_tiny}}, each the mean over
+    the unit's repeats of the run's value vs scripted (a region
     by its region values; pop_term / quality: card_split); `values` the city deltas of its runs, `handover` the city score at the hand-over (the same for every
     repeat while the warm-up code is the same)."""
     groups: dict[str, list] = {}
@@ -1188,7 +1248,18 @@ def unit_values(cards: list[dict]) -> dict:
                   "roles": {r: _r(_mean([u["role_delta"].get(r) for u in us])) for r in roles},
                   "handover": (us[0].get("at_handover") or {}).get("city"),
                   "values": [u["delta"]["city"] for u in us]}
+        out[k].update(_unit_noop(us))
     return out
+
+
+def _unit_noop(us: list[dict]) -> dict:
+    """A unit's noop fields: its mean change, the scripted and noop change (one hand-over: the same for every repeat)
+    and the normalized score of the mean change (normalized(): a ratio of the unit's means, not a mean of ratios)."""
+    ch = _mean([(u.get("change") or {}).get("city") for u in us])
+    yc = _mean([(u.get("yard_change") or {}).get("city") for u in us])
+    nc = _mean([(u.get("noop_change") or {}).get("city") for u in us])
+    v, tiny = normalized(ch, yc, nc)
+    return {"change": _r(ch), "yard_change": _r(yc), "noop_change": _r(nc), "normalized": _r(v), "norm_tiny": tiny}
 
 
 def _ci(values, d=3) -> dict:
@@ -1214,7 +1285,8 @@ def _agg(cards: list[dict], ev: dict) -> dict:
     """Aggregates over finished runs. Scores vs scripted are over units (config + seed, a region once by its region
     values), each the mean of its repeats: mean, std of the units (the seed spread) and a 95% t-interval (lo, hi);
     `values` lists every run's. `noise`: the replay noise (K >= 2), `mde`: the smallest difference a paired comparison
-    with another eval on these units can see, by repeats."""
+    with another eval on these units can see, by repeats. `noop_change`: the do-nothing reference's mean change (over
+    the scored runs with one, like `yard_change`), `normalized`: norm_summary over the units."""
     units = [c["total"] for c in cards if c.get("total")]
     scored = [u for u in units if u.get("delta")]
     cd = [u["delta"]["city"] for u in scored]
@@ -1236,6 +1308,8 @@ def _agg(cards: list[dict], ev: dict) -> dict:
            "population_delta": _ci([u["population"] for u in U], 1),
            "city_change": _r(_mean([u["change"]["city"] for u in units if u.get("change")])),
            "yard_change": _r(_mean([u["yard_change"]["city"] for u in scored])),
+           "noop_change": _r(_mean([u["noop_change"]["city"] for u in scored if u.get("noop_change")])),
+           "normalized": norm_summary(U),
            "beats_scripted": sum(u["city"] > 0 for u in U),
            "roles": {r: c["mean"] for r, c in roles_ci.items()}, "roles_ci": roles_ci,
            "teamwork": team["mean"], "teamwork_ci": team,
@@ -1322,6 +1396,7 @@ def _summary_rows(a: dict) -> list[tuple[str, str]]:
             ("beats scripted", f"{a['beats_scripted']} of {n_units} units"),
             ("city score change since hand-over (mean)", _f(a["city_change"], 1, True)),
             ("scripted change from the same start (mean)", _f(a["yard_change"], 1, True)),
+            *_noop_rows(a, n_units),
             ("population vs scripted (mean, 95% CI)", ci_text(a["population_delta"], 0)),
             ("Teamwork (mean)", _f(a["teamwork"])),
             ("failed actions per turn", _f(a["failed_per_turn"], 2)),
@@ -1337,6 +1412,26 @@ def _summary_rows(a: dict) -> list[tuple[str, str]]:
     return rows
 
 
+def _noop_rows(a: dict, n_units: int) -> list[tuple[str, str]]:
+    """The summary rows of the do-nothing reference and the normalized score ("n/a" for an eval saved before them)."""
+    nm = a.get("normalized") or {}
+    left = (f"{nm['tiny']} of {n_units}" if nm else "n/a") + \
+        (f"; {nm['missing']} without a noop reference" if nm.get("missing") else "")
+    return [("doing-nothing change from the same start (mean)", _f(a.get("noop_change"), 1, True)),
+            ("points over doing nothing (mean, 95% CI)", ci_text(nm.get("vs_noop"))),
+            ("normalized (run - noop) / (scripted - noop), pooled (95% CI)", ci_text(nm.get("pooled"), 2)),
+            ("· per unit: mean (95% CI) / median",
+             f"{ci_text(nm, 2)} / {_f(nm.get('median'), 2, True)}" if nm else "n/a"),
+            (f"· units without a ratio (scripted within {nm.get('min_gap', NORM_MIN):g} of noop)", left)]
+
+
+def _norm_cell(u: dict) -> str:
+    """A Runs-table cell: the normalized score, "tiny" when scripted and noop are too close, "n/a" without."""
+    if u.get("normalized") is not None:
+        return _f(u["normalized"], 2, True)
+    return "tiny" if u.get("norm_tiny") else "n/a"
+
+
 def _line(c: dict, u: dict, label: str, split: dict | None = None) -> str:
     ch, ych, dl = u.get("change") or {}, u.get("yard_change") or {}, u.get("delta") or {}
     sp = split or {}
@@ -1346,7 +1441,8 @@ def _line(c: dict, u: dict, label: str, split: dict | None = None) -> str:
     tok = (tk.get("prompt") or 0) + (tk.get("completion") or 0)
     hand = u.get("at_handover") or {}
     return (f"| {label} | {_f(hand.get('city'))} | {_f(ch.get('city'), 1, True)} | {_f(ych.get('city'), 1, True)} "
-            f"| **{_f(dl.get('city'), 1, True)}** | {_f(sp.get('population'), 1, True)} "
+            f"| **{_f(dl.get('city'), 1, True)}** | {_f((u.get('noop_change') or {}).get('city'), 1, True)} "
+            f"| {_norm_cell(u)} | {_f(sp.get('population'), 1, True)} "
             f"| {_f(sp.get('quality'), 1, True)} | {_f(ch.get('population'), 0, True)} "
             f"| {_f(ych.get('population'), 0, True)} | {_f(dl.get('population'), 0, True)} | {_f(u.get('teamwork'))} "
             f"| {per('failed')} | {per('refused')} | {tk.get('turns') or 0} | {_tok(tok) if tok else 'n/a'} "
@@ -1383,8 +1479,14 @@ def markdown(ev: dict) -> str:
           "Intervals are 95% t-intervals over the units: an interval above 0 means the model beats scripted on this "
           "suite beyond seed luck. **Replay noise** is how much one unit varies between runs of the same model; the "
           "**detectable difference** is the smallest gap between two evals on these units that a paired comparison "
-          "(`civitas eval --compare`) finds 80% of the time, from the replay noise alone (a lower bound).", ""]
-    cols = list(groups) if len(groups) > 1 else []
+          "(`civitas eval --compare`) finds 80% of the time, from the replay noise alone (a lower bound).", "",
+          "**noop** is the change of the same city from the same hand-over when the model's roles do nothing "
+          "(yardstick.json's `noop`). **normalized** = (run change - noop change) / (scripted change - noop change): "
+          "0 is no better than doing nothing, 1 the scripted baseline, 2 twice what scripted adds over doing nothing. "
+          f"A unit whose scripted and noop changes are within {NORM_MIN:g} city points has no ratio (\"tiny\"); the "
+          "pooled value (the ratio of the means over all units) doesn't need that guard and is the steadier number. "
+          "**Points over doing nothing** is the run's change minus the noop change.", ""]
+    cols =list(groups) if len(groups) > 1 else []
     L += ["## Summary", "", "| | all runs" + "".join(f" | {g}" for g in cols) + " |",
           "|---|---:" + "|---:" * len(cols) + "|"]
     per_group = [dict(_summary_rows(groups[g])) for g in cols]
@@ -1400,14 +1502,14 @@ def markdown(ev: dict) -> str:
         for r in roles:
             L.append(f"| {r} | {rc(a, r)}" + "".join(f" | {rc(groups[g], r)}" for g in cols) + " |")
     L += ["", "## Runs", "",
-          "| run | city at hand-over | city change | scripted | vs scripted | · population term | · quality terms "
-          "| population change | scripted | vs scripted | Teamwork | failed / turn | refused / turn | model turns "
-          "| tokens | run time |",
-          "|---|" + "---:|" * 15]
+          "| run | city at hand-over | city change | scripted | vs scripted | noop | normalized | · population term "
+          "| · quality terms | population change | scripted | vs scripted | Teamwork | failed / turn | refused / turn "
+          "| model turns | tokens | run time |",
+          "|---|" + "---:|" * 17]
     for c in cards:
         name = run_label(c)
         if not c.get("total"):
-            L.append(f"| {name} (`{c['run_id']}`) | {c.get('status')}" + " |" * 15)
+            L.append(f"| {name} (`{c['run_id']}`) | {c.get('status')}" + " |" * 17)
             continue
         if c["region"]:
             L.append(_line(c, c["total"], f"**{name} (region)**", card_split(c)))
@@ -1920,6 +2022,19 @@ def _split_ci(ev: dict, a: dict) -> tuple[dict, dict]:
     return pick(p), pick(q)
 
 
+def _noop_row(a: dict) -> dict:
+    """A leaderboard row's do-nothing fields from the eval's aggregate (None for one saved before them): `noop_change`
+    and `scripted_change` (mean changes since the hand-over), `vs_noop` ({mean, lo, hi}: points over doing nothing)
+    and `normalized` ({mean, lo, hi, median, n, tiny, missing, pooled: {mean, lo, hi, n}}: norm_summary)."""
+    nm = a.get("normalized")
+    pick = lambda c: None if not c else {x: c.get(x) for x in ("mean", "lo", "hi")}
+    return {"noop_change": a.get("noop_change"), "scripted_change": a.get("yard_change"),
+            "vs_noop": pick((nm or {}).get("vs_noop")),
+            "normalized": None if not nm else {
+                **{x: nm.get(x) for x in ("mean", "lo", "hi", "median", "n", "tiny", "missing")},
+                "pooled": nm.get("pooled")}}
+
+
 def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
     """Per environment version (default: the default suite's), the latest finished, non-drifted eval of each model
     ranked by its score vs the scripted yardstick: {"env", "envs", "baseline", "rows": [...], "skipped": [{"eval_dir",
@@ -1987,7 +2102,7 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
                      "failed_per_turn": a.get("failed_per_turn"), "refused_per_turn": a.get("refused_per_turn"),
                      "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"), "efficiency": eff,
                      "verdict": verdict_text(p)[0] if p else None, "paired": p,
-                     "baseline": k == baseline})
+                     "baseline": k == baseline, **_noop_row(a)})
     rows.sort(key=lambda r: (r["vs_yardstick"]["mean"] is None, -(r["vs_yardstick"]["mean"] or 0)))
     for i, r in enumerate(rows):
         r["rank"] = i + 1
@@ -2027,6 +2142,7 @@ def leaderboard_markdown(lb: dict) -> str:
             for row in lb["rows"]:
                 L.append(f"| {row['model']} | " + " | ".join(_f(row["departments"].get(r), 1, True) for r in roles)
                          + " |")
+    L += _noop_board(lb)
     if lb.get("skipped"):
         L += ["", "## Not ranked", ""]
         L += [f"- `{Path(s['eval_dir']).name}` ({s.get('model') or '?'}): {s['reason']}" for s in lb["skipped"]]
@@ -2035,6 +2151,30 @@ def leaderboard_markdown(lb: dict) -> str:
         L += ["", "Other versions with evals: " + ", ".join(f"`{e}`" for e in others)
               + " (`civitas eval --leaderboard --env <name>`)."]
     return "\n".join(L) + "\n"
+
+
+def _noop_board(lb: dict) -> list[str]:
+    """leaderboard_markdown's "Against doing nothing" table (nothing while no row has a noop reference)."""
+    rows = [r for r in lb.get("rows") or [] if r.get("normalized")]
+    if not rows:
+        return []
+    L = ["", "## Against doing nothing", "",
+         "The change since the hand-over of the run, the scripted yardstick and the noop reference (the model's roles "
+         "idle from the same hand-over), mean over units; normalized = (run - noop) / (scripted - noop): 0 no better "
+         "than doing nothing, 1 the scripted baseline. Pooled is the ratio of the means (all units); per-unit ratios "
+         f"leave out units whose scripted and noop changes are within {NORM_MIN:g}.", "",
+         "| model | run change | scripted | noop | points over noop (95% CI) | normalized, pooled (95% CI) "
+         "| per unit: mean (95% CI) | median | units without a ratio |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in rows:
+        nm = r["normalized"]
+        run = None if r.get("scripted_change") is None or (r.get("vs_yardstick") or {}).get("mean") is None else \
+            r["scripted_change"] + r["vs_yardstick"]["mean"]
+        L.append(f"| {r['model']} | {_f(run, 1, True)} | {_f(r.get('scripted_change'), 1, True)} "
+                 f"| {_f(r.get('noop_change'), 1, True)} | {ci_text(r.get('vs_noop'))} | {ci_text(nm.get('pooled'), 2)} "
+                 f"| {ci_text(nm, 2)} | {_f(nm.get('median'), 2, True)} | {nm.get('tiny', 0)} of {r.get('n_units') or 0}"
+                 + (f" ({nm['missing']} without noop)" if nm.get("missing") else "") + " |")
+    return L
 
 
 def write_leaderboard(lb: dict, runs_dir="runs") -> Path:

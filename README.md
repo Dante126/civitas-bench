@@ -157,7 +157,8 @@ civitas bench -c configs/fleet_scripted.toml --seeds 0-4 --workers 5
 civitas run -c configs/fleet_smoke_late.toml
 civitas run -c configs/fleet_smoke.toml --set game.months=72 --warmup 60      # the same, from any config
 civitas prompt -c configs/fleet_smoke_late.toml --role transport               # its first briefing after the warm-up
-civitas yardstick <run_id>     # a warm-up run's scripted yardstick (written by `run` at the end; no model calls)
+civitas yardstick <run_id>     # a warm-up run's scripted yardstick + noop reference (written by `run` at the end; no model calls)
+civitas yardstick --noop --evals --workers 4   # add the noop reference to every eval run that lacks one
 
 civitas leaderboard            # every finished run, grouped by agent line-up
 ```
@@ -291,7 +292,8 @@ civitas env check | civitas env list | civitas env freeze civitas-v2   # environ
 - **Leaderboard**: per version, the latest finished, non-drifted eval of each model, ranked by its score vs the
   scripted yardstick (95% interval) and its population / quality split (rows' `pop_term` / `quality`; an eval saved
   before the split gets it from its run cards), with the final city score, Teamwork, failed actions and refusals per
-  model turn (`failed_per_turn` / `refused_per_turn`), departments, tokens, cost and the paired verdict
+  model turn (`failed_per_turn` / `refused_per_turn`), departments, tokens, cost, the do-nothing reference
+  (`noop_change`, `vs_noop`, `normalized`: see "Against doing nothing" below) and the paired verdict
   against the suite's `baseline_model` (trinity-large-thinking). Evals of other versions, drifted, unfinished or
   superseded are listed as not ranked, with the reason. The viewer's Evals page (Models, Evals, Leaderboard) drives
   all of this from `civitas serve`. Stopping an eval (SIGTERM / SIGHUP to `civitas eval`, or Ctrl+C) stops its runs.
@@ -321,6 +323,24 @@ vs scripted, each department's final
 score minus the yardstick's, Teamwork, failures per turn, tokens per model turn and in all, run time; for all runs
 and per config. A Versions table gives each run's `fleet_version`, a hash of its logged system prompts and the code
 commit (adopted runs: the last commit before the run started, inferred from git).
+
+**Against doing nothing.** Each card also has `noop_change` (the city's change from the same hand-over with the
+model's roles idle, yardstick.json's `noop`) and `normalized` = (run change - noop change) / (scripted change - noop
+change): 0 no better than doing nothing, 1 the scripted baseline, 2 twice what scripted adds over doing nothing. A
+unit (its repeats' mean change first) whose scripted and noop changes are within `evals.NORM_MIN` = 0.5 city points
+gets no ratio and is counted (`norm_tiny`): a run's replay noise is ~0.4, so over a smaller gap one replay moves the
+ratio by about the whole noop-to-scripted range. The aggregate's `normalized` has the per-unit mean with its
+t-interval, the median, the counts `tiny` / `missing`, `pooled` (the ratio of the means over every unit with a noop
+reference, `stats.ratio_ci`: a t-interval on the ratio estimator's residuals; small gaps weigh little, so no unit is
+left out) and `vs_noop` (points over doing nothing); `noop_change` / `yard_change` are the mean changes. The
+scorecard shows them in its summary and the Runs table (noop, normalized: "tiny" for a unit without a ratio), the
+leaderboard rows carry `noop_change`, `scripted_change`, `vs_noop` and `normalized`, and leaderboard.md an "Against
+doing nothing" table; an eval saved before them reads n/a (`civitas eval --report` rebuilds it). Read `pooled` or
+`vs_noop`, not the per-unit mean: in the 12-month late windows scripted adds only ~1.1-1.3 points over doing nothing
+(civitas-v2: noop +0.5, scripted +1.8 on average; 2 of 8 v2 units and v1's seed 6 have gaps under 0.5), so per-unit
+ratios swing with the threshold (deepseek-v4-flash on v2: per-unit mean 3.6 / 2.6 / 1.6 at thresholds 0.25 / 0.5 /
+1.0, pooled 2.4 at all three). Paired verdicts don't change: points over noop is vs scripted plus a per-unit
+constant.
 
 **Cost.** The suite keeps reference numbers per run (trinity-large-thinking): a single city ~1.4M prompt + 0.15M
 completion tokens and ~9.5 min, a region ~3.2M + 0.35M and ~23.5 min; the whole suite ~11.6M tokens (10.5M prompt,
@@ -1735,6 +1755,18 @@ transit at 17% and no shortage, so a 60-month warm-up still tested the middle ga
   late runs' yardsticks (months 96-107): single city seeds 0 / 1 / 2 +1.1 / +268, +6.2 /
   +1,532, +1.4 / +868; region seeds 0 / 1 +0.7 / +1,360, +5.1 / +3,520 (seed 0 from month 60
   in a 72-month game: city 55.8 -> 62.3, population 2,724 -> 4,436).
+- **Noop reference.** Beside it the runner plays the same window once more with the run's
+  model roles doing nothing after the hand-over (`yardstick.idle_roles`: every fleet / llm /
+  remote role, all roles in an all-scripted run; each acting turn a `NoopAgent`'s empty
+  decision, what the RL noop policy's lone `end_turn` amounts to), the other roles as in the
+  yardstick line-up, under the same safety checks. It goes to `yardstick.json` under `noop`
+  (the scripted part's shape, `idle`, and `matches_run` / `matches_yardstick`: its hand-over
+  must be the run's and the yardstick's, else `noop_ok` drops it). `civitas yardstick <run>
+  --noop` adds it to an existing yardstick.json without replaying the scripted part;
+  `civitas yardstick --noop --evals [GLOB] --workers 4` does every run of the evals in
+  `runs/` (skipping runs that have one, `--force` replays). Code that no longer plays a run's
+  warm-up gives a mismatched hand-over: civitas-v1's runs were backfilled from a `git
+  archive env/civitas-v1` export with the new `yardstick.py` copied in (identical otherwise).
 - **Reports.** The fleet report, the Problems tab, the Team tab and the collaboration score
   cover the months after the warm-up only (`run_collab` reads `warmup_months` as `since`).
   The report's header names the warm-up and the score change. In a region, `deals` keeps the
