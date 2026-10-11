@@ -21,7 +21,11 @@ class ScriptedMayor(Agent):
     it also reclaims idle department money (RECLAIM): a service keeps a standing balance only while it spends (its
     first building is funded in full, later builds it asks for), an ask a department sits on goes unfunded, and what
     a department holds well above its working balance and twice its recent spending is taken back (v1's mayor ended
-    seed 0 with $31k idle in departments)."""
+    seed 0 with $31k idle in departments). Take-backs have hysteresis (HOLD_TURNS): a department keeps the largest
+    working balance of this and its last two turns (utilities' swings 7,000 <-> 3,000 as supply's margin crosses 1.3x,
+    a service's 3,000 -> 1,000 as its last build leaves the spending window), and nothing is taken from one that asked
+    for money in this or its last two turns unless it sits on that ask: without them it took $4,000 from utilities
+    and gave it back the next quarter, and a service's station money before it built."""
     kind = "scripted"
     RECLAIM = True              # False: civitas-v1's mayor (ScriptedMayorV1)
     last_turn_month: int | None = None      # month of its previous turn this episode (None: no turn yet)
@@ -30,6 +34,7 @@ class ScriptedMayor(Agent):
     STANDING_MIN = 1000         # a service's working balance while it spends nothing (up to its usual balance)
     IDLE_MIN = 1000             # a take-back reclaims at least this much ("well above" what it can spend soon)
     SAT_SHARE = 0.95            # still holding this share of an ask it was fully funded for, and asking again: sat on it
+    HOLD_TURNS = 2              # take-backs look back this many turns: the largest working balance, any ask
 
     def __init__(self, role: str, **kwargs):
         super().__init__(role, **kwargs)
@@ -41,6 +46,7 @@ class ScriptedMayor(Agent):
         self.spending: list[tuple[int, dict]] = []   # (month, {dept: spent since the turn before}) per turn
         self.sat: dict[str, float] = {}              # dept -> an ask it was fully funded for and didn't spend
         self.spenders: set[str] = set()              # departments seen spending (a service's first building is paid)
+        self.past: list[tuple[dict, set]] = []       # last HOLD_TURNS turns: (working balances before asks, askers)
 
     def _spent(self, funds: dict, month: int) -> dict[str, float]:
         """What each department spent over the last SPEND_MONTHS months: its funds right after each of the mayor's
@@ -88,6 +94,7 @@ class ScriptedMayor(Agent):
                             if m["month"] >= since and m["sender"] != "mayor")
         spent = self._spent(funds, obs["month"])
         asks = _requested_amounts(obs["council"], since)
+        askers = set(asks) | ({"utilities"} if "utilities" in requests and "fund" in requests else set())
         if self.RECLAIM:
             asks = self._honoured(asks, funds)
         pop = c["population"]
@@ -99,21 +106,28 @@ class ScriptedMayor(Agent):
             targets = [targets[0], ("health", 3000, 0.35), ("fire", 3000, 0.35), ("police", 3000, 0.35),
                        ("education", 3000, 0.35), ("transport", 2000, 0.3), ("planning", 7000, 0.6)]
         self.targets = {}       # dept -> the working balance aimed for this turn (the scripted fleet's plan budgets)
+        base = {}               # dept -> that balance before asks
         for dept, target, _ in targets:
             if dept not in funds:
                 continue
             if self.RECLAIM and dept in self.SERVICES and dept in self.spenders:
                 # after its first building a service keeps a standing balance only while it spends; it asks for a build
                 target = min(target, max(self.STANDING_MIN, 2 * spent.get(dept, 0.0)))
+            base[dept] = target
             self.targets[dept] = max(target, asks.get(dept, 0) + 200)
 
         # --- idle money: before any loan or top-up, take back what a department holds well above both its working
-        # balance and twice what it spent over the last SPEND_MONTHS months (none from fire while a flood is coming)
+        # balance and twice what it spent over the last SPEND_MONTHS months (none from fire while a flood is coming).
+        # Hysteresis: the largest balance of this and the last HOLD_TURNS turns counts, and a department that asked in
+        # them keeps its money unless it sits on the ask (taken now, it would be given back next turn); HOLD_TURNS = 0
+        # is the mayor without hysteresis
         flood = any("flood" in x.lower() for x in obs.get("forecast", []))
+        asked = askers.union(*(a for _, a in self.past)) - set(self.sat) if self.HOLD_TURNS else set()
         taken = {}
         for dept, target in self.targets.items():
-            idle = round(funds[dept] - max(target, 2 * spent.get(dept, 0.0)))
-            if self.RECLAIM and idle >= self.IDLE_MIN and not (dept == "fire" and flood):
+            keep = max([target, 2 * spent.get(dept, 0.0)] + [b.get(dept, 0.0) for b, _ in self.past])
+            idle = round(funds[dept] - keep)
+            if self.RECLAIM and idle >= self.IDLE_MIN and dept not in asked and not (dept == "fire" and flood):
                 acts.append({"type": "allocate_budget", "department": dept, "amount": -idle})
                 funds[dept] -= idle
                 treasury += idle
@@ -194,6 +208,7 @@ class ScriptedMayor(Agent):
         if deals:
             why.append(", ".join(f"{a['type']} {a.get('deal') or a['resource']}" for a in deals))
         self.held = funds
+        self.past = (self.past + [(base, askers)])[-self.HOLD_TURNS:] if self.HOLD_TURNS else []
         return Decision(actions=acts[: obs.get("max_actions", 8)] + deals, messages=msgs, thinking="; ".join(why))
 
 

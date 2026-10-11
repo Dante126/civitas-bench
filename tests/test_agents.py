@@ -118,16 +118,17 @@ def test_scripted_mayor_reads_the_requests_since_its_previous_turn():
 
 
 def _mayor_turns(cls):
-    """turn(month, funds, *council, forecast=()) -> (decision, targets) of one scripted mayor on a city of 500 with
-    ample supply and a rich treasury; funds left out hold what the mayor's last turn left them (nothing spent)."""
+    """turn(month, funds, *council, forecast=(), supply=900) -> (decision, targets) of one scripted mayor on a city of
+    500 with ample supply (power and water demand 100; supply=120 is tight) and a rich treasury; funds left out hold
+    what the mayor's last turn left them (nothing spent)."""
     env = CivitasEnv(GameConfig(seed=0, months=24))
     base = env.observe("mayor")
-    city = {**base["city"], "population": 500, "power": {"supply": 900, "demand": 100},
-            "water": {"supply": 900, "demand": 100}}
     mayor = cls("mayor")
     mayor.reset(0)
 
-    def turn(month, funds=None, *council, forecast=()):
+    def turn(month, funds=None, *council, forecast=(), supply=900):
+        city = {**base["city"], "population": 500, "power": {"supply": supply, "demand": 100},
+                "water": {"supply": supply, "demand": 100}}
         held = {d: 0.0 for d in base["finance"]["department_funds"]} | dict(getattr(mayor, "held", None) or {})
         fin = {**base["finance"], "treasury": 200000, "department_funds": held | dict(funds or {})}
         d = mayor.act({**base, "month": month, "city": city, "finance": fin, "council": list(council),
@@ -167,7 +168,9 @@ def test_scripted_mayor_stops_funding_an_ask_a_department_sits_on():
 def test_scripted_mayor_keeps_a_service_balance_only_while_it_spends():
     """A service gets its usual working balance until it builds its first building; after that it keeps twice what
     it spent over the last 6 months (at least $1,000, at most the usual balance) and asks for a build it can't pay.
-    Fire isn't touched while a flood is forecast."""
+    A take-back waits two turns after its balance falls, and the money for an ask stays while it asked in this or
+    the last two turns (taken back, it would be given again for the same build). Fire isn't touched while a flood
+    is forecast."""
     from civitas.agents.scripted import ScriptedMayor
     turn = _mayor_turns(ScriptedMayor)
     d, t = turn(3)
@@ -177,15 +180,45 @@ def test_scripted_mayor_keeps_a_service_balance_only_while_it_spends():
     d, t = turn(9)
     assert t["police"] == 3000 and not _takes(d)                    # spent $2,500 within 6 months
     d, t = turn(12)
-    assert t["police"] == 1000 and _takes(d) == {"police": 2000}    # nothing spent since month 6
+    assert t["police"] == 1000 and not _takes(d)                    # nothing spent since month 6: 3,000 last turn
+    d, t = turn(15)
+    assert t["police"] == 1000 and not _takes(d)                    # ... and the turn before
+    d, t = turn(18)
+    assert t["police"] == 1000 and _takes(d) == {"police": 2000}
     assert t["fire"] == 3000                                        # no first building yet: the full balance
-    station = {"month": 12, "sender": "police", "to": "mayor", "text": "Police needs $2,500 for a new building."}
-    d, t = turn(15, None, station)
+    station = {"month": 18, "sender": "police", "to": "mayor", "text": "Police needs $2,500 for a new building."}
+    d, t = turn(21, None, station)
     assert t["police"] == 2700 and {"type": "allocate_budget", "department": "police", "amount": 1700} in d.actions
-    d, t = turn(18, {"fire": 0})                                    # fire built: the full balance while it spends
-    d, t = turn(24, {"fire": 3000})
-    d, t = turn(27, {"fire": 4000}, forecast=["River flood expected in 2 month(s) along rows 3-17: ..."])
+    d, t = turn(24)                                                 # not built yet, not asking again
+    assert t["police"] == 1000 and not _takes(d)                    # asked last turn: it keeps the money
+    d, t = turn(27)
+    assert not _takes(d)                                            # asked two turns ago
+    d, t = turn(30)
+    assert _takes(d) == {"police": 1700}                            # no ask in the last two turns: idle
+    d, t = turn(33, {"fire": 0})                                    # fire built: the full balance while it spends
+    d, t = turn(39, {"fire": 3000})
+    d, t = turn(42, {"fire": 4000}, forecast=["River flood expected in 2 month(s) along rows 3-17: ..."])
     assert "fire" not in _takes(d)
+
+
+def test_scripted_mayor_keeps_utilities_money_while_supply_swings():
+    """Utilities' working balance is 7,000 while supply is under 1.3x demand and 3,000 otherwise. The money for the
+    tight balance stays for two turns after supply recovers (the first cut took $4,000 back and gave it again the
+    next quarter as the margin crossed 1.3x); after that the money above 3,000 comes back."""
+    from civitas.agents.scripted import ScriptedMayor
+    turn = _mayor_turns(ScriptedMayor)
+    d, t = turn(3, {"utilities": 3000}, supply=120)                 # tight: topped up to 7,000
+    assert t["utilities"] == 7000 and {"type": "allocate_budget", "department": "utilities",
+                                       "amount": 4000} in d.actions
+    d, t = turn(6)
+    assert t["utilities"] == 3000 and not _takes(d)                 # ample again: kept
+    d, t = turn(9, supply=120)                                      # tight again: nothing to give back
+    assert t["utilities"] == 7000 and not [a for a in d.actions if a.get("department") == "utilities"]
+    d, t = turn(12)
+    d, t = turn(15)
+    assert not _takes(d)
+    d, t = turn(18)
+    assert _takes(d) == {"utilities": 4000}
 
 
 def test_remote_agent_over_http(tmp_path):
