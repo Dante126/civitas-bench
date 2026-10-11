@@ -566,8 +566,11 @@ workers, SFT export, `civitas rl compare`). With trl installed (the training ven
 end_turn, the other answers in text): TRL's own loop runs the env's tools, the tool responses are masked out of the
 loss, the two rollouts score apart and an optimizer step happens (~90 s on a laptop CPU). On macOS, where TRL's
 Triton log-prob kernel doesn't exist, `train.py` swaps in a plain-PyTorch one (`_TorchLogProbs`). The 0.6B smoke
-(`configs/rl_smoke_local.toml`, `CIVITAS_TRL_SMOKE=1` for its test) is the same with a real model's generations;
-on a 16 GB Mac under load one step takes tens of minutes (7k-token prompts on CPU).
+(`configs/rl_smoke_local.toml`, `CIVITAS_TRL_SMOKE=1` for its test) is the same with a real model's generations.
+It is too heavy for a busy 16 GB Mac: on 2026-10-10 generation, the env and the reward ran (two rollouts in ~4.5
+min, no tool call in 384 tokens, both -2.362: a zero-variance group), but the backward pass over two ~7k-token
+sequences hadn't finished after an hour under memory pressure (CPU attention with a padding mask materializes the
+7k x 7k matrices; Apple MPS ran out of memory on them). Use a Linux GPU box, or Modal's `check` + a short `train`.
 
 **Config** (`configs/rl_qwen3_4b.toml`, read by `civitas/rl/train.py` and `modal_app.py`; `--set section.key=value`):
 [data] bank / split / roles (`["planning"]`) / styles / dev_seeds; [reward] and [env]; [lora] r 32, alpha 64 on
