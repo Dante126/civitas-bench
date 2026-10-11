@@ -176,6 +176,14 @@ BUS_FULL, BUS_LINES_MAX, CONGESTED_LOAD = 0.9, 4, 1.0
 # every stop) still missed hubs that moved: region run 20261005, north, month 66: 61% of residents near a stop,
 # transit 9.6%, no line offered; 1-3% at month 108-120 in every 120-month LLM run (scripted fleet: 10-15%)
 TRANSIT_GOAL, BUS_GAIN = 0.12, 0.01
+# transport's stations (first_build names one, priced, when nothing else is ready). A train station or harbour links the
+# city to the region: without one, R and C demand stay capped from CAP_POP_CONNECTION residents (World.demand_caps).
+# Their lists offer one only when it pays (link_room): no link yet, a first train station (the scripted transport's
+# rule), or freight at FREIGHT_FULL of its capacity or more (the scripted harbour's rule); else another adds only freight
+# room nobody uses. v1 seed 3, month 96: "Next: a harbour ($10k)" with freight at 15% of a harbour's capacity
+STATION_PURPOSES = ("train_station", "harbour", "metro_station")
+LINK_PURPOSES = ("train_station", "harbour")
+FREIGHT_FULL = 0.7
 RIVERBANK_PURPOSES = {"pump", "sewage", "riverbank_2x2"}      # empty when no road reaches free riverbank
 BANK_TOP_UP = {"pump": "pump", "sewage": "outlet"}   # one-tile riverbank purposes site_lists tops up -> crowd line
 # utilities' first-building purposes -> the supply their building adds to (near_homes: its cheapest, the water tower)
@@ -1153,6 +1161,9 @@ class DeptMoney:
                 s = supply_of(pr.name)
                 dear[s] = max(dear.get(s, 0.0), pr.cost)
             self.bound = sum(dear.values())
+        if self.bound is not None and dept in TIER_UP_LINES:     # a tier upgrade its next build may name (tier_up,
+            self.bound = max(self.bound, upgrade_bound(w, dept))  # school_upgrade): v1 police held $7,095, above its
+                                                                  # $4,000 jail, and read idle beside an $7,800 HQ
         # its funded first buildings with no lot of their own (unclaimed_firsts across departments): funding_gaps
         # sets it, so a DeptMoney made alone reads () and its kind is "blocked" only for lack of land
         self.unclaimed: tuple[str, ...] = ()
@@ -1366,7 +1377,8 @@ class DeptMoney:
         """Its money for a line with nothing else to show (no idle money, needs line or block): "funds cover its
         builds" when its funds reach its dearest priced purpose (bound), "funds cover its next build" when they reach
         its next build (first_build: a first building it lacks before a cheaper site), else why nothing is named:
-        "supply has room" (utilities sites left out while their supply has room: FirstBuild.room), "only a library
+        "supply has room" (utilities sites left out while their supply has room: FirstBuild.room), education's
+        "enrolment covered: elementary 99%, high-school 92%" (FirstBuild.covered), "only a library
         ready ($1,500)" (FirstBuild.extra), or "nothing ready to buy"; "" for planning (never shown). Review, seed 0,
         month 108: utilities read "nothing ready to buy" with a pump and an outlet ready, water and sewage spare."""
         if self.dept == "planning":
@@ -1380,6 +1392,8 @@ class DeptMoney:
             return "funds cover its next build"
         if b is not None and b.room:
             return "supply has room"
+        if b is not None and b.covered:
+            return b.covered + (f"; only {a_or_an(b.extra[0])} ready ({money(b.extra[1])})" if b.extra else "")
         if b is not None and b.extra:
             return f"only {a_or_an(b.extra[0])} ready ({money(b.extra[1])})"
         return "nothing ready to buy"
@@ -1925,7 +1939,9 @@ def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> 
     elif m.gap is not None:                                        # a building at a ready site would add nothing
         instead = f"ask planning for a lot or a road near the uncovered homes at ({m.gap[0]},{m.gap[1]})"
     elif b is not None and b.cost is not None and b.named and not short_of(m.funds, b.cost):
-        instead = f"build {_yours(b.what)} ({money(b.cost)}): your funds cover it"
+        call = b.named[0].call                                     # a tier upgrade: its exact call
+        instead = (f"{call} ({_yours(b.what)}, {money(b.cost)})" if call else
+                   f"build {_yours(b.what)} ({money(b.cost)})") + ": your funds cover it"
     elif room:
         instead = "no supply needs building yet"
     elif unready:
@@ -1976,7 +1992,7 @@ def topped_up(m: DeptMoney) -> str:
     with nothing named "needs nothing now: supply has room" (FirstBuild.room), "had only a library ready ($1,500)"
     (FirstBuild.extra) or "had nothing ready to buy"."""
     if (b := m.needs) is not None:
-        less = ("" if m.dept == "planning" else ": less buys fewer tiles" if any(n.have is None for n in b.named)
+        less = ("" if m.dept == "planning" else ": less buys fewer tiles" if any(n.tiles for n in b.named)
                 else ": less buys fewer of them" if b.all_of and len(b.named) > 1 or m.count > 1
                 else ": less buys nothing")
         return f"still {money(m.top_up)} short of {m.what}{less}"
@@ -2052,6 +2068,10 @@ def site_lists(w, role: str, obs: dict) -> dict[str, SiteList]:
             sites, (short, note) = [], SITE_NOTES[purpose]
         elif purpose == "bus_stops" and (room := bus_room(w, sites)):    # sites kept: find_sites still shows them
             short, note = room
+        elif sites and (room := link_room(w, purpose)):                  # a station that wouldn't pay: sites kept
+            short, note = room
+        elif sites and purpose in EDU_LEVELS and not _wanted(w, purpose):  # a school level enrolled: sites kept
+            short, note = edu_room(w, purpose)
         elif sites:
             short = note = None
         elif purpose == "road_extension" and (branches := branch_sites(w)):    # no dead end: branch off a road
@@ -2119,6 +2139,12 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
                 "the river bank tiles next to highway-connected roads are all taken (zoned or built): ask planning "
                 f"(send_message) to leave or free (dezone) a riverbank lot beside the road (e.g. near {near}, where "
                 "the road meets the river), and build what doesn't need the river meanwhile", True)
+    if purpose == "train_station" and capped_unlinked(w):        # the first link waits for a road to the map edge
+        return ("no free map-edge lot by a connected road: ask planning for a road to the map edge",
+                "a train station goes on an empty tile at the map edge beside a highway-connected road, and none is "
+                f"free: without a train station or harbour R and C demand stay capped from {C.CAP_POP_CONNECTION:,} "
+                f"residents; ask planning (send_message) to extend a road to the map edge and leave the edge tile "
+                f"beside it free ({roads()})", True)
     free = _free_roadside(w)
     if role == "planning":
         return ("no free roadside strip: extend the roads (find_sites road_extension)",
@@ -2490,6 +2516,9 @@ class Need(NamedTuple):
     first: bool = False         # a primary first building (Price.first) the city lacks: the mayor's priority line
     upkeep: float = 0.0         # what it adds a month (Price.upkeep; per-tile ones for all their tiles); 0 for the road
     count: int = 1              # how many: more than one only to keep coverage up (DeptMoney.goal), `upkeep` for all
+    call: str = ""              # the exact call when it is no site build (a tier upgrade: Upgrade.call)
+    note: str = ""              # for the department's line only: what the alternative would do (Upgrade.alt)
+    tiles: bool = False         # a per-tile build (avenue or levee tiles): less money buys fewer of them
 
     @property
     def label(self) -> str:
@@ -2548,6 +2577,8 @@ class FirstBuild(NamedTuple):
                                 # up to MAX_SITES), else (): keep_up picks among them (DeptMoney.keep_ups)
     keep_up: bool = False       # more than one building, to bring coverage back (DeptMoney.goal): `named` are bought
                                 # together (all_of when several), each with its count and coverage
+    covered: str = ""           # with nothing named: what is covered already, its purposes left out (education's
+                                # "enrolment covered: elementary 99%, high-school 92%"): DeptMoney.state
 
     @property
     def what(self) -> str:
@@ -2634,6 +2665,36 @@ def bus_room(w, sites: list[dict]) -> tuple[str, str] | None:
             f"its ends, so another line pays once buses run {pct(100 * BUS_FULL)} full, or while transit is under "
             f"{pct(100 * TRANSIT_GOAL)} and the next line (today's job centres and the homes the lines miss) would "
             f"add {pct(100 * BUS_GAIN)} of trips or more")
+
+
+def linked(w) -> bool:
+    """The city has a train station or harbour (World.demand_caps' regional link)."""
+    return bool(w.facilities(C.TRAIN) or w.facilities(C.HARBOUR))
+
+
+def capped_unlinked(w) -> bool:
+    """R and C demand are capped for want of a regional link: no train station or harbour from CAP_POP_CONNECTION
+    residents (World.demand_caps). transport's first link is then a first building (first_build)."""
+    return not linked(w) and w.metrics()["population"] >= C.CAP_POP_CONNECTION
+
+
+def link_room(w, purpose: str) -> tuple[str, str] | None:
+    """(short, note) when a train station or harbour (LINK_PURPOSES) wouldn't pay now: the city has a link and, for a
+    train station, one already, and freight runs under FREIGHT_FULL of its capacity (exports + imports, as the scripted
+    transport reads it); None when it would pay, and for other purposes."""
+    if purpose not in LINK_PURPOSES or not linked(w) or (purpose == "train_station" and not w.facilities(C.TRAIN)):
+        return None
+    m = w.metrics()
+    used = (m.get("exports", 0.0) + m.get("imports", 0.0)) / max(1.0, m.get("freight_capacity", 0.0))
+    if used >= FREIGHT_FULL:
+        return None
+    what = "train station" if purpose == "train_station" else "harbour"
+    trains, harbours = len(w.facilities(C.TRAIN)), len(w.facilities(C.HARBOUR))
+    return (f"freight runs {pct(100 * used)} of capacity: another {what} pays from {pct(100 * FREIGHT_FULL)}",
+            f"the city's {trains} train station{'s' * (trains != 1)} and {harbours} harbour{'s' * (harbours != 1)} link "
+            f"it to the region already (without a link R and C demand stay capped from {C.CAP_POP_CONNECTION:,} "
+            f"residents); freight runs {pct(100 * used)} of its capacity, and another {what} adds only freight room, "
+            f"which pays once freight passes {pct(100 * FREIGHT_FULL)}")
 
 
 # transit_estimate's results per world: (World.version, {(stops, the lines' stops, fare): (now, with)}), dropped when
@@ -2803,27 +2864,44 @@ def _road_cover(w, parts: list[list[tuple[int, int]]], radius: int, caps: np.nda
 
 class _Sources:
     """ServicesMixin.coverage for the buildings of one struct, with buildings of a tier-1 `spec` added at top-left
-    tiles (grid(extra)); the buildings there and their capacities read once. Writes nothing."""
+    tiles (grid(extra)); the buildings there and their capacities read once. Writes nothing. grid's `swap` puts one
+    of them a tier up ((x, y) -> (its next spec, its tiles then)), `drop` leaves some out and `add` adds buildings of
+    other specs ((spec, tiles)): a tier upgrade's estimate (tier_up)."""
 
     def __init__(self, w, struct: int, demand: np.ndarray, dept: str, spec: dict | None = None, *,
                  full: float = C.COVERAGE_FULL, skip=frozenset(), traffic: bool = False, cap_key: str = "capacity",
                  min_tier: int = 1):
         self.w, self.demand, self.spec, self.full, self.traffic, self.cap_key = w, demand, spec, full, traffic, cap_key
-        sources = [s for s in w.facilities(struct) if w.building_network(*s) >= 0 and s not in skip
-                   and w.facility_tier(*s) >= min_tier]
+        self.struct, self.min_tier = struct, min_tier
+        self.sources = [s for s in w.facilities(struct) if w.building_network(*s) >= 0 and s not in skip
+                        and w.facility_tier(*s) >= min_tier]
         self.eff = w.funding_eff(dept)
-        specs = [w.facility_spec(*s) for s in sources]
-        self.parts = [w.parts(*s) for s in sources]
-        self.caps = [sp[cap_key] * self.eff * w.module_factor(x, y, "expansion") for (x, y), sp in zip(sources, specs)]
+        specs = [w.facility_spec(*s) for s in self.sources]
+        self.parts = [w.parts(*s) for s in self.sources]
+        self.caps = [sp[cap_key] * self.eff * w.module_factor(x, y, "expansion")
+                     for (x, y), sp in zip(self.sources, specs)]
         self.radii = [int(sp["radius"]) for sp in specs]
 
-    def grid(self, extra=()) -> np.ndarray:
-        w, parts, caps, radii = self.w, list(self.parts), list(self.caps), list(self.radii)
-        for x, y in extra:
-            fw, fh = self.spec["footprint"]
-            parts.append([(x + i, y + j) for j in range(fh) for i in range(fw)])
-            caps.append(self.spec[self.cap_key] * self.eff)
-            radii.append(int(self.spec["radius"]))
+    def takes(self, spec: dict) -> bool:
+        """Whether a building of `spec` would be one of these (its struct, at min_tier or above)."""
+        return spec["struct"] == self.struct and spec["tier"] >= self.min_tier
+
+    def grid(self, extra=(), swap: dict | None = None, drop=frozenset(), add=()) -> np.ndarray:
+        w = self.w
+        keep = [k for k, s in enumerate(self.sources) if s not in drop]
+        parts, caps, radii = [self.parts[k] for k in keep], [self.caps[k] for k in keep], [self.radii[k] for k in keep]
+        for (x, y), (spec, tiles) in (swap or {}).items():
+            if (x, y) in self.sources and (x, y) not in drop:
+                k = keep.index(self.sources.index((x, y)))
+                parts[k] = list(tiles)
+                caps[k] = spec[self.cap_key] * self.eff * w.module_factor(x, y, "expansion")
+                radii[k] = int(spec["radius"])
+        adds = [(self.spec, [(x + i, y + j) for j in range(self.spec["footprint"][1])
+                             for i in range(self.spec["footprint"][0])]) for x, y in extra] + list(add)
+        for spec, tiles in adds:
+            parts.append(list(tiles))
+            caps.append(spec[self.cap_key] * self.eff)
+            radii.append(int(spec["radius"]))
         if not parts:
             return np.zeros((w.h, w.w))
         cov = None
@@ -2848,14 +2926,14 @@ class _Coverage:
         self.service = service
         developed = np.isin(w.struct, C.ZONES) & (w.level > 0)
         self.dev_hi = developed & (w.level >= C.DOWNTOWN_LEVEL)
-        self.fixed = None
+        self.fixed_src = None
         if service in ("police", "fire"):
             struct, demand = (C.POLICE, w._people_grid()) if service == "police" else (C.FIRE, developed.astype(float))
             self.own = _Sources(w, struct, demand, service, spec, traffic=True)
-            self.fixed = _Sources(w, struct, demand, service, traffic=True, min_tier=2).grid()     # tier-2 cover
+            self.fixed_src = _Sources(w, struct, demand, service, traffic=True, min_tier=2)     # tier-2 cover
         elif service == "health":
             self.own = _Sources(w, C.CLINIC, res, "health", spec, traffic=True)
-            self.fixed = _Sources(w, C.HOSPITAL, res, "health", traffic=True).grid()
+            self.fixed_src = _Sources(w, C.HOSPITAL, res, "health", traffic=True)
         elif service in ("school", "high"):
             n = w.cohorts
             share = float(n[0 if service == "school" else 1].sum()) / max(1.0, float(n.sum()))
@@ -2866,13 +2944,26 @@ class _Coverage:
             full = {s for s in w.facilities(C.LANDFILL) if (cap := w.facility_spec(*s).get("fill"))
                     and w.facility_state.get(s, {}).get("fill", 0.0) >= cap}       # _full_landfills, read-only
             self.own = _Sources(w, C.LANDFILL, prod, "health", spec, full=1.0, skip=full, cap_key="collect")
-            self.fixed = _Sources(w, C.INCINERATOR, prod, "health", full=1.0, cap_key="collect").grid()
+            self.fixed_src = _Sources(w, C.INCINERATOR, prod, "health", full=1.0, cap_key="collect")
+        self.fixed = self.fixed_src.grid() if self.fixed_src is not None else None
 
-    def value(self, extra=()) -> tuple[float, np.ndarray]:
-        """The metric, and the per-tile cover it weighs residents by (a school's: covered or not)."""
+    def value(self, extra=(), up: tuple | None = None) -> tuple[float, np.ndarray]:
+        """The metric, and the per-tile cover it weighs residents by (a school's: covered or not). `up`: one
+        building a tier up instead, ((x, y), its next spec, its tiles then; World.next_tier), as upgrade_building
+        leaves it: the same struct keeps its place among its sources with the new capacity and radius, a new struct
+        (a clinic's hospital) leaves them; the new spec joins the tier-2 / hospital cover when it counts there."""
         if self.rsum <= 0:
             return 0.0, np.zeros(self.res.shape)
-        g, fixed = self.own.grid(extra), self.fixed
+        if up is None:
+            g, fixed = self.own.grid(extra), self.fixed
+        else:
+            xy, spec, tiles = up
+            moved = {xy: (spec, tiles)}
+            g = (self.own.grid(extra, swap=moved) if self.own.takes(spec)
+                 else self.own.grid(extra, drop={xy}))
+            src = self.fixed_src
+            fixed = (self.fixed if src is None or not src.takes(spec) else src.grid(swap=moved)
+                     if xy in src.sources else src.grid(add=[(spec, tiles)]))
         if self.service in ("school", "high"):
             g = (g > 0.05).astype(float)
         elif self.service == "garbage":
@@ -2920,10 +3011,7 @@ def keep_up(w, dept: str, purpose: str, sites) -> KeepUp | None:
     sites = tuple(tuple(s) for s in sites)[:MAX_SITES]
     if service is None or not sites or w.metrics()[key] >= KEEP_UP_GOAL:
         return None
-    state, cache = _KEEP_UPS.get(w, (None, {}))
-    if state != (now := _cover_key(w)):
-        cache = {}
-        _KEEP_UPS[w] = (now, cache)
+    cache = _keep_up_cache(w)
     k = (dept, purpose, sites)
     if k not in cache:
         line = C.TIER_BY_NAME[SITE_BUILDS[dept][purpose][0]][0]
@@ -2956,11 +3044,275 @@ def keep_up(w, dept: str, purpose: str, sites) -> KeepUp | None:
     return cache[k]
 
 
+def _keep_up_cache(w) -> dict:
+    """keep_up's per-world cache (_KEEP_UPS), emptied when what coverage reads moves (_cover_key)."""
+    state, cache = _KEEP_UPS.get(w, (None, {}))
+    if state != (now := _cover_key(w)):
+        cache = {}
+        _KEEP_UPS[w] = (now, cache)
+    return cache
+
+
+# ------------------------------------------------------------------ tier upgrades
+# v1 leaderboard (4 models x 8 seeds, fleet_smoke_late, the models from month 96): police and fire read "build another
+# police / fire station ($2,500)" every turn and never an upgrade; tier-1 stations cover level 4-5 tiles only to
+# T1_DOWNTOWN, the model cities grew high-density tiles 140 -> ~250, and each model built 23-26 tier-1 police stations
+# and 16-26 fire stations with almost no upgrade (the scripted fleet: 6 police and 6 fire upgrades). Police, fire and
+# health name the tier upgrade that adds the most coverage (tier_up) instead of another tier-1 building when it adds
+# more than one at the best ready site; education names a level's bigger school while that level's enrolment is short
+# of seats rather than of schools in reach (school_upgrade). An upgrade is "another" building on the mayor's lines
+# (Need.first False): it comes out of the money above the reserve after first buildings, supply and planning's road
+# (fund_cover), never their allowance, and the guards treat it as they treat another station
+TIER_UP = {"police": ("station", "police"), "fire": ("station", "fire"), "health": ("clinic", "health")}
+TIER_UP_LINES = {"police": ("police_station",), "fire": ("fire_station",), "health": ("clinic",),
+                 "education": ("elementary_school", "high_school")}
+# the builds an upgrade may take the place of (a first building or a levee keeps its turn; so does a landfill while
+# garbage coverage is under KEEP_UP_GOAL: health's clinic and landfill both cost $2,000, so a tie names both)
+TIER_UP_REPLACES = {"police": {"station", "jail"}, "fire": {"station"}, "health": {"clinic", "hospital"}}
+TIER_UP_TRIED = 3            # upgrade offers estimated at most (observation lists them by downtown need)
+UPGRADE_OFFERS = {"police": ("police", "upgrades"), "fire": ("fire", "upgrades"),
+                  "health": ("health", "upgrades", "care"), "education": ("education", "upgrades")}
+# education's enrolment (World.enrollment, what scoring._enrolled weighs by children and teens): a level is short
+# under ENROL_GOAL. v1: "build your first university ($12k)" on 7 of 8 seeds at month 96, while high-school enrolment
+# was 78-85% (seed 7: 28%); a university counts in no enrolment the score reads, costs $150 a month, and each model
+# built 7, then 16-22 elementary schools at ~99% elementary enrolment (the needs line's cheapest "another"). The
+# school list's purpose -> its level; a university only once both school levels are covered (_wanted)
+ENROL_GOAL = 0.9
+EDU_LEVELS = {"school": "elementary", "high_school": "high", "university": "university"}
+EDU_WHO = {"elementary": "children", "high": "teens", "university": "students"}
+EDU_LABEL = {"elementary": "elementary", "high": "high-school", "university": "university"}
+
+
+class Upgrade(NamedTuple):
+    """A tier upgrade a department's next build names (tier_up, school_upgrade)."""
+    x: int                  # the building (its top-left tile); a fresh building's site
+    y: int
+    frm: str                # its tier name now ("police_station"); "" for a fresh tier-2 building (health's hospital
+                            # at a ready 2x2 site, when no clinic has room to grow into one)
+    to: str                 # the next tier's ("police_hq")
+    cost: float             # what upgrade_facility charges (catalog.upgrade_cost)
+    upkeep: float           # what it adds a month, at the department's funding level
+    status: str             # why, for the needs line: "coverage 81%, ~88% with it; 24 downtown tiles lack tier-2 cover"
+    purpose: str            # the find_sites purpose of its line's tier-1 building ("station", "clinic", "school")
+    alt: str = ""           # what the tier-1 building would do instead ("another police station adds under 1%")
+
+    @property
+    def call(self) -> str:
+        if not self.frm:
+            return f"build_{self.to} " + json.dumps({"x": self.x, "y": self.y}, separators=(",", ":"))
+        return "upgrade_facility " + json.dumps({"x": self.x, "y": self.y, "module": "tier"}, separators=(",", ":"))
+
+    @property
+    def what(self) -> str:
+        """"an upgrade of its police station at (12,20) to a police HQ" (its -> your in the department's words); a
+        fresh one "a hospital at (14,17)"."""
+        if not self.frm:
+            return f"{a_or_an(tier_name(self.to))} at ({self.x},{self.y})"
+        return f"an upgrade of its {tier_name(self.frm)} at ({self.x},{self.y}) to {a_or_an(tier_name(self.to))}"
+
+
+def _replaceable(w, dept: str, purposes) -> bool:
+    """Whether a tier upgrade may take the place of `dept`'s next build of these purposes (TIER_UP_REPLACES)."""
+    covered = w.metrics()["garbage_coverage"] >= KEEP_UP_GOAL
+    return all(p in TIER_UP_REPLACES[dept] or (p == "landfill" and covered) for p in purposes)
+
+
+def tier_name(name: str) -> str:
+    """A tier name for people: building_name, HQ in capitals ("police HQ", "large high school")."""
+    return re.sub(r"\bhq\b", "HQ", building_name(name))
+
+
+def upgrade_bound(w, dept: str) -> float:
+    """The dearest unlocked tier upgrade of `dept`'s TIER_UP_LINES buildings (room to grow not checked): DeptMoney's
+    bound, so funds that cover every site price but not an upgrade still read short of it."""
+    best = 0.0
+    for line in TIER_UP_LINES.get(dept, ()):
+        tiers = C.TIER_LINES[line]
+        for st in {t["struct"] for t in tiers}:
+            for x, y in w.facilities(st):
+                t = w.facility_tier(x, y)
+                if t < len(tiers) and (not tiers[t].get("unlock") or w.unlocked(tiers[t]["unlock"])):
+                    best = max(best, C.upgrade_cost(tiers[t - 1], tiers[t]))
+    return best
+
+
+def _offers(obs: dict, dept: str) -> list[dict]:
+    """The observation's upgrade offers for `dept`'s TIER_UP_LINES buildings (unlocked, room to grow), best first."""
+    found = obs
+    for key in UPGRADE_OFFERS[dept]:
+        found = found.get(key) if isinstance(found, dict) else None
+    lines = TIER_UP_LINES[dept]
+    return [o for o in found or [] if C.TIER_BY_NAME.get(o["from"], (None,))[0] in lines]
+
+
+def _upgrade(w, dept: str, o: dict, cur: dict, nxt: dict, status: str, purpose: str, alt: str = "") -> Upgrade:
+    up = (nxt["upkeep"] - cur["upkeep"]) * w.funding.get(dept, 1.0)
+    return Upgrade(int(o["x"]), int(o["y"]), cur["name"], nxt["name"], float(C.upgrade_cost(cur, nxt)), up, status,
+                   purpose, alt)
+
+
+def tier_up(w, dept: str, sites, offers: list[dict], fresh=()) -> Upgrade | None:
+    """Police, fire or health's tier upgrade worth naming: while level 4-5 tiles lack tier-2 cover (World.stats
+    downtown_uncovered), the offer (up to TIER_UP_TRIED) whose upgrade brings the coverage metric highest (the sim's
+    coverage with that building a tier up: _Coverage.value(up=...)), when it adds KEEP_UP_GAIN or more and more than
+    one more tier-1 building at the best of its ready `sites` ((x, y); none ready: nothing); else None. Health's
+    `fresh` are its ready hospital sites (2x2 top-left tiles, up to TIER_UP_TRIED): a hospital built there competes
+    with the upgrades (a clinic grows into one only with a free 2x2 block around it). Cached like keep_up. Late
+    states, seeds 4 and 7 at month 96: "ready sites add under 1% ... 18 points are lost downtown"."""
+    purpose, service = TIER_UP[dept]
+    key = COVERAGE_OF[dept, purpose]
+    down = (w.stats.get("downtown_uncovered") or {}).get(service, 0)
+    offers = [o for o in offers if C.TIER_BY_NAME.get(o["from"], (None,))[0] in TIER_UP_LINES[dept]][:TIER_UP_TRIED]
+    fresh = tuple(tuple(s) for s in fresh)[:TIER_UP_TRIED] if dept == "health" else ()
+    if not down or not (offers or fresh):
+        return None
+    sites = tuple(tuple(s) for s in sites)[:MAX_SITES]
+    cache = _keep_up_cache(w)
+    k = ("tier", dept, sites, tuple((o["x"], o["y"]) for o in offers), fresh)
+    if k not in cache:
+        line = TIER_UP_LINES[dept][0]
+        model = _Coverage(w, service, C.TIER_LINES[line][0])
+        base = model.value()[0]
+        station = max((model.value([s])[0] for s in sites), default=base)
+        best = None
+        for o in offers:
+            try:
+                cur, nxt, _, tiles = w.next_tier(o["x"], o["y"])
+            except ValueError:
+                continue
+            level = model.value(up=((o["x"], o["y"]), nxt, tiles))[0]
+            if best is None or level > best[0]:
+                best = (level, o, cur, nxt)
+        hosp = C.TIER_LINES["clinic"][1]
+        for x, y in fresh:                          # xy None: no building of its own moves, the hospital is added
+            fw, fh = hosp["footprint"]
+            level = model.value(up=(None, hosp, [(x + i, y + j) for j in range(fh) for i in range(fw)]))[0]
+            if best is None or level > best[0]:
+                best = (level, {"x": x, "y": y}, None, hosp)
+        cache[k] = None
+        if best is not None and best[0] - base >= KEEP_UP_GAIN and best[0] > station:
+            level, o, cur, nxt = best
+            now = w.metrics()[key]
+            alt = building_name(SITE_BUILDS[dept][purpose][0])
+            gain = round(100 * (station - base))
+            status = (f"coverage {coverage_trend(w, key) or pct(100 * now)}, ~{pct(100 * level)} with it; {down} "
+                      + ("downtown tile lacks" if down == 1 else "downtown tiles lack") + " tier-2 cover")
+            alt = (f"another {alt} at your best ready site adds " + (f"~{gain}%" if gain >= 1 else "under 1%")
+                   if sites else f"no ready site for another {alt}")
+            if cur is None:                         # a fresh hospital, priced as build_hospital charges it
+                pr = site_price(w, dept, "hospital")
+                cache[k] = Upgrade(o["x"], o["y"], "", nxt["name"], pr.cost, pr.upkeep, status, "hospital", alt)
+            else:
+                cache[k] = _upgrade(w, dept, o, cur, nxt, status, purpose, alt)
+    return cache[k]
+
+
+def enrolment(w, level: str) -> tuple[float, float, float, float]:
+    """(enrolled share, students, seats, share of their homes in reach) of a school level as the sim's
+    _update_enrollment computes it: World.enrollment (last tick), the cohorts, the seats and the coverage."""
+    n, st = w.cohorts, w.stats
+    if level == "university":
+        students, cov = float(n[2, 2]) * C.STUDENT_AGE_SHARE, 1.0 if st.get("seats_university", 0) else 0.0
+    else:
+        students = float(n[0 if level == "elementary" else 1].sum())
+        cov = st.get("school_coverage" if level == "elementary" else "high_coverage", 0.0)
+    return float(w.enrollment.get(level, 0.0)), students, float(st.get(f"seats_{level}", 0)), float(cov)
+
+
+def enrol_short(w, level: str) -> bool:
+    """A school level with students enrols under ENROL_GOAL of them."""
+    share, students, _, _ = enrolment(w, level)
+    return students >= 1 and share < ENROL_GOAL
+
+
+def enrol_text(w, level: str) -> str:
+    """"high-school enrolment 86%: 700 seats for 817 teens, 92% of their homes in reach"."""
+    share, students, seats, cov = enrolment(w, level)
+    reach = f", {pct(100 * cov)} of their homes in reach" if level != "university" else ""
+    return (f"{EDU_LABEL[level]} enrolment {pct(100 * share)}: {round(seats):,} seats for {round(students):,} "
+            f"{EDU_WHO[level]}{reach}")
+
+
+def upgrade_line(w, dept: str, obs: dict) -> list[str]:
+    """The Ready sites line of `dept`'s tier upgrades on offer (TIER_UP_LINES; unlocked, with room to grow: the
+    observation's, which my_facilities lists too), [] with none: "- upgrade: 3 on offer, best police station (12,20) to
+    police HQ, need 318; $7,800" (need: what the observation ranks them by; downtown people, buildings or residents
+    without tier-2 cover, or a school's students over its seats)."""
+    if dept not in UPGRADE_OFFERS:
+        return []
+    offers = _offers(obs, dept)
+    if not offers:
+        return []
+    o = offers[0]
+    cost = o["cost"]
+    need = f", need {_brief(o['need'])}" if o.get("need") else ""
+    return [f"- upgrade: {len(offers)} on offer, best {tier_name(o['from'])} ({o['x']},{o['y']}) to "
+            f"{tier_name(o['to'])}{need}; {money(cost)} (upgrade_facility, module \"tier\")"]
+
+
+def edu_room(w, purpose: str) -> tuple[str, str]:
+    """(short, note) for a school level's list while education doesn't want it (_wanted): its level enrols ENROL_GOAL
+    already, or, for a university, a school level is short (or its own enrolment isn't). v1: each model built 16-22
+    elementary schools at ~99% elementary enrolment and 7 universities beside 78-85% high-school enrolment."""
+    goal = pct(100 * ENROL_GOAL)
+    if purpose != "university":
+        text = enrol_text(w, EDU_LEVELS[purpose])
+        return (f"{text.split(':')[0]} (goal {goal})", f"{text}: at {goal} or more another school of this level "
+                "adds upkeep, not enrolment (the score counts elementary and high-school enrolment)")
+    short = [lv for lv in ("elementary", "high") if enrol_short(w, lv)]
+    if short:
+        why = " and ".join(enrol_text(w, lv).split(":")[0] for lv in short)
+        upkeep = money(upkeep_of(w, "education", "university"))
+        return (f"{why}: schools first (a university counts in no enrolment the score reads)",
+                f"{why}, under {goal}: elementary and high-school enrolment count in your score, a university's doesn't "
+                f"(it trains graduates for skilled jobs and costs {upkeep}/month); build it once both school levels "
+                f"enrol {goal}")
+    text = enrol_text(w, "university")
+    return (f"{text.split(':')[0]} (goal {goal})", f"{text}: another university adds upkeep, not graduates")
+
+
+def enrolled_text(w) -> str:
+    """Education's state with every school level enrolled (no EDU_LEVELS purpose wanted): "enrolment covered:
+    elementary 99%, high-school 92%, university 100%" (university once it has seats)."""
+    levels = ["elementary", "high"] + ["university"] * bool(w.stats.get("seats_university", 0))
+    return "enrolment covered: " + ", ".join(f"{EDU_LABEL[lv]} {pct(100 * enrolment(w, lv)[0])}" for lv in levels)
+
+
+def seat_bound(w, level: str) -> bool:
+    """More seats would enrol more: the level's seats (at education's funding) are fewer than the students whose homes
+    a school reaches (the sim's min(students x coverage, seats x funding) / students)."""
+    _, students, seats, cov = enrolment(w, level)
+    return seats * w.funding_eff("education") < students * cov - 0.5
+
+
+def school_upgrade(w, obs: dict, purpose: str) -> Upgrade | None:
+    """Education's upgrade for a short school level ("school" or "high_school") whose enrolment is short of seats, not of
+    schools in reach (seat_bound): the most overloaded school of the level the observation offers a bigger tier for
+    (large elementary from 1,000 residents, large high school from 5,000); None otherwise. Seed 3 at month 96: high
+    school enrolment 86% with 92% of the teens' homes in reach and 700 seats for 817 teens."""
+    level = EDU_LEVELS[purpose]
+    if not enrol_short(w, level) or not seat_bound(w, level):
+        return None
+    line = "elementary_school" if purpose == "school" else "high_school"
+    for o in _offers(obs, "education"):
+        if C.TIER_BY_NAME[o["from"]][0] != line:
+            continue
+        try:
+            cur, nxt, _, _ = w.next_tier(o["x"], o["y"])
+        except ValueError:
+            continue
+        return _upgrade(w, "education", o, cur, nxt, enrol_text(w, level), purpose)
+    return None
+
+
 def blocked_firsts(w, dept: str, lists: dict[str, SiteList]) -> dict[str, Price]:
-    """`dept`'s unlocked first buildings (Price.first, SUPPLEMENTARY skipped) whose lists are blocked for lack of land
-    or roads (SiteList.blocked), priced: purpose -> site_price. A utilities building only while the city needs it
-    (_wanted)."""
-    return {p: pr for p, lst in lists.items() if lst.blocked and p not in SUPPLEMENTARY and _wanted(w, p)
+    """`dept`'s unlocked first buildings (Price.first, SUPPLEMENTARY skipped but transport's first link while R and C
+    demand are capped without one: capped_unlinked) whose lists are blocked for lack of land or roads
+    (SiteList.blocked), priced: purpose -> site_price. A utilities building or a school level only while the city
+    needs it (_wanted). Seed 4 at month 96: 6,052 residents, no train station or harbour, and no edge lot by a road
+    ("nothing needs it right now" before v2)."""
+    return {p: pr for p, lst in lists.items() if lst.blocked and _wanted(w, p)
+            and (p not in SUPPLEMENTARY or p in LINK_PURPOSES and capped_unlinked(w))     # the first link, capped
             and (pr := site_price(w, dept, p)) and pr.first}
 
 
@@ -2973,7 +3325,14 @@ def _wanted(w, purpose: str) -> bool:
     them" (its playbook frees a bank lot when asked); their own lists still say the bank is taken. Smoke v15: all 8
     leave-free lines named a water tower with water never short (e.g. 125 of 250): the near_homes list ranks every
     roadside lot by the homes around it. A riverbank 2x2 building by the supply of the one pricing it (water works:
-    water): first_build counts only wanted ones, and with the tower and turbine left out it would name that $12k."""
+    water): first_build counts only wanted ones, and with the tower and turbine left out it would name that $12k.
+    Education's school levels go by enrolment (EDU_LEVELS): an elementary or high school while its level enrols under
+    ENROL_GOAL (enrol_short), a university only once both school levels reach it and while its own enrolment is short;
+    v1 named the first university ahead of 78-85% high-school enrolment on 7 of 8 seeds."""
+    if purpose in EDU_LEVELS:
+        if purpose == "university":
+            return not (enrol_short(w, "elementary") or enrol_short(w, "high")) and enrol_short(w, "university")
+        return enrol_short(w, EDU_LEVELS[purpose])
     if purpose == "riverbank_2x2":
         pr = site_price(w, "utilities", purpose)
         return pr is None or _busy(w, supply_of(pr.name))
@@ -3166,7 +3525,7 @@ def land_blocked(env, lists: dict[str, dict[str, SiteList]] | None = None) -> di
     out = {}
     for d, ls in (dept_lists(env) if lists is None else lists).items():
         if found := blocked_firsts(w, d, ls):
-            out[d] = list(cheapest(found)[0])
+            out[d] = list(cheapest(found, supplementary=True)[0])      # transport's first link is one
     return out
 
 
@@ -3180,6 +3539,8 @@ def land_fix(w, dept: str, purpose: str) -> str:
     and garbage coverage stayed 0 all run."""
     if purpose in AWAY_FROM_HOMES:
         return "away from homes"
+    if purpose == "train_station":
+        return "a road to the map edge"
     if purpose in RIVERBANK_PURPOSES:
         if not _riverbank_by_roads(w)[1]:
             return "a road to the river"
@@ -3362,11 +3723,20 @@ def first_build(env, dept: str) -> FirstBuild | None:
     sites of the first purpose pricing it; at a tie with a first one, the others go (health's clinic built: its first
     landfill alone). Each Need carries what the building adds in upkeep a month (Price.upkeep; a per-tile one for its
     whole stretch, bridges twice). Its funded_firsts ride along (FirstBuild.funded) for unclaimed_firsts. Utilities
-    names one building per short supply instead, bought together (_supply_build). With nothing else ready or blocked,
-    a FirstBuild without a cost says why when something was ready: utilities sites whose supply has room (`room`), a
-    supplementary building (`extra`); else None."""
+    names one building per short supply instead, bought together (_supply_build). Education's school levels count only
+    while their enrolment is short (_wanted: a university after both school levels). civitas-v2: in place of another
+    station, clinic or school (never of a first building, a levee, or a landfill while garbage is short), police, fire
+    and health name the tier upgrade (or health's fresh hospital) that adds the most coverage when it adds more than one
+    more tier-1 building (tier_up), education a short level's bigger school while it lacks seats (school_upgrade): one
+    Need with its exact call (Need.call), priced as the action charges it, "another" on the mayor's lines. Transport's
+    first link to the region is a first building once demand is capped without one (capped_unlinked), before another
+    bus line or an avenue; with nothing else ready its station, harbour or metro station is a priced build ("another"),
+    no longer a cost-less extra. With nothing else ready or blocked, a FirstBuild without a cost says why when something
+    was ready: utilities sites whose supply has room (`room`), every school level enrolled (`covered`), a supplementary
+    building (`extra`); else None."""
     w = env.world
-    lists = site_lists(w, dept, role_obs(env, dept))
+    obs = role_obs(env, dept)
+    lists = site_lists(w, dept, obs)
     blocked = blocked_firsts(w, dept, lists)
     ready = ready_prices(w, dept, lists)
     prices, tiles = {p: pr for p, pr in ready.items() if _wanted(w, p)}, {}
@@ -3379,6 +3749,10 @@ def first_build(env, dept: str) -> FirstBuild | None:
             bridges = (units - tiles[p]) / (BRIDGE_UPGRADE - 1)
             prices[p] = pr._replace(cost=pr.cost * units, upkeep=pr.upkeep * (tiles[p] + bridges))
     labels = {p: _label(w, pr, tiles.get(p, 1)) for p, pr in prices.items()}
+    unlinked = dept == "transport" and capped_unlinked(w)
+    for p in LINK_PURPOSES if unlinked else ():      # the first link to the region: "its first train station"
+        if p in prices:
+            labels[p] = (prices[p].building, 0)
     # never below the needs line: with only an upgrade ready (health's $8,000 hospital) money saved for it isn't idle
     label = lambda what, have: what if have is None else f"its first {what}" if not have else f"another {what}"
     firsts = [(pr.cost, label(*labels[p])) for p, pr in prices.items() if p not in SUPPLEMENTARY and pr.first] + [
@@ -3387,32 +3761,63 @@ def first_build(env, dept: str) -> FirstBuild | None:
         return supply._replace(funded=_funded_of(w, dept, lists))
     lacking = {p: pr for p, pr in prices.items()                                         # cheapest skips SUPPLEMENTARY
                if pr.first and labels[p][1] == 0 and (p != "jail" or _cells_busy(w))}
+    # transport's first link to the region (a train station or harbour) once the city is capped without one (R and C
+    # demand at CAP_LEVEL from CAP_POP_CONNECTION residents: World.demand_caps): a first building, before another bus
+    # line or an avenue (after the first bus line, a lacking first building); below the cap it is a station like any
+    link = cheapest({p: prices[p] for p in LINK_PURPOSES if p in prices}, supplementary=True) if unlinked else None
     # transport's next bus line, while its list offers one (bus_room: transit under TRANSIT_GOAL and the line adds
     # riders, or full buses), before any avenue stretch: the 120-month LLM runs named "$30 for an avenue tile" on 131
     # of the mayor's transport lines and another bus line on 9, transport got 0.8-3.2% of the mayor's top-ups, and
     # transit fell to 1-3% (briefing._transport_next shows transport this same build)
     line = (("bus_stops",), prices["bus_stops"]) if dept == "transport" and "bus_stops" in prices else None
-    purposes, low = cheapest(lacking) or line or cheapest(prices) or ((), None)
+    # transport's station, harbour or metro station with nothing else ready: a priced build ("another" on the mayor's
+    # lines), no longer a cost-less extra. v1 (4 models x 8 seeds, months 96-107): the Next line named "a train station
+    # ($8,000)" or "a harbour ($10k)" in about half the turns that had one, with transport's funds short, while the
+    # mayor had $17-27k above the reserve: kind "nothing", so no to-fund item and no ask, and none was ever funded.
+    # site_lists lists them only when needed (link_room: no link yet, a first train station, or freight running full)
+    stations = {p: pr for p, pr in prices.items() if p in STATION_PURPOSES} if dept == "transport" else {}
+    first = cheapest(lacking) or link
+    purposes, low = (first or line or cheapest(prices) or cheapest(stations, supplementary=True) or ((), None))
+    up = None
+    if first or low and any(labels[p][1] == 0 for p in purposes):
+        pass                                        # a first building keeps its turn
+    elif dept in TIER_UP and (low is None or _replaceable(w, dept, purposes)):
+        p = TIER_UP[dept][0]                         # another station / clinic: a tier upgrade if it adds more
+        sites = [(s["x"], s["y"]) for s in lists[p].sites] if p in prices else []
+        fresh = [(s["x"], s["y"]) for s in lists["hospital"].sites] if "hospital" in ready else []
+        up = tier_up(w, dept, sites, _offers(obs, dept), fresh)
+    elif dept == "education":                        # a short level's bigger school while it lacks seats, not reach
+        levels = ([p for p in purposes if p in ("school", "high_school")] if low is not None
+                  else [p for p in ("school", "high_school") if _wanted(w, p)])
+        up = next((u for p in levels if (u := school_upgrade(w, obs, p)) is not None), None)
+    if up is not None:
+        need = Need(up.what, 1, None, up.status, False, up.upkeep, call=up.call, note=up.alt)
+        dearest = max(firsts + [(up.cost, need.label)], key=lambda t: t[0])
+        return FirstBuild(up.cost, (need,), dearest[0], (), _funded_of(w, dept, lists), keep_for=dearest[1],
+                          purposes=(up.purpose,))
     if low is None and not blocked:
         extra = cheapest(prices, supplementary=True)
-        if len(prices) == len(ready) and extra is None:
+        room = dept == "utilities" and len(prices) < len(ready)
+        covered = (enrolled_text(w) if dept == "education" and not any(_wanted(w, p) for p in EDU_LEVELS if p in ready
+                                                                        or p != "university") else "")
+        if not (room or extra or covered):
             return None
-        return FirstBuild(None, (), 0.0, (), None, room=len(prices) < len(ready),
+        return FirstBuild(None, (), 0.0, (), None, room=room,
                           extra=(extra[1].building, extra[1].cost) if extra else None,
-                          purposes=extra[0][:1] if extra else ())
+                          purposes=extra[0][:1] if extra else (), covered=covered)
     named, which = {}, {}
     for p in purposes:
         pr, (what, have) = prices[p], labels[p]
         which.setdefault(what, p)
         named.setdefault(what, Need(what, len(lists[p].sites[:MAX_SITES]), have,
                                     build_status(w, dept, p, pr.name) if have else "", have == 0 and pr.first,
-                                    pr.upkeep))
+                                    pr.upkeep, tiles=pr.per_tile))
     if any(nd.have == 0 for nd in named.values()):
         named = {k: nd for k, nd in named.items() if not nd.have}
     if low:
         firsts.append((low.cost, next(iter(named.values())).label))
     dearest = max(firsts, key=lambda t: t[0])                   # the first of the dearest, as max() reads them
-    shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked)[0]))
+    shut = () if low else tuple(dict.fromkeys(a_or_an(blocked[p].building) for p in cheapest(blocked, True)[0]))
     spots = tuple(tuple((int(s["x"]), int(s["y"])) for s in lists[which[k]].sites[:MAX_SITES])
                   if (dept, which[k]) in KEEP_UP else () for k in named)
     return FirstBuild(low.cost if low else None, tuple(named.values()), dearest[0], shut, _funded_of(w, dept, lists),

@@ -963,12 +963,19 @@ def test_a_first_building_the_city_lacks_comes_before_a_cheaper_build(monkeypatc
     fake["transport"]["bus_stops"] = fake["transport"]["bus_stops"]._replace(short="buses have room")
     avenue = T.first_build(env, "transport")                     # buses have room: the avenue stretch is next again
     assert avenue.cost == 5 * C.ROAD_UPGRADE_COST[C.ROAD_CLASSES["avenue"]] and avenue.named[0].what == "5 avenue tiles"
+    short = {"elementary", "high", "university"}                  # every level enrols under ENROL_GOAL
+    monkeypatch.setattr(T, "enrol_short", lambda w, level: level in short)
     school = T.first_build(env, "education")                      # another elementary school is cheaper
     assert [(n.what, n.have) for n in school.named] == [("high school", 0)] and school.cost == 5000
-    assert (school.dearest, school.keep_for) == (12000, "its first university")
+    # v2: no university while a school level is short (it counts in no enrolment): it isn't what education keeps for
+    assert (school.dearest, school.keep_for) == (5000, "its first high school")
     w.dept_funds["education"] = 3291
     m = DeptMoney(env, "education")
-    assert (m.kind, m.top_up, m.keep_why) == ("first/supply", 5000 - 3291, "for its first university")
+    assert (m.kind, m.top_up, m.keep_why) == ("first/supply", 5000 - 3291, "for its first high school")
+    short -= {"elementary", "high"}                               # both school levels enrolled: the university's turn
+    uni = T.first_build(env, "education")
+    assert [(n.what, n.have, n.first) for n in uni.named] == [("university", 0, True)] and uni.cost == 12000
+    assert (uni.dearest, uni.keep_for) == (12000, "its first university")
 
 
 def test_a_line_without_a_needs_line_says_why(monkeypatch):
@@ -1116,7 +1123,8 @@ def test_money_polish(monkeypatch):
     assert "close that" not in spend_lines(fk, f)[0] and "operations +$200/month;" in spend_lines(fk, f)[0]
     assert "close that in 2 months" in spend_lines(fk, f._replace(months_left=2))[0]
     # top-ups: planning's road and per-tile needs buy part with less
-    _builds(monkeypatch, {"fire": FB(900, (N("3 levee tiles", 1, None, upkeep=3),), 900, ()), "police": STATION},
+    levees = FB(900, (N("3 levee tiles", 1, None, upkeep=3, tiles=True),), 900, ())
+    _builds(monkeypatch, {"fire": levees, "police": STATION},
             road=ROAD_315)
     w.dept_funds.update(fire=600, planning=100, police=1000)
     assert T.topped_up(DeptMoney(env, "fire")) == "still $300 short of 3 levee tiles: less buys fewer tiles"

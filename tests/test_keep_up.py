@@ -38,6 +38,13 @@ def short_env():
     return env
 
 
+@pytest.fixture
+def tier1(monkeypatch):
+    """No tier upgrade on offer (tools.tier_up): these tests are about tier-1 buildings; short_env's fire has one
+    downtown tile without tier-2 cover, and a fire HQ would be its next build (tests/test_tier_up.py)."""
+    monkeypatch.setattr(T, "tier_up", lambda *a, **k: None)
+
+
 def _copy(env, treasury: float):
     env = copy.deepcopy(env)
     env.world.treasury = treasury
@@ -61,7 +68,7 @@ def test_service_coverage_is_the_metric_and_writes_nothing(short_env):
     assert (w.version, len(w._bfs_cache), set(w.facility_state)) == before[:3] and (w.struct == before[3]).all()
 
 
-def test_keep_up_counts_the_buildings_back_to_the_goal_capped_by_sites(short_env):
+def test_keep_up_counts_the_buildings_back_to_the_goal_capped_by_sites(short_env, tier1):
     env = copy.deepcopy(short_env)
     w = env.world
     b = DeptMoney(env, "police").build
@@ -140,7 +147,7 @@ def test_another_building_still_meets_the_reserve_guard(short_env):
     assert res.get("refused") == "reserve" and "for another police station" in res["error"]
 
 
-def test_the_needs_line_says_when_coverage_is_falling(short_env):
+def test_the_needs_line_says_when_coverage_is_falling(short_env, tier1):
     env = copy.deepcopy(short_env)
     w = env.world
     now = round(100 * w.metrics()["fire_coverage"])
@@ -156,7 +163,7 @@ def test_the_needs_line_says_when_coverage_is_falling(short_env):
     assert f"needs $2,500 for another fire station (coverage falling: {now + 5} -> {now}%" in line
 
 
-def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeypatch):
+def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeypatch, tier1):
     """Late smoke seed 2, month 102: no ready station site reached the uncovered homes (another road), and the fire
     station built at the Ready line's best served one building."""
     env = copy.deepcopy(short_env)

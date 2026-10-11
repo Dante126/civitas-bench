@@ -28,9 +28,10 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spend_lines, unclaimed_spots
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
-from .tools import Ask, keep_up_where, mayor_ask, needs_count
+from .tools import Ask, _yours, keep_up_where, mayor_ask, needs_count
 from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
+from .tools import TIER_UP, enrol_text, upgrade_line
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -630,8 +631,9 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
     """Transport's Next line, every turn: the build first_build names (`b`, its DeptMoney.build: the one the mayor's needs line and mayor_ask
     name, so the price and the ask amount always agree), shown with its call. The first bus line (_bus_first); another
     one (first_build names it while its bus_stops list offers it), with transit now and with it (transit_estimate);
-    an avenue stretch, priced whole, as one upgrade_road call on the most jammed stretch; with nothing else ready, the
-    cheapest station or harbour (FirstBuild.extra) and its build call; else that nothing is to build, and why (a
+    an avenue stretch, priced whole, as one upgrade_road call on the most jammed stretch; the first link to the region
+    once demand is capped without one ("your first train station"), or with nothing else ready the cheapest station or
+    harbour its lists offer, and its build call; else that nothing is to build, and why (a
     region city's links are its Region block's). When funds are short, the ask amount when the mayor would fund it
     (mayor_ask), else to say so in the end_turn report. 120-month LLM runs: 156 of 240 transport turns did nothing, 142
     reasoned about "1,500 residents" past 1,500 (122 with it in memory), and in the region run 47 of 52 turns that
@@ -664,7 +666,8 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
     if purpose in STATION_ACTIONS:
         s = lists[purpose].sites[0]
         call = json.dumps({"x": s["x"], "y": s["y"]}, separators=(",", ":"))
-        return (f"- Next: {a_or_an(b.extra[0])} ({money(cost)}): {STATION_ACTIONS[purpose]} {call}"
+        what = _yours(b.named[0].label) if b.named else a_or_an(b.extra[0])     # "your first train station"
+        return (f"- Next: {what} ({money(cost)}): {STATION_ACTIONS[purpose]} {call}"
                 + (" (a metro line needs 2 stations, then create_metro_line)" if purpose == "metro_station" else "")
                 + lack())
     m = w.metrics()
@@ -741,7 +744,20 @@ def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
     they pay for now; when no ready site adds coverage, where the uncovered homes are and to ask planning (stuck); []
     otherwise. Late smoke 20261007 seed 2: fire read "build another fire station" every quarter while coverage went
     94 -> 86 -> 81 -> 78%; at month 99 it built at the Ready line's best (37,23), which served one building, where
-    (36,30) would have brought coverage from 86% to ~92%."""
+    (36,30) would have brought coverage from 86% to ~92%.
+    A tier upgrade its next build names (tier_up, school_upgrade: Need.call) gets the same line, with its call: "- tier
+    upgrade: an upgrade of your police station at (12,20) to a police HQ ($7,800, +$75/month; coverage 81%, ~88% with
+    it; 24 downtown tiles lack tier-2 cover; another police station at your best ready site adds under 1%):
+    upgrade_facility {"x":12,"y":20,"module":"tier"} this turn: your funds cover it" (or "once your funds cover it (you
+    have $2,129)"). v1: police and fire never read an upgrade, and the models built 23-26 tier-1 police stations."""
+    b = m.build
+    if b is not None and b.named and b.named[0].call and b.cost is not None:
+        n = b.named[0]
+        up = f", +{money(n.upkeep)}/month" if round(n.upkeep) else ""
+        when = ("this turn: your funds cover it" if not short_of(funds, b.cost) else
+                f"once your funds cover it (you have {money(math.floor(funds))})")
+        return [f"- tier upgrade: {_yours(n.label)} ({money(b.cost)}{up}; {n.status}"
+                + (f"; {n.note}" if n.note else "") + f"): {n.call} {when}"]
     if not m.keep_ups:
         if not m.stuck:
             return []
@@ -762,6 +778,19 @@ def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
              if p in best and best[p] not in spots and best[p] not in m.avoid]     # not one an earlier dept takes
     note = f"; the Ready line's best {', '.join(other)} adds less" if other else ""
     return [f"- keep up with growth: {keep_up_where(g)} ({status}): {now}{note}"]
+
+
+def _service_metrics(w, role: str) -> list[str]:
+    """Key metrics lines the coverage metrics don't show: police, fire and health's level 4-5 tiles without tier-2
+    cover (tier-1 buildings cover them only to T1_DOWNTOWN: an upgrade covers them), education's enrolment per level
+    (what its score counts; school coverage alone read 99% beside 78-85% high-school enrolment in v1)."""
+    if role in TIER_UP:
+        n = (w.stats.get("downtown_uncovered") or {}).get(TIER_UP[role][1], 0)
+        return [f"- downtown (level 4-5) tiles without tier-2 cover: {n} (tier 1 covers them to "
+                f"{pct(100 * C.T1_DOWNTOWN)} at most)"]
+    if role == "education":
+        return ["- " + "; ".join(enrol_text(w, lv) for lv in ("elementary", "high"))]
+    return []
 
 
 def _bus_riders(w) -> str:
@@ -835,6 +864,7 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     if role == "transport":
         L.append(_bus_riders(w))
+    L += _service_metrics(w, role)
     if role == "planning":
         L += cap_line(w)
     reqs = open_requests(env, fleet, to="planning") if view is not None else []
@@ -845,8 +875,9 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
         prices = {**prices, "road_extension": road}
     keep = bank_keep(w, supplies) if role == "utilities" else None
-    return (L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds, keep, view) + [""]
-            + _memory(fleet, role))
+    ready = _ready_sites(env, role, lists, prices, funds, keep, view)
+    ready[-1:-1] = upgrade_line(w, role, obs)                     # before the find_sites footer
+    return L + [""] + _map(w, role) + [""] + ready + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,

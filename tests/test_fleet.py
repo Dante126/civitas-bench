@@ -799,6 +799,8 @@ def test_two_by_two_lists_say_when_no_free_block_is_left(open_env):
         assert (lst.sites, lst.short, lst.blocked) == ([], "no free 2x2 roadside block: ask planning for one", True)
         assert "2x2" in lst.note and "ask planning (send_message)" in lst.note, lst.note
     assert "hospital" not in blocked_firsts(w, "health", lists["health"])       # the clinic's tier 2: an upgrade
+    assert "university" not in blocked_firsts(w, "education", lists["education"])     # school enrolment short (v2)
+    w.enrollment.update(elementary=1.0, high=1.0)       # both school levels enrolled: the university's turn
     assert "university" in blocked_firsts(w, "education", lists["education"])
     w.school_cov[:] = w.high_cov[:] = 1.0              # schools need no lot: the university is the cheapest blocked
     line, = [ln for ln in _ready_sites(briefing(env, "planning", mark=False)) if ln.startswith("- blocked")]
@@ -4451,6 +4453,7 @@ def test_briefings_stay_bounded_at_the_limits(monkeypatch):
     _fill_roadside(w)                                  # every roadside lot taken: a blocked line outruns an idle one
     monkeypatch.setattr(T, "_uncovered_need", lambda w, role, purpose: ((0, 0), 1.0) if (role, purpose) in T.NEAR_NEED
                         else None)                     # as if the (empty) map had people to serve
+    monkeypatch.setattr(T, "enrol_short", lambda w, level: level != "university")     # ... and children to school
     # the blocked mix: 2 idle, 5 blocked, each holding its first building's price (4 digits, like the idle ones)
     w.dept_funds.update(utilities=4000, police=2500, fire=2500, health=2000, education=2500)
     mayor = check("blocked")
@@ -6001,10 +6004,22 @@ def test_transport_next_line_is_what_first_build_names(open_env, monkeypatch):
     assert offered, lists
     purpose = min(offered, key=offered.get)
     b = T.first_build(env, "transport")
-    assert b.cost is None and b.purposes == (purpose,) and b.extra[1] == offered[purpose]
+    # a priced build (v2: "another" on the mayor's lines, with a top-up the to-fund line counts), no longer a cost-less
+    # extra: v1's Next line named "a train station ($8,000)" in about half the turns that had one, and the mayor, which
+    # funds its to-fund line, never funded one
+    building = T.site_price(w, "transport", purpose).building
+    assert b.cost == offered[purpose] and b.purposes == (purpose,) and b.named[0].label == f"a {building}"
+    assert not b.named[0].first and not T.capped_unlinked(w)
     s = lists[purpose].sites[0]
-    assert nxt().startswith(f"- Next: a {b.extra[0]} (${offered[purpose]:,}): build_{purpose} "
+    assert nxt().startswith(f"- Next: a {building} (${offered[purpose]:,}): build_{purpose} "
                             f'{{"x":{s["x"]},"y":{s["y"]}}}'), nxt()
+    assert f"; needs ${offered[purpose]:,} for a {building} (" in mayor(), mayor()
+    m = T.funding_gaps(env, FleetState.of(env)).depts["transport"]
+    assert m.kind == "another" and m.top_up == offered[purpose] - 100
+    w.treasury = T.reserve(w) + 1_000_000                     # the money above the reserve covers it: an ask
+    assert nxt().endswith(f"; you have $100: ask the mayor for ${offered[purpose] - 100:,} (send_message)"), nxt()
+    w.treasury = 0                                            # in a hold: say it in the end_turn report
+    w.dept_funds.update({d: 0 for d in DEPARTMENTS if d != "transport"})          # no idle money to take back
     assert nxt().endswith("; you have $100: say what you need in your end_turn report"), nxt()
     w.dept_funds["transport"] = offered[purpose]
     assert "you have" not in nxt(), nxt()                       # its funds cover it: no ask
