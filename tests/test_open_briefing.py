@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from civitas.agents.scripted import ScriptedMayor
 from civitas.bench.runner import warm_up
 from civitas.config import load_config
 from civitas.fleet.briefing import briefing, system_prompt
@@ -48,7 +49,10 @@ def _late_cfg() -> dict:
 
 
 def _handover(seed: int):
-    env, _ = warm_up(_late_cfg(), seed)
+    """The hand-over the snapshot was taken on: civitas-v2's scripted mayor before its take-back hysteresis."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ScriptedMayor, "HOLD_TURNS", 0)
+        env, _ = warm_up(_late_cfg(), seed)
     return env
 
 

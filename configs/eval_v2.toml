@@ -4,8 +4,10 @@
 # recession (industrial jobs to 0, unemployment ~45%), which the scripted yardstick recovers from by itself. The seeds
 # here are the eight of 0-23 whose scripted warm-up (v2's scripted mayor) has no shock in months 84-96: no recession
 # under way or within 6 months of ending, no flood, no fall of industrial jobs over 30%, unemployment under 10%, no
-# population fall over 5% (seed 2: a flood at month 85 cost 37% of its population; seed 3, also clean, is left out
-# as the largest hand-over city). Hand-over population 6,246 on average (all 24 seeds: 5,890; v1's 0-7: 6,302).
+# population fall over 5% (seed 2: a flood at month 85 cost 45% of its population; seed 3, also clean, is left out
+# as the largest hand-over city). Hand-over population 5,897 on average (all 24 seeds: 5,756; seeds 0-7: 5,824).
+# Re-scanned after the scripted mayor's take-back hysteresis changed every hand-over city: the same 9 clean seeds.
+# None of the eight has a train station or harbour at the hand-over; 0, 5, 18 and 20 (past 6,000) have R/C capped.
 # The per-run reference wall time and tokens are eval_singles' (trinity-large-thinking on v1's seeds).
 # Not a run config: the launcher (civitas serve) leaves suite files out.
 name = "v2"
