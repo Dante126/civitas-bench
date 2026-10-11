@@ -16,12 +16,24 @@ holds a model client) before a single month is played (`ModelAgentError`).
 plays, compares with its summary and writes `yardstick.json`. The record has `summary["warmup"]`'s shape (the city
 score and population at hand-over and at the end, the change, the average city score after the hand-over), the
 departments' final scores and per frame month from N on the city score and population (a region: per city too).
+
+The do-nothing reference (`noop`): the same window from the same hand-over with the run's model roles idle after it
+(`idle_roles`: the roles the warm-up line-up stands in for, i.e. every fleet / llm / remote agent; all roles when there
+is none), the other roles as in the yardstick line-up. An idle role is a `NoopAgent`: each acting turn no action and no
+message, which is what the RL noop policy (rl/policies.py: end_turn at once) amounts to in the game. A fleet line-up
+is idle as a whole: no budget top-ups, no roads, no zoning, no buildings, the treasury and taxes left as handed over.
+`play(..., idle=roles)` plays it; its record has the scripted part's shape and goes into yardstick.json under `noop`
+(`noop_part`), with its own `matches_run` and `matches_yardstick` (the hand-over must be the run's and the scripted
+part's; `noop_ok` is the part only when neither is False). `yardstick(run_dir, scripted=False)` adds the noop part to
+an existing yardstick.json (`civitas yardstick <run> --noop`), `backfill()` does so for many runs in worker processes
+(`civitas yardstick --noop --evals`).
 """
 from __future__ import annotations
 
 import json
 import statistics
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from ..agents.base import NoopAgent, RandomAgent
@@ -33,6 +45,9 @@ from ..fleet.scripted import MODEL as SCRIPTED_FLEET, ScriptedFleetAgent
 
 FILE = "yardstick.json"
 VERSION = 1
+NOOP_VERSION = 1
+NOOP_KEYS = ("handed_over", "bankrupt", "idle", "agents", "at_handover", "at_end", "change", "avg_city_score",
+             "final_scores", "series", "by_city", "wall_time_s")
 MODEL_KINDS = ("llm", "remote")                 # kinds that call a model or a live process
 
 
@@ -72,6 +87,15 @@ def yardstick_config(cfg: dict) -> dict:
     return out
 
 
+def idle_roles(cfg: dict) -> list[str]:
+    """The roles a noop reference leaves idle after the hand-over: those the warm-up line-up plays in place of the
+    configured agent (fleet on a model, llm, remote: `warmup_config`'s changes, as runner.lineups finds them); every
+    role when there are none (an all-scripted run: the noop floor of the whole line-up)."""
+    w = warmup_config(cfg)
+    roles = _roles(cfg)
+    return [r for r in roles if agent_spec(w, r) != agent_spec(cfg, r)] or roles
+
+
 def check_agents(agents: dict) -> None:
     """Raise ModelAgentError unless every built agent is exactly one of `safe_types()` and holds no model client
     (a scripted fleet agent on the scripted model). Called before the yardstick plays a month."""
@@ -100,12 +124,14 @@ def _mark(env, city: str | None, scores: dict) -> dict:
 
 
 def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bool = False,
-         on_handover=None) -> dict:
+         on_handover=None, idle: list[str] | None = None) -> dict:
     """Play `cfg` (a warm-up config) from month 0 with the yardstick line-up, no logs. Returns the yardstick record
     (see the module doc). ValueError without a warm-up; ModelAgentError for a line-up that could call a model.
     `hook(env, role, obs, decision, results)` runs after each turn is applied, only reading (bench/envs.py's probe);
     `on_handover(env, agents)` runs once at the hand-over, before that month's turns, only reading (the probe's model
-    part plays on a deep copy); `keep_env` puts the finished env on the record as `env` (not JSON)."""
+    part plays on a deep copy); `keep_env` puts the finished env on the record as `env` (not JSON). `idle` (roles,
+    e.g. `idle_roles(cfg)`): the noop reference: from the hand-over those roles are NoopAgents (the record's `idle`
+    and `agents` say so; `on_handover` sees the idle line-up)."""
     n = warmup_months(cfg)
     if not n:
         raise ValueError("a yardstick needs a warm-up run ([game].warmup_months > 0)")
@@ -140,6 +166,12 @@ def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bo
             hand = {"month": env.world.month, **_mark(env, None, env.last_scores), "scores": dict(env.last_scores)}
             hand_city = {c: _mark(env, c, env.last_scores) for c in cities}
             record(env.last_scores)
+            if idle:                                       # the noop reference: these roles do nothing from here
+                for r in idle:
+                    agents[r] = NoopAgent(r.split(".", 1)[-1])
+                    agents[r].reset(seed)
+                    agents[r].bind(env)
+                check_agents(agents)
             if on_handover is not None:
                 on_handover(env, agents)
         acting = [r for r in env.roles if env.acts_this_month(r)]
@@ -163,6 +195,8 @@ def play(cfg: dict, seed: int, *, verbose: bool = False, hook=None, keep_env: bo
            "handed_over": hand is not None,
            "bankrupt": any(e.world.bankrupt for e in (getattr(env, "envs", None) or {"": env}).values()),
            "wall_time_s": None}
+    if idle is not None:
+        out["idle"] = list(idle)
     from .runner import agent_signature                  # (runner imports this module)
     out["signature"] = agent_signature(ycfg, env.roles)
     if hand is not None:
@@ -202,10 +236,39 @@ def compare_with_run(ys: dict, summary: dict | None) -> dict:
     return ys
 
 
-def yardstick(run_dir: str | Path, *, write: bool = True, verbose: bool = False) -> dict:
-    """The yardstick of the warm-up run in `run_dir` (its meta.json config and seed), compared with its summary when
-    finished, written to `yardstick.json` there (`write`). ValueError for a run without a warm-up."""
-    d = Path(run_dir)
+def noop_part(rec: dict, ys: dict | None = None, summary: dict | None = None) -> dict:
+    """The `noop` entry of yardstick.json from a `play(..., idle=...)` record: the scripted part's fields
+    (NOOP_KEYS), `matches_yardstick` (its hand-over is the scripted part's, `ys`) and `matches_run` (the run's, from
+    its summary) when there is something to compare with."""
+    out = {"version": NOOP_VERSION, **{k: rec[k] for k in NOOP_KEYS if k in rec}}
+    if ys and ys.get("at_handover"):
+        out["matches_yardstick"] = _same(out.get("at_handover"), ys.get("at_handover"))
+    w = (summary or {}).get("warmup") or {}
+    if w.get("handed_over"):
+        out["matches_run"] = _same(out.get("at_handover"), w.get("at_handover"))
+    out["created"] = time.time()
+    return out
+
+
+def play_noop(cfg: dict, seed: int, ys: dict | None = None, summary: dict | None = None, *,
+              verbose: bool = False) -> dict:
+    """The noop reference of `cfg` (idle_roles idle from the hand-over) as yardstick.json's `noop` entry."""
+    return noop_part(play(cfg, seed, verbose=verbose, idle=idle_roles(cfg)), ys, summary)
+
+
+def noop_ok(ys: dict | None) -> dict | None:
+    """The usable noop part of a yardstick record: present, handed over, and from the run's hand-over (neither match
+    flag False); None otherwise (an old yardstick.json, or a noop part played by code that no longer plays the run's
+    warm-up)."""
+    n = (ys or {}).get("noop")
+    if not n or not n.get("handed_over") or not n.get("change"):
+        return None
+    if n.get("matches_run") is False or n.get("matches_yardstick") is False:
+        return None
+    return n
+
+
+def _meta(d: Path) -> dict:
     try:
         meta = json.loads((d / "meta.json").read_text())
     except (OSError, ValueError) as e:
@@ -213,17 +276,85 @@ def yardstick(run_dir: str | Path, *, write: bool = True, verbose: bool = False)
     cfg = meta.get("config") or {}
     if not int(meta.get("warmup_months") or (cfg.get("game") or {}).get("warmup_months") or 0):
         raise ValueError(f"run {d.name} has no warm-up: a yardstick plays from a warm-up's hand-over")
-    ys = play(cfg, int(meta.get("seed") or 0), verbose=verbose)
-    ys["run_id"] = meta.get("run_id") or d.name
+    return meta
+
+
+def yardstick(run_dir: str | Path, *, write: bool = True, verbose: bool = False, scripted: bool = True,
+              noop: bool | str = True) -> dict:
+    """The yardstick of the warm-up run in `run_dir` (its meta.json config and seed), compared with its summary when
+    finished, written to `yardstick.json` there (`write`). `scripted` False keeps the scripted part of an existing
+    yardstick.json (played when there is none); `noop` adds the do-nothing reference (`noop`: play_noop), which with
+    `scripted` False is kept when present unless `noop` is "force". ValueError for a run without a warm-up."""
+    d = Path(run_dir)
+    meta = _meta(d)
+    cfg, seed = meta.get("config") or {}, int(meta.get("seed") or 0)
     try:
         summary = json.loads((d / "summary.json").read_text())
     except (OSError, ValueError):
         summary = None
-    compare_with_run(ys, summary)
-    ys["created"] = time.time()
+    ys = None if scripted else read(d)
+    if not ys or not ys.get("version"):
+        ys = play(cfg, seed, verbose=verbose)
+        ys["run_id"] = meta.get("run_id") or d.name
+        compare_with_run(ys, summary)
+        ys["created"] = time.time()
+    if noop and (scripted or noop == "force" or not ys.get("noop")):
+        ys["noop"] = play_noop(cfg, seed, ys, summary, verbose=verbose)
     if write:
         (d / FILE).write_text(json.dumps(ys, indent=2))
     return ys
+
+
+def eval_run_dirs(runs_dir: str | Path, pattern: str = "eval_*") -> list[Path]:
+    """The run folders of the evals in `runs_dir` whose folder matches `pattern` (each eval.json's run ids, not
+    earlier attempts), in order, each once; run ids without a folder are skipped."""
+    rd, out = Path(runs_dir), []
+    for p in sorted(rd.glob(f"{pattern}/eval.json")):
+        try:
+            ev = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        for r in ev.get("runs") or []:
+            d = rd / str(r.get("run_id") or "")
+            if r.get("run_id") and (d / "meta.json").exists() and d not in out:
+                out.append(d)
+    return out
+
+
+def _backfill_one(args) -> dict:
+    d, force = args
+    t0 = time.time()
+    try:
+        ys = yardstick(d, scripted=False, noop="force" if force else True)
+        n = ys.get("noop") or {}
+        return {"run": Path(d).name, "ok": True, "noop": (n.get("change") or {}).get("city"),
+                "scripted": (ys.get("change") or {}).get("city"), "matches": noop_ok(ys) is not None,
+                "s": round(time.time() - t0, 1)}
+    except Exception as e:                                # one run's failure doesn't stop the others
+        return {"run": Path(d).name, "ok": False, "error": f"{type(e).__name__}: {e}", "s": round(time.time() - t0, 1)}
+
+
+def backfill(run_dirs, *, workers: int = 4, force: bool = False, out=print) -> list[dict]:
+    """Add the noop part to each run's yardstick.json (yardstick(scripted=False): the scripted part kept, played only
+    where missing; a run that has a noop part is skipped unless `force`), `workers` processes at a time (scripted and
+    noop play only: never a model). Returns one result per run, printed as each finishes."""
+    todo = [Path(d) for d in run_dirs]
+    if not force:
+        todo = [d for d in todo if not (read(d) or {}).get("noop")]
+    res: list[dict] = []
+    if not todo:
+        return res
+    with ProcessPoolExecutor(max_workers=max(1, min(workers, len(todo)))) as ex:
+        for r in ex.map(_backfill_one, [(str(d), force) for d in todo]):
+            res.append(r)
+            if out is None:
+                continue
+            if not r["ok"] or r["noop"] is None:
+                out(f"{r['run']}: {r.get('error') or 'no hand-over'} ({r['s']} s)")
+            else:
+                out(f"{r['run']}: noop {r['noop']:+.2f}, scripted {r['scripted']:+.2f}"
+                    + ("" if r["matches"] else "  (hand-over differs from the run's: not used)") + f" ({r['s']} s)")
+    return res
 
 
 def read(run_dir: str | Path) -> dict | None:
@@ -238,7 +369,9 @@ def line(ys: dict) -> str:
     c = ys.get("change") or {}
     if not ys.get("handed_over") or not c:
         return "scripted from the same start: no hand-over (the game ended in the warm-up)"
-    return f"scripted from the same start: {c['city']:+.1f} / {c['population']:+,}"
+    n = (noop_ok(ys) or {}).get("change")
+    return (f"scripted from the same start: {c['city']:+.1f} / {c['population']:+,}"
+            + (f"; doing nothing: {n['city']:+.1f} / {n['population']:+,}" if n else ""))
 
 
 def comparison(ys: dict) -> str:
@@ -256,6 +389,16 @@ def comparison(ys: dict) -> str:
                    f"  (city {float(e['city']):.1f}, population {e['population']:,}; {ys.get('wall_time_s')} s)")
     for city, b in (ys.get("by_city") or {}).items():
         out.append(f"    {city}: {b['change']['city']:+.1f} / {b['change']['population']:+,}")
+    n = ys.get("noop") or {}
+    if n.get("change"):
+        ne = n.get("at_end") or {}
+        out.append(f"  doing nothing:       {n['change']['city']:+.1f} city / {n['change']['population']:+,} residents"
+                   f"  (city {float(ne['city']):.1f}, population {ne['population']:,}; {len(n.get('idle') or [])} "
+                   f"roles idle; {n.get('wall_time_s')} s)")
+        for city, b in (n.get("by_city") or {}).items():
+            out.append(f"    {city}: {b['change']['city']:+.1f} / {b['change']['population']:+,}")
+        if noop_ok(ys) is None:
+            out.append("  WARNING: the noop reference's hand-over differs from the run's or the yardstick's: not used")
     if ys.get("matches_run") is False:
         out.append("  WARNING: the city at hand-over differs from the run's: the engine or config changed since it ran")
     return "\n".join(out)

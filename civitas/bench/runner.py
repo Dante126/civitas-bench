@@ -597,7 +597,8 @@ def _play(run: dict) -> dict:
 
 def _yardstick(run: dict, summary: dict) -> dict | None:
     """The scripted yardstick of a finished warm-up run (bench/yardstick.py: the same game from the same hand-over,
-    every agent scripted, no logs; seconds), for the run folder's yardstick.json. A failure only warns."""
+    every agent scripted, no logs; seconds) and its `noop` reference (the run's model roles idle from the hand-over),
+    for the run folder's yardstick.json. A failure only warns."""
     try:
         if run["verbose"]:
             print(f"[{run['run_id']}] scripted yardstick: the same game from month {run['warmup']['months']}, "
@@ -609,6 +610,10 @@ def _yardstick(run: dict, summary: dict) -> dict | None:
         if ys.get("matches_run") is False:
             print(f"[{run['run_id']}] warning: the yardstick's city at hand-over differs from the run's",
                   file=sys.stderr)
+        try:                                         # the do-nothing reference from the same hand-over
+            ys["noop"] = Y.play_noop(run["cfg"], run["seed"], ys, summary)
+        except Exception as e:
+            print(f"[{run['run_id']}] warning: noop reference failed: {type(e).__name__}: {e}", file=sys.stderr)
         return ys
     except Exception as e:                           # the yardstick is extra: never lose the run over it
         print(f"[{run['run_id']}] warning: yardstick failed: {type(e).__name__}: {e}", file=sys.stderr)
