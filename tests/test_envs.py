@@ -179,7 +179,9 @@ def test_tagging_never_fails_a_freeze(probed, monkeypatch):
 
 def test_the_shipped_version_and_suite():
     s = E.load_suite(ROOT / E.DEFAULT_SUITE)
-    assert s.env == "civitas-v1" and s.baseline_model == "trinity-large-thinking"
+    assert s.env == "civitas-v2" and s.baseline_model == "trinity-large-thinking"
+    assert E.load_suite(ROOT / "configs/eval_open.toml").env == "civitas-v2-open"
+    assert E.load_suite(ROOT / "configs/eval_singles.toml").env == "civitas-v1"      # v1's frozen suite stays
     assert E.load_suite(ROOT / "configs/eval_late.toml").env is None
     rec = V.load_env("civitas-v1")
     if rec is not None:                                    # frozen with the CLI at the end of the change

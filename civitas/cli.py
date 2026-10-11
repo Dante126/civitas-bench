@@ -395,7 +395,7 @@ def main(argv=None):
     sp = sub.add_parser("eval", help="evaluate a model: a suite of late-start runs scored against the scripted "
                                      "yardstick, in one scorecard (see configs/eval_late.toml)")
     sp.add_argument("--suite", "-s", default=None, help="suite file (default with --model: "
-                                                        "configs/eval_singles.toml)")
+                                                        "configs/eval_v2.toml)")
     sp.add_argument("--model", default=None, help="the model every fleet agent plays: a key of configs/models.toml "
                                                   "(its provider and settings), else a served id with --provider "
                                                   "(sets [fleet].model and each [agents.<role>] that names its own)")
@@ -437,7 +437,7 @@ def main(argv=None):
                                     "check the code against it, list them")
     sp.add_argument("action", choices=("freeze", "check", "list"))
     sp.add_argument("name", nargs="?", default=None, help="freeze: the new version's name, e.g. civitas-v2")
-    sp.add_argument("--suite", "-s", default=None, help="the suite (default configs/eval_singles.toml)")
+    sp.add_argument("--suite", "-s", default=None, help="the suite (default configs/eval_v2.toml)")
     sp.add_argument("--workers", type=int, default=8, help="seeds probed at once")
     sp.add_argument("--no-cache", action="store_true", help="probe again even when this code state was probed")
     sp.add_argument("--no-tag", action="store_true", help="freeze: don't tag HEAD env/<name>")

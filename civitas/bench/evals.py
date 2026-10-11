@@ -1511,7 +1511,7 @@ def list_evals(runs_dir: str | Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------------------------------- plug-in evals
-DEFAULT_SUITE = "configs/eval_singles.toml"
+DEFAULT_SUITE = "configs/eval_v2.toml"        # civitas-v2, guided; eval_open.toml is the open track, eval_singles civitas-v1
 
 
 def model_key(ev: dict) -> str | None:
