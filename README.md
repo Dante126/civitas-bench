@@ -376,11 +376,15 @@ scored within 0.8 points. `[fleet] briefing` picks the briefing style (per role 
   enrolment, supply and demand, transit share, downtown cover, demand caps), funds and plan target, every Ready sites
   line with its price, estimates as data ("coverage estimate: ... ~97% with it", "transit estimate"), upgrade offers,
   requests, the map, Finances with the reserve and its rule, and per department its funds, spending, what a take-back
-  must leave it and its priced options. Dropped: exact call text, Next lines (and their refresh in tool results),
+  must leave it and its priced options, each tagged as the reserve guard counts it ("the city has none" for a first
+  building, "supply" for a short utility). Dropped: exact call text, Next lines (and their refresh in tool results),
   "This turn", the to-spend / to-fund lines and request states, "ask the mayor for $X" / "no money ask" lines, the
   repay_loan suggestion, fixes in failed-action results (the reason stays: "(24,23) holds a town hall", "costs $7,800
-  but the police budget only has $6,632") and the "do X instead" part of guard refusals. The playbooks are rewritten
-  without them. `civitas prompt -c configs/fleet_open_late.toml --role mayor` shows an open briefing.
+  but the police budget only has $6,632"), the "do X instead" part of guard refusals, and what the money buys in the
+  mayor's money results (a top-up's result gives the treasury against the reserve; the take-back, reserve and loan
+  guards state their rule, never a named build or an amount "needed"). No money ask to the mayor is held back: the
+  mayor decides. The playbooks are rewritten without them. The scripted fleet renders in the configured style too
+  (so the environment probe hashes open text) and plays the same in either. `civitas prompt -c configs/fleet_open_late.toml --role mayor` shows an open briefing.
 
 ---
 
