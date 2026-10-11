@@ -574,7 +574,7 @@ def test_run_efficiency_counts_calls_tools_and_capped_turns(tmp_path):
                         _turn(["offer_deal", "end_turn"], calls=1, prompt=200, completion=20, role="north.mayor")])
     e = E.run_efficiency(d)
     assert e == {"turns": 3, "model_calls": 7, "tool_calls": 10, "actions": 3, "lookups": 3, "capped": 1,
-                 "prompt": 1200, "completion": 120}
+                 "prompt": 1200, "completion": 120, "budget_turns": 0, "budget_cuts": 0, "budget_used": 0}
     assert E.run_efficiency(tmp_path / "missing") is None
     # cached on the file: a second read doesn't parse it again
     E._EFF_CACHE[str(d / "trajectories.jsonl")][1]["turns"] = 99
@@ -584,8 +584,27 @@ def test_run_efficiency_counts_calls_tools_and_capped_turns(tmp_path):
     assert agg["runs"] == 2 and agg["turns"] == 6 and agg["tokens_per_turn"] == 440
     assert agg["model_calls_per_turn"] == pytest.approx(7 / 3, abs=0.01) and agg["lookups_per_turn"] == 1.0
     assert agg["capped_share"] == pytest.approx(1 / 3, abs=1e-3) and agg["context_per_call"] == round(1200 / 7)
-    assert agg["tokens_per_run"] == 1320
+    assert agg["tokens_per_run"] == 1320 and agg["budget_cut_rate"] is None and agg["budget_used_mean"] is None
     assert E.efficiency_of([{"run_id": "nope", "total": {}}], tmp_path) is None
+
+
+def test_efficiency_counts_token_budget_cuts(tmp_path):
+    """civitas-v3: the turns played with a token budget, the share it cut and their mean units (run_efficiency,
+    efficiency_of, a run card's and a leaderboard row's own budget_cut_rate / budget_used_mean)."""
+    d = tmp_path / "r"
+    _efficiency_run(d, [_turn(["inspect"], turn_budget=100_000, budget_used=100_000, finish_reason="turn_budget"),
+                        _turn(["end_turn"], turn_budget=100_000, budget_used=40_000, finish_reason="end_turn"),
+                        _turn(["end_turn"], turn_budget=100_000, budget_used=30_000, finish_reason="end_turn"),
+                        _turn(["end_turn"], turn_budget=100_000, budget_used=10_000, finish_reason="end_turn")])
+    e = E.run_efficiency(d)
+    assert (e["budget_turns"], e["budget_cuts"], e["budget_used"]) == (4, 1, 180_000)
+    agg = E.efficiency_of([{"run_id": "r", "total": {}}], tmp_path)
+    assert agg["budget_cut_rate"] == 0.25 and agg["budget_used_mean"] == 45_000
+    assert E._budget_fields(agg) == {"budget_cut_rate": 0.25, "budget_used_mean": 45_000}
+    rows = dict(E._budget_rows(E._budget_fields(agg)))          # the scorecard's summary rows (none without a budget)
+    assert E._budget_rows({"budget_cut_rate": None}) == []
+    assert rows["turns cut by the token budget"] == "25.0%"
+    assert rows["token budget used per turn (prompt chars / 4 + completion)"] == "45k"
 
 
 def test_leaderboard_rows_carry_efficiency(tmp_path):
@@ -599,6 +618,13 @@ def test_leaderboard_rows_carry_efficiency(tmp_path):
     eff = row["efficiency"]
     assert eff["turns"] == 2 and eff["tokens_per_turn"] == 1_000_000 and eff["tokens_per_run"] == 1_000_000
     assert eff["vs_per_10m"] == pytest.approx(1.5 / 0.1) and row["vs_yardstick"]["mean"] == pytest.approx(1.5)
+    assert row["budget_cut_rate"] is None and row["budget_used_mean"] is None       # no token budget (v2)
+    for c in ev["scorecard"]["runs"]:                                               # civitas-v3: one turn of two cut
+        _efficiency_run(runs / c["run_id"], [_turn(["inspect"], turn_budget=10, budget_used=12,
+                                                   finish_reason="turn_budget"),
+                                             _turn(["end_turn"], turn_budget=10, budget_used=4)])
+    row = E.leaderboard("tiny-v1", runs)["rows"][0]
+    assert row["budget_cut_rate"] == row["efficiency"]["budget_cut_rate"] == 0.5 and row["budget_used_mean"] == 8
     assert E.leaderboard("tiny-v1", tmp_path / "empty")["rows"] == []
 
 

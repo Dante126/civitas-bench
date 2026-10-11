@@ -622,18 +622,20 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
     if (!E.length) return "";
     const n = (v, d = 1) => v == null ? "—" : v.toFixed(d);
     const best = (k, dir) => { const xs = E.map(r => r.efficiency[k]).filter(v => v != null); return xs.length > 1 ? (dir > 0 ? Math.max(...xs) : Math.min(...xs)) : null; };
-    const B = { tokens_per_turn: best("tokens_per_turn", -1), model_calls_per_turn: best("model_calls_per_turn", -1), lookups_per_turn: best("lookups_per_turn", -1), capped_share: best("capped_share", -1), vs_per_10m: best("vs_per_10m", 1) };
+    const B = { tokens_per_turn: best("tokens_per_turn", -1), model_calls_per_turn: best("model_calls_per_turn", -1), lookups_per_turn: best("lookups_per_turn", -1), capped_share: best("capped_share", -1), budget_cut_rate: best("budget_cut_rate", -1), vs_per_10m: best("vs_per_10m", 1) };
+    const budget = E.some(r => r.efficiency.budget_cut_rate != null);   // civitas-v3's token budget: its column only then
+    const pct = v => v == null ? "—" : `${(100 * v).toFixed(v > 0 && v < 0.1 ? 1 : 0)}%`;
     const cell = (r, k, txt) => `<td class="${B[k] != null && r.efficiency[k] === B[k] ? "ev-best" : ""}">${txt}</td>`;
     const tr = E.map(r => { const e = r.efficiency, v = r.vs_yardstick || {};
       return `<tr><td><b>${esc(r.model)}</b></td><td>${sgn(v.mean)}</td>
         ${cell(r, "tokens_per_turn", tok(e.tokens_per_turn))}${cell(r, "model_calls_per_turn", n(e.model_calls_per_turn))}<td>${tok(e.context_per_call)}</td>
         <td>${n(e.tool_calls_per_turn)}</td><td>${n(e.actions_per_turn)}</td>${cell(r, "lookups_per_turn", n(e.lookups_per_turn))}
-        ${cell(r, "capped_share", e.capped_share == null ? "—" : `${(100 * e.capped_share).toFixed(e.capped_share > 0 && e.capped_share < 0.1 ? 1 : 0)}%`)}${cell(r, "vs_per_10m", e.vs_per_10m == null ? "—" : sgn(e.vs_per_10m))}</tr>`; }).join("");
+        ${cell(r, "capped_share", pct(e.capped_share))}${budget ? cell(r, "budget_cut_rate", pct(e.budget_cut_rate)) : ""}${cell(r, "vs_per_10m", e.vs_per_10m == null ? "—" : sgn(e.vs_per_10m))}</tr>`; }).join("");
     const th = (label, key) => `<th>${label} ${I(key)}</th>`;
     return `<div class="ev-card"><div class="ev-head"><h4>Efficiency</h4><span class="muted small">how each model spent its tokens, per model turn after the hand-over</span></div>
       <div class="ev-eff">
         <div class="ev-scroll"><table class="ev-t"><thead><tr><th>Model</th>${th("vs scripted", "vs_scripted")}${th("tokens / turn", "tokens_turn")}${th("model calls / turn", "model_calls_turn")}${th("context / call", "context_call")}
-          ${th("tool calls / turn", "tool_calls_turn")}${th("actions / turn", "actions_turn")}${th("look-ups / turn", "lookups_turn")}${th("at step cap", "capped")}${th("vs scripted per 10M tokens", "per_10m")}</tr></thead><tbody>${tr}</tbody></table></div>
+          ${th("tool calls / turn", "tool_calls_turn")}${th("actions / turn", "actions_turn")}${th("look-ups / turn", "lookups_turn")}${th("at step cap", "capped")}${budget ? th("cut by budget", "budget_cut") : ""}${th("vs scripted per 10M tokens", "per_10m")}</tr></thead><tbody>${tr}</tbody></table></div>
         <figure class="ev-scatter"><figcaption class="small">Cost against score ${I("scatter")}</figcaption><svg id="effSvg" role="img" aria-label="Tokens per model turn against vs scripted, one dot per model"></svg></figure>
       </div></div>`;
   }

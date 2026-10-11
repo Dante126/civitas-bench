@@ -24,10 +24,13 @@ What it mirrors of fleet/agent.py:ToolAgent.act, and how:
   `end_at_action_cap=True` also ends the turn once the action cap is reached (ToolAgent doesn't: after the cap the
   model can still message and report, and a message to the mayor changes what the scripted mayor funds).
 - the token budget (civitas-v3, fleet/budget.py): `turn_budget` (None: the task config's `[fleet] turn_budget`, 0 =
-  off for every v2 bank) gives the system prompt its rule and the briefing its line, and then each reply's `usage`
-  (as the provider reported it; estimated from characters when none is given) counts against it, every tool result
-  ends with ToolAgent's "budget left" line, and the turn is done ("turn_budget", ToolAgent's cut report) once the next
-  reply wouldn't fit: check `done` before sampling it, as ToolAgent checks before each call.
+  off for every v2 bank) gives the system prompt its rule and the briefing its line, and then each reply counts
+  against it in the budget's units (the request's characters / 4, and the completion from the reply's `usage` as the
+  provider reported it, or its characters / 4 when none is given), every tool result ends with ToolAgent's "budget
+  left" line, end_turn skips its open-requests reminder when the next reply may not fit (ToolBox.budget_low), and the
+  turn is done ("turn_budget", a refused end_turn's report, else ToolAgent's cut report) once the next
+  reply wouldn't fit: check `done` before sampling it, as ToolAgent checks before each call. A ToolAgent trajectory's
+  `call_usage` replays a logged turn's cutoff exactly (`replay(messages, usage=...)`).
 What is the trainer's: turn_tokens and max_tokens, sampling, and whether to send the nudge messages `reply` appends
 (`step` sends none).
 """
@@ -146,6 +149,9 @@ class TaskEpisode:
         self.tools = self.box.schemas()
         self.max_steps = fc.max_steps
         self.budget = TurnBudget(fc.turn_budget, fc.budget_reserve, self.tools) if fc.turn_budget else None
+        if self.budget is not None:                       # ToolAgent's hook: no end_turn reminder past the budget
+            b = self.budget
+            self.box.budget_low = lambda: b.low(b.chars(self.messages))
         self.messages = [{"role": "system", "content": self.system}, {"role": "user", "content": self.briefing}]
         out = {"task_id": self.row.get("task_id"), "role": self.role, "month": self.row["month"],
                "style": fc.briefing, "system_prompt": self.system, "briefing": self.briefing, "tools": self.tools,
@@ -202,12 +208,17 @@ class TaskEpisode:
         b = self.budget
         if b is not None and not self.done and not b.fits(b.chars(self.messages)):
             b.cut, self.stopped, self.reason = True, True, "turn_budget"
-            self.box.close(CUT_REPORT)
+            self.box.close(self.box.refused_report or CUT_REPORT)
 
     @property
     def budget_used(self) -> int | None:
         """Tokens counted against the budget so far (None without one)."""
         return self.budget.used if self.budget is not None else None
+
+    @property
+    def budget_over(self) -> int | None:
+        """Tokens counted beyond the budget (None without one): ToolAgent's `budget_over`."""
+        return self.budget.over if self.budget is not None else None
 
     def _reason(self) -> None:
         if self.box.ended:
@@ -265,11 +276,13 @@ class TaskEpisode:
         self._budget_check()
         return results
 
-    def replay(self, messages: list[dict], *, check: bool = False) -> list[dict]:
+    def replay(self, messages: list[dict], *, check: bool = False, usage: list | None = None) -> list[dict]:
         """Play a whole OpenAI-format conversation's assistant replies (system / user / tool messages are skipped:
         the episode makes its own) until the turn is done. Each call: {id, name, content}, plus with `check`
         `match`: whether the conversation's tool message for that id says the same (False when it differs, None when
-        it has none). With `check` a differing system prompt or briefing raises ValueError."""
+        it has none). With `check` a differing system prompt or briefing raises ValueError. `usage`: one entry per
+        assistant reply, in order (a ToolAgent trajectory's `call_usage`: the provider's usage, and in civitas-v3 the
+        units the budget counted, which are taken as they are), so a v3 turn is cut where it was."""
         if self.box is None:
             self.reset()
         given = {m.get("tool_call_id"): m.get("content") for m in messages if m.get("role") == "tool"}
@@ -277,13 +290,16 @@ class TaskEpisode:
             for want, (i, role) in ((self.system, (0, "system")), (self.briefing, (1, "user"))):
                 if len(messages) > i and messages[i].get("role") == role and messages[i].get("content") != want:
                     raise ValueError(f"replay: message {i} ({role}) differs from this task's")
-        out = []
+        out, k = [], 0
         for m in messages:
             if m.get("role") != "assistant" or self.done:
                 continue
             calls = m.get("tool_calls") or []
             n0 = len(self.messages)
-            self.reply(m.get("content") or "", calls, reasoning=m.get("reasoning_content") or m.get("reasoning") or "")
+            u = usage[k] if usage is not None and k < len(usage) else None
+            k += 1
+            self.reply(m.get("content") or "", calls, reasoning=m.get("reasoning_content") or m.get("reasoning") or "",
+                       usage=u)
             ran = [x for x in self.messages[n0:] if x.get("role") == "tool"]
             for c, t in zip(calls or [None] * len(ran), ran):
                 cid = (c or {}).get("id") or t["tool_call_id"]

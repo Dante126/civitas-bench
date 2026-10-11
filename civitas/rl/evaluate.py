@@ -6,7 +6,8 @@ Per task and sample: the task's state is prepared (episode.py), a ToolAgent with
 (playbooks, max_steps, max_tokens, turn_tokens, briefing style) but the given model and endpoint is bound to it and
 plays the turn (its nudges, recovered text calls, step and token limits), then the branch runs H months against the
 cached baseline. Written to runs/_rl_evals/<name>_<stamp>/: results.jsonl (one line per task and sample: reward and
-components, counts, tokens, steps, finish reason, errors), transcripts.jsonl (the messages a ToolAgent sent and got,
+components, counts, tokens, steps, finish reason, errors; with a token budget its turn_budget, budget_used,
+budget_cut and budget_over), transcripts.jsonl (the messages a ToolAgent sent and got,
 unless `transcripts=False`), summary.json and summary.md (mean reward with a 95% t-interval over tasks, by role and
 style, the noop reference from the bank, failed / refused / invalid calls per task, tokens).
 """
@@ -24,6 +25,7 @@ from . import bank as B
 from . import reward as R
 
 OUT_DIR = Path("runs") / "_rl_evals"
+BUDGET_KEYS = ("turn_budget", "budget_used", "budget_cut", "budget_over")   # a row's token budget (civitas-v3)
 
 
 def play_one(task, *, base_url: str, model: str, api_key_env: str = "", stream: bool = True, timeout: float = 300.0,
@@ -60,9 +62,11 @@ def play_one(task, *, base_url: str, model: str, api_key_env: str = "", stream: 
            "recovered_calls": meta.get("recovered_calls"), "error": d.parse_error,
            "tools": [t["tool"] for t in meta.get("tool_trace") or []],
            "latency_s": meta.get("latency_s"), "turn_s": round(t1 - t0, 2),
-           "reward_s": round(time.perf_counter() - t1, 3)}
+           "reward_s": round(time.perf_counter() - t1, 3),
+           **{k: meta[k] for k in BUDGET_KEYS if k in meta}}       # civitas-v3's token budget, when the task has one
     transcript = {"task_id": task.task_id, "messages": meta.get("messages") or [], "system": agent.system,
-                  "tool_trace": meta.get("tool_trace") or [], "report": d.thinking}
+                  "tool_trace": meta.get("tool_trace") or [], "report": d.thinking,
+                  "call_usage": meta.get("call_usage") or []}      # TaskEpisode.replay(messages, usage=...)
     return {"row": row, "transcript": transcript}
 
 

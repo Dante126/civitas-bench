@@ -905,8 +905,10 @@ def _calls(roles: dict | None) -> dict | None:
 # ---------------------------------------------------------------------------------------------------- efficiency
 # How a model's turns spent their tokens (the Leaderboard's efficiency view): model calls (API replies; each re-sends
 # the whole conversation, so prompt tokens ~ model calls x context), tool calls split into game actions and look-ups
-# (every tool but the actions and the turn controls), and turns that ran into the step cap.
-EFF = ("turns", "model_calls", "tool_calls", "actions", "lookups", "capped", "prompt", "completion")
+# (every tool but the actions and the turn controls), and turns that ran into the step cap; with civitas-v3's token
+# budget (fleet/budget.py) also the turns played with one, the turns it cut and the units they used.
+EFF = ("turns", "model_calls", "tool_calls", "actions", "lookups", "capped", "prompt", "completion",
+       "budget_turns", "budget_cuts", "budget_used")
 TURN_CONTROLS = frozenset({"end_turn", "send_message", "update_memory", "update_plan"})
 _EFF_CACHE: dict[str, tuple] = {}   # trajectories.jsonl -> ((size, mtime_ns), run_efficiency result)
 
@@ -931,7 +933,9 @@ def run_efficiency(d: str | Path) -> dict | None:
     """The model turns after the warm-up in a run's trajectories.jsonl (as _tokens counts them): {turns, model_calls
     (API replies: len(finish_reasons), else 1 per turn), tool_calls (tool_trace entries), actions (game actions),
     lookups (other tools but end_turn / send_message / update_memory / update_plan), capped (turns whose steps reached
-    max_steps), prompt, completion}; None without trajectories.jsonl. Cached on the file's size and mtime."""
+    max_steps), prompt, completion, budget_turns (turns with a `turn_budget`, civitas-v3), budget_cuts (of those, ended
+    by it: finish_reason "turn_budget"), budget_used (their units, summed)}; None without trajectories.jsonl. Cached on
+    the file's size and mtime."""
     d = Path(d)
     p = d / "trajectories.jsonl"
     try:
@@ -970,15 +974,26 @@ def run_efficiency(d: str | Path) -> dict | None:
             c = per.get(role, cap)
             if c and int(t.get("steps") or 0) >= int(c):
                 out["capped"] += 1
+            if t.get("turn_budget"):
+                out["budget_turns"] += 1
+                out["budget_cuts"] += t.get("finish_reason") == "turn_budget"
+                out["budget_used"] += int(t.get("budget_used") or 0)
     _EFF_CACHE[str(p)] = (key, dict(out))
     return out
+
+
+def _budget_fields(eff: dict | None) -> dict:
+    """budget_cut_rate / budget_used_mean (civitas-v3's token budget) of an efficiency_of result: a run card's,
+    an aggregate's and a leaderboard row's own fields (None without turns played with a budget)."""
+    return {k: (eff or {}).get(k) for k in ("budget_cut_rate", "budget_used_mean")}
 
 
 def efficiency_of(cards: list[dict], runs_dir: str | Path) -> dict | None:
     """Per model turn over an eval's finished runs (a card's `efficiency`, else run_efficiency of its folder in
     `runs_dir`): {runs, turns, tokens_per_turn, model_calls_per_turn, tool_calls_per_turn, actions_per_turn,
-    lookups_per_turn, capped_share, context_per_call (prompt tokens per model call), tokens_per_run}; None without
-    model turns."""
+    lookups_per_turn, capped_share, context_per_call (prompt tokens per model call), tokens_per_run, budget_cut_rate
+    and budget_used_mean (share of the turns with a token budget that it cut, and their mean units: civitas-v3; None
+    without such turns)}; None without model turns."""
     tot, n = {k: 0 for k in EFF}, 0
     for c in cards:
         if c.get("total") is None:              # not finished
@@ -995,12 +1010,15 @@ def efficiency_of(cards: list[dict], runs_dir: str | Path) -> dict | None:
     if not T:
         return None
     toks = tot["prompt"] + tot["completion"]
+    B = tot["budget_turns"]
     return {"runs": n, "turns": T, "tokens_per_turn": round(toks / T),
             "model_calls_per_turn": _r(tot["model_calls"] / T, 2), "tool_calls_per_turn": _r(tot["tool_calls"] / T, 2),
             "actions_per_turn": _r(tot["actions"] / T, 2), "lookups_per_turn": _r(tot["lookups"] / T, 2),
             "capped_share": _r(tot["capped"] / T, 3),
             "context_per_call": round(tot["prompt"] / tot["model_calls"]) if tot["model_calls"] else None,
-            "tokens_per_run": round(toks / n)}
+            "tokens_per_run": round(toks / n),
+            "budget_cut_rate": _r(tot["budget_cuts"] / B, 3) if B else None,
+            "budget_used_mean": round(tot["budget_used"] / B) if B else None}
 
 
 def _teamwork(d: Path, city: str | None, fallback: dict | None) -> float | None:
@@ -1189,6 +1207,7 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
     tok = _tokens(d, cities)
     out["fleet_turns"] = tok[""]["turns"]
     out["efficiency"] = run_efficiency(d)
+    out.update(_budget_fields(efficiency_of([{"total": True, "efficiency": out["efficiency"]}], d.parent)))
     if not out["region"]:
         roles = {k: v for k, v in scores.items() if k != "city"}
         yroles = {k: v for k, v in yscores.items() if k != "city"}
@@ -1321,6 +1340,7 @@ def _agg(cards: list[dict], ev: dict) -> dict:
                       "per_turn": round((tk["prompt"] + tk["completion"]) / tk["turns"]) if tk["turns"] else None},
            "wall_time_s": {"sum": _r(sum(wall), 1), "max": _r(max(wall), 1) if wall else None},
            "bankrupt": sum(bool(c.get("bankrupt")) for c in cards if c.get("total"))}
+    out.update(_budget_fields(out["efficiency"]))
     usd = _usd(ev, tk["prompt"], tk["completion"])
     if usd is not None:
         out["usd"] = round(usd, 4)
@@ -1404,12 +1424,21 @@ def _summary_rows(a: dict) -> list[tuple[str, str]]:
             ("model turns", f"{t['turns']:,}"),
             ("tokens per model turn", _tok(t["per_turn"])),
             ("tokens: prompt / completion", f"{_tok(t['prompt'])} / {_tok(t['completion'])}"),
+            *_budget_rows(a),
             ("run time (sum / longest)", f"{_dur(a['wall_time_s']['sum'])} / {_dur(a['wall_time_s']['max'])}")]
     if a.get("usd") is not None:
         rows.append(("cost at the suite's prices", f"${a['usd']:,.2f}"))
     if a.get("bankrupt"):
         rows.append(("bankrupt runs", str(a["bankrupt"])))
     return rows
+
+
+def _budget_rows(a: dict) -> list[tuple[str, str]]:
+    """The token budget's summary rows (civitas-v3), none for an eval without one."""
+    if a.get("budget_cut_rate") is None:
+        return []
+    return [("turns cut by the token budget", f"{100 * a['budget_cut_rate']:.1f}%"),
+            ("token budget used per turn (prompt chars / 4 + completion)", _tok(a.get("budget_used_mean")))]
 
 
 def _noop_rows(a: dict, n_units: int) -> list[tuple[str, str]]:
@@ -2101,6 +2130,7 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
                      "teamwork": a.get("teamwork"), "beats_scripted": a.get("beats_scripted"),
                      "failed_per_turn": a.get("failed_per_turn"), "refused_per_turn": a.get("refused_per_turn"),
                      "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"), "efficiency": eff,
+                     **_budget_fields(eff),
                      "verdict": verdict_text(p)[0] if p else None, "paired": p,
                      "baseline": k == baseline, **_noop_row(a)})
     rows.sort(key=lambda r: (r["vs_yardstick"]["mean"] is None, -(r["vs_yardstick"]["mean"] or 0)))

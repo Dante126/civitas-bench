@@ -420,43 +420,66 @@ scored within 0.8 points. `[fleet] briefing` picks the briefing style (per role 
 
 **civitas-v3: an equal token budget per turn** (`configs/eval_v3.toml` on `fleet_smoke_late_v3.toml`, env
 `civitas-v3`; `configs/eval_v3_open.toml` on `fleet_open_late_v3.toml`, env `civitas-v3-open`): civitas-v2 plus
-`[fleet] turn_budget = 90000`, prompt + completion tokens summed over a turn's model calls as the provider reports
-them (`civitas/fleet/budget.py`). Same seeds, game, tools, guards, briefings and yardstick; the scripted warm-up has no
-budget. *Why:* on v2 every model had the same caps (20 tool calls, 80k completion tokens a turn, 16k a call), but
-token use differed 3x for the same ~2.1-2.5 actions a turn. Every reply re-sends the whole conversation (~6-7.6k
-tokens of context for every model), so prompt tokens grow with the number of replies: on the open track
-trinity-large-thinking made 11.6 model calls a department turn (one tool call per reply, 8.4 look-ups, the 20-call cap
-in 23% of turns), 92k tokens a turn; kimi-k3 4.3 calls, 1.6 look-ups, 34k; glm-5.3-flash 51k, deepseek-v4-flash 54k.
-Efficiency didn't enter the score. *How it works:* the system prompt states the rule, the briefing header has a "Token
-budget: 90,000 tokens this turn" line, and every tool result ends with "budget left: ~N tokens". The first call always
-runs; before each further call the call's prompt is estimated from the request's characters at the last call's
-reported tokens per character, plus `budget_reserve` (4,000) completion tokens, and when that would pass the budget
-the call isn't made: the turn ends (`finish_reason` "turn_budget", completed actions stay, the report reads "(no report:
-the turn's token budget ran out before end_turn ...)"). Once the next reply is about the last that fits, the result
-says "room for about one more reply: call end_turn with your report now", so a model that heeds it always ends with
-end_turn. max_steps 20 stays a hard cap; trajectories log `turn_budget`, `budget_used` and `budget_cut`, the fleet
-report counts `budget_cuts`. Budget 0 (the default) is v2 exactly: the civitas-v2 and civitas-v2-open fingerprints
-are unchanged. *How 90k was chosen:* from the v2 evals (eval_*-v2 / eval_*-open of 2026-10-10, 256 turns per model
-and track), total tokens per turn:
+`[fleet] turn_budget = 100000` tokens a turn, summed over the turn's model calls (`civitas/fleet/budget.py`). Same
+seeds, game, tools, guards, briefings and yardstick; the scripted warm-up has no budget. *Why:* on v2 every model had
+the same caps (20 tool calls, 80k completion tokens a turn, 16k a call), but token use differed 3x for the same
+~2.1-2.5 actions a turn. Every reply re-sends the whole conversation (~6-7.6k tokens of context for every model), so
+prompt tokens grow with the number of replies: on the open track trinity-large-thinking made 11.6 model calls a
+department turn (one tool call per reply, 8.4 look-ups, the 20-call cap in 23% of turns), 92k tokens a turn; kimi-k3
+4.3 calls, 1.6 look-ups, 34k; glm-5.3-flash 51k, deepseek-v4-flash 54k. Efficiency didn't enter the score.
 
-| model | track | p50 | p75 | p90 | p95 | >60k | >80k | >90k | cut at 90k (replayed) |
-|---|---|---|---|---|---|---|---|---|---|
-| kimi-k3 | guided | 19.9k | 31.3k | 47.5k | 55.8k | 3.9% | 0.8% | 0.4% | 0.4% |
-| deepseek-v4-flash | guided | 20.4k | 29.5k | 42.1k | 54.1k | 3.9% | 1.2% | 1.2% | 1.2% |
-| glm-5.3-flash | guided | 26.3k | 44.0k | 63.4k | 73.9k | 11.7% | 3.5% | 2.0% | 2.0% |
-| trinity-large-thinking | guided | 33.0k | 65.6k | 110.7k | 124.2k | 27.7% | 16.8% | 14.1% | 14.8% |
-| kimi-k3 | open | 26.7k | 38.9k | 64.8k | 87.9k | 11.3% | 7.0% | 4.7% | 5.1% |
-| glm-5.3-flash | open | 39.8k | 66.5k | 97.1k | 112.6k | 28.5% | 19.1% | 12.9% | 12.9% |
-| deepseek-v4-flash | open | 40.2k | 69.5k | 106.4k | 124.3k | 29.3% | 21.1% | 16.0% | 16.4% |
-| trinity-large-thinking | open | 80.9k | 124.7k | 182.0k | 193.5k | 63.7% | 50.0% | 43.8% | 44.5% |
+*Units (tokenizer-neutral):* a call's prompt counts its request's characters / 4 (the tool schemas and every message
+as sent), never the provider's prompt tokens, so the same conversation costs the same for every model; its
+completion counts the provider's completion tokens (what the model chose to write and think), hardened to the largest
+of `completion_tokens`, `completion_tokens_details.reasoning_tokens` and `total_tokens - prompt_tokens`, and the
+reply's characters / 4 when the provider reports nothing. Trajectories log the provider's usage apart (`usage`, and
+per call `call_usage`: the cost) and the budget's units (`budget_used`; per call under `call_usage[i].budget`).
 
-90k is the budget the most efficient model (kimi-k3) passes in under ~5% of its open-track turns (11 of its 12 turns
-over 90k are planning's), while it binds the wasteful pattern: replayed through the cutoff (each call's prompt
-estimated from the logged conversation, the reserve included), 45% of trinity-large-thinking's open turns would be
-cut (losing 1.3 tool calls each on average; 21% of its turns would lose a successful action), 15% of its guided ones,
-16% of deepseek's and 13% of glm's open turns. Unchanged models would use 70% (trinity, open) to 99% (kimi, guided)
-of their v2 tokens; told the budget, they can do better. RL tasks match it with `TaskEpisode(task,
-turn_budget=90000)` and each reply's `usage` (rl/episode.py).
+*How it works:* the system prompt states the rule, the briefing header has a "Token budget: 100,000 tokens this turn"
+line, and every tool result ends with "budget left: ~N tokens (~K more replies at the current size)" (K = what's left
+over the next reply's cost; the same text on both tracks and for every model). The first call always runs; before
+each further call its cost is the request's units plus max(`budget_reserve` = 4,000, the largest completion this
+turn), and when that would pass the budget the call isn't made: the turn ends (`finish_reason` "turn_budget",
+completed actions stay; the report is the one a refused end_turn carried, else "(no report: the turn's token budget
+ran out before end_turn ...)"). The largest completion rather than the mean: the cutoff should admit a reply only when
+it fits, and the longest reply a model has written this turn bounds its next one best; with a mean (or a fixed 4k) a
+model writing 12k-token replies would overshoot by up to 8k on its last reply, so verbosity bought budget. Now a
+verbose model is cut a reply earlier and a terse one keeps the 4k floor; what is left over is logged as `budget_over`
+(units past the budget: a reply longer than any before it, bounded by `max_tokens`). Once the next reply is about the
+last that fits, the result says "room for about one more reply: call end_turn with your report now", so a model that
+heeds it always ends with end_turn; then the mayor's and planning's once-a-turn end_turn reminder of open requests
+waits (`ToolBox.budget_low`, as it does with under 2 tool calls left), so heeding the note never costs the report.
+max_steps 20 stays a hard cap. Trajectories log `turn_budget`, `budget_used`, `budget_cut` and `budget_over`;
+fleet_report.md shows budget cuts apart from step-limit ends (and a Token budget section: cuts, units per turn,
+overshoot); eval run cards, aggregates and leaderboard rows carry `budget_cut_rate` and `budget_used_mean` (the
+scorecard's summary rows, the Leaderboard's Efficiency column "cut by budget"). Budget 0 (the default) is v2 exactly:
+the civitas-v2 and civitas-v2-open fingerprints are unchanged.
+
+*How 100k was chosen:* every v2 department turn (eval_*-v2 / eval_*-open of 2026-10-10, 256 turns per model and track)
+replayed in these units: each call's prompt from the logged conversation (meta.json's system prompt plus v3's budget
+rule and playbook line, the tool schemas, every message, the briefing line and a "budget left" line per tool result) /
+4, and the turn's provider completion tokens split over its calls by each reply's characters (reasoning included).
+Units per turn, the share over 100k, and the share the cutoff would cut:
+
+| model | track | p50 | p90 | p95 | >100k | cut at 90k | cut at 100k | cut at 100k (even split) |
+|---|---|---|---|---|---|---|---|---|
+| kimi-k3 | guided | 19.7k | 46.0k | 53.2k | 0.4% | 0.8% | 0.4% | 0.4% |
+| deepseek-v4-flash | guided | 19.0k | 39.6k | 49.6k | 0.0% | 1.2% | 0.8% | 0.0% |
+| glm-5.3-flash | guided | 25.8k | 63.0k | 73.1k | 1.2% | 3.9% | 2.3% | 1.2% |
+| trinity-large-thinking | guided | 32.9k | 105.0k | 122.9k | 11.7% | 15.6% | 12.9% | 12.9% |
+| kimi-k3 | open | 26.3k | 60.2k | 84.8k | 3.1% | 7.0% | 4.7% | 3.5% |
+| glm-5.3-flash | open | 39.3k | 93.8k | 111.5k | 8.2% | 18.4% | 12.5% | 8.2% |
+| deepseek-v4-flash | open | 36.0k | 95.7k | 112.0k | 7.4% | 16.4% | 11.7% | 9.4% |
+| trinity-large-thinking | open | 77.4k | 172.8k | 186.2k | 36.3% | 45.7% | 39.5% | 39.1% |
+
+100k is the cleanest budget the most efficient model (kimi-k3) is cut at in under ~5% of its open-track turns (4.7%,
+11 of its 12 cuts planning's; 95k: 5.5%, 90k: 7.0%: the largest-completion reserve cuts earlier than the earlier
+calibration's fixed 4k, which put the line at 90k in provider tokens). It still binds the wasteful pattern: 40% of
+trinity-large-thinking's open turns would be cut (losing 5.4 tool calls each on average; 18% of its turns would lose a
+successful action), 13% of its guided ones, 12-13% of deepseek's and glm's open turns. Unchanged models would use 76%
+(trinity, open) to 99.5% (kimi, guided) of their v2 units; told the budget, they can do better. RL tasks match it with
+`TaskEpisode(task, turn_budget=100000)` and each reply's `usage`; `replay(messages, usage=trajectory["call_usage"])`
+reproduces a logged v3 turn's cutoff exactly (rl/episode.py).
 
 ## 6. RL tasks
 
@@ -505,8 +528,10 @@ call recovery, NUDGE once, LENGTH_NUDGE for cut replies, the turn ending on a fu
 a successful end_turn, after `max_steps` (20) calls, or on a reply without a call past the nudge;
 `end_at_action_cap=True` also ends it at the action cap (ToolAgent doesn't: a message to the mayor after the cap still
 changes what the scripted mayor funds). civitas-v3's token budget: `TaskEpisode(task, turn_budget=...)` (default the
-task config's, 0 for v2 banks) with each reply's `usage` passed to `reply()` / `step()`; check `done` before sampling
-the next reply. Left to the trainer: `max_tokens`, `turn_tokens` and sampling.
+task config's, 0 for v2 banks) with each reply's `usage` passed to `reply()` / `step()`, or a ToolAgent trajectory's
+`call_usage` to `replay(messages, usage=...)` (the same cutoff); check `done` before sampling the next reply.
+`civitas rl eval` rows keep `turn_budget`, `budget_used`, `budget_cut` and `budget_over` when the task has a budget,
+and transcripts each call's `call_usage`. Left to the trainer: `max_tokens`, `turn_tokens` and sampling.
 `tests/test_rl.py` checks a ToolAgent turn and the same replies through `reply()` give identical messages, trace and
 reward. Prompts are ~20-25k characters (system 7-11k, briefing 2-4k, tool schemas 6-10k).
 
@@ -1648,8 +1673,8 @@ lessons go into the fleet report, and every edit is in the tool traces.
 - `max_steps` tool calls (default 20)
 - `max_tokens` per model call (16,000)
 - `turn_tokens` completion tokens per turn (80,000)
-- `turn_budget` prompt + completion tokens per turn (0 = off; civitas-v3: 90,000, with `budget_reserve` 4,000; see
-  "civitas-v3" in section 5)
+- `turn_budget` prompt (request characters / 4) + completion tokens per turn (0 = off; civitas-v3: 100,000, with
+  `budget_reserve` 4,000, the least kept for the next reply; see "civitas-v3" in section 5)
 - the game's `max_actions_per_turn` successful actions
 
 A model that answers without a tool call gets one nudge, and a second one ends the turn.
@@ -2068,7 +2093,7 @@ next to its summary. They contain:
 
 - the scoreboard
 - the final plan and the months it changed
-- per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups, refused calls (repeats and guard refusals) and overrides (earned `confirm: true` repeats; fleet_report.md's `repeats (look-ups / refused / overrides)` column), spending, tokens, turns ended on a limit, length stops and turns cut short by an API or briefing error
+- per-role stats: turns, tool calls, actions, failures, tool errors, repeated look-ups, refused calls (repeats and guard refusals) and overrides (earned `confirm: true` repeats; fleet_report.md's `repeats (look-ups / refused / overrides)` column), spending, tokens, turns ended on the step limit and, apart, turns cut by civitas-v3's token budget (with a Token budget section: cuts, units per turn, overshoot), length stops and turns cut short by an API or briefing error
 - a collaboration score (see below)
 - the top failures, last reports and the lessons in memory
 - coaching hints

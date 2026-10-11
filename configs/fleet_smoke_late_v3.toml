@@ -1,6 +1,7 @@
 # civitas-v3 late-game fleet check (guided): configs/fleet_smoke_late.toml (the same game, warm-up, model, limits,
-# tools, guards and playbooks) plus `[fleet] turn_budget = 90000`: an equal budget of prompt + completion tokens per
-# turn for every model (fleet/budget.py; README "civitas-v3"). The system prompt states the rule, the briefing header
+# tools, guards and playbooks) plus `[fleet] turn_budget = 100000`: an equal budget of prompt + completion tokens per
+# turn for every model, the prompt counted as its characters / 4 (the same for every tokenizer; fleet/budget.py;
+# README "civitas-v3"). The system prompt states the rule, the briefing header
 # has a "Token budget" line, every tool result ends with the budget left, and the turn ends before a reply that
 # wouldn't fit (completed actions stay). The scripted warm-up (months 0-95) is unchanged: the budget binds only
 # model-backed fleet agents. Key: ARCEE_API_KEY in ./.env.
@@ -28,7 +29,7 @@ temperature = 0.4
 max_steps = 20             # tool calls per turn
 max_tokens = 16000         # per model call (reasoning + tool calls)
 turn_tokens = 80000        # completion tokens per turn
-turn_budget = 90000        # civitas-v3: prompt + completion tokens per turn, summed over the model calls (fleet/budget.py)
+turn_budget = 100000       # civitas-v3: prompt (characters / 4) + completion tokens per turn, over the model calls (fleet/budget.py)
 playbook = """
 - Grow first, then add quality. Population is half the city score; happiness, finances, utility coverage, \
 safety, health and education are the other half.
@@ -53,7 +54,7 @@ change the site, the option or the plan; never repeat the same call.
 - Ask the mayor for money (send_message, a dollar amount and a reason) only when your budget block says to: a \
 first building, supply, planning's road, or another building the mayor's money covers. Otherwise put what you \
 need in your end_turn report: the mayor reads every report, and an ask it can't fund only costs it a reply.
-- Token budget: 90,000 tokens a turn, prompt plus completion over all your replies. Every reply re-sends the \
+- Token budget: 100,000 tokens a turn, prompt plus completion over all your replies. Every reply re-sends the \
 conversation, so put several tool calls in one reply, skip look-ups your briefing answers, and call end_turn \
 before the budget left in your tool results runs out.
 """

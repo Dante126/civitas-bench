@@ -1,16 +1,18 @@
 # Eval suite (civitas eval -s configs/eval_v3.toml --model M): civitas-v3, guided. civitas-v2 (configs/eval_v2.toml:
 # the same eight single-city late starts, seeds, warm-up, game, tools, guards, briefings and scripted yardstick) plus
-# an equal token budget per turn: configs/fleet_smoke_late_v3.toml sets `[fleet] turn_budget = 90000`, prompt +
-# completion tokens summed over a turn's model calls as the provider reports them (fleet/budget.py; README
-# "civitas-v3"). On v2 every model had the same caps (20 tool calls, 80k completion tokens a turn, 16k a call) but
-# used 1x-3x the tokens for the same ~2.3 actions a department turn: one tool call per reply re-sends the whole
-# conversation each time. 90k is what kimi-k3 (the most efficient model on v2) passes in 4.7% of its open-track turns
-# (0.4% guided); replayed through the cutoff, v2's turns would be cut in: trinity-large-thinking 15% guided / 45%
-# open, glm-5.3-flash 2% / 13%, deepseek-v4-flash 1% / 16%, kimi-k3 0.4% / 5%. max_steps 20 stays a hard cap.
+# an equal token budget per turn: configs/fleet_smoke_late_v3.toml sets `[fleet] turn_budget = 100000`, prompt +
+# completion tokens summed over a turn's model calls, the prompt counted as its characters / 4 (the same for every
+# tokenizer), the completion as the provider reports it (fleet/budget.py; README "civitas-v3"). On v2 every model
+# had the same caps (20 tool calls, 80k completion tokens a turn, 16k a call) but used 1x-3x the tokens for the same
+# ~2.3 actions a department turn: one tool call per reply re-sends the whole conversation each time. 100k is the
+# budget whose cutoff (the request's units plus max(4,000, the turn's largest completion)) would cut 4.7% of
+# kimi-k3's open-track turns (the most efficient model on v2; 0.4% guided); replayed in these
+# units, v2's turns would be cut in: trinity-large-thinking 13% guided / 40% open, glm-5.3-flash 2% / 13%,
+# deepseek-v4-flash 1% / 12%, kimi-k3 0.4% / 5%. max_steps 20 stays a hard cap.
 # Scripted agents play months 0-95 (no budget), the model's fleet months 96-107. Not a run config: the launcher
 # (civitas serve) leaves suite files out.
 name = "v3"
-description = "late starts with a 90k token budget per turn: eight single cities (32 model turns each), one run per seed"
+description = "late starts with a 100k token budget per turn: eight single cities (32 model turns each), one run per seed"
 
 [eval]
 workers = 8                 # runs at once: they wait on the API, not the CPU
@@ -24,10 +26,10 @@ baseline_model = "trinity-large-thinking"    # the leaderboard's paired verdicts
 "claude-haiku-5-5" = [0.10, 0.50]
 
 # Per run: trinity-large-thinking's v2 wall time and tokens (eval trinity-large-thinking-v2_20261010: 13.7 min,
-# 1.33M / 165k) scaled by its v2 turns replayed through the 90k cutoff (87% of the tokens).
+# 1.33M / 165k) scaled by its v2 turns replayed through the 100k cutoff (89% of the tokens).
 [[runs]]
 config = "configs/fleet_smoke_late_v3.toml"
 seeds = [0, 4, 5, 11, 12, 16, 18, 20]
-minutes = 12.0
-prompt_tokens = 1_160_000
-completion_tokens = 141_000
+minutes = 12.2
+prompt_tokens = 1_180_000
+completion_tokens = 147_000

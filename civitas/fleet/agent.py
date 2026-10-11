@@ -4,7 +4,9 @@ Actions run inside `act()` (through `ToolBox`), so the returned `Decision` carri
 and the council messages to post; `env.apply` only logs them. In `game.simultaneous` mode fleet agents therefore
 act on the state left by the roles before them. In region mode the agent binds to its own city's env (`bind`), so
 the region runs it like any other agent of that city (fleet/region.py). With `[fleet] turn_budget` (civitas-v3) the
-turn also ends before a model call that wouldn't fit the token budget (fleet/budget.py).
+turn also ends before a model call that wouldn't fit the token budget (fleet/budget.py). Every turn logs each model
+call's provider usage in `call_usage` (with the budget's units under "budget" in v3), so TaskEpisode.replay
+reproduces a v3 turn's cutoff exactly.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from ..agents.llm_client import ChatClient, ProviderConfig
 from ..core.decision import Decision
 from ..core.region import RegionEnv
 from .briefing import briefing, system_prompt
-from .budget import CUT_REPORT, MESSAGE_CHARS, TurnBudget
+from .budget import CUT_REPORT, MESSAGE_CHARS, TurnBudget, call_record
 from .config import FleetAgentConfig
 from .fmt import TOOL_MESSAGE_CHARS, briefing_style
 from .memory import FleetState
@@ -201,6 +203,11 @@ class ToolAgent(Agent):
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         nudged, cuts, error, reason, latency, step, recovered = False, 0, None, "max_steps", 0.0, 0, 0
         tb = TurnBudget(cfg.turn_budget, cfg.budget_reserve, tools) if cfg.turn_budget else None   # civitas-v3
+        if tb is not None:                           # end_turn skips its open-requests reminder when the reply after
+                                                     # this one may not fit (ToolBox.budget_low)
+            box.budget_low = lambda: tb.low(tb.chars(messages))
+        calls_usage = []                             # per model call: the provider's usage (call_record) and, with a
+                                                     # budget, its units: logged as call_usage (TaskEpisode.replay)
         while len(trace) < cfg.max_steps:
             sent = tb.chars(messages) if tb is not None else 0
             if tb is not None and not tb.fits(sent):    # the next reply wouldn't fit: the turn ends before it
@@ -218,8 +225,10 @@ class ToolAgent(Agent):
             latency += out.get("latency_s") or 0.0
             for k in usage:
                 usage[k] += int((out.get("usage") or {}).get(k) or 0)
+            calls_usage.append(call_record(out.get("usage")))
             if tb is not None:
                 tb.record(out.get("usage"), sent, _reply_chars(out))
+                calls_usage[-1]["budget"] = dict(tb.log[-1])
             if out.get("reasoning"):
                 reasoning.append(f"[step {step}] {out['reasoning']}")
             finish = out.get("finish_reason")
@@ -273,7 +282,8 @@ class ToolAgent(Agent):
             if nudge:
                 messages.append({"role": "user", "content": nudge})
         if tb is not None and tb.cut and not box.ended:
-            box.close(CUT_REPORT)                    # end_turn's record of a report, without its refusals
+            box.close(box.refused_report or CUT_REPORT)   # end_turn's record of a report (a refused end_turn's),
+                                                          # without its refusals
         for k in usage:
             self.usage[k] += usage[k]
         self.usage["tool_calls"] += len(trace)
@@ -289,9 +299,10 @@ class ToolAgent(Agent):
                   "length_stops": finishes.count("length"), "recovered_calls": recovered,
                   "reasoning": "\n\n".join(reasoning),
                   "response": box.report or (said[-1] if said else ""),   # the end_turn report, else the last reply
-                  "latency_s": round(latency, 3)}
-        if tb is not None:                           # civitas-v3 only: a v2 turn logs what it always did
-            d.meta.update({"turn_budget": tb.limit, "budget_used": tb.used, "budget_cut": tb.cut})
+                  "latency_s": round(latency, 3), "call_usage": calls_usage}
+        if tb is not None:                           # civitas-v3 only: a v2 turn plays as it always did
+            d.meta.update({"turn_budget": tb.limit, "budget_used": tb.used, "budget_cut": tb.cut,
+                           "budget_over": tb.over})
         return d
 
     def _failed_turn(self, error: str, reason: str) -> Decision:
@@ -301,5 +312,5 @@ class ToolAgent(Agent):
         d.meta = {"model": self.cfg.model, "messages": [], "tool_trace": [],
                   "usage": {"prompt_tokens": 0, "completion_tokens": 0}, "steps": 0, "ended": False,
                   "finish_reason": reason, "finish_reasons": [], "length_stops": 0, "recovered_calls": 0,
-                  "reasoning": "", "response": "", "latency_s": 0.0}
+                  "reasoning": "", "response": "", "latency_s": 0.0, "call_usage": []}
         return d

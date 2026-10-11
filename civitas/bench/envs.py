@@ -161,7 +161,7 @@ CANNED_CUT = "Weighing every ready site against the funds, one by one, before"  
 CANNED_DONE = "Nothing more this turn."                              # after the script: the turn ends
 CANNED_CHARS = 4            # the canned model's usage: prompt tokens = request characters / this (messages, tools) ...
 CANNED_THINKING = 400       # ... completion tokens = this + the reply's characters / CANNED_CHARS (max_tokens when cut)
-BUDGET_META = ("turn_budget", "budget_used", "budget_cut")   # a turn's token budget (civitas-v3), when it has one
+BUDGET_META = ("turn_budget", "budget_used", "budget_cut", "budget_over")   # a turn's token budget (civitas-v3), when it has one
 _REFUSED = re.compile(r'"refused":\s*"([a-z_]+)"')
 
 

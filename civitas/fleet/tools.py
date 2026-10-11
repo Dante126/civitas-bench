@@ -4310,6 +4310,11 @@ class ToolBox:
                                                           # Next line (_next_refresh; ToolAgent only)
         self.max_steps = max_steps                        # the turn's tool-call limit (ToolAgent only): the mayor's
         self.reminded = False                             # end_turn reminder of open requests, once a turn (end_turn)
+        self.budget_low = None                            # civitas-v3 (ToolAgent / TaskEpisode): () -> whether the
+                                                          # reply after this one may not fit the token budget, which
+                                                          # skips that reminder (fleet/budget.py:TurnBudget.low)
+        self.refused_report = ""                          # the report of an end_turn the reminder refused: a turn cut
+                                                          # at the token budget closes with it (close)
         self.held_ask = False                             # a department's money ask held back, once a turn
         self.fleet = FleetState.of(env)
         self.ended = False
@@ -5790,13 +5795,16 @@ class ToolBox:
     def end_turn(self, report: str) -> dict:
         """End the turn with the report. The model's mayor and planning (max_steps given: ToolAgent) are first refused
         once a turn ("refused": "open_requests") while requests to them are still open after this turn's top-ups,
-        actions and messages (open_requests), unless fewer than REMIND_MIN_LEFT calls would be left; the next end_turn
-        ends it."""
+        actions and messages (open_requests), unless fewer than REMIND_MIN_LEFT calls would be left or the reply after
+        this one may not fit the turn's token budget (`budget_low`, civitas-v3); the next end_turn ends it. A refused
+        end_turn's report is kept (`refused_report`): a turn the budget cuts before the next one closes with it."""
         if self.role in ("mayor", "planning") and self.max_steps is not None and not self.reminded \
-                and self.max_steps - self.n_calls >= REMIND_MIN_LEFT:
+                and self.max_steps - self.n_calls >= REMIND_MIN_LEFT \
+                and not (self.budget_low is not None and self.budget_low()):
             self.reminded = True
             reqs = open_requests(self.env, self.fleet, self.messages, to=self.role)
             if reqs:
+                self.refused_report = report if isinstance(report, str) else ""
                 return {"ok": False, "refused": "open_requests",
                         "error": (requests_reminder if self.role == "mayor" else planning_reminder)(reqs)}
         self.ended = True

@@ -29,6 +29,7 @@ from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, OPEN_BLOCKED, ROAD_NA
     SUPPLEMENTARY, SUPPLY_OF, building_name
 
 LIMIT_REASONS = ("max_steps", "turn_tokens", "turn_budget")
+STEP_REASONS = ("max_steps", "turn_tokens")          # the step cap and v2's completion cap; turn_budget is apart
 ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
 REPEATED_FAILURES = 3
 FUNDS_MULTIPLE, FUNDS_MONTHS, UNUSED_FLOOR = 2.0, 3, 1000.0
@@ -114,6 +115,7 @@ def turn_row(rec: dict) -> dict:
             "tool_errors": [e for e in errors if e is not None],
             "repeats": marked("repeat"), "refused": marked("refused"),   # repeated look-ups / refused actions
             "overrides": marked("override"),       # guard refusals overridden by an earned confirm: true
+            **{k: rec[k] for k in ("turn_budget", "budget_used", "budget_over") if k in rec},   # civitas-v3 only
             "seen": _safe(_seen, rec, None), "asked": _safe(_asked, rec, {})}
 
 
@@ -244,12 +246,23 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
             "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
             "completion_tokens": sum(r["completion_tokens"] for r in rows),
             "limit_turns": sum(r["finish_reason"] in LIMIT_REASONS for r in rows),
-            "budget_cuts": sum(r["finish_reason"] == "turn_budget" for r in rows),   # civitas-v3's token budget
+            "step_cap_ends": sum(r["finish_reason"] in STEP_REASONS for r in rows),
+            **_budget_stats(rows),
             "length_stops": sum(r["length_stops"] for r in rows),
             "api_errors": sum(r["finish_reason"] in ERROR_REASONS for r in rows),
             "top_failures": groups[:max(3, sum(g["count"] >= REPEATED_FAILURES for g in groups))],
             "lessons": list((fleet.memory.get(role) or {}).get("lessons", [])),
             "last_report": cut(fleet.reports[role], REPORT_PREVIEW_CHARS) if fleet.reports.get(role) else None}
+
+
+def _budget_stats(rows: list[dict]) -> dict:
+    """civitas-v3's token budget over a role's turns: budget_turns (turns played with one), budget_cuts (turns it
+    ended), budget_used (units, summed), budget_over (units beyond the budget, summed; budget_over_max the largest)."""
+    b = [r for r in rows if r.get("turn_budget")]
+    over = [int(r.get("budget_over") or 0) for r in b]
+    return {"budget_turns": len(b), "budget_cuts": sum(r["finish_reason"] == "turn_budget" for r in rows),
+            "budget_used": sum(int(r.get("budget_used") or 0) for r in b), "budget_over": sum(over),
+            "budget_over_max": max(over, default=0)}
 
 
 def _longest(turns: list[tuple[int, str]], kind: str, months: int) -> tuple[int, int, int] | None:
@@ -868,6 +881,24 @@ def _collab_lines(co: dict | None) -> list[str]:
     return L
 
 
+def _budget_lines(roles: dict, h: str) -> list[str]:
+    """The Token budget section (civitas-v3), [] when no turn had a budget: per role the turns it cut (apart from
+    the step-limit ends in the Roles table), the units used per turn and any overshoot past the budget."""
+    rows = [(r, st) for r, st in roles.items() if st.get("budget_turns")]
+    if not rows:
+        return []
+    L = ["", f"{h} Token budget", "",
+         "Turns the token budget cut (the next reply wouldn't fit; completed actions stay), apart from turns that "
+         "ended on the step limit; used = prompt (request characters / 4) + completion units per turn; over = units "
+         "past the budget (a reply longer than the cutoff reckoned).", "",
+         "| role | turns | budget cuts | used per turn | over (total / largest) |", "|---|---:|---:|---:|---:|"]
+    for r, st in rows:
+        n = st["budget_turns"]
+        L.append(f"| {r} | {n} | {st['budget_cuts']} ({100 * st['budget_cuts'] / n:.0f}%) "
+                 f"| {round(st['budget_used'] / n):,} | {st['budget_over']:,} / {st['budget_over_max']:,} |")
+    return L
+
+
 def _aim_text(ma: dict) -> str:
     """The money aim row's "from" cell: what the aimed dollars went to, by its basis (collaboration())."""
     head = f"{money(ma['aimed'])} of {money(ma['given'])} in {ma['n']} top-ups"
@@ -902,13 +933,16 @@ def _body(rep: dict, h: str = "##") -> list[str]:
         L += ["", f"Notes: {_cell(plan['notes'])}"]
     L += ["", f"{h} Roles", "",
           "| role | turns | tool calls | actions | failed | tool errors | repeats (look-ups / refused / overrides) "
-          "| spent | tokens (prompt / completion) | limit turns | length stops | API / briefing errors |",
-          "|---|" + "---:|" * 11]
+          "| spent | tokens (prompt / completion) | step-limit ends | budget cuts | length stops "
+          "| API / briefing errors |",
+          "|---|" + "---:|" * 12]
     for r, st in rep["roles"].items():
+        steps = st.get("step_cap_ends", st["limit_turns"] - st.get("budget_cuts", 0))
         L.append(f"| {r} | {st['turns']} | {st['tool_calls']} | {st['actions']} | {st['failed']} | {st['tool_errors']} "
                  f"| {st['repeats']} / {st['refused']} / {st.get('overrides', 0)} | {money(st['spent'])} "
                  f"| {st['prompt_tokens']:,} / {st['completion_tokens']:,} "
-                 f"| {st['limit_turns']} | {st['length_stops']} | {st['api_errors']} |")
+                 f"| {steps} | {st.get('budget_cuts', 0)} | {st['length_stops']} | {st['api_errors']} |")
+    L += _budget_lines(rep["roles"], h)
     L += ["", f"{h} Collaboration", "", *_collab_lines(rep.get("collaboration"))]
     fails =[(r, st["top_failures"]) for r, st in rep["roles"].items() if st["top_failures"]]
     if fails:

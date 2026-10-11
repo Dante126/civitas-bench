@@ -260,6 +260,44 @@ def test_episode_matches_a_toolagent_turn_with_the_token_budget(bank):
                 {k: mine[k] for k in ("reward", "city", "role", "penalty")}
 
 
+class VariedUsageClient(ScriptClient):
+    """Replies with reasoning text and a usage that varies per reply: some report hidden reasoning in total_tokens,
+    every third reports none (the budget then counts the reply's characters, reasoning included)."""
+
+    def chat(self, model, messages, **kw):
+        out = super().chat(model, messages, **kw)
+        n = self.n
+        u = {"prompt_tokens": 50 + n, "completion_tokens": 400 * n, "total_tokens": 50 + n + 400 * n + 900 * (n % 2)}
+        return {**out, "reasoning": "weighing the sites " * (40 * n), "usage": None if n % 3 == 0 else u}
+
+
+def test_replay_with_the_logged_usage_cuts_where_the_turn_was_cut(bank):
+    """A civitas-v3 ToolAgent turn's `call_usage` (each call's provider usage and the units the budget counted)
+    replayed through TaskEpisode.replay: the same cut, units, messages and report; without it the cut moves (the
+    log has no reasoning text for the replies that reported no usage)."""
+    t = next(x for x in bank.tasks() if x.role == "planning")
+    replies = _replies(t)
+    first = _usage(TaskEpisode(t).reset()["messages"])["prompt_tokens"]
+    limit = 6 * first + 8000
+    ep0 = TaskEpisode(t, turn_budget=limit)
+    env = ep0.prepare()
+    a = ToolAgent(t.role, cfg=ep0.fleet_cfg, provider=ProviderConfig(base_url="http://127.0.0.1:9", api_key_env=""))
+    a.bind(env)
+    a.client = VariedUsageClient(replies)
+    d = a.act(env.observe(t.role))
+    cu = d.meta["call_usage"]
+    assert d.meta["finish_reason"] == "turn_budget" and len(cu) == len(d.meta["finish_reasons"]) >= 3
+    assert any(c["prompt_tokens"] == 0 for c in cu) and all("budget" in c for c in cu)
+    ep = TaskEpisode(t, turn_budget=limit)
+    ep.replay(d.meta["messages"], usage=cu)
+    assert ep.done and ep.reason == "turn_budget" and ep.budget_used == d.meta["budget_used"]
+    assert ep.budget.log == [c["budget"] for c in cu] and ep.messages[1:] == d.meta["messages"][1:]
+    assert ep.box.report == d.thinking and ep.budget_over == d.meta["budget_over"]
+    bare = TaskEpisode(t, turn_budget=limit)
+    bare.replay(d.meta["messages"], usage=[{k: v for k, v in c.items() if k != "budget"} for c in cu])
+    assert bare.budget_used != d.meta["budget_used"]
+
+
 def test_replay_of_a_conversation_checks_every_tool_message(bank):
     t = next(x for x in bank.tasks() if x.role == "planning")
     replies = _replies(t)
@@ -365,6 +403,28 @@ def test_eval_runner_against_a_fake_server(bank, tmp_path):
     assert (d / "summary.md").read_text().startswith("# RL eval: fake-nano")
     tr = [json.loads(x) for x in (d / "transcripts.jsonl").read_text().splitlines()]
     assert len(tr) == 8 and tr[0]["messages"][1]["role"] == "user"
+    assert all(len(x["call_usage"]) >= 2 and x["call_usage"][0] == {"prompt_tokens": 100, "completion_tokens": 7}
+               for x in tr)
+    assert not any("turn_budget" in r or "budget_used" in r for r in rows)          # a v2 bank: no token budget
+
+
+def test_eval_rows_carry_the_token_budget(bank, monkeypatch):
+    """A task played with a token budget (civitas-v3): its row keeps turn_budget, budget_used, budget_cut and
+    budget_over, its transcript each call's usage with the units the budget counted."""
+    from civitas.fleet.config import fleet_agent_config
+    t = next(x for x in bank.tasks("train") if x.role == "police")
+
+    def fc(self):
+        c = fleet_agent_config(self.cfg, self.role)
+        c.turn_budget = 10 ** 6
+        return c
+    monkeypatch.setattr(TaskEpisode, "fleet_cfg", property(fc))
+    with _server() as srv:
+        out = E.play_one(t, base_url=f"http://127.0.0.1:{srv.server_port}/v1", model="fake-nano", stream=False)
+    row, tr = out["row"], out["transcript"]
+    assert row["turn_budget"] == 10 ** 6 and row["budget_cut"] is False and row["budget_over"] == 0
+    assert row["budget_used"] == sum(c["budget"]["prompt"] + c["budget"]["completion"] for c in tr["call_usage"])
+    assert [c["budget"]["completion"] for c in tr["call_usage"]] == [7, 7]
 
 
 @pytest.mark.slow

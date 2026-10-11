@@ -1,6 +1,7 @@
 # civitas-v3 late-game fleet check on the OPEN track: configs/fleet_open_late.toml (the same game, warm-up, model,
-# limits, tools, guards, open briefings and playbooks) plus `[fleet] turn_budget = 90000`: an equal budget of prompt +
-# completion tokens per turn for every model (fleet/budget.py; README "civitas-v3"). The system prompt states the
+# limits, tools, guards, open briefings and playbooks) plus `[fleet] turn_budget = 100000`: an equal budget of prompt +
+# completion tokens per turn for every model, the prompt counted as its characters / 4 (the same for every
+# tokenizer; fleet/budget.py; README "civitas-v3"). The system prompt states the
 # rule, the briefing header has a "Token budget" line, every tool result ends with the budget left, and the turn ends
 # before a reply that wouldn't fit (completed actions stay). The scripted warm-up (months 0-95) is unchanged. Key:
 # ARCEE_API_KEY in ./.env.
@@ -29,7 +30,7 @@ temperature = 0.4
 max_steps = 20             # tool calls per turn
 max_tokens = 16000         # per model call (reasoning + tool calls)
 turn_tokens = 80000        # completion tokens per turn
-turn_budget = 90000        # civitas-v3: prompt + completion tokens per turn, summed over the model calls (fleet/budget.py)
+turn_budget = 100000       # civitas-v3: prompt (characters / 4) + completion tokens per turn, over the model calls (fleet/budget.py)
 playbook = """
 - Grow first, then add quality. Population is half the city score; happiness, finances, utility coverage, \
 safety, health and education are the other half.
@@ -51,7 +52,7 @@ before building. When an action fails, read the error and change the site, the o
 same call.
 - Ask the mayor for money with send_message (an amount and a reason) when your funds are short of something worth \
 building; the mayor funds what it judges most urgent and reads every end_turn report.
-- Token budget: 90,000 tokens a turn, prompt plus completion over all your replies. Every reply re-sends the \
+- Token budget: 100,000 tokens a turn, prompt plus completion over all your replies. Every reply re-sends the \
 conversation, so put several tool calls in one reply, skip look-ups your briefing answers, and call end_turn \
 before the budget left in your tool results runs out.
 """

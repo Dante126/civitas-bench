@@ -40,6 +40,7 @@ export const INFO = {
   actions_turn: ["Actions per turn", "Game actions per model turn (build, zone, allocate_budget, ...), whether they succeeded or not."],
   lookups_turn: ["Look-ups per turn", "Read-only tool calls per model turn (map_overview, find_sites, inspect, ...): every tool but the game actions and the turn controls. The briefing already holds most facts, so many look-ups mostly cost tokens."],
   capped: ["Step cap", "The share of model turns that used every step the environment allows (max_steps, 20): those turns ended at the cap rather than with the model's own end_turn."],
+  budget_cut: ["Cut by the token budget", "civitas-v3: the share of model turns the per-turn token budget ended (the next reply wouldn't fit; completed actions stay). The budget counts each reply's prompt as its characters / 4, the same for every model, plus the tokens the model writes. Shown when the eval had a budget."],
   per_10m: ["vs scripted per 10M tokens", "vs scripted divided by the tokens one run's model turns use, per 10 million tokens: score per token. A model can sit lower on vs scripted and higher here."],
   scatter: ["Cost against score", "One dot per model: tokens per model turn (x) against vs scripted (y), the vertical bar its 95% interval. Up and to the left is better and cheaper; the dashed line joins the Pareto front, the models no other model beats on both."],
   // ------------------------------------------------ eval scorecards and the Compare view
