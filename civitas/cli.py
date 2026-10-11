@@ -299,7 +299,7 @@ def cmd_prompt(args):
         print("=" * 30, "SYSTEM", "=" * 30)
         print(agent.system)
         print("=" * 30, "USER (briefing)", "=" * 30)
-        print(briefing(agent.env, agent.role, mode=agent.cfg.mode, mark=False))
+        print(briefing(agent.env, agent.role, mode=agent.cfg.mode, mark=False, style=agent.cfg.briefing))
         print("=" * 30, "TOOLS", "=" * 30)
         print(", ".join(ToolBox(agent.env, agent.role).tools))
         return

@@ -364,6 +364,24 @@ that cost 37% of its population; seeds 13 and 15 a recession starting at months 
 seed 3 (the largest hand-over city) is left out: hand-over population 6,246 on average (all 24 seeds 5,890, v1's
 seeds 0-7 6,302), city score 67.2 ± 2.3.
 
+**Guided and open tracks.** v1's evals measured briefing-following: 88-92% of department actions were an exact
+briefing call or a briefing site, the mayor funded the to-fund line to the dollar ~92% of the time, and four models
+scored within 0.8 points. `[fleet] briefing` picks the briefing style (per role like every fleet key):
+
+- `"guided"` (the default; `eval_v2.toml`, env `civitas-v2`): briefings and tool results name the build, its exact
+  call and the money to ask for (Next lines, "This turn: ...", the mayor's needs and to-fund lines, fixes after a
+  failure).
+- `"open"` (`configs/eval_open.toml` on `configs/fleet_open_late.toml`, env `civitas-v2-open`; same seeds, game,
+  tools, guards and yardstick): the same facts, never a chosen action. Kept: the city, key metrics (coverage,
+  enrolment, supply and demand, transit share, downtown cover, demand caps), funds and plan target, every Ready sites
+  line with its price, estimates as data ("coverage estimate: ... ~97% with it", "transit estimate"), upgrade offers,
+  requests, the map, Finances with the reserve and its rule, and per department its funds, spending, what a take-back
+  must leave it and its priced options. Dropped: exact call text, Next lines (and their refresh in tool results),
+  "This turn", the to-spend / to-fund lines and request states, "ask the mayor for $X" / "no money ask" lines, the
+  repay_loan suggestion, fixes in failed-action results (the reason stays: "(24,23) holds a town hall", "costs $7,800
+  but the police budget only has $6,632") and the "do X instead" part of guard refusals. The playbooks are rewritten
+  without them. `civitas prompt -c configs/fleet_open_late.toml --role mayor` shows an open briefing.
+
 ---
 
 ## How it works

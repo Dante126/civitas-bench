@@ -31,7 +31,7 @@ import numpy as np
 from ..core.actions import zone_density, zone_price
 from ..sim import catalog as C
 from ..sim.grid import box_sum
-from .fmt import money
+from .fmt import advice, money
 from .tools import (AWAY_FROM_HOMES, BUILT_NAMES, DIRECTIONS, MAX_SITES, SiteList, Spot, _connected_roads, _empty_land,
                     _riverbank_by_roads, _touching, _wanted, _where, claim_spots, dept_lists, edge_site, funded_sites,
                     land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded, zone_fit_rect,
@@ -145,7 +145,7 @@ def parks_line(p: Parks, site: ParkSite | None) -> list[str]:
            f"{math.ceil(C.CAP_POP_PARKS / C.RESIDENTS_PER_PARK)}" if p.soon else "")
     return [f"- parks: {p.have} of {p.want} park tiles{cap}; each raises land value {round(100 * PARK_STEP)} points "
             f"within {PARK_RADIUS} tiles (up to {round(100 * PARK_MAX)} from 4); best {_where(site._asdict())}, "
-            f"{site.homes} homes near; {money(site.cost)}: {call('build_park', site.args())}"]
+            f"{site.homes} homes near; {money(site.cost)}" + advice(f": {call('build_park', site.args())}")]
 
 
 def cap_line(w) -> list[str]:
@@ -156,7 +156,7 @@ def cap_line(w) -> list[str]:
         return []
     p, pop = parks(w), w.stats.get("population", 0.0)
     linked = bool(w.facilities(C.TRAIN)) or bool(w.facilities(C.HARBOUR))
-    why = ([f"parks {p.have} of {p.by_pop} tiles (yours: build_park)"] if p.capped else []) + (
+    why = ([f"parks {p.have} of {p.by_pop} tiles" + advice(" (yours: build_park)")] if p.capped else []) + (
         ["no train station or harbour (transport's)"] if pop >= C.CAP_POP_CONNECTION and not linked else [])
     return [f"- demand capped: {', '.join(f'{k} +{v:g}' for k, v in caps.items())}: "
             + (", ".join(why) or "see city_overview")]

@@ -25,8 +25,8 @@ from ..bench.collab import OPENERS, run_collab
 from ..sim import catalog as C
 from .fmt import REPORT_PREVIEW_CHARS, cut, money, pct
 from .memory import DEPARTMENTS, FleetState
-from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, ROAD_NAME, SITE_BUILDS, SITE_PURPOSES, SUPPLEMENTARY, \
-    SUPPLY_OF, building_name
+from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, OPEN_BLOCKED, ROAD_NAME, SITE_BUILDS, SITE_PURPOSES, \
+    SUPPLEMENTARY, SUPPLY_OF, building_name
 
 LIMIT_REASONS = ("max_steps", "turn_tokens")
 ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
@@ -136,9 +136,9 @@ def _seen(rec: dict) -> dict | None:
     """What a department's briefing (the turn's first user message) showed, for the idle rule: its funds and plan
     target (Your budget), each find_sites purpose's Ready sites state and the Key metrics lines NEED reads. States:
     "ok" (a price its funds cover), "short" (a price with "- you have $X"), "ready" (sites, no price), "blocked" (none
-    for lack of land or roads: every such _why_empty reason asks planning; `why` is the part before), "none" (none
-    otherwise: nothing needs it, no flood forecast) and "locked". None without a briefing, and for the mayor's (no
-    Your budget block)."""
+    for lack of land or roads: every such _why_empty reason asks planning, an open-style one starts with OPEN_BLOCKED;
+    `why` is the reason), "none" (none otherwise: nothing needs it, no flood forecast) and "locked". None without a
+    briefing, and for the mayor's (no Your budget block)."""
     text = next((m.get("content") for m in rec.get("prompt") or [] if m.get("role") == "user"), None)
     if not isinstance(text, str) or "\n## Your budget\n" not in text:
         return None
@@ -173,6 +173,8 @@ def _site_state(rest: str) -> dict:
     m = PRICE_END.search(rest)
     if rest.startswith("none - ") and m is None:
         why = rest[len("none - "):]
+        if why.startswith(OPEN_BLOCKED):                 # the open briefing style's reason (tools._why_empty_open)
+            return {"state": "blocked", "why": why[len(OPEN_BLOCKED):].split(" (")[0]}
         return {"state": "blocked", "why": why.split(": ask planning")[0]} if "ask planning" in why else {
             "state": "none"}
     return {"state": "ready"} if m is None else {"state": "short" if m[3] else "ok",

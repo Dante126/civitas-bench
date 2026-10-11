@@ -33,7 +33,8 @@ from ..core.roles import ROLES
 from ..sim import catalog as C
 from ..sim.grid import box_sum, label_components, road_bfs, shift, spread_to_tiles
 from ..sim.world import own_supply
-from .fmt import TOOL_MESSAGE_CHARS, a_or_an, cash, cut, money, months, pct, signed
+from .fmt import STYLES, TOOL_MESSAGE_CHARS, a_or_an, advice, briefing_style, cash, cut, is_open, money, months, pct, \
+    signed
 from .memory import DEPARTMENTS, HISTORY_KINDS, LIMITS, FleetState
 
 RESULT_CHARS = TOOL_MESSAGE_CHARS - 200     # the agent cuts tool messages at TOOL_MESSAGE_CHARS; lists are trimmed below
@@ -1207,7 +1208,7 @@ class DeptMoney:
         hi = round(100 * ku.downtown)
         return (f"ready sites add under {100 * KEEP_UP_GAIN:g}%: the uncovered homes near ({x},{y}) are out of "
                 "their road reach" + (f"; {hi} points are lost downtown (level 4-5), where tier 1 covers "
-                                       f"{pct(100 * C.T1_DOWNTOWN)} at most: upgrade_facility to tier 2"
+                                       f"{pct(100 * C.T1_DOWNTOWN)} at most" + advice(": upgrade_facility to tier 2")
                                        if ku.downtown >= DOWNTOWN_SHOWN else ""))
 
     @property
@@ -1814,6 +1815,9 @@ def planning_reminder(reqs: list[OpenRequest]) -> str:
     """Planning's end_turn refusal while requests to it are open (ToolBox.end_turn): who asks, since when."""
     names = [f"{d} (since m{rs[0].month})" for d, rs in request_groups(reqs)]
     n = len(reqs)
+    if is_open():
+        return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Call end_turn again "
+                "to end the turn whatever is still open.")
     return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Answer each now: do what "
             "it asks at the spot it names (your Open requests block names the call), or send_message to it with one "
             "line on where it can build or why not; one send_message can answer several (to: \"police,health\"). "
@@ -1825,6 +1829,9 @@ def requests_reminder(reqs: list[OpenRequest]) -> str:
     names = [f"{d} ({f'asks {money(a)}, ' if (a := next((r.amount for r in reversed(rs) if r.amount), None)) else ''}"
              f"since m{rs[0].month})" for d, rs in request_groups(reqs)]
     n = len(reqs)
+    if is_open():
+        return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Call end_turn again "
+                "to end the turn whatever is still open.")
     return (f"not ended: {n} request{'s' * (n != 1)} to you still open: {', '.join(names)}. Answer each department "
             "now: allocate_budget, or send_message to it with one line on why not or when (the reserve, a first "
             "building elsewhere first, its funds already cover it); one send_message can answer several (to: "
@@ -1900,8 +1907,8 @@ def mayor_ask(env, fleet: FleetState, dept: str, m: DeptMoney | None = None) -> 
     if k == "idle":
         return _not_now(env, fleet, m, f"you hold {money(m.idle)} more than you need now")
     if k == "blocked":
-        return _not_now(env, fleet, m, f"{' or '.join(m.blocked)} is blocked for lack of land: ask planning for a lot, "
-                                       "not the mayor for money")
+        return _not_now(env, fleet, m, f"{' or '.join(m.blocked)} is blocked for lack of land"
+                        + advice(": ask planning for a lot, not the mayor for money"))
     if dept == "planning":
         return _not_now(env, fleet, m, "your funds cover your road" if m.build is not None
                         and m.build.cost is not None else "no road is ready")
@@ -1956,6 +1963,9 @@ def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> 
 def ask_refusal(a: Ask) -> str:
     """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal): why, the plan note,
     when to ask and what to do this turn instead (_not_now)."""
+    if is_open():
+        return (f"not sent: {a.why}, so a money ask now gets a no. To post this message anyway, send it to the mayor "
+                "again.")
     return (f"not sent: {a.why}, so a money ask now gets a no" + (f"; {a.plan}" if a.plan else "") + ". "
             + (f"Ask when {a.when}. " if a.when else "")
             + f"Instead this turn: {a.instead}; put what you need in your end_turn report (the mayor reads it). To post "
@@ -2113,6 +2123,8 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
     nothing needing it). Review probe, month 60 (6,564 residents): the university list read "nothing needs it right
     now" with no free 2x2 block, and education's $12,000 keep for it read idle."""
     roads = lambda: _roads_text(_roads(w))
+    if is_open():
+        return _why_empty_open(w, role, purpose)
     if purpose == "road_extension":                  # and no branch either (site_lists offers those first)
         return ("no straight extension from a dead end: build_road from any road into free land",
                 "no straight extension from a dead end into open land; build_road from any road tile into free "
@@ -2182,6 +2194,71 @@ def _why_empty(w, role: str, purpose: str) -> tuple[str, str, bool]:
     return ("nothing needs it right now",
             f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles "
             "(check coverage in city_overview / my_facilities before building)", False)
+
+
+OPEN_BLOCKED = "blocked: "      # an open-style reason for lack of land or roads starts so (fleet/report.py reads it)
+
+
+def _why_empty_open(w, role: str, purpose: str) -> tuple[str, str, bool]:
+    """_why_empty in the open briefing style (fmt.py): the same cases and `blocked`, the facts without what to do
+    or whom to ask; a reason for lack of land or roads starts with OPEN_BLOCKED."""
+    roads = lambda: _roads_text(_roads(w))
+    b = lambda short, note: (OPEN_BLOCKED + short, note, True)
+    if purpose == "road_extension":
+        return ("no straight extension from a dead end", "no straight extension from a dead end into open land "
+                f"(build_road takes L-shaped roads; bridges cross the river; {roads()})", False)
+    if purpose in RIVERBANK_PURPOSES:
+        river = _river_cols(w)
+        if river is None:
+            return "no river on this map", "this map has no river", False
+        lots, contact = _riverbank_by_roads(w)
+        near = ", ".join(f"({x},{y})" for x, y in _ends(contact))
+        if not contact:
+            return b(f"no connected road reaches the river yet (river at x {_span(river[0], river[1])})",
+                     f"no free riverbank tile next to a highway-connected road: no such road reaches the river "
+                     f"({_river_span(w)})")
+        free = [(int(x), int(y)) for y, x in zip(*np.nonzero(lots & _empty_land(w)))]
+        if purpose == "riverbank_2x2" and free:
+            return b(f"no free 2x2 riverbank block by a road (roads meet the river near {near})",
+                     f"no free 2x2 block on the riverbank beside a highway-connected road (free bank lots are single "
+                     f"tiles, e.g. ({free[0][0]},{free[0][1]}); roads meet the river near {near})")
+        return b(f"riverbank beside roads all taken (zoned or built; roads meet the river near {near})",
+                 f"the river bank tiles next to highway-connected roads are all taken (zoned or built); roads meet the "
+                 f"river near {near}")
+    if purpose == "train_station" and capped_unlinked(w):
+        return b("no free map-edge lot by a connected road",
+                 "a train station goes on an empty tile at the map edge beside a highway-connected road, and none is "
+                 f"free; without a train station or harbour R and C demand stay capped from {C.CAP_POP_CONNECTION:,} "
+                 f"residents ({roads()})")
+    free = _free_roadside(w)
+    if role == "planning":
+        return b("no free roadside strip", f"no free strip along a highway-connected road ({roads()}; {free} free "
+                 "roadside tiles)")
+    near = (role, purpose) in NEAR_NEED
+    need = _uncovered_need(w, role, purpose) if near else None
+    if near and need is None:
+        return ("nothing needs it right now",
+                f"nothing needs this right now: under {NEED_SHARE:.0%} of the {NEAR_NEED[role, purpose][0]} it would "
+                f"serve are poorly covered (coverage under {NEED_COVERED})", False)
+    if not free:
+        return b("no free roadside land", f"no free land next to a highway-connected road ({roads()})")
+    if purpose in AWAY_FROM_HOMES and not (_roadside(w) & ~_far_from_homes(w)).any():
+        return b("no roadside lot away from homes (3+ within 4 tiles)",
+                 f"all {free} free roadside tiles have 3 or more homes within 4 tiles, and a {purpose} must stay away "
+                 f"from homes ({roads()})")
+    if purpose in TWO_BY_TWO and not w.site_candidates(np.ones(w.struct.shape), radius=1, k=1, size=2):
+        return b("no free 2x2 roadside block",
+                 f"no free 2x2 block of empty land beside a highway-connected road ({roads()}; {free} free roadside "
+                 f"tiles, none in a free 2x2 block), and a {purpose} takes 2x2 tiles")
+    if need is not None:
+        (x, y), share = need
+        what = NEAR_NEED[role, purpose][0]
+        return b(f"no free roadside lot near the homes that need it (around ({x},{y}))",
+                 f"no free roadside tile within {NEAR_NEED[role, purpose][2]} tiles of the uncovered {what} "
+                 f"({share:.0%} of them poorly covered, most around ({x},{y})); the {free} free roadside tiles are all "
+                 f"farther away ({roads()})")
+    return ("nothing needs it right now",
+            f"nothing needs this right now: no uncovered homes or jobs near the {free} free roadside tiles", False)
 
 
 def _served(w, what: str) -> np.ndarray:
@@ -2328,12 +2405,22 @@ def branch_sites(w, clear: int = BRANCH_CLEAR, k: int = MAX_SITES) -> list[Branc
 
 
 def branch_text(w, b: Branch) -> str:
-    """The Ready sites line's reason for road_extension with branch roads."""
+    """The Ready sites line's reason for road_extension with branch roads (open style: the road and what is in its
+    way, no steps)."""
+    if is_open():
+        way = f" through {b.first(w).split(' ', 1)[1]}" if b.clear else ""
+        return (f"no dead end; branch road ({b.start[0]},{b.start[1]})-({b.end[0]},{b.end[1]}){way}, opens {b.opens} "
+                "land tiles")
     return f"no dead end; branch: {b.steps(w)}, opens {b.opens} land tiles"
 
 
 def branch_note(w) -> str:
     """find_sites' note on road_extension with branch roads."""
+    if is_open():
+        return ("no straight extension from a dead end into open land, so these are branch roads: each leaves a road "
+                "tile (branch_from) at x1,y1 and runs straight to x2,y2; 'first' names the zoned lots in its way "
+                f"(dezoning is free; bulldozing a building {money(C.CATALOG['bulldoze']['cost'])} a tile; "
+                f"{_roads_text(_roads(w))})")
     return ("no straight extension from a dead end into open land, so these are branch roads, best first: each leaves "
             "a road tile (branch_from) at x1,y1 and runs straight to x2,y2; run its 'first' action if it has one "
             f"(dezone empty lots: free; bulldoze a building: {money(C.CATALOG['bulldoze']['cost'])} a tile), then "
@@ -3263,6 +3350,10 @@ def edu_room(w, purpose: str) -> tuple[str, str]:
     if short:
         why = " and ".join(enrol_text(w, lv).split(":")[0] for lv in short)
         upkeep = money(upkeep_of(w, "education", "university"))
+        if is_open():
+            return (f"{why} (a university counts in no enrolment the score reads)",
+                    f"{why}, under {goal}: elementary and high-school enrolment count in your score, a university's "
+                    f"doesn't (it trains graduates for skilled jobs and costs {upkeep}/month)")
         return (f"{why}: schools first (a university counts in no enrolment the score reads)",
                 f"{why}, under {goal}: elementary and high-school enrolment count in your score, a university's doesn't "
                 f"(it trains graduates for skilled jobs and costs {upkeep}/month); build it once both school levels "
@@ -3921,7 +4012,7 @@ def zone_line(purpose: str, sites: list[dict], strips: dict[str, dict], site: Ca
     own = next((s for s in sites if not any(_overlaps(s, t) for t in strips.values())), None)
     if own is None:
         took = _and([p + "'s" for p, t in strips.items() if any(_overlaps(s, t) for s in sites)])
-        return f"all {took} strips ({ZONE_RULE}): extend the roads", None
+        return f"all {took} strips ({ZONE_RULE})" + advice(": extend the roads"), None
     strips[purpose] = own
     if own is sites[0]:
         return f"best {site(purpose, own)}", own
@@ -3964,13 +4055,13 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
     def tag(purpose: str, s: dict) -> str:
         if kept is None:
             bank = purpose not in RIVER_PURPOSES and "x2" not in s and (s["x"], s["y"]) in keep_bank
-            return " (riverbank: keep for pump/sewage)" if bank else ""
+            return advice(" (riverbank: keep for pump/sewage)", " (scarce riverbank lot)") if bank else ""
         k = kept_for(s)
         return "" if k is None or (k == "pump/sewage" and purpose in RIVER_PURPOSES) else f" (riverbank: kept for {k})"
 
     def site(purpose: str, s: dict) -> str:
         return (_where(s) + _extra(purpose, s) + tag(purpose, s)
-                + (f" (leave {s['leave']})" if "leave" in s else ""))
+                + (f" (leave {s['leave']})" if "leave" in s and not is_open() else ""))
 
     def price(purpose: str) -> str:
         pr = (prices or {}).get(purpose)
@@ -3987,7 +4078,8 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
             continue
         if purpose == "bus_stops":                   # one line through every stop, not a choice of sites
             stops = bus_stops(lst)
-            lines.append(head + f"{len(stops)} stops for one line: {bus_line_call(stops)}" + price(purpose))
+            lines.append(head + f"{len(stops)} stops for one line: "
+                         + advice(bus_line_call(stops), ", ".join(f"({x},{y})" for x, y in stops)) + price(purpose))
             continue
         sites = lst.sites[:MAX_SITES]
         head += f"{len(sites)} site{'s' * (len(sites) != 1)}, "
@@ -4030,6 +4122,21 @@ def ready_lines(role: str, lists: dict[str, SiteList], keep_bank: set | dict = f
 
 
 # ------------------------------------------------------------------ toolbox
+# what core/actions.py appends to a failure's reason as advice (shared with the plain LLM agents): the open briefing
+# style shows the reason alone (core_fact); executed and the history log keep the core message
+CORE_ADVICE = ("; ask the mayor for funds", "; bulldoze it or route around")
+
+
+def core_fact(message: str) -> str:
+    """A core action message as the open style shows it: without CORE_ADVICE ("costs $7,800 but the police budget only
+    has $6,632"); unchanged in the guided style."""
+    if not is_open():
+        return message
+    for a in CORE_ADVICE:
+        message = message.replace(a, "")
+    return message
+
+
 class Took(NamedTuple):
     """A successful action of this turn: its call, action and arguments, and the tiles it took (a build_road its
     whole line, road already or not; anything else the tiles it filled)."""
@@ -4041,10 +4148,14 @@ class Took(NamedTuple):
 
 class ToolBox:
     def __init__(self, env, role: str, branch_dezone: bool = False, max_steps: int | None = None,
-                 next_line: bool = False):
+                 next_line: bool = False, style: str = "guided"):
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
+        if style not in STYLES:
+            raise ValueError(f"briefing style must be one of {', '.join(STYLES)}, got {style!r}")
         self.env, self.role = env, role
+        self.style = style                                # the briefing style its results render in (fmt.py): open
+                                                          # results state facts, never a call or a fix to make
         self.world = env.world
         self.branch_dezone = branch_dezone                # planning's branch road dezones its empty lots (_branch_clear)
         self.next_line = next_line                        # a successful action's result ends with the role's refreshed
@@ -4092,8 +4203,10 @@ class ToolBox:
         return [t.schema() for t in self.tools.values()]
 
     def call(self, name: str, arguments: str | dict | None = None) -> dict:
-        """Run one tool call (`_call`) and report it to the game's live feed (bench/live.py), if it has one."""
-        res = self._call(name, arguments)
+        """Run one tool call (`_call`) in the toolbox's briefing style and report it to the game's live feed
+        (bench/live.py), if it has one."""
+        with briefing_style(self.style):
+            res = self._call(name, arguments)
         live.call(self.env, self.role, name, arguments, res, name in ALL_ACTIONS)
         return res
 
@@ -4315,7 +4428,7 @@ class ToolBox:
         else:
             done, fix = self._done_note(name, args), self._explain(name, args, res["message"])
             note = done + (f"; {fix.removeprefix(' - ')}" if done and fix else fix)
-        message = cleared + res["message"] + note
+        message = cleared + core_fact(res["message"]) + note
         if res["ok"] and self.next_line:
             message += self._next_refresh(len(message))
         out = {"ok": res["ok"], "message": message, "cost": res["cost"],
@@ -4382,15 +4495,15 @@ class ToolBox:
             return None
         if name in ROAD_REMOVERS:
             lost, gone = cut_off(w, tiles), [(x, y) for x, y in tiles if w.struct[y, x] == C.ROAD]
-            why = "; build a new link first or pick tiles that aren't on the only route"
+            why = advice("; build a new link first or pick tiles that aren't on the only route")
         else:
             (x, y), = tiles
             link = LINKS.get(int(w.struct[y, x]))
             if link is None:                              # not a link: nothing to relabel
                 return None
             lost, gone = cut_off(w, (), drop={w._anchor_of(x, y)}), w.parts(x, y)
-            why = (f": the {link} is their only link; ask planning to connect them to the highway by road first, or "
-                   "build another link")
+            why = f": the {link} is their only link" + advice("; ask planning to connect them to the highway by road "
+                                                               "first, or build another link")
         if not lost.any():
             return None
         ys, xs = np.nonzero(lost)
@@ -4417,8 +4530,8 @@ class ToolBox:
             return None
         return (f"this upgrade ({money(cost)}) would leave transport {money(math.floor(funds - cost))}, short of the "
                 f"{money(bus.cost)} first bus line, and the city has none yet (transit is a fifth of your score): "
-                f"build the line first, {bus_line_call(bus_stops(lists['bus_stops']))}, asking the mayor for what "
-                "you lack; to upgrade anyway repeat with confirm: true")
+                + advice(f"build the line first, {bus_line_call(bus_stops(lists['bus_stops']))}, asking the mayor for "
+                         "what you lack; ") + "to upgrade anyway repeat with confirm: true")
 
     def _allocations(self) -> list[tuple[str, float]]:
         """This turn's successful allocate_budget calls as (department, amount), oldest first (take-backs negative)."""
@@ -4493,16 +4606,19 @@ class ToolBox:
         wait = (f"first/supply and growth come first: {_some(firsts, FUNDED_SHOWN)} still wait" if firsts else
                 "the reserve keeps the city solvent and pays for first buildings, supply and planning's road when they "
                 "come (none waits now)")
+        if is_open():                       # the rule, no queue of what to fund first
+            wait = ("the reserve is kept for solvency, first buildings, supply and planning's road, which may use the "
+                    f"treasury down to {money(RESERVE_MIN)}")
         idle = ", ".join(f"{d} {money(v)}" for d, v in f.idle.items() if d != dept)
         buys = (f"for {m.what}" if m.kind == KINDS[2] else
                 f"buys nothing now ({dept}: {m.state or 'nothing ready to buy'}) and" if m.kind == KINDS[4] else
                 f"buys nothing now ({dept} holds {money(m.idle)} idle) and")
         return (f"this top-up {buys} leaves the treasury at {money(after)}, {money(keep - after)} under the "
                 f"{money(keep)} reserve{reserve_why(w)}; {wait}"
-                + (f"; take back idle money first ({idle})" if idle else "")
+                + (advice(f"; take back idle money first ({idle})", f"; idle money elsewhere: {idle}") if idle else "")
                 + (f". You borrowed {money(self.borrowed)} this turn, and a loan pays only for first buildings, supply "
-                   "and planning's road: fund this from money above the reserve next turn (confirm: true doesn't "
-                   "count after a loan)." if self.borrowed > 0 else
+                   "and planning's road" + advice(": fund this from money above the reserve next turn") + " (confirm: "
+                   "true doesn't count after a loan)." if self.borrowed > 0 else
                    ". To fund it anyway, repeat this exact call with confirm: true."))
 
     def _take_back_refusal(self, dept: str, amount: float) -> str | None:
@@ -4527,13 +4643,13 @@ class ToolBox:
         free = f"its idle money is {money(m.idle)}" if m.idle else "it has no idle money"
         if top > 0:
             free += f"{', plus' if m.idle else ', only'} the {money(top)} you moved to it this turn"
-        todo = f"take back {money(m.idle + top)}" if m.idle or top > 0 else "leave its funds"
+        todo = advice(f": take back {money(m.idle + top)}" if m.idle or top > 0 else ": leave its funds")
         took = -sum(a for d, a in self._allocations() if d == dept and a < 0)
         took = f"; you already took back {money(took)} from it this turn" if took > 0 else ""
         cant = m.cant_pay(left)
         return (f"that takes {dept} below the {money(m.keep)} it keeps ({m.keep_why})"
                 + (f", so it can't pay for {cant}" if cant else "")
-                + f"{took}; {free}: {todo}. To take it anyway, repeat this exact call with confirm: true.")
+                + f"{took}; {free}{todo}. To take it anyway, repeat this exact call with confirm: true.")
 
     def _loan_refusal(self, args: dict) -> str | None:
         """Why the mayor's take_loan (guarded()) must not run, as one text: the treasury holds RESERVE_MIN or more,
@@ -4582,14 +4698,15 @@ class ToolBox:
                     f"{money(amount - need)} would {buys}")
             if own:
                 return f"{own} Also, {over}." + anyway
-            return (f"{over} at {money((amount - need) * C.LOAN_INTEREST)}/month interest until repaid {debt}: "
-                    f"borrow {money(need)} or less." + anyway)
+            return (f"{over} at {money((amount - need) * C.LOAN_INTEREST)}/month interest until repaid {debt}"
+                    + advice(f": borrow {money(need)} or less") + "." + anyway)
         waits = f"only another: {_some(extras, FUNDED_SHOWN)}" if extras else "nothing is ready to fund"
         none = f"no first building, supply or planning road is waiting ({waits})"
         if own:
             return f"{own} Also, {none}: the loan would {buys}." + anyway
         return (f"{none}; this {money(amount)} loan would {buys} at {interest}/month interest until repaid {debt}"
-                + (": fund another building only from the money above the reserve" if extras else "") + "." + anyway)
+                + (advice(": fund another building only from the money above the reserve") if extras else "") + "."
+                + anyway)
 
     def _own_loan_refusal(self, amount: float, interest: str, short: bool = False) -> str | None:
         """_loan_refusal's first part, a sentence without the confirm advice: (a) the treasury holds RESERVE_MIN or
@@ -4607,8 +4724,9 @@ class ToolBox:
         if w.treasury >= RESERVE_MIN:
             return None if short else (f"the treasury holds {cash(w.treasury)}, over the {money(RESERVE_MIN)} minimum: a "
                     f"{money(amount)} loan costs {interest}/month until repaid (debt would be "
-                    f"{money(w.debt + amount)} of {money(C.MAX_DEBT)}); borrow only for a first building or supply "
-                    "need the treasury can't cover.")
+                    f"{money(w.debt + amount)} of {money(C.MAX_DEBT)})" + advice("; borrow only for a first building "
+                                                                              "or supply need the treasury can't cover")
+                    + ".")
         net = sum(a for _, a in self._allocations())
         if self.start_treasury < RESERVE_MIN or (net <= 0 and self.repaid <= 0):
             return None
@@ -4624,6 +4742,10 @@ class ToolBox:
         back = f"take back (free) a top-up that isn't a first building or supply ({', '.join(others)})"
         todo = (f"{loan} borrows back what you just repaid; {back} instead" if others and self.repaid else
                 f"{back} instead of {loan}" if others else f"{loan} borrows back what you just repaid")
+        if is_open():
+            mine = f"top-ups not for a first building or supply: {', '.join(others)}"
+            todo = (f"{loan} borrows back what you just repaid; {mine}" if others and self.repaid else
+                    f"{mine}; {loan}" if others else f"{loan} borrows back what you just repaid")
         return (f"the treasury started this turn at {money(self.start_treasury)}; {causes} took it under "
                 f"{money(RESERVE_MIN)}: {todo}.")
 
@@ -4656,7 +4778,8 @@ class ToolBox:
         if not len(xs):                                   # not taken by this zoning: someone else's doing
             return ""
         return (" WARNING: that zoned the last free riverbank lot(s) beside roads; utilities still needs one for its "
-                f"{' and '.join(missing)} - dezone one near ({xs[0]},{ys[0]})")
+                f"{' and '.join(missing)}" + advice(f" - dezone one near ({xs[0]},{ys[0]})",
+                                                    f" (one was ({xs[0]},{ys[0]}))"))
 
     def _funded_sites(self) -> dict[tuple[str, str], tuple[Price, list[tuple[int, int]]]]:
         """funded_sites, kept until an action succeeds: a zone's warning, planning's find_sites zone_* and a failed
@@ -4713,6 +4836,8 @@ class ToolBox:
             else:
                 items = [f"{b} ({held} held)" for b, _, held in names]
                 what = ", ".join(items[:-1]) + " and " + items[-1]
+            if is_open():
+                return f" WARNING: that zoned the last site for {what}"
             return f" WARNING: that zoned the last site for {what}: " + self._dezone_fix(before, hit, taken)
         except Exception:
             return ""
@@ -4785,6 +4910,10 @@ class ToolBox:
             took = lambda way: [(x, y) for x, y in way if before[y, x] == C.NONE and w.struct[y, x] in C.ZONES]
             tiles = next((t for way in ways if (t := took(way))), [])
             where = _tiles_text(tiles) if tiles else ""
+            if is_open():
+                at = f" ({where})" if where else ""
+                return (f"; it also zoned the last lot a new road could branch from{at}" if prior else
+                        f" WARNING: that zoned the last lot a new road could branch from{at}")
             if prior:
                 return "; it also zoned the last lot a new road could branch from" + (
                     f" (dezone {where} to leave one)" if where and where not in prior else "")
@@ -4801,6 +4930,8 @@ class ToolBox:
         RESULT_CHARS leaves after the `used` characters of the message; "" for other roles or on any error. The late
         smokes: planning did its briefing's Next-line calls first, then sent them again word for word 6-15 calls
         later, reading the briefing's stale line (_done_note)."""
+        if is_open():
+            return ""
         try:
             from .briefing import next_clause, next_line      # briefing imports this module
             cap = self.env.cfg.max_actions_per_turn
@@ -4823,6 +4954,9 @@ class ToolBox:
         done = next((t for t in reversed(self.took) if t.action == name and t.args == args), None)
         if done is None:
             return ""
+        if is_open():
+            return (f" - this exact call already succeeded at call {done.call} this turn, so it is done (your briefing "
+                    "was written before it)")
         return (f" - this exact call succeeded at call {done.call} this turn: it is done (your briefing's Next line "
                 "and Ready sites were written before it); go on to the next item, or end_turn")
 
@@ -4843,6 +4977,8 @@ class ToolBox:
         the best branch road (_branch_hint). A build on a taken tile says what took it and the next free site
         (_taken_hint). "" otherwise."""
         w = self.world
+        if is_open():
+            return self._explain_open(name, args, message)
         if name == "zone" and message == w.unlock_note("high_density"):
             return ' - zone with density "low" now'
         if name == "zone" and message.startswith("costs $") and " budget only has " in message:
@@ -4922,6 +5058,48 @@ class ToolBox:
         if not built:
             return f"{head}; {fix}, then retry"
         return f"{head} and building{bs} {tiles(built)}; {fix}{tail}"
+
+    def _explain_open(self, name: str, args: dict, message: str) -> str:
+        """_explain in the open briefing style (fmt.py): what the failed action found (what a rectangle or tile holds,
+        this turn's own zones, roads and parks there, what is in a road's way), never what to do instead; "" on any
+        error or when the core message says it all (over budget, locked, off the map)."""
+        w = self.world
+        try:
+            if (name, message) in (("zone", "no empty land tiles in that area"),
+                                   ("dezone", "no zoned tiles in that area")) or \
+                    (name == "build_park" and message == "no empty land tiles there"):
+                tiles = _rect(w, args)
+                mine = self._own_zones(tiles) if name == "zone" else ""
+                if name == "build_park":
+                    calls = [t.call for t in self.took if t.action == "build_park" and t.tiles & set(tiles)]
+                    mine = f"your park at call {_and([str(c) for c in calls])}" if calls else ""
+                return f" - {_contents(w, tiles)}" + (f"; {mine}" if mine else "")
+            if name == "build_road" and message == "every tile on that line is already road":
+                line = _line(w, args)
+                on = [_road_line_text(ln) for ln in _road_lines(w)
+                      if sum(_on_road_line(ln, x, y) for x, y in line) >= min(2, len(line))]
+                own = self._own_roads(args)
+                mine = f"you built {_some(own, OWN_NAMED, ' and ')} this turn" if own else ""
+                if not on:
+                    return f" - {mine + '; ' if mine else ''}{_roads_text(_roads(w))}"
+                many = len(on) > 1
+                return (f" - the road line{'s' * many} {' and '.join(on)} {'are' if many else 'is'} already built"
+                        + (f" ({mine})" if mine else ""))
+            if name == "build_road" and " is occupied by " in message:
+                line = _line(w, args)
+                lots = [(x, y) for x, y in line if w.struct[y, x] in C.ZONES and w.level[y, x] == 0]
+                built = list({w._anchor_of(x, y): (x, y) for x, y in line
+                              if w.struct[y, x] not in (C.NONE, C.ROAD, C.HIGHWAY) and (x, y) not in lots}.values())
+                tiles = lambda pts: _some([f"({x},{y})" for x, y in pts], BLOCKERS_NAMED)
+                parts = ([f"empty zoned lot{'s' * (len(lots) > 1)} {tiles(lots)}"] * bool(lots)
+                         + [f"building{'s' * (len(built) > 1)} {tiles(built)}"] * bool(built))
+                return f" - in the way: {' and '.join(parts)}" if parts else ""
+            if name != "build_road" and (m := NOT_EMPTY.match(message)):
+                hint = self._taken_hint(name, args, (int(m[1]), int(m[2])), m[3])
+                return hint.split("; next free ")[0].split("; no free ")[0]
+        except Exception:
+            return ""
+        return ""
 
     def _park_hint(self, args: dict) -> str:
         """For a build_park with no empty land in its rectangle: what the rectangle holds, this turn's own parks there
@@ -5117,20 +5295,22 @@ class ToolBox:
             if name == "take_loan" and not ok and msg.startswith("debt limit"):
                 room, interest = C.MAX_DEBT - w.debt, f"{money(w.debt * rate)}/month"
                 if round(room) <= 0:
-                    return f" | no more credit: repay_loan from money above the reserve cuts the {interest} interest"
+                    return advice(f" | no more credit: repay_loan from money above the reserve cuts the {interest} "
+                                  "interest", f" | no more credit: debt at the {money(C.MAX_DEBT)} limit, {interest} "
+                                              "interest")
                 return f" | only {money(room)} more can be borrowed (interest {interest})"
             if not ok and "treasury only has" not in msg:
                 return ""
             f = funding_gaps(self.env, self.fleet)
-            where, still = treasury_state(w, f), f"still to fund: {still_to_fund(f)}"
+            where, still = treasury_state(w, f), advice(f"; still to fund: {still_to_fund(f)}")
             if not ok:
                 idle = ", ".join(f"{d} {money(v)}" for d, v in f.idle.items()) or "none"
-                return f" | {where}; idle to take back: {idle}; {still}"
+                return f" | {where}; " + advice("idle to take back", "idle") + f": {idle}{still}"
             if name == "take_loan":
                 room = C.MAX_DEBT - w.debt
                 credit = f"{money(room)} more can be borrowed" if round(room) > 0 else "no more can be borrowed"
                 added = signed(float(args["amount"]) * rate, money)
-                return f" | interest now {money(w.debt * rate)}/month ({added}); {credit}; {where}; {still}"
+                return f" | interest now {money(w.debt * rate)}/month ({added}); {credit}; {where}{still}"
             if name == "repay_loan":
                 if w.debt <= 1e-9:                    # it repaid what was left, maybe less than it asked
                     return f" | no debt left: no more interest; {where}"
@@ -5143,7 +5323,7 @@ class ToolBox:
                     f"{dept}: not in this game, so nothing spends it"
             else:
                 what = taken_back(m) if amount < 0 else f"{dept}: {topped_up(m)}"
-            return f" | {what}; {where}; {still}"
+            return f" | {what}; {where}{still}"
         except Exception:
             return ""
 
@@ -5262,7 +5442,7 @@ class ToolBox:
         if key == "bus_stops" and sites:           # one line through all of them (near_x/near_y don't reorder it)
             stops = bus_stops(lst)
             out = {"ok": True, "purpose": purpose, "stops": stops,
-                   "line": f"{len(stops)} stops for one line: {bus_line_call(stops)}"}
+                   "line": f"{len(stops)} stops for one line" + advice(f": {bus_line_call(stops)}")}
             if lst.note:
                 out["note"] = lst.note if role == self.role else f"({role} department's note) {lst.note}"
             return out
@@ -5414,6 +5594,13 @@ class ToolBox:
         except ValueError as e:
             raise ToolError(str(e))
         f = funding_gaps(self.env, self.fleet)
+        if is_open():                       # the money as it stands, no to-fund list or next steps
+            out.update(treasury=math.floor(w.treasury), reserve=round(f.reserve))
+            if f.gaps:
+                out["below_target"] = f.gaps
+            if flags := nothing_to_fund(f, self.fleet.plan["budgets"], fields.get("priorities")):
+                out["nothing_to_fund"] = flags
+            return out
         if f.idle:
             out["idle"] = f.idle
         if f.gaps:

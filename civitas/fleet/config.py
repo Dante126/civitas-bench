@@ -4,7 +4,9 @@ A run config's `[fleet]` table holds fleet-wide settings (`playbook` is the flee
 `[agents.<role>]` with `kind = "fleet"` can override any of them (its `playbook` is the role's playbook; its
 `extra_body` replaces `[fleet].extra_body` as a whole; `temperature = "default"` sends no temperature, the
 provider's own, which OpenAI's reasoning models require). `[fleet].session_months` is run-wide: a supervised run
-pauses after that many months (see `bench/session.py`).
+pauses after that many months (see `bench/session.py`). `briefing` ("guided", the default, or "open") is the
+briefing style (fmt.py): open briefings and tool results state facts and options, never an exact call or a chosen
+action.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import json
 from dataclasses import dataclass, field, fields
 
 from ..agents.llm_client import temperature_of
+from .fmt import STYLES
 
 MODES = ("autonomous", "supervised")
 
@@ -29,6 +32,7 @@ class FleetAgentConfig:
     turn_tokens: int = 80000         # per turn
     temperature: float | None = 0.4  # None (`temperature = "default"`): the request carries none
     extra_body: dict = field(default_factory=dict)
+    briefing: str = "guided"         # "guided" names the build and the call; "open" only the facts (fmt.STYLES)
 
 
 def _table(v, name: str) -> dict:
@@ -60,6 +64,8 @@ def fleet_agent_config(cfg: dict, role: str) -> FleetAgentConfig:
     out.extra_body = dict(out.extra_body or {})
     if out.mode not in MODES:
         raise ValueError(f"agents.{role}: fleet mode must be one of {', '.join(MODES)}, got {out.mode!r}")
+    if out.briefing not in STYLES:
+        raise ValueError(f"agents.{role}: fleet briefing must be one of {', '.join(STYLES)}, got {out.briefing!r}")
     return out
 
 
