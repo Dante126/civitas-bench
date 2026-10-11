@@ -143,6 +143,97 @@ def _forbidden(text: str) -> list[str]:
             for m in rx.finditer(text)]
 
 
+def _same_play(open_calls: list, guided_calls: list) -> bool:
+    """The open script did what the guided one did: each call's ok and refused kind, except that the open style holds
+    back no money ask to the mayor (guided "refused": "ask"; open posts it)."""
+    if len(open_calls) != len(guided_calls):
+        return False
+    for (r, n, a, o), (_, _, _, g) in zip(open_calls, guided_calls):
+        if g.get("refused") == "ask":
+            if not (n == "send_message" and o.get("ok") and "refused" not in o):
+                return False
+        elif (o.get("ok"), o.get("refused")) != (g.get("ok"), g.get("refused")):
+            return False
+    return True
+
+
+# what the mayor's money results (money notes, the take-back, reserve and loan guards) never show in the open style:
+# what the money buys or lacks, a named build, an amount "needed" from the to-fund model, a keep reason
+MONEY_FORBIDDEN = {
+    "short of": re.compile(r"short of"),
+    "is needed": re.compile(r"\bis needed\b"),
+    "less buys": re.compile(r"less buys"),
+    "can pay for": re.compile(r"can(?:'t)? pay for|needs nothing now|had (?:only|nothing)"),
+    "keep reason": re.compile(r"it keeps \(|keeps \(for"),
+    "would pay for": re.compile(r"would (?:pay for|sit in)|only another"),
+    "named build": re.compile(r"\b(?:station|HQ|clinic|hospital|landfill|university|school|cemetery|crematorium|"
+                              r"jail|plant|turbine|pump|tower|outlet|bus line|road into open land|library)\b"),
+}
+
+
+def mayor_money(env, style: str) -> list:
+    """The mayor's money actions on `env` (changed: pass a copy) in many states, as [role, tool, args, result]: a
+    top-up and a take-back for every department, take-backs of everything (the keep guard), a loan with the treasury
+    high, top-ups draining it towards the reserve (the reserve guard; the first one that passes leaves it low), loans
+    with nothing first waiting, more than the treasury (a failed top-up's note), a repayment with no debt, a loan over
+    the debt cap; then a new turn under $3,000 with education's first university waiting (the loan guard's part on
+    what waits, alone; a loan within it, repaid), and one whose own top-up took a $3,000+ treasury under (its first
+    part)."""
+    env.cfg.max_actions_per_turn = 999
+    w, out, box = env.world, [], [None]
+
+    def turn():
+        box[0] = ToolBox(env, "mayor", max_steps=20, next_line=True, style=style)
+
+    def call(name, args):
+        res = box[0].call(name, json.dumps(args))
+        out.append(["mayor", name, args, res])
+        return res
+
+    turn()
+    depts = [d for d in ROLES[1:] if d in env.roles]
+    for d in depts:
+        call("allocate_budget", {"department": d, "amount": 500})
+    for d in depts:
+        call("allocate_budget", {"department": d, "amount": -200})
+    for d in depts:
+        call("allocate_budget", {"department": d, "amount": -int(w.dept_funds[d])})
+    call("take_loan", {"amount": 10000})
+    turn()
+    for d in depts:
+        call("allocate_budget", {"department": d, "amount": max(1, int(w.treasury) - 1500)})
+    call("take_loan", {"amount": 10000})
+    call("allocate_budget", {"department": "police", "amount": 999999})
+    call("repay_loan", {"amount": 100})
+    call("take_loan", {"amount": 10 ** 7})
+    w.dept_funds["education"] = 0.0
+    w.treasury = 2000.0
+    turn()
+    call("take_loan", {"amount": 40000})
+    call("take_loan", {"amount": 1000})
+    call("repay_loan", {"amount": 1000})
+    w.treasury = 5000.0
+    turn()
+    call("allocate_budget", {"department": "fire", "amount": 2500})
+    call("allocate_budget", {"department": "fire", "amount": 2500, "confirm": True})    # overrides the reserve guard
+    call("take_loan", {"amount": 30000})
+    return out
+
+
+def _money_leaks(rows: list) -> list[str]:
+    """FORBIDDEN and MONEY_FORBIDDEN hits in the money results of `rows` (the guards' rule naming "first buildings,
+    supply, a levee or planning's road" generically is no named build)."""
+    hits = []
+    for _, n, a, res in rows:
+        if n not in ("allocate_budget", "take_loan", "repay_loan"):
+            continue
+        text = f"{res.get('message') or ''} {res.get('error') or ''}"
+        hits += [f"{n} {a} {h}" for h in _forbidden(text)]
+        hits += [f"{n} {a} {k}: ...{text[max(0, m.start() - 60):m.end() + 40]}..."
+                 for k, rx in MONEY_FORBIDDEN.items() for m in rx.finditer(text)]
+    return hits
+
+
 # ------------------------------------------------------------------ the switch
 def test_briefing_style_config():
     """[fleet] briefing: "guided" by default, per role like every fleet key, validated."""
@@ -229,13 +320,17 @@ def test_open_states_facts_not_calls(late):
         b["planning"]
     parks = next(ln for ln in b["planning"].splitlines() if ln.startswith("- parks: "))
     assert parks.startswith("- parks: 21 of 18 park tiles") and parks.endswith("8 homes near; $600")
-    # the tools stay the same: identical schemas, and the guards refuse what they refused (open text, same kinds)
+    # the reserve guard's classification on the options: a first building the city lacks, a wanted supply
+    assert "university $12k (+$150/month, the city has none)" in mayor
+    assert 'its cheapest option marked "the city has none", its supply ("supply"), a levee or planning\'s road' in mayor
+    # the tools stay the same: identical schemas, and the guards refuse what they refused (open text, same kinds),
+    # but a department's money ask to the mayor always goes through (the mayor decides)
     guided = run_script(late, style="guided")
-    assert [(r, n, a, res.get("ok"), res.get("refused")) for r, n, a, res in data["calls"]] == \
-           [(r, n, a, res.get("ok"), res.get("refused")) for r, n, a, res in guided["calls"]]
+    assert _same_play(data["calls"], guided["calls"])
     assert ToolBox(late, "mayor", style="open").schemas() == ToolBox(late, "mayor").schemas()
     refused = {res.get("refused") for _, _, _, res in data["calls"]} - {None}
-    assert {"take_back", "duplicate", "reserve", "loan", "open_requests", "ask"} <= refused
+    assert {"take_back", "duplicate", "reserve", "loan", "open_requests"} <= refused and "ask" not in refused
+    assert "ask" in {res.get("refused") for _, _, _, res in guided["calls"]}
     # failures keep their reason as a fact
     calls = {(r, n): res for r, n, a, res in data["calls"]}
     taken = calls["police", "build_police_station"]["message"]
@@ -247,6 +342,88 @@ def test_open_states_facts_not_calls(late):
     loan = calls["mayor", "take_loan"]["error"]
     assert loan.startswith("the treasury holds $27.1k, over the $3,000 minimum: a $5,000 loan costs $25/month") and \
         loan.endswith("To borrow anyway, repeat this exact call with confirm: true."), loan
+
+
+def test_open_money_results_state_facts(late):
+    """The mayor's money results in the open style (seed-4 hand-over): a top-up's note is the treasury against the
+    reserve, a take-back's the funds against the keep as a number; the take-back, reserve and loan guards state their
+    rule; none names a build, what the money is short of or an amount "needed". The guided texts still do, and both
+    styles refuse and pass the same calls."""
+    rows = mayor_money(copy.deepcopy(late), "open")
+    guided = mayor_money(copy.deepcopy(late), "guided")
+    assert not _money_leaks(rows), _money_leaks(rows)[:5]
+    assert _same_play(rows, guided)
+    got = {(n, json.dumps(a)): res for _, n, a, res in rows}
+    was = {(n, json.dumps(a)): res for _, n, a, res in guided}
+    top = ("allocate_budget", '{"department": "police", "amount": 500}')
+    assert "short of an upgrade of its police station" in was[top]["message"]
+    assert got[top]["message"] == ("transferred $500 to police (now $7,132) | treasury $25.7k, $11.1k above the $14.6k "
+                                   "reserve (3 x $4,875 expenses)"), got[top]["message"]
+    back = ("allocate_budget", '{"department": "police", "amount": -200}')
+    assert "below what it keeps (for an upgrade of its police station" in was[back]["message"]
+    assert "police now $6,932, $868 below the $7,800 it keeps; treasury" in got[back]["message"]
+    keep = got["allocate_budget", '{"department": "police", "amount": -6932}']
+    assert keep["refused"] == "take_back" and keep["error"].startswith(
+        "a take-back must leave police the $7,800 it keeps; this one leaves $0;"), keep
+    res = next(r for _, n, a, r in rows if r.get("refused") == "reserve" and a["department"] == "health")
+    assert res["error"].startswith("this top-up to health is not for a first building, supply, a levee or planning's "
+                                   "road and leaves the treasury at "), res
+    loans = [r["error"] for _, n, a, r in rows if n == "take_loan" and r.get("refused") == "loan"]
+    assert loans[0].startswith("the treasury holds $25.6k, over the $3,000 minimum: a $10k loan costs $50/month until "
+                               "repaid (debt would be $10k of $50k). Also, a loan may pay only for the first buildings, "
+                               "supply and planning's road that wait and for keeping the treasury at the $14.6k "
+                               "reserve through operations to your next turn, and this $10k loan is more than those "
+                               "add up to."), loans[0]
+    assert loans[1].startswith("no first building, supply or planning road is waiting, and a loan may pay only for "
+                               "those; this $10k loan costs $50/month interest until repaid"), loans[1]
+    assert got["take_loan", '{"amount": 40000}']["error"].startswith("a loan may pay only for the first buildings")
+    assert "is needed ($12k for first/supply and growth" in was["take_loan", '{"amount": 40000}']["error"]
+    assert got["take_loan", '{"amount": 1000}']["ok"]
+    own = got["take_loan", '{"amount": 30000}']["error"]
+    assert own.startswith("the treasury started this turn at $5,000; this turn's top-ups ($2,500 net) took it under "
+                          "$3,000: top-ups not for a first building or supply: fire $2,500; a $30k loan at $150/month"), own
+
+
+def test_open_sends_every_money_ask(late):
+    """A department's money ask to the mayor goes through in the open style (the mayor decides); the guided style holds
+    back one it can't get (refused "ask")."""
+    text = {"to": "mayor", "text": "Planning needs $5,000 for roads into open land."}
+    guided = ToolBox(copy.deepcopy(late), "planning", max_steps=20).call("send_message", text)
+    assert guided["refused"] == "ask" and "gets a no" in guided["error"]
+    box = ToolBox(copy.deepcopy(late), "planning", max_steps=20, style="open")
+    sent = box.call("send_message", text)
+    assert sent["ok"] and box.messages == [{"to": "mayor", "text": text["text"]}], sent
+
+
+@pytest.mark.slow
+def test_scripted_fleet_plays_the_same_in_open(tmp_path, monkeypatch):
+    """The scripted fleet renders its briefings and tool results in its [fleet] briefing style (bench/envs.py's probe
+    hashes them) and plays the same in either: fleet_scripted with briefing = "open" plays the guided game month by
+    month and call by call, with open briefings in its trajectories."""
+    from civitas.bench import runner
+    from civitas.config import apply_cli_overrides
+    from civitas.core.env import make_env
+
+    def play(style):
+        cfg = apply_cli_overrides(load_config(str(ROOT / "configs/fleet_scripted.toml")),
+                                  sets=["game.months=30", f"fleet.briefing={style}"])
+        envs, out = [], tmp_path / style
+        out.mkdir()
+        monkeypatch.setattr(runner, "make_env", lambda *a, **k: envs.append(make_env(*a, **k)) or envs[-1])
+        s = runner.run_episode(cfg, 4, out, verbose=False, yardstick=False)
+        traj = [json.loads(x) for x in (out / s["run_id"] / "trajectories.jsonl").read_text().splitlines()]
+        return envs[-1], traj
+
+    (eg, tg), (eo, to) = play("guided"), play("open")
+    assert eg.world.history == eo.world.history
+    calls = lambda traj: [(t["month"], t["role"], [(c["tool"], c["args"], c["result"].get("ok"),
+                                                    c["result"].get("refused")) for c in t["tool_trace"]])
+                          for t in traj]
+    assert calls(tg) == calls(to)
+    brief = lambda traj, role: next(t["prompt"][1]["content"] for t in reversed(traj) if t["role"] == role)
+    assert "- reserve $" in brief(to, "mayor") and "- reserve $" not in brief(tg, "mayor")
+    for role in ROLES:
+        assert not _forbidden(brief(to, role)), (role, _forbidden(brief(to, role))[:3])
 
 
 def test_open_region_states_deals_without_calls():
@@ -293,9 +470,10 @@ def test_open_on_more_hand_overs(seed):
         assert re.search(r"- \$[\d.,k]+ in department funds", data["briefings"][d])
         assert "## Ready sites" in data["briefings"][d] and "## Key metrics" in data["briefings"][d]
     assert "- reserve $" in data["briefings"]["mayor"] and "; options: " in data["briefings"]["mayor"]
-    guided = run_script(env, style="guided")
-    assert [(r, n, res.get("ok"), res.get("refused")) for r, n, _, res in data["calls"]] == \
-           [(r, n, res.get("ok"), res.get("refused")) for r, n, _, res in guided["calls"]]
+    assert _same_play(data["calls"], run_script(env, style="guided")["calls"])
+    money = mayor_money(copy.deepcopy(env), "open")
+    assert not _money_leaks(money), _money_leaks(money)[:5]
+    assert _same_play(money, mayor_money(copy.deepcopy(env), "guided"))
 
 
 @pytest.mark.slow

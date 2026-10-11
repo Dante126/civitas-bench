@@ -116,9 +116,12 @@ class ScriptedFleetAgent(Agent):
         if self.env is None:
             raise RuntimeError("ScriptedFleetAgent.act before bind(env)")
         env, role = self.env, self.role
-        box = ToolBox(env, role)
+        # the briefing and tool results render in the configured style (bench/envs.py's probe hashes them); the
+        # policy reads neither text and confirms refusals by their kind, so it plays the same in either style
+        style = self.cfg.briefing
+        box = ToolBox(env, role, style=style)
         turn = _Turn(box, self.cfg.max_steps)
-        brief = briefing(env, role, mode=self.cfg.mode)
+        brief = briefing(env, role, mode=self.cfg.mode, style=style)
         d = self.decide(turn.call)
         if role == "mayor":
             self._plan(turn)

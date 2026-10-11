@@ -1962,10 +1962,7 @@ def _not_now(env, fleet: FleetState, m: DeptMoney, why: str, what: str = "") -> 
 
 def ask_refusal(a: Ask) -> str:
     """send_message's hold-back of a money ask the mayor can't fund now (ToolBox._ask_refusal): why, the plan note,
-    when to ask and what to do this turn instead (_not_now)."""
-    if is_open():
-        return (f"not sent: {a.why}, so a money ask now gets a no. To post this message anyway, send it to the mayor "
-                "again.")
+    when to ask and what to do this turn instead (_not_now). Guided only: the open style holds no ask back."""
     return (f"not sent: {a.why}, so a money ask now gets a no" + (f"; {a.plan}" if a.plan else "") + ". "
             + (f"Ask when {a.when}. " if a.when else "")
             + f"Instead this turn: {a.instead}; put what you need in your end_turn report (the mayor reads it). To post "
@@ -2023,9 +2020,13 @@ def taken_back(m: DeptMoney) -> str:
     """What a department holds after a take-back against what it keeps (DeptMoney.keep), for its result: "planning now
     $1,240, what it keeps (nothing idle)", "... $508 over what it keeps" (": still idle" when it is), or "... $1,316
     below what it keeps (2 x its $658 spending)" (keep_why), then ": it can't pay for a road into open land and
-    zoning it ($640)" when what is left is short of its next build (DeptMoney.cant_pay)."""
+    zoning it ($640)" when what is left is short of its next build (DeptMoney.cant_pay). Open style (fmt.py): the funds
+    against the keep as a number, "police now $6,932, $868 below the $7,800 it keeps": no keep reason, no build."""
     over = round(m.funds - m.keep)
     head = f"{m.dept} now {money(m.funds)}, "
+    if is_open():
+        return head + (f"{money(over)} over" if over > 0 else f"{money(-over)} below" if over < 0 else "at") + \
+            f" the {money(m.keep)} it keeps"
     if over > 0:
         return head + f"{money(over)} over what it keeps" + (": still idle" if m.idle else "")
     if over < 0:
@@ -4607,12 +4608,15 @@ class ToolBox:
                 "the reserve keeps the city solvent and pays for first buildings, supply and planning's road when they "
                 "come (none waits now)")
         if is_open():                       # the rule, no queue of what to fund first
-            wait = ("the reserve is kept for solvency, first buildings, supply and planning's road, which may use the "
-                    f"treasury down to {money(RESERVE_MIN)}")
+            wait = ("the reserve is kept for solvency, first buildings, supply, levees and planning's road, which may "
+                    f"use the treasury down to {money(RESERVE_MIN)}")
         idle = ", ".join(f"{d} {money(v)}" for d, v in f.idle.items() if d != dept)
         buys = (f"for {m.what}" if m.kind == KINDS[2] else
                 f"buys nothing now ({dept}: {m.state or 'nothing ready to buy'}) and" if m.kind == KINDS[4] else
                 f"buys nothing now ({dept} holds {money(m.idle)} idle) and")
+        if is_open():                       # the guard's classification, not what the money would buy
+            held = f" ({dept} holds {money(m.idle)} above what it keeps)" if m.kind == KINDS[5] else ""
+            buys = f"to {dept}{held} is not for a first building, supply, a levee or planning's road and"
         return (f"this top-up {buys} leaves the treasury at {money(after)}, {money(keep - after)} under the "
                 f"{money(keep)} reserve{reserve_why(w)}; {wait}"
                 + (advice(f"; take back idle money first ({idle})", f"; idle money elsewhere: {idle}") if idle else "")
@@ -4646,6 +4650,9 @@ class ToolBox:
         todo = advice(f": take back {money(m.idle + top)}" if m.idle or top > 0 else ": leave its funds")
         took = -sum(a for d, a in self._allocations() if d == dept and a < 0)
         took = f"; you already took back {money(took)} from it this turn" if took > 0 else ""
+        if is_open():                       # the keep as the guard's rule: no reason naming a build, no "can't pay"
+            return (f"a take-back must leave {dept} the {money(m.keep)} it keeps; this one leaves {money(left)}{took}; "
+                    f"{free}. To take it anyway, repeat this exact call with confirm: true.")
         cant = m.cant_pay(left)
         return (f"that takes {dept} below the {money(m.keep)} it keeps ({m.keep_why})"
                 + (f", so it can't pay for {cant}" if cant else "")
@@ -4691,6 +4698,13 @@ class ToolBox:
             need = math.ceil(fund + gap)
             if amount - need < LOAN_SLACK:
                 return own + anyway if own else None
+            if is_open():                   # the guard's rule, no amount "needed" from the to-fund model
+                over = (f"a loan may pay only for the first buildings, supply and planning's road that wait and for "
+                        f"keeping the treasury at the {money(keep)} reserve through operations to your next turn, and "
+                        f"this {money(amount)} loan is more than those add up to")
+                if own:
+                    return f"{own} Also, {over}." + anyway
+                return f"{over}; it costs {interest}/month interest until repaid {debt}." + anyway
             parts = ([f"{money(fund)} for first/supply and growth"] * bool(firsts)
                      + [f"{money(math.ceil(gap))} to keep the treasury at the {money(keep)} reserve"
                         + (f" through operations of {signed(-bills, money)} to your next turn" if bills else "")] * bool(gap))
@@ -4702,6 +4716,11 @@ class ToolBox:
                     + advice(f": borrow {money(need)} or less") + "." + anyway)
         waits = f"only another: {_some(extras, FUNDED_SHOWN)}" if extras else "nothing is ready to fund"
         none = f"no first building, supply or planning road is waiting ({waits})"
+        if is_open():                       # the guard's rule, not what waits or what the loan would buy
+            none = "no first building, supply or planning road is waiting, and a loan may pay only for those"
+            if own:
+                return f"{own} Also, {none}." + anyway
+            return f"{none}; this {money(amount)} loan costs {interest}/month interest until repaid {debt}." + anyway
         if own:
             return f"{own} Also, {none}: the loan would {buys}." + anyway
         return (f"{none}; this {money(amount)} loan would {buys} at {interest}/month interest until repaid {debt}"
@@ -5321,6 +5340,8 @@ class ToolBox:
             if m is None:                             # a department not in the game: nobody spends it
                 what = f"{dept} now {money(w.dept_funds[dept])} (not in this game)" if amount < 0 else \
                     f"{dept}: not in this game, so nothing spends it"
+            elif is_open() and amount > 0:            # nothing on what it buys: the core message has its funds now
+                return f" | {where}"
             else:
                 what = taken_back(m) if amount < 0 else f"{dept}: {topped_up(m)}"
             return f" | {what}; {where}{still}"
@@ -5545,7 +5566,7 @@ class ToolBox:
         """Queue one council message per recipient (`to`: one address, or several separated by commas: recipients()),
         posted at the end of the turn, so per-role digests, the Team tab's threads and the mayor's Open requests see
         one message each. A department's money ask to the mayor it can't get now is held back once a turn
-        (_ask_refusal: the model only); sent to others too, only the mayor's copy is held back."""
+        (_ask_refusal: the model only, in the guided style); sent to others too, only the mayor's copy is held back."""
         if not text.strip():
             raise ToolError("text is empty")
         from .region import message_targets
@@ -5563,9 +5584,10 @@ class ToolBox:
     def _ask_refusal(self, text: str) -> str:
         """The model's department (max_steps given: ToolAgent) sending the mayor a money ask (collab.is_request and
         MONEY) it can't get now (mayor_ask: not first/supply, growth or another building the money covers): the
-        refusal, once a turn (the next send_message posts it); "" otherwise. The scripted fleet never sees it."""
-        if (self.role == "mayor" or self.max_steps is None or self.held_ask or not is_request("mayor", text)
-                or not MONEY.search(text)):
+        refusal, once a turn (the next send_message posts it); "" otherwise. The scripted fleet never sees it, nor does
+        the open briefing style (fmt.py): there every ask goes through and the mayor decides."""
+        if (self.role == "mayor" or self.max_steps is None or self.held_ask or is_open()
+                or not is_request("mayor", text) or not MONEY.search(text)):
             return ""
         a = mayor_ask(self.env, self.fleet, self.role)
         if a.ok:

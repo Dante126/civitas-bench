@@ -35,6 +35,7 @@ from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
 from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
 from .tools import TIER_UP, enrol_text, upgrade_line
 from .tools import AHEAD_MONTHS, BANK_BUSY, RESERVE_MIN, _offers, core_fact, reserve_why, tier_name
+from .tools import LINK_PURPOSES, SUPPLEMENTARY, _cells_busy, buildings_of, capped_unlinked
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -426,10 +427,32 @@ def _blocked(m: DeptMoney, unclaimed: tuple[str, ...] = ()) -> str:
 OPTIONS_SHOWN = 4          # a department's priced options on the mayor's open Departments line before "+N more"
 
 
+FIRST_TAG = "the city has none"     # an option the reserve guard counts as a first building (_first_tag)
+SUPPLY_TAG = "supply"               # a utilities option for a supply the guard counts as wanted
+
+
+def _first_tag(w, d: str, p: str, pr) -> str:
+    """The open Departments option's tag for what the reserve guard lets use the treasury down to RESERVE_MIN, as
+    first_build classifies it (DeptMoney.kind "first/supply"): "supply" for a utilities purpose while its supply is
+    wanted (_wanted: 90% used now or within AHEAD_MONTHS, or no pump / outlet), "the city has none" for a primary
+    first building the city lacks (Price.first, buildings_of 0, not SUPPLEMENTARY or per tile, wanted; a jail only
+    while its cells are busy) and for transport's first link to the region while demand is capped without one; ""
+    otherwise. Review of the open track: the mayor couldn't tell which top-ups the guard let through."""
+    if d == "utilities":
+        return SUPPLY_TAG if _wanted(w, p) else ""
+    if d == "transport" and p in LINK_PURPOSES and capped_unlinked(w):
+        return FIRST_TAG
+    if (pr.first and not pr.per_tile and p not in SUPPLEMENTARY and buildings_of(w, pr.name) == 0 and _wanted(w, p)
+            and (p != "jail" or _cells_busy(w))):
+        return FIRST_TAG
+    return ""
+
+
 def _options(env, d: str) -> str:
     """The open style's (fmt.py) Departments suffix: what `d` could build now, each option with its price and upkeep
-    (its Ready sites' prices: ready_prices; planning's road into open land with its zoning, road_price), its best tier
-    upgrade on offer, and its first buildings blocked for lack of land; no needs line, no amount to fund."""
+    (its Ready sites' prices: ready_prices; planning's road into open land with its zoning, road_price) and the reserve
+    guard's tag (_first_tag), its best tier upgrade on offer, and its first buildings blocked for lack of land; no
+    needs line, no amount to fund."""
     w = env.world
     obs = role_obs(env, d)
     lists = site_lists(w, d, obs)
@@ -440,8 +463,8 @@ def _options(env, d: str) -> str:
         if pr.building in seen:
             continue
         seen.add(pr.building)
-        up = f" (+{money(pr.upkeep)}/month)" if round(pr.upkeep) else ""
-        items.append(f"{pr.building} {pr.text()}{up}")
+        tags = [f"+{money(pr.upkeep)}/month"] * bool(round(pr.upkeep)) + [t for t in [_first_tag(w, d, p, pr)] if t]
+        items.append(f"{pr.building} {pr.text()}" + (f" ({', '.join(tags)})" if tags else ""))
     offers = _offers(obs, d) if d in TIER_UP or d == "education" else []
     if offers:
         o = offers[0]
@@ -467,8 +490,10 @@ def _reserve_line(w, f: Funding, cf: CashFlow) -> str:
     where = f"{money(gap)} above it" if gap > 0 else f"{money(-gap)} under it" if gap < 0 else "at it"
     ops = f"; operations {signed(cf.ops_per_month, money)}/month" if cf.since is not None else ""
     return (f"- reserve {money(f.reserve)}{reserve_why(w)}: the treasury is {where}{ops}. allocate_budget refuses a "
-            f"top-up that leaves the treasury under the reserve unless it pays for a department's first building, "
-            f"its supply or planning's road (those may use the treasury down to {money(RESERVE_MIN)})")
+            f"top-up that leaves the treasury under the reserve unless the department's funds are below the price of "
+            f"its cheapest option marked \"{FIRST_TAG}\", its supply (\"{SUPPLY_TAG}\"), a levee or planning's road, "
+            f"or its first building is blocked for lack of land (those may use the treasury down to "
+            f"{money(RESERVE_MIN)})")
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
