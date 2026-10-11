@@ -5799,9 +5799,15 @@ class ToolBox:
             if reqs:
                 return {"ok": False, "refused": "open_requests",
                         "error": (requests_reminder if self.role == "mayor" else planning_reminder)(reqs)}
+        self.ended = True
+        self.close(report)
+        return {"ok": True, "message": "turn ended"}
+
+    def close(self, report: str) -> None:
+        """end_turn's record of the turn's report, without its refusals; `ended` is end_turn's to set. A turn cut at
+        the token budget (fleet/budget.py) ends with this, so the mayor reads why the department said nothing."""
         report = report.strip()[:REPORT_MAX_CHARS]
-        self.ended, self.report = True, report
+        self.report = report
         self.fleet.reports[self.role] = report
         self.fleet.record(self.world.month, self.role, "report", text=report)
-        return {"ok": True, "message": "turn ended"}
 

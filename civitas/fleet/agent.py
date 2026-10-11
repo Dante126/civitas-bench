@@ -3,7 +3,8 @@
 Actions run inside `act()` (through `ToolBox`), so the returned `Decision` carries their results in `executed`
 and the council messages to post; `env.apply` only logs them. In `game.simultaneous` mode fleet agents therefore
 act on the state left by the roles before them. In region mode the agent binds to its own city's env (`bind`), so
-the region runs it like any other agent of that city (fleet/region.py).
+the region runs it like any other agent of that city (fleet/region.py). With `[fleet] turn_budget` (civitas-v3) the
+turn also ends before a model call that wouldn't fit the token budget (fleet/budget.py).
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from ..agents.llm_client import ChatClient, ProviderConfig
 from ..core.decision import Decision
 from ..core.region import RegionEnv
 from .briefing import briefing, system_prompt
+from .budget import CUT_REPORT, MESSAGE_CHARS, TurnBudget
 from .config import FleetAgentConfig
 from .fmt import TOOL_MESSAGE_CHARS, briefing_style
 from .memory import FleetState
@@ -118,6 +120,12 @@ def _slim(res: dict) -> dict:
     return out
 
 
+def _reply_chars(out: dict) -> int:
+    """A reply's characters (content, reasoning, tool calls): the token budget's estimate when usage is missing."""
+    return (len(out.get("content") or "") + len(out.get("reasoning") or "")
+            + len(json.dumps(out.get("tool_calls") or [], separators=(",", ":"))))
+
+
 def _budget(res: dict, left: int) -> dict:
     """The result with the tool calls left this turn, and a wrap-up note when few are."""
     out = {**res, "steps_left": left}
@@ -184,14 +192,20 @@ class ToolAgent(Agent):
             # Next lines in its action results
             box = ToolBox(env, role, branch_dezone=True, max_steps=cfg.max_steps, next_line=True, style=cfg.briefing)
             messages = [{"role": "system", "content": self.system},
-                        {"role": "user", "content": briefing(env, role, mode=cfg.mode, style=cfg.briefing)}]
+                        {"role": "user", "content": briefing(env, role, mode=cfg.mode, style=cfg.briefing,
+                                                             turn_budget=cfg.turn_budget)}]
             tools = box.schemas()
         except Exception as e:                       # a briefing bug costs the role this turn, not the run
             return self._failed_turn(f"briefing_error: {type(e).__name__}: {e}", "briefing_error")
         trace, reasoning, finishes = [], [], []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         nudged, cuts, error, reason, latency, step, recovered = False, 0, None, "max_steps", 0.0, 0, 0
+        tb = TurnBudget(cfg.turn_budget, cfg.budget_reserve, tools) if cfg.turn_budget else None   # civitas-v3
         while len(trace) < cfg.max_steps:
+            sent = tb.chars(messages) if tb is not None else 0
+            if tb is not None and not tb.fits(sent):    # the next reply wouldn't fit: the turn ends before it
+                tb.cut, reason = True, "turn_budget"
+                break
             live.emit(env, role, "think", step=step)
             try:
                 out = self.client.chat(cfg.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
@@ -204,6 +218,8 @@ class ToolAgent(Agent):
             latency += out.get("latency_s") or 0.0
             for k in usage:
                 usage[k] += int((out.get("usage") or {}).get(k) or 0)
+            if tb is not None:
+                tb.record(out.get("usage"), sent, _reply_chars(out))
             if out.get("reasoning"):
                 reasoning.append(f"[step {step}] {out['reasoning']}")
             finish = out.get("finish_reason")
@@ -241,8 +257,12 @@ class ToolAgent(Agent):
                                   "result": _slim(res)})
                     if not box.ended:                    # end_turn's own result needs no budget
                         res = _budget(res, cfg.max_steps - len(trace))
-                messages.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]})
+                    if tb is not None:
+                        trace[-1]["tokens_left"] = max(0, tb.left)
+                content = json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]
+                if tb is not None and not box.ended:     # "budget left: ~N tokens" (and a wrap-up note when low)
+                    content += tb.suffix(tb.chars(messages) + len(content) + MESSAGE_CHARS)
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": content})
             step += 1
             if box.ended:
                 reason = "end_turn"
@@ -252,6 +272,8 @@ class ToolAgent(Agent):
                 break
             if nudge:
                 messages.append({"role": "user", "content": nudge})
+        if tb is not None and tb.cut and not box.ended:
+            box.close(CUT_REPORT)                    # end_turn's record of a report, without its refusals
         for k in usage:
             self.usage[k] += usage[k]
         self.usage["tool_calls"] += len(trace)
@@ -268,6 +290,8 @@ class ToolAgent(Agent):
                   "reasoning": "\n\n".join(reasoning),
                   "response": box.report or (said[-1] if said else ""),   # the end_turn report, else the last reply
                   "latency_s": round(latency, 3)}
+        if tb is not None:                           # civitas-v3 only: a v2 turn logs what it always did
+            d.meta.update({"turn_budget": tb.limit, "budget_used": tb.used, "budget_cut": tb.cut})
         return d
 
     def _failed_turn(self, error: str, reason: str) -> Decision:

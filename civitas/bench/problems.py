@@ -17,8 +17,8 @@ from pathlib import Path
 
 from ..fleet.report import CAUSES, _key
 
-BAD_ENDS = {"max_steps": "step limit", "no_tool_calls": "no tool call", "turn_tokens": "token budget",
-            "length": "cut at max_tokens"}
+BAD_ENDS = {"max_steps": "step limit", "no_tool_calls": "no tool call", "turn_tokens": "completion-token limit",
+            "turn_budget": "token budget", "length": "cut at max_tokens"}
 GUARDS_NOT_REPEATS = {"repeat"}
 ACTION_LIMIT = "action limit reached"          # a refused repeat of a failed call is the agent's mistake, not a guard's
 

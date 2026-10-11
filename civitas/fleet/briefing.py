@@ -19,6 +19,7 @@ from ..bench.scoring import ScoringConfig
 from ..core.actions import zone_price
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
+from .budget import briefing_line, budget_rule
 from .config import FleetAgentConfig
 from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, advice, briefing_style, cash, cut, is_open, money, months, num, pct, \
     signed
@@ -107,7 +108,7 @@ read the error and fix the cause (another site, a cheaper option, wait for an un
 lessons) and the game's history log. Write down what you learn.
 - When you are done, call end_turn with a short report (what you did, what you need).
 - Limits per turn: at most {max_steps} tool calls; at that limit the turn ends and completed actions stay. \
-{actions}
+{actions}{budget_rule}
 - Each tool result shows steps_left; repeating an identical call returns the earlier result (look-ups) or is \
 refused (a failed action or an invalid call).
 - The mode in your briefing header: autonomous = no coach will intervene during the game; supervised = your coach \
@@ -1032,7 +1033,8 @@ def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_ev
                  lookups=", ".join(LOOKUP_NOTES.get((role, t), t) for t in LOOKUPS
                                    if t != "find_sites" or SITE_PURPOSES[role] or role == "mayor"),
                  coords="" if role == "mayor" else " Coordinates: x = column (0 = west), y = row (0 = north).",
-                 max_steps=cfg.max_steps, actions=cap + " (look-ups still work; call end_turn)."),
+                 max_steps=cfg.max_steps, actions=cap + " (look-ups still work; call end_turn).",
+                 budget_rule=budget_rule(cfg.turn_budget)),
              f"# Your role: {spec['title']}\n{spec['mission']}",
              "# Game rules\n" + rules.format(turn_order=" -> ".join(TURN_ORDER), months=total_months,
                                              target_pop=target_pop or ScoringConfig.target_population).rstrip()]
@@ -1044,14 +1046,18 @@ def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_ev
     return "\n\n".join(parts)
 
 
-def briefing(env, role: str, *, mode: str = "autonomous", mark: bool = True, style: str | None = None) -> str:
+def briefing(env, role: str, *, mode: str = "autonomous", mark: bool = True, style: str | None = None,
+             turn_budget: int = 0) -> str:
     """The first user message of `role`'s turn. Syncs the fleet log with the latest month (idempotent) and, unless
     `mark=False`, marks the turn so the next briefing's "since your last turn" digest starts from here. `style`: the
-    briefing style ("guided" / "open", fmt.py; None: the one in force, guided by default)."""
+    briefing style ("guided" / "open", fmt.py; None: the one in force, guided by default). `turn_budget` (a model's
+    `[fleet] turn_budget`, civitas-v3; 0 = none) adds its line to the header."""
     fleet = FleetState.of(env)
     fleet.sync(env)
     with briefing_style(style):
         L = _header(env, role, mode)
+        if turn_budget:
+            L.insert(2, briefing_line(turn_budget))
         L += _mayor(env, fleet) if role == "mayor" else _department(env, fleet, role)
         L += region_lines(env, role)              # region mode: neighbours, links, flows, deals ([] in one city)
         L += ["", _milestone(env, role)]

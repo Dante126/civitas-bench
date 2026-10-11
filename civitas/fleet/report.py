@@ -28,7 +28,7 @@ from .memory import DEPARTMENTS, FleetState
 from .tools import ALL_ACTIONS, BANK_BUSY, OFF_TIER_SPECS, OPEN_BLOCKED, ROAD_NAME, SITE_BUILDS, SITE_PURPOSES, \
     SUPPLEMENTARY, SUPPLY_OF, building_name
 
-LIMIT_REASONS = ("max_steps", "turn_tokens")
+LIMIT_REASONS = ("max_steps", "turn_tokens", "turn_budget")
 ERROR_REASONS = ("api_error", "briefing_error")     # turns cut short by an error, not the model
 REPEATED_FAILURES = 3
 FUNDS_MULTIPLE, FUNDS_MONTHS, UNUSED_FLOOR = 2.0, 3, 1000.0
@@ -244,6 +244,7 @@ def _role_stats(role: str, rows: list[dict], fleet: FleetState) -> dict:
             "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
             "completion_tokens": sum(r["completion_tokens"] for r in rows),
             "limit_turns": sum(r["finish_reason"] in LIMIT_REASONS for r in rows),
+            "budget_cuts": sum(r["finish_reason"] == "turn_budget" for r in rows),   # civitas-v3's token budget
             "length_stops": sum(r["length_stops"] for r in rows),
             "api_errors": sum(r["finish_reason"] in ERROR_REASONS for r in rows),
             "top_failures": groups[:max(3, sum(g["count"] >= REPEATED_FAILURES for g in groups))],
@@ -534,7 +535,7 @@ def _hints(roles: dict, rows: list[dict], fleet: FleetState, history: list[dict]
             hints.append({"kind": "limit", "role": role, "count": st["limit_turns"], "turns": st["turns"],
                           "text": f"{role}: {st['limit_turns']} of {st['turns']} turns "
                                   f"({100 * st['limit_turns'] / st['turns']:.0f}%) ended on the step or token limit - "
-                                  "raise max_steps / turn_tokens or tell it to end_turn sooner"})
+                                  "raise max_steps / turn_tokens / turn_budget or tell it to end_turn sooner"})
     return hints
 
 

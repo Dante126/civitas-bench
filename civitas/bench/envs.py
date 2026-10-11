@@ -18,8 +18,9 @@ no model) and hashes, per part:
   `CannedClient`, a canned "model" with ChatClient's `.chat` interface and no network: a plain-text reply, a reply
   cut at max_tokens, the role's scripted decision for that turn one tool call per reply (fleet/scripted.py's
   `decide` / `plan_args`; a guard refusal the policy means repeated with confirm: true), end_turn twice, then plain
-  text. The part hashes every message list the agent sends it (system prompt, briefing, tool results, nudges,
-  refusals) and the copy's metrics after that month. In a region (whose yardstick plays plain scripted agents) the
+  text, each reply with a provider-like usage (so civitas-v3's `[fleet] turn_budget` counts and may cut the turn).
+  The part hashes every message list the agent sends it (system prompt, briefing, tool results, nudges, refusals)
+  and the copy's metrics after that month. In a region (whose yardstick plays plain scripted agents) the
   canned model sends the plain agent's decision instead, city by city.
 A refactor or a comment leaves it alone; a sim, briefing, tool or config change moves the part it touches. Seeds run
 in a process pool, one fresh process per seed (balance overrides are global state: `_isolated_map`); a probe is
@@ -158,6 +159,9 @@ MAX_MONTHS = 12             # months the copy plays at most until every model ro
 CANNED_TEXT = "Let me read the briefing before I act."              # (a): no tool call, so the nudge
 CANNED_CUT = "Weighing every ready site against the funds, one by one, before"   # (b): cut at max_tokens
 CANNED_DONE = "Nothing more this turn."                              # after the script: the turn ends
+CANNED_CHARS = 4            # the canned model's usage: prompt tokens = request characters / this (messages, tools) ...
+CANNED_THINKING = 400       # ... completion tokens = this + the reply's characters / CANNED_CHARS (max_tokens when cut)
+BUDGET_META = ("turn_budget", "budget_used", "budget_cut")   # a turn's token budget (civitas-v3), when it has one
 _REFUSED = re.compile(r'"refused":\s*"([a-z_]+)"')
 
 
@@ -180,7 +184,7 @@ def _refusal(content) -> str | None:
 
 
 def _reply(content: str, finish: str, *, reasoning: str = "", call: tuple | None = None) -> dict:
-    """A reply in ChatClient.chat's shape."""
+    """A reply in ChatClient.chat's shape (its usage set by CannedClient.chat)."""
     from ..fleet.scripted import _plain
     calls = []
     if call:
@@ -191,13 +195,25 @@ def _reply(content: str, finish: str, *, reasoning: str = "", call: tuple | None
             "usage": {"prompt_tokens": 0, "completion_tokens": 0}, "latency_s": 0.0, "finish_reason": finish}
 
 
+def _usage(out: dict, messages: list, tools: list, max_tokens: int) -> dict:
+    """`out` with the usage a provider would report for it (deterministic: characters / CANNED_CHARS)."""
+    sent = len(canonical(messages)) + len(canonical(tools))
+    said = (len(out.get("content") or "") + len(out.get("reasoning") or "")
+            + len(canonical(out.get("tool_calls") or [])))
+    done = max_tokens if out.get("finish_reason") == "length" else CANNED_THINKING + said // CANNED_CHARS
+    return {**out, "usage": {"prompt_tokens": sent // CANNED_CHARS, "completion_tokens": int(done)}}
+
+
 class CannedClient:
     """The probe's stand-in for a ToolAgent's `client` (ChatClient's `.chat` interface; not a ChatClient, no network).
     Its "model", one reply per request: (a) plain text without a tool call (ToolAgent nudges), (b) a reply cut at
     max_tokens (the length nudge), (c) the role's scripted calls from `script()` (computed at the first of them),
     one per reply, a guard refusal the policy means (fleet/scripted.py:CONFIRMED) repeated once with confirm: true,
     then plain text, which ends the turn (the nudge is spent). `script` ends with end_turn twice (a first one may be
-    refused). Every request's messages and tools go into the hash `h`."""
+    refused). Every request's messages and tools go into the hash `h`. Each reply reports usage as a provider would
+    (`_usage`: from the request's and the reply's characters, max_tokens for the cut reply), so a `[fleet]
+    turn_budget` (civitas-v3, fleet/budget.py) counts and cuts the canned turn as it would a model's; v2's
+    turn_tokens (80k) is never reached and nothing else reads usage, so v2's model part is unchanged."""
 
     def __init__(self, agent, script, h):
         self.agent, self.script, self.h = agent, script, h
@@ -211,6 +227,9 @@ class CannedClient:
             raise RuntimeError(f"a canned turn asked for more than {MAX_CHATS} replies")
         self.h.update(canonical({"messages": messages, "tools": _h((extra or {}).get("tools") or [])}).encode())
         self.h.update(b"\n")
+        return _usage(self._next(messages), messages, (extra or {}).get("tools") or [], max_tokens)
+
+    def _next(self, messages: list) -> dict:
         if self.n == 1:
             return _reply(CANNED_TEXT, "stop")
         if self.n == 2:
@@ -280,7 +299,8 @@ def _canned_turn(cfg: dict, env, role: str, agent, obs: dict, h) -> object:
     m = d.meta or {}
     h.update(canonical({"role": role, "thinking": d.thinking, "error": getattr(d, "parse_error", None),
                         **{k: m.get(k) for k in ("finish_reason", "finish_reasons", "steps", "ended",
-                                                 "length_stops", "recovered_calls", "response")}}).encode())
+                                                 "length_stops", "recovered_calls", "response")},
+                        **{k: m[k] for k in BUDGET_META if k in m}}).encode())   # v3's budget; v2 has none
     return d
 
 

@@ -83,6 +83,25 @@ def test_a_model_only_change_moves_the_model_part(suite, probed, monkeypatch):
     assert V.diff(probed, V.probe(suite, workers=0, cache=False, sets=SETS)) == ["model"]
 
 
+def test_the_token_budget_moves_the_prompts_and_the_model_part(suite, probed, monkeypatch):
+    """civitas-v3's [fleet] turn_budget: the rule in the system prompt and what the canned turn meets (its usage
+    counted, "budget left" in every result, the cut) move; the scripted game doesn't. Budget 0 moves only the config,
+    and the canned model's usage is what lets the budget bind (a 60k budget cuts some canned turns, not all)."""
+    assert V.diff(probed, V.probe(suite, workers=0, cache=False, sets=[*SETS, "fleet.turn_budget=0"])) == ["config"]
+    cuts = []
+    from civitas.fleet import agent
+    real = agent.ToolAgent.act
+    monkeypatch.setattr(agent.ToolAgent, "act", lambda self, obs: cuts.append(real(self, obs)) or cuts[-1])
+    p = V.probe(suite, workers=0, cache=False, sets=[*SETS, "fleet.turn_budget=60000"])
+    assert V.diff(probed, p) == ["config", "prompts", "model"]
+    turns = [d.meta for d in cuts if d.meta.get("messages")]
+    assert turns and all(m["turn_budget"] == 60000 and m["budget_used"] > 0 for m in turns)
+    assert any(m["budget_cut"] for m in turns) and any(m["finish_reason"] == "end_turn" for m in turns)
+    out = V._usage(V._reply("", "length", reasoning="x"), [{"role": "user", "content": "y" * 400}], [], 16000)
+    assert out["usage"] == {"prompt_tokens": (len(V.canonical([{"role": "user", "content": "y" * 400}])) + 2) // 4,
+                            "completion_tokens": 16000}
+
+
 def test_the_canned_model_is_never_a_real_client(monkeypatch):
     import hashlib
     from civitas.agents.llm_client import ChatClient, LLMError
@@ -181,6 +200,10 @@ def test_the_shipped_version_and_suite():
     s = E.load_suite(ROOT / E.DEFAULT_SUITE)
     assert s.env == "civitas-v2" and s.baseline_model == "trinity-large-thinking"
     assert E.load_suite(ROOT / "configs/eval_open.toml").env == "civitas-v2-open"
+    v3, v3o = E.load_suite(ROOT / "configs/eval_v3.toml"), E.load_suite(ROOT / "configs/eval_v3_open.toml")
+    assert (v3.env, v3o.env) == ("civitas-v3", "civitas-v3-open")          # v2 + the token budget (fleet/budget.py)
+    assert v3.baseline_model == v3o.baseline_model == "trinity-large-thinking"
+    assert [e.seeds for e in v3.entries] == [e.seeds for e in v3o.entries] == [e.seeds for e in s.entries]
     assert E.load_suite(ROOT / "configs/eval_singles.toml").env == "civitas-v1"      # v1's frozen suite stays
     assert E.load_suite(ROOT / "configs/eval_late.toml").env is None
     rec = V.load_env("civitas-v1")

@@ -23,8 +23,13 @@ What it mirrors of fleet/agent.py:ToolAgent.act, and how:
 - done when end_turn succeeds, after max_steps tool calls, or (reply only) on a reply without a call past the nudge;
   `end_at_action_cap=True` also ends the turn once the action cap is reached (ToolAgent doesn't: after the cap the
   model can still message and report, and a message to the mayor changes what the scripted mayor funds).
-What is the trainer's: turn_tokens and max_tokens (no token counts here), sampling, and whether to send the nudge
-messages `reply` appends (`step` sends none).
+- the token budget (civitas-v3, fleet/budget.py): `turn_budget` (None: the task config's `[fleet] turn_budget`, 0 =
+  off for every v2 bank) gives the system prompt its rule and the briefing its line, and then each reply's `usage`
+  (as the provider reported it; estimated from characters when none is given) counts against it, every tool result
+  ends with ToolAgent's "budget left" line, and the turn is done ("turn_budget", ToolAgent's cut report) once the next
+  reply wouldn't fit: check `done` before sampling it, as ToolAgent checks before each call.
+What is the trainer's: turn_tokens and max_tokens, sampling, and whether to send the nudge messages `reply` appends
+(`step` sends none).
 """
 from __future__ import annotations
 
@@ -34,7 +39,8 @@ import threading
 from collections import OrderedDict
 
 from ..core.decision import Decision
-from ..fleet.agent import LENGTH_NUDGE, LENGTH_NUDGES, NUDGE, _budget, _norm_call, _recover, _slim
+from ..fleet.agent import LENGTH_NUDGE, LENGTH_NUDGES, NUDGE, _budget, _norm_call, _recover, _reply_chars, _slim
+from ..fleet.budget import CUT_REPORT, MESSAGE_CHARS, TurnBudget
 from ..fleet.fmt import TOOL_MESSAGE_CHARS
 from . import bank as B
 from . import reward as R
@@ -47,13 +53,19 @@ _LOCK = threading.Lock()                               # evaluate.py plays tasks
 
 class TaskEpisode:
     def __init__(self, task: B.Task | None = None, *, end_at_action_cap: bool = False, check: bool = True,
-                 row: dict | None = None, cfg: dict | None = None, blob: bytes | None = None):
+                 row: dict | None = None, cfg: dict | None = None, blob: bytes | None = None,
+                 turn_budget: int | None = None):
         if task is not None:
             row, cfg = task.row, task.cfg
         if row is None or cfg is None:
             raise ValueError("TaskEpisode needs a bank task (or a row, its config and its snapshot bytes)")
         self.task, self.row, self.cfg, self._blob = task, row, cfg, blob
         self.end_at_action_cap, self.check = end_at_action_cap, check
+        if turn_budget is not None and (isinstance(turn_budget, bool) or not isinstance(turn_budget, int)
+                                        or turn_budget < 0):
+            raise ValueError(f"turn_budget must be a whole number of tokens (0 = off), got {turn_budget!r}")
+        self.turn_budget = turn_budget          # None: the task config's [fleet] turn_budget
+        self.budget: TurnBudget | None = None
         self.env = self.agents = self.box = None
         self.trace: list[dict] = []
         self.messages: list[dict] = []
@@ -74,7 +86,10 @@ class TaskEpisode:
     @property
     def fleet_cfg(self):
         from ..fleet.config import fleet_agent_config
-        return fleet_agent_config(self.cfg, self.role)
+        fc = fleet_agent_config(self.cfg, self.role)
+        if self.turn_budget is not None:
+            fc.turn_budget = self.turn_budget
+        return fc
 
     def prepare(self):
         """The env (and scripted agents) at the role's turn: the snapshot, the roles before it this month played by
@@ -127,14 +142,18 @@ class TaskEpisode:
         self.system = agent.system
         self.box = ToolBox(self.env, self.role, branch_dezone=True, max_steps=fc.max_steps, next_line=True,
                            style=fc.briefing)
-        self.briefing = briefing(self.env, self.role, mode=fc.mode, style=fc.briefing)
+        self.briefing = briefing(self.env, self.role, mode=fc.mode, style=fc.briefing, turn_budget=fc.turn_budget)
         self.tools = self.box.schemas()
         self.max_steps = fc.max_steps
+        self.budget = TurnBudget(fc.turn_budget, fc.budget_reserve, self.tools) if fc.turn_budget else None
         self.messages = [{"role": "system", "content": self.system}, {"role": "user", "content": self.briefing}]
-        return {"task_id": self.row.get("task_id"), "role": self.role, "month": self.row["month"],
-                "style": fc.briefing, "system_prompt": self.system, "briefing": self.briefing, "tools": self.tools,
-                "messages": [dict(m) for m in self.messages], "max_steps": fc.max_steps,
-                "max_actions": self.env.cfg.max_actions_per_turn}
+        out = {"task_id": self.row.get("task_id"), "role": self.role, "month": self.row["month"],
+               "style": fc.briefing, "system_prompt": self.system, "briefing": self.briefing, "tools": self.tools,
+               "messages": [dict(m) for m in self.messages], "max_steps": fc.max_steps,
+               "max_actions": self.env.cfg.max_actions_per_turn}
+        if self.budget is not None:
+            out["turn_budget"] = self.budget.limit
+        return out
 
     # ---------------------------------------------------------------------------------------------- turn
     @property
@@ -156,15 +175,39 @@ class TaskEpisode:
             res = {"ok": False, "error": f"not run: tool-call limit reached ({self.max_steps} per turn)"}
         elif self.end_at_action_cap and self.capped:
             res = {"ok": False, "error": "not run: the action limit ended the turn"}
+        elif self.budget is not None and self.budget.cut:     # ToolAgent makes no further call
+            res = {"ok": False, "error": "not run: the turn's token budget ran out"}
         else:
             res = self.box.call(name, raw)
             self.trace.append({"step": self.replies, "finish_reason": None, "tool": name, "args": raw,
                                "result": _slim(res)})
             if not self.box.ended:
                 res = _budget(res, self.max_steps - len(self.trace))
+            if self.budget is not None:
+                self.trace[-1]["tokens_left"] = max(0, self.budget.left)
         self.last_result = res
         self._reason()
-        return json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]
+        content = json.dumps(res, separators=(",", ":"))[:TOOL_MESSAGE_CHARS]
+        if self.budget is not None and not self.box.ended:     # ToolAgent's "budget left" line
+            content += self.budget.suffix(self.budget.chars(self.messages) + len(content) + MESSAGE_CHARS)
+        return content
+
+    def _count(self, usage: dict | None, out: dict) -> None:
+        """Count one reply against the token budget (before its messages join the transcript)."""
+        if self.budget is not None:
+            self.budget.record(usage, self.budget.chars(self.messages), _reply_chars(out))
+
+    def _budget_check(self) -> None:
+        """ToolAgent's check before its next call: done ("turn_budget", the cut report) when that reply won't fit."""
+        b = self.budget
+        if b is not None and not self.done and not b.fits(b.chars(self.messages)):
+            b.cut, self.stopped, self.reason = True, True, "turn_budget"
+            self.box.close(CUT_REPORT)
+
+    @property
+    def budget_used(self) -> int | None:
+        """Tokens counted against the budget so far (None without one)."""
+        return self.budget.used if self.budget is not None else None
 
     def _reason(self) -> None:
         if self.box.ended:
@@ -174,26 +217,30 @@ class TaskEpisode:
         elif self.end_at_action_cap and self.capped:
             self.reason = "action_cap"
 
-    def step(self, name: str, arguments: str | dict | None = None) -> str:
+    def step(self, name: str, arguments: str | dict | None = None, *, usage: dict | None = None) -> str:
         """Run one tool call (arguments as the model sent them: JSON text, or a dict) and return the tool message
-        content; the transcript in `messages` gets the call and its result as a one-call reply."""
+        content; the transcript in `messages` gets the call and its result as a one-call reply. `usage`: the reply's
+        tokens, for the token budget."""
         raw = arguments if isinstance(arguments, str) else json.dumps(arguments if arguments is not None else {})
         cid = f"call_{len(self.trace)}_{self.replies}"
+        call = {"id": cid, "type": "function", "function": {"name": name, "arguments": raw}}
+        self._count(usage, {"tool_calls": [call]})
+        self.messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
         content = self._run(name, raw)
-        self.messages += [{"role": "assistant", "content": "",
-                           "tool_calls": [{"id": cid, "type": "function", "function": {"name": name,
-                                                                                       "arguments": raw}}]},
-                          {"role": "tool", "tool_call_id": cid, "content": content}]
+        self.messages.append({"role": "tool", "tool_call_id": cid, "content": content})
         self.replies += 1
+        self._budget_check()
         return content
 
     def reply(self, content: str = "", tool_calls: list | None = None, *, reasoning: str = "",
-              finish_reason: str | None = None, nudges: bool = True) -> list[str]:
+              finish_reason: str | None = None, nudges: bool = True, usage: dict | None = None) -> list[str]:
         """One assistant reply, handled as one iteration of ToolAgent's loop (module doc). Returns the tool message
-        contents in call order; `messages` gets the reply, the tool messages and any nudge (when `nudges`)."""
+        contents in call order; `messages` gets the reply, the tool messages and any nudge (when `nudges`). `usage`:
+        the reply's prompt / completion tokens as the provider reported them, for the token budget."""
         if self.box is None:
             raise RuntimeError("TaskEpisode: call reset() first")
         out = {"content": content or "", "reasoning": reasoning or "", "finish_reason": finish_reason}
+        self._count(usage, {**out, "tool_calls": list(tool_calls or [])})
         raw_calls = list(tool_calls or []) or _recover(out)
         pairs = [_norm_call(c, self.replies, i) for i, c in enumerate(raw_calls)]
         calls = [c for c, _ in pairs]
@@ -215,6 +262,7 @@ class TaskEpisode:
         self.replies += 1
         if nudge and nudges and not self.done:
             self.messages.append({"role": "user", "content": nudge})
+        self._budget_check()
         return results
 
     def replay(self, messages: list[dict], *, check: bool = False) -> list[dict]:

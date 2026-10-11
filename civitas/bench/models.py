@@ -48,7 +48,8 @@ from ..agents.llm_client import DEFAULT_TEMPERATURE, ChatClient, ProviderConfig,
 ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = ROOT / "configs/models.toml"
 MODEL_KEYS = ("provider", "id", "temperature", "max_tokens", "extra_body", "notes")
-ENV_KEYS = ("max_steps", "turn_tokens", "act_every", "max_actions_per_turn", "playbook", "mode")   # refused
+ENV_KEYS = ("max_steps", "turn_tokens", "turn_budget", "budget_reserve", "act_every", "max_actions_per_turn",
+            "playbook", "mode")   # refused
 PROVIDER_KEYS = tuple(f.name for f in dataclasses.fields(ProviderConfig))
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]*_API_KEY$")
