@@ -6,7 +6,8 @@ A run config's `[fleet]` table holds fleet-wide settings (`playbook` is the flee
 provider's own, which OpenAI's reasoning models require). `[fleet].session_months` is run-wide: a supervised run
 pauses after that many months (see `bench/session.py`). `briefing` ("guided", the default, or "open") is the
 briefing style (fmt.py): open briefings and tool results state facts and options, never an exact call or a chosen
-action.
+action. `turn_budget` (tokens, prompt + completion over a turn's model calls; 0 = off) is civitas-v3's equal token
+budget per turn (fleet/budget.py); `budget_reserve` is what it keeps for the next reply.
 """
 from __future__ import annotations
 
@@ -29,7 +30,10 @@ class FleetAgentConfig:
     model: str = "trinity-large-thinking"
     max_steps: int = 20              # tool calls per turn
     max_tokens: int = 16000          # per model call
-    turn_tokens: int = 80000         # per turn
+    turn_tokens: int = 80000         # completion tokens per turn
+    turn_budget: int = 0             # prompt + completion tokens per turn, as the provider reports them (0 = off:
+                                     # civitas-v2); civitas-v3: 90000 (fleet/budget.py)
+    budget_reserve: int = 4000       # completion tokens the budget keeps for the next reply (fleet/budget.py)
     temperature: float | None = 0.4  # None (`temperature = "default"`): the request carries none
     extra_body: dict = field(default_factory=dict)
     briefing: str = "guided"         # "guided" names the build and the call; "open" only the facts (fmt.STYLES)
@@ -57,6 +61,11 @@ def fleet_agent_config(cfg: dict, role: str) -> FleetAgentConfig:
         setattr(out, k, int(getattr(out, k)))
         if getattr(out, k) < 1:
             raise ValueError(f"agents.{role}: fleet {k} must be at least 1, got {getattr(out, k)}")
+    for k in ("turn_budget", "budget_reserve"):
+        v = getattr(out, k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 or v != int(v):
+            raise ValueError(f"agents.{role}: fleet {k} must be a whole number of tokens (0 or more), got {v!r}")
+        setattr(out, k, int(v))
     try:
         out.temperature = temperature_of(out.temperature)
     except ValueError as e:

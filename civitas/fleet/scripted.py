@@ -14,6 +14,7 @@ carries the report. Arguments are sent as JSON text, as a model sends them. The 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from ..agents.base import Agent
 from ..agents.scripted import SCRIPTED
@@ -105,7 +106,8 @@ class ScriptedFleetAgent(Agent):
         self.env = env
         FleetState.of(env)
         c = env.cfg
-        self.system = system_prompt(self.role, self.cfg, c.months, act_every=c.act_every,
+        cfg = replace(self.cfg, turn_budget=0)             # no model, no token budget (fleet/budget.py)
+        self.system = system_prompt(self.role, cfg, c.months, act_every=c.act_every,
                                     max_actions=c.max_actions_per_turn, target_pop=env.scoring.target_population)
 
     def describe(self) -> str:

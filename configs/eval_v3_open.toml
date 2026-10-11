@@ -1,0 +1,31 @@
+# Eval suite (civitas eval -s configs/eval_v3_open.toml --model M): civitas-v3's OPEN track. civitas-v2-open
+# (configs/eval_open.toml: the same eight single-city late starts, seeds, warm-up, game, tools, guards, fact-only
+# briefings and scripted yardstick) plus the equal token budget per turn of configs/eval_v3.toml:
+# configs/fleet_open_late_v3.toml sets `[fleet] turn_budget = 90000`, prompt + completion tokens summed over a turn's
+# model calls as the provider reports them (fleet/budget.py; README "civitas-v3"). On v2's open track
+# trinity-large-thinking made 11.6 model calls a department turn (one tool call per reply, 8.4 look-ups), 92k tokens,
+# kimi-k3 4.3 calls and 34k, for the same ~2.3 actions. Replayed through the cutoff, v2's open turns would be cut in:
+# trinity-large-thinking 45%, deepseek-v4-flash 16%, glm-5.3-flash 13%, kimi-k3 5%. Scripted agents play months 0-95
+# (no budget), the model's fleet months 96-107. Not a run config: the launcher (civitas serve) leaves suite files out.
+name = "v3-open"
+description = "open track with a 90k token budget per turn: eight single-city late starts (32 model turns each), one run per seed"
+
+[eval]
+workers = 8                 # runs at once: they wait on the API, not the CPU
+caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
+reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+env = "civitas-v3-open"     # the environment version (configs/envs/civitas-v3-open.json): an eval on other code is refused
+baseline_model = "trinity-large-thinking"    # the leaderboard's paired verdicts are against this model's eval
+
+[eval.prices]
+"claude-sonnet-5-5" = [2.00, 10.00]   # $ per million prompt / completion tokens (no prompt caching on the compatible endpoint)
+"claude-haiku-5-5" = [0.10, 0.50]
+
+# Per run: trinity-large-thinking's v2 open wall time and tokens (eval trinity-large-thinking-open_20261010: 18.1 min,
+# 2.72M / 220k) scaled by its v2 open turns replayed through the 90k cutoff (70% of the tokens).
+[[runs]]
+config = "configs/fleet_open_late_v3.toml"
+seeds = [0, 4, 5, 11, 12, 16, 18, 20]
+minutes = 12.7
+prompt_tokens = 1_900_000
+completion_tokens = 168_000

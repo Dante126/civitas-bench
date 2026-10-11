@@ -212,6 +212,54 @@ def test_episode_matches_a_toolagent_turn(bank):
         assert theirs["series"]["city"] == mine["series"]["city"]
 
 
+def _usage(messages) -> dict:
+    """A provider's usage, deterministic: the request's characters / 4 and 300 completion tokens a reply."""
+    return {"prompt_tokens": len(json.dumps(messages)) // 4, "completion_tokens": 300}
+
+
+class UsageScriptClient(ScriptClient):
+    def chat(self, model, messages, **kw):
+        return {**super().chat(model, messages, **kw), "usage": _usage(messages)}
+
+
+def test_episode_matches_a_toolagent_turn_with_the_token_budget(bank):
+    """civitas-v3's turn_budget (fleet/budget.py): the same messages (the rule, the briefing line, every "budget
+    left" line), the same cut and report, the same reward, whether the budget cuts the turn or not."""
+    from civitas.fleet.budget import CUT_REPORT
+    for t in [x for x in bank.tasks() if x.role in ("mayor", "planning")]:
+        replies = _replies(t)
+        first = _usage(TaskEpisode(t).reset()["messages"])["prompt_tokens"]
+        assert TaskEpisode(t).reset().get("turn_budget") is None                  # off unless asked (v2 banks)
+        for limit, cut in ((4000 + 4 * (first + 300), True), (10 ** 6, False)):
+            ep = TaskEpisode(t, turn_budget=limit)
+            obs = ep.reset()
+            assert obs["turn_budget"] == limit and f"{limit:,} tokens this turn" in obs["briefing"]
+            for content, calls in replies:
+                if ep.done:
+                    break
+                ep.reply(content, calls, usage=_usage(ep.messages))
+            assert ep.done and ep.reason == ("turn_budget" if cut else "end_turn"), (t.task_id, limit)
+            mine = ep.finish(horizon=6)
+
+            ep2 = TaskEpisode(t, turn_budget=limit)
+            env = ep2.prepare()
+            a = ToolAgent(t.role, cfg=ep2.fleet_cfg,
+                          provider=ProviderConfig(base_url="http://127.0.0.1:9", api_key_env=""))
+            a.bind(env)
+            a.client = UsageScriptClient(replies)
+            d = a.act(env.observe(t.role))
+            assert a.system == obs["system_prompt"] and f"{limit:,} tokens per turn" in a.system
+            assert d.meta["messages"][1:] == ep.messages[1:], t.task_id
+            assert d.meta["finish_reason"] == ep.reason and d.meta["budget_used"] == ep.budget_used
+            assert d.meta["budget_cut"] == cut and (d.thinking == CUT_REPORT) == cut
+            assert [x["tokens_left"] for x in d.meta["tool_trace"]] == [x["tokens_left"] for x in ep.trace]
+            assert all("budget left: ~" in m["content"] for m in ep.messages if m["role"] == "tool"
+                       and '"turn ended"' not in m["content"])
+            theirs = ep2.finish(decision=d, horizon=6)
+            assert {k: theirs[k] for k in ("reward", "city", "role", "penalty")} == \
+                {k: mine[k] for k in ("reward", "city", "role", "penalty")}
+
+
 def test_replay_of_a_conversation_checks_every_tool_message(bank):
     t = next(x for x in bank.tasks() if x.role == "planning")
     replies = _replies(t)

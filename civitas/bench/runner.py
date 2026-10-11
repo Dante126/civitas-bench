@@ -488,7 +488,8 @@ def _play(run: dict) -> dict:
                 rec["usage"] = decision.meta.get("usage")
                 rec["latency_s"] = decision.meta.get("latency_s")
                 rec.update({k: decision.meta[k] for k in ("tool_trace", "steps", "ended", "finish_reasons",
-                                                          "length_stops", "recovered_calls")
+                                                          "length_stops", "recovered_calls", "turn_budget",
+                                                          "budget_used", "budget_cut")
                             if k in decision.meta})
             elif log_observations:
                 rec["observation_text"] = obs["text"]

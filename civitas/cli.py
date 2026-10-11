@@ -299,7 +299,9 @@ def cmd_prompt(args):
         print("=" * 30, "SYSTEM", "=" * 30)
         print(agent.system)
         print("=" * 30, "USER (briefing)", "=" * 30)
-        print(briefing(agent.env, agent.role, mode=agent.cfg.mode, mark=False, style=agent.cfg.briefing))
+        from .fleet.agent import ToolAgent
+        print(briefing(agent.env, agent.role, mode=agent.cfg.mode, mark=False, style=agent.cfg.briefing,
+                       turn_budget=agent.cfg.turn_budget if isinstance(agent, ToolAgent) else 0))
         print("=" * 30, "TOOLS", "=" * 30)
         print(", ".join(ToolBox(agent.env, agent.role).tools))
         return
