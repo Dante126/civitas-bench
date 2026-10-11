@@ -198,7 +198,7 @@ def test_tagging_never_fails_a_freeze(probed, monkeypatch):
 
 def test_the_shipped_version_and_suite():
     s = E.load_suite(ROOT / E.DEFAULT_SUITE)
-    assert s.env == "civitas-v2" and s.baseline_model == "trinity-large-thinking"
+    assert s.env == "civitas-v3" and s.baseline_model == "trinity-large-thinking"
     assert E.load_suite(ROOT / "configs/eval_open.toml").env == "civitas-v2-open"
     v3, v3o = E.load_suite(ROOT / "configs/eval_v3.toml"), E.load_suite(ROOT / "configs/eval_v3_open.toml")
     assert (v3.env, v3o.env) == ("civitas-v3", "civitas-v3-open")          # v2 + the token budget (fleet/budget.py)
