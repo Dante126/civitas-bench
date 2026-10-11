@@ -360,8 +360,8 @@ class Launcher:
             except Exception as e:  # pragma: no cover
                 out.append({"file": p.name, "error": str(e)})
                 continue
-            if is_suite(cfg) or is_registry(cfg):  # an eval suite (civitas eval -s) or configs/models.toml
-                continue
+            if is_suite(cfg) or is_registry(cfg) or "grpo" in cfg:   # an eval suite (civitas eval -s),
+                continue                    # configs/models.toml or an RL training config (configs/rl_*.toml)
             agents = {}
             for r in ROLES:
                 a = cfg["agents"].get(r, {"kind": "scripted"})

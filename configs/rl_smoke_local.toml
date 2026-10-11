@@ -1,0 +1,58 @@
+# Local GRPO smoke (README "RL training"): 2 steps of TRL GRPO with a 0.6B model on a laptop, proving the
+# environment / reward / masking plumbing. CPU, no vLLM (Apple MPS materializes the ~7k-token attention matrices and
+# ran out of memory on 16 GB). Qwen3-0.6B's weights with Qwen3-4B-Instruct-2507's tokenizer (same vocabulary; the
+# target model's non-thinking chat template). Needs a bank, e.g.
+#   civitas rl bank build --name rl-dev -c configs/fleet_smoke_late.toml -c configs/fleet_open_late.toml \
+#       --seeds 100,300 --months 48,72 --workers 2
+#   python -m civitas.rl.train -c configs/rl_smoke_local.toml        (in a venv with torch, trl, peft, datasets)
+
+name = "smoke-local"
+
+[model]
+id = "Qwen/Qwen3-0.6B"
+tokenizer = "Qwen/Qwen3-4B-Instruct-2507"
+dtype = "float32"
+attn_implementation = "sdpa"
+
+[data]
+bank = "rl-dev"
+split = "train"
+roles = ["police"]                   # the shortest prompts (~4.5k tokens)
+limit = 2
+
+[env]
+reward_workers = 0
+
+[reward]
+horizon = 6
+
+[lora]
+enabled = true
+r = 8
+lora_alpha = 16
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[grpo]
+learning_rate = 1e-5
+beta = 0.0
+num_generations = 2
+per_device_train_batch_size = 2
+gradient_accumulation_steps = 1
+temperature = 0.7
+max_completion_length = 384
+max_tool_calling_iterations = 3
+epsilon_high = 0.28
+loss_type = "dapo"
+mask_truncated_completions = false   # keep the cut rollouts in the loss: the point here is that a loss happens
+gradient_checkpointing = true
+max_steps = 2
+save_strategy = "no"
+eval_strategy = "no"
+logging_steps = 1
+report_to = "none"
+seed = 0
+dataloader_pin_memory = false
+use_cpu = true
+
+[civitas]
+drop_zero_std = false                # with 2 rollouts a zero-variance group is likely: keep them for the smoke

@@ -565,6 +565,16 @@ def cmd_rl_eval(args):
         sys.exit(f"error: {e}")
 
 
+def cmd_rl_compare(args):
+    from .rl import bank as B
+    from .rl import evaluate as E
+    try:
+        c = E.compare(args.a, args.b)
+    except (B.BankError, OSError) as e:
+        sys.exit(f"error: {e}")
+    print(json.dumps(c, indent=2) if args.json else E.compare_text(c))
+
+
 def _rl_parsers(sub):
     from .rl.bank import DEFAULT_MONTHS, HORIZON_MAX, TASKS_DIR
     rl = sub.add_parser("rl", help="RL tasks: one department's turn from a saved city, scored against the scripted "
@@ -648,6 +658,12 @@ def _rl_parsers(sub):
     sp.add_argument("--quiet", action="store_true")
     reward(sp)
     sp.set_defaults(fn=cmd_rl_eval)
+
+    sp = rsub.add_parser("compare", help="paired comparison of two `civitas rl eval` folders (b - a per task)")
+    sp.add_argument("a", help="the reference eval folder (e.g. the baseline's)")
+    sp.add_argument("b", help="the eval folder compared to it (e.g. the trained model's)")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_rl_compare)
 
 
 if __name__ == "__main__":

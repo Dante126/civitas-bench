@@ -1,0 +1,124 @@
+# GRPO on civitas RL tasks (README "RL training"): Qwen3-4B-Instruct-2507 + LoRA with TRL 1.15 on Modal.
+# Read by civitas/rl/train.py (the trainer) and civitas/rl/modal_app.py (images, GPUs, volumes, the vLLM server).
+# Not a game config: the launcher skips files with a [grpo] table. `--set section.key=value` overrides any key.
+#
+#   python -m civitas.rl.modal_app --print-config -c configs/rl_qwen3_4b.toml     # plan + cost, no Modal needed
+#   modal run --detach civitas/rl/modal_app.py::train --config configs/rl_qwen3_4b.toml
+
+name = "qwen3-4b-planning-v1"
+
+[model]
+id = "Qwen/Qwen3-4B-Instruct-2507"
+tokenizer = ""                       # default: the model's (its chat template is the one vLLM serves)
+dtype = "bfloat16"
+attn_implementation = "sdpa"         # "flash_attention_2" when flash-attn is in the image
+
+[data]
+bank = "rl-train"                    # runs/_tasks/<bank> (on the Modal volume: /vol/tasks/<bank>)
+split = "train"
+roles = ["planning"]                 # start with one department (research: per-role curriculum); [] = all eight
+styles = []                          # [] = guided and open
+months = []                          # [] = every task month of the bank
+dev_seeds = [290, 291, 292, 293, 294, 295, 296, 297, 298, 299]   # held out of training: the periodic eval
+limit = 0                            # 0 = every task
+repeat = 1                           # list each task this many times (more epochs per dataset pass)
+eval_limit = 24                      # dev tasks in each periodic eval (0: no periodic eval)
+test_split = "test"                  # `evaluate` / `baseline`: held-out seeds 300-339, never trained on
+
+[env]
+end_at_action_cap = false            # as ToolAgent: the turn goes on after the action cap (messages, report)
+reward_workers = 8                   # processes playing the reward branches (~0.5 s each at H = 6)
+check_prompt = true
+
+[reward]                             # rl/reward.py (README "RL tasks"); p_malformed: a <tool_call> TRL couldn't parse
+horizon = 6
+w_role = 0.25
+p_failed = 0.05
+p_refused = 0.02
+p_invalid = 0.02
+p_unended = 0.1
+p_malformed = 0.02
+
+[lora]                               # peft.LoraConfig; enabled = false trains every weight (fits one H100 at 4B)
+enabled = true
+r = 32
+lora_alpha = 64
+lora_dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[grpo]                               # trl.GRPOConfig, passed as is (unknown keys are refused)
+learning_rate = 2e-5                 # LoRA: 1e-5 .. 5e-5
+lr_scheduler_type = "constant_with_warmup"
+warmup_steps = 10
+max_grad_norm = 1.0
+beta = 0.0                           # no KL, no reference model
+num_generations = 8                  # group size
+per_device_train_batch_size = 1      # one ~25k-token sequence per micro-batch (logits are 25k x 152k)
+gradient_accumulation_steps = 64     # 64 completions per optimizer step = 8 tasks x 8 rollouts
+num_iterations = 1
+temperature = 1.0
+top_p = 1.0
+top_k = 0
+max_completion_length = 20480        # every token after the prompt, tool results included (~6-8k prompt on top)
+max_tool_calling_iterations = 20     # = the fleet's max_steps
+epsilon = 0.2
+epsilon_high = 0.28                  # clip-higher (DAPO)
+loss_type = "dapo"                   # token-level normalisation (no per-sequence length bias)
+scale_rewards = "group"
+mask_truncated_completions = true
+vllm_importance_sampling_correction = true
+gradient_checkpointing = true
+bf16 = true
+max_steps = 300
+save_strategy = "steps"
+save_steps = 10                      # checkpoints on the volume; a preempted container resumes from the latest
+save_total_limit = 4
+eval_strategy = "steps"
+eval_steps = 25                      # the dev-seed reward (eval/civitas/*) every 25 steps
+num_generations_eval = 2
+per_device_eval_batch_size = 2
+logging_steps = 1
+log_completions = true
+num_completions_to_print = 0
+report_to = "none"                   # "wandb" with a WANDB_API_KEY secret
+seed = 0
+
+[civitas]
+drop_zero_std = true                 # zero-advantage rollouts (all-equal groups) out of the loss
+
+[vllm]                               # `vllm serve` on GPU 0 for the trainer (server mode) and for evals
+port = 8000
+gpu_memory_utilization = 0.9
+max_model_len = 32768
+tool_call_parser = "hermes"          # OpenAI-compatible endpoint for `civitas rl eval` (baseline / evaluate)
+extra_args = ["--enable-prefix-caching"]
+
+[eval]                               # `civitas rl eval` against the served model (baseline / evaluate)
+n = 2                                # samples per task
+limit = 0                            # 0 = every actionable test task of the roles above
+temperature = 0.7
+max_tokens = 4096                    # per model call
+workers = 32                         # turns at once
+all_roles = false                    # true: every role, not only [data].roles
+
+[modal]
+app = "civitas-rl"
+train_gpu = "H100:2"                 # GPU 0: vLLM server, GPU 1: trainer (LoRA)
+eval_gpu = "H100"
+cpu = 16                             # reward branches and the bank run on CPU cores beside the GPUs
+memory_gb = 128
+timeout_hours = 24                   # Modal's maximum per call
+retries = 10                         # GPU containers are preemptible: retry, resume from the latest checkpoint
+volume = "civitas-rl"                # banks, checkpoints, eval results
+hf_volume = "civitas-hf-cache"
+gpu_hour_usd = 3.95                  # H100 list price (modal.com/pricing, 2026-10); estimates only
+python = "3.12"
+vllm = "0.31.0"
+trl = "1.15.0"
+peft = "0.21.2"
+extra_pip = ["liger-kernel", "datasets", "accelerate"]
+
+[estimate]                           # back-of-envelope (README "RL training"), printed by --print-config
+step_minutes = 3.0                   # 8 tasks x 8 rollouts x ~20 calls: ~1.5 min generation + ~1.5 min training
+eval_minutes = 3.0                   # one periodic dev eval (24 tasks x 2)
+startup_minutes = 15                 # image pull, model download (cached on the hf volume after the first), vLLM up

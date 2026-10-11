@@ -186,3 +186,40 @@ def markdown(s: dict) -> str:
         for k, c in s[key].items():
             L.append(f"| {key[3:]} | {k} | {f(c)} |")
     return "\n".join(L) + "\n"
+
+
+def _per_task(d) -> dict:
+    """{task_id: (mean reward over samples, role)} from an eval folder's results.jsonl."""
+    by: dict[str, list] = {}
+    for line in (Path(d) / "results.jsonl").read_text().splitlines():
+        r = json.loads(line) if line.strip() else {}
+        if r.get("reward") is not None:
+            by.setdefault(r["task_id"], [[], r.get("role")])[0].append(float(r["reward"]))
+    return {t: (statistics.fmean(v), role) for t, (v, role) in by.items()}
+
+
+def compare(a, b) -> dict:
+    """Paired comparison of two `civitas rl eval` folders on their common tasks (b - a per task: mean and 95%
+    t-interval, overall and by role; wins / ties / losses)."""
+    pa, pb = _per_task(a), _per_task(b)
+    common = sorted(set(pa) & set(pb))
+    if not common:
+        raise B.BankError(f"{a} and {b} share no scored task")
+    diff = {t: pb[t][0] - pa[t][0] for t in common}
+    roles = sorted({pa[t][1] for t in common}, key=str)
+    return {"a": str(a), "b": str(b), "tasks": len(common), "only_a": len(set(pa) - set(pb)),
+            "only_b": len(set(pb) - set(pa)), "a_mean": _ci([pa[t][0] for t in common]),
+            "b_mean": _ci([pb[t][0] for t in common]), "diff": _ci(diff.values()),
+            "wins": sum(1 for v in diff.values() if v > 1e-9), "ties": sum(1 for v in diff.values() if abs(v) <= 1e-9),
+            "losses": sum(1 for v in diff.values() if v < -1e-9),
+            "by_role": {r: _ci([diff[t] for t in common if pa[t][1] == r]) for r in roles}}
+
+
+def compare_text(c: dict) -> str:
+    f = lambda x: "-" if not x else (f"{x['mean']:+.3f} [{x['lo']:+.3f}, {x['hi']:+.3f}] (n={x['n']})"
+                                     if x.get("lo") is not None else f"{x['mean']:+.3f} (n={x['n']})")
+    L = [f"paired: {c['b']} - {c['a']} on {c['tasks']} common tasks ({c['only_a']} only in a, {c['only_b']} only in b)",
+         f"  a {f(c['a_mean'])}", f"  b {f(c['b_mean'])}",
+         f"  b - a {f(c['diff'])}; b better in {c['wins']}, equal in {c['ties']}, worse in {c['losses']}"]
+    L += [f"  {r}: {f(v)}" for r, v in c["by_role"].items()]
+    return "\n".join(L)

@@ -494,6 +494,129 @@ ToolAgent loop with one ChatClient on `--base-url` / `--model` (the task config'
 `summary.md` (mean reward with CI, by role / style / month, the bank's noop reference and model - noop, failed /
 refused / invalid per task, tokens, within-task std over samples).
 
+## 7. RL training
+
+GRPO on the RL tasks above with TRL's `GRPOTrainer` (trl 1.15.0) on Modal H100s: Qwen/Qwen3-4B-Instruct-2507 with
+LoRA, one department first. Everything is ready to launch, and nothing here launches it: every Modal function costs
+money, so the commands below are for when the spend is approved.
+
+```bash
+# 1. a bank (locally, free; ~4 workers): training seeds 100-299 (dev seeds 290-299 held out) + test seeds 300-339
+civitas rl bank build --name rl-train -c configs/fleet_smoke_late.toml -c configs/fleet_open_late.toml \
+    --seeds 100-299,300-339 --workers 4            # 480 games, 15,360 tasks, ~2.5-3.5 h at 4 workers
+modal volume create civitas-rl && modal volume put civitas-rl runs/_tasks/rl-train /tasks/rl-train
+
+# 2. the plan, the pins and the cost (no Modal account needed)
+python -m civitas.rl.modal_app --print-config [-c configs/rl_qwen3_4b.toml] [--set grpo.max_steps=50]
+
+# 3. on Modal
+modal run civitas/rl/modal_app.py::check                                    # image versions + bank (CPU, cents)
+modal run --detach civitas/rl/modal_app.py --action baseline                # base model on the test split
+modal run --detach civitas/rl/modal_app.py --action sft                     # optional SFT warm start
+modal run --detach civitas/rl/modal_app.py --action train                   # GRPO; resumes after preemption
+modal run --detach civitas/rl/modal_app.py --action evaluate --run qwen3-4b-planning-v1
+modal volume get civitas-rl /evals runs/_rl_evals_modal                      # results back
+
+# local: the env / reward / masking plumbing with a 0.6B model, 2 GRPO steps (CPU or Apple MPS, no vLLM)
+uv venv --python 3.12 .venv-train && uv pip install --python .venv-train/bin/python torch trl peft datasets accelerate
+civitas rl bank build --name rl-dev -c configs/fleet_smoke_late.toml -c configs/fleet_open_late.toml \
+    --seeds 100,300 --months 48,72 --workers 2
+PYTHONPATH=$PWD .venv-train/bin/python -m civitas.rl.train -c configs/rl_smoke_local.toml
+```
+
+**The pipeline.** bank -> baseline (`civitas rl eval` of the base model on the test split: its failed / invalid
+calls per task say whether SFT is needed) -> optional SFT -> GRPO -> evaluate (the same test split, `--n 2`) ->
+paired comparison, `civitas rl compare <baseline eval dir> <trained eval dir>`: the per-task differences of the mean
+reward on the tasks both scored (mean and 95% t-interval, overall and by role, wins / ties / losses); each
+summary.md also gives model - noop per task. With `suite=configs/eval_v2.toml` (`baseline` / `evaluate` functions) the guided eval
+suite runs on the served model too (the full 12-month late start, against the scripted yardstick).
+
+**The environment** (`civitas/rl/trl_env.py`, written against trl 1.15.0's source). TRL's `environment_factory` makes
+one env instance per rollout, calls `reset(**row)` (its string is appended to the row's user message) and exposes the
+public methods of the class as tools, called with the parsed arguments; the reward function gets the instances as
+`environments`. `task_set(bank, split, roles=...)` builds the rows (`prompt` = [system prompt, empty user], `task_id`,
+`environment`) by resetting each task once; `factories()` generates one class per tool set (role + schema digest,
+a dict factory: each row's `environment` picks it) with one method per ToolBox tool, each running the call through
+`TaskEpisode.step`, so a tool result is exactly the tool message ToolAgent sends (guards, refusals, hints, refreshed
+Next lines, `steps_left`). TRL renders tool schemas from docstrings and type hints, which can't express every
+civitas schema, so `CivitasGRPOTrainer` (`trainer_class()`) swaps the exact ToolBox schemas into the trainer after
+`__init__` (`install_schemas`: `trainer._env_tools`, read only when rendering a prompt); the generated methods still
+carry typed signatures and Google docstrings that `get_json_schema` turns into a close equivalent (tested).
+`CivitasReward` scores each rollout with the counterfactual reward of `reward.py` (H 6, w_role 0.25, the penalties)
+plus `p_malformed` for a `<tool_call>` TRL couldn't parse, and logs every component and count through `log_metric`
+(`civitas/reward`, `city`, `role`, `penalty`, `actions`, `failed`, `refused`, `invalid`, `malformed`, `ended` = the
+end_turn rate, `end_turn_first`, `lookups`, `messages`, `money_asks`, `asks_held`, `overrides` (earned confirms),
+`loans`, `repaid`, `take_backs`, `top_ups`, `any_failed` ...) and per completion through `log_extra`. With
+`[env].reward_workers` the 6-month branches run in a spawned process pool (the env pickled after the turn; identical
+rewards, tested). The trainer also drops zero-advantage rollouts (all-equal groups) from the loss
+(`drop_zero_std`, logged as `civitas/dropped_zero_std`).
+
+How a TRL rollout differs from ToolAgent's loop, all TRL's doing: no nudges (a reply without a tool call ends the
+rollout: unended, `p_unended`), no recovery of calls written as text (`malformed`), and the model sees end_turn's
+result and replies once more (calls after end_turn are "not run" and cost nothing). Messages are append-only: TRL
+renders the prompt once and grows the sequence by token concatenation (prompt + completion + tool suffix ids), the
+env never rewrites anything, and the Qwen3-2507 template renders each message of a turn as a pure token suffix
+(`tests/test_rl_trl.py`). Tool tokens are out of the loss (TRL's `tool_mask`); `max_completion_length` counts them.
+`CIVITAS_RL_VERBOSE=1` prints each reset, tool call and reward batch.
+
+**Tests.** `tests/test_rl_trl.py` drives the env classes with a stand-in for TRL's loop (no trl needed: tool
+discovery, tool messages = TaskEpisode's, append-only conversation, reward and logging, penalties, the reward
+workers, SFT export, `civitas rl compare`). With trl installed (the training venv) it also runs a real
+`CivitasGRPOTrainer` step with a tiny random Qwen3 and scripted generations (one rollout calls find_sites then
+end_turn, the other answers in text): TRL's own loop runs the env's tools, the tool responses are masked out of the
+loss, the two rollouts score apart and an optimizer step happens (~90 s on a laptop CPU). On macOS, where TRL's
+Triton log-prob kernel doesn't exist, `train.py` swaps in a plain-PyTorch one (`_TorchLogProbs`). The 0.6B smoke
+(`configs/rl_smoke_local.toml`, `CIVITAS_TRL_SMOKE=1` for its test) is the same with a real model's generations;
+on a 16 GB Mac under load one step takes tens of minutes (7k-token prompts on CPU).
+
+**Config** (`configs/rl_qwen3_4b.toml`, read by `civitas/rl/train.py` and `modal_app.py`; `--set section.key=value`):
+[data] bank / split / roles (`["planning"]`) / styles / dev_seeds; [reward] and [env]; [lora] r 32, alpha 64 on
+q,k,v,o,gate,up,down; [grpo] passed to `GRPOConfig` as is: lr 2e-5 (constant after 10 warmup steps), beta 0,
+group 8, 8 tasks per step (64 completions: batch 1 x 64 accumulation), T 1.0, no top-p / top-k, 20 tool iterations,
+`max_completion_length` 20480, epsilon 0.2 / 0.28, `loss_type` dapo, truncated completions masked, vLLM importance
+sampling on, 300 steps, a checkpoint every 10 steps, the dev-seed reward every 25 (`eval/civitas/*`); [vllm],
+[eval], [modal] (GPUs, volumes, timeout, retries, pins: python 3.12, vllm 0.31.0, trl 1.15.0, peft 0.21.2, torch and
+transformers as vLLM resolves them) and [estimate]. `configs/rl_smoke_local.toml` is the laptop smoke.
+The launcher leaves files with a [grpo] table out.
+
+**Modal** (`civitas/rl/modal_app.py`). One Volume (`civitas-rl` at /vol: tasks/, train/<run>/, sft/, evals/) and one
+for the Hugging Face cache; the repo is mounted at /repo. `train` runs on `H100:2`: `vllm serve` on GPU 0 with NCCL
+weight transfer (`--weight-transfer-config '{"backend":"nccl"}' --logprobs-mode processed_logprobs --max-logprobs -1`;
+TRL merges the LoRA and pushes the weights after each step, no vLLM adapter path) and the trainer on GPU 1 in TRL's
+server mode. GPU functions are preemptible: `retries` (10) restarts the call and `train.py` resumes from the newest
+complete checkpoint on the volume (committed after each save). One call is at most 24 h; a longer run is the same
+command again. `baseline` / `evaluate` serve the base model / the trained adapter (`--enable-lora`) with the hermes
+tool parser (the chat template the trainer used) and run `civitas rl eval` on the test split. `sft` exports
+scripted-policy transcripts (`civitas/rl/sft.py`: the better of oracle / scripted per task, kept when it made no
+failed or invalid call and scored >= 0; OpenAI chat JSONL with tool calls and the exact schemas) and trains a LoRA
+with TRL's SFTTrainer (assistant-only loss). `python -m civitas.rl.sft export --bank rl-train --out x.jsonl` does
+the export locally.
+
+**Budget** (estimates; measure step 1 and re-plan). H100 $3.95/GPU-h. GRPO ~3 min a step (generation ~1.5 min: 64
+rollouts x ~20 calls; training ~1.5 min: 64 sequences x ~15-25k tokens), 300 steps + 12 dev evals ~16 h on 2 GPUs
+~$125; baseline and final evaluate ~$4-12 each; optional SFT $8-24; smoke / debug runs $50-150: ~$200-330 in all.
+`--print-config` prints it for the config at hand.
+
+**Metrics to watch** (TRL logs plus `civitas/*`): `reward` mean and `reward_std`; `frac_reward_zero_std` and
+`civitas/dropped_zero_std` (no signal when most groups tie: harder tasks, more roles, higher temperature);
+`civitas/city` vs `civitas/role` (the role term shouldn't carry the reward alone); `civitas/ended` (end_turn rate)
+and `civitas/end_turn_first` (a noop collapse: ending at once is safe while the noop gap is small);
+`civitas/failed` / `refused` / `invalid` / `malformed`; `completions/mean_length` and `clipped_ratio` (truncation);
+`tools/call_frequency`; `entropy`, `clip_ratio/*`, `sampling/sampling_logp_difference` and
+`sampling/importance_sampling_ratio` (vLLM vs trainer mismatch); `grad_norm`; and the dev reward `eval/civitas/reward`
+every 25 steps against the baseline's.
+
+**Known risks and reward-hacking signals.** The reward reads the city 6 months on: a turn that borrows (`loans`), takes
+money back (`take_backs`), forces refusals through (`overrides`) or spams the mayor (`money_asks`, `asks_held`) can
+look good at H = 6 and cost later; inspect those counts against the baseline's and re-score suspicious checkpoints
+at H = 12 (`civitas rl eval --horizon 12`). `end_turn_first` rising with flat reward means the policy found the noop
+(the scripted turn's edge over noop is ~0.1-0.2 points). A role-score gain without a city gain is the role term
+being gamed (`w_role`). Zero-variance groups are frequent (the sim is deterministic: only sampling varies a group).
+Truncation at 20k tokens on long turns (20 tool results of up to 4,000 characters) masks those rollouts. The tool
+schemas reach the model only through `install_schemas`, which depends on TRL's private `_env_tools` (refused with a
+clear error if it's gone). Qwen3.5 is the stretch model (Gated-DeltaNet layers, the `qwen3_coder` parser, reported
+silent LoRA no-ops in vLLM: test that generation changes after a weight sync).
+
 ---
 
 ## How it works
