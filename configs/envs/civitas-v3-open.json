@@ -1,0 +1,70 @@
+{
+  "name": "civitas-v3-open",
+  "fingerprint": "087b837c4c8b9115",
+  "created": 1791749049.9180832,
+  "created_iso": "2026-10-11T13:04:09-0700",
+  "commit": "c6bba185c5c8",
+  "dirty": false,
+  "suite": "configs/eval_v3_open.toml",
+  "suite_name": "v3-open",
+  "probe_version": 2,
+  "probe_seconds": 20.31,
+  "agents": [],
+  "sets": [],
+  "parts": {
+    "config": "233b0f594cc692ff",
+    "prompts": "bb76709a36a8a3c9",
+    "tools": "3f8ed33f7bd0f99a",
+    "seeds": {
+      "configs/fleet_open_late_v3.toml:0": {
+        "briefings": "465da6e1e5e0686c",
+        "results": "aacd1f6c13cfac2a",
+        "metrics": "6f6946c6d3ad97c4",
+        "model": "4379e1ab4264ec5b"
+      },
+      "configs/fleet_open_late_v3.toml:4": {
+        "briefings": "524243e5d7b421e1",
+        "results": "704c1b6340c78736",
+        "metrics": "8d988144466368d8",
+        "model": "606d723e0d86a9f1"
+      },
+      "configs/fleet_open_late_v3.toml:5": {
+        "briefings": "773e2aea693cc741",
+        "results": "cc4d0a14ff1e8eb5",
+        "metrics": "4a8615a59695bb3f",
+        "model": "8b36fea599ecc970"
+      },
+      "configs/fleet_open_late_v3.toml:11": {
+        "briefings": "612c19111c48d0f3",
+        "results": "b071fecaed9c1dae",
+        "metrics": "92eb56848dbeb94b",
+        "model": "7436b21e85ac9a9f"
+      },
+      "configs/fleet_open_late_v3.toml:12": {
+        "briefings": "9ba98a12ed0f780a",
+        "results": "f3b24b9821820f6a",
+        "metrics": "a87884c71745b9f4",
+        "model": "dc5dfe445a6c4672"
+      },
+      "configs/fleet_open_late_v3.toml:16": {
+        "briefings": "4a8e3fbaf0452329",
+        "results": "582719c284cbc798",
+        "metrics": "6f4a3232a1eacc95",
+        "model": "b29c88e5188a6c57"
+      },
+      "configs/fleet_open_late_v3.toml:18": {
+        "briefings": "c9ec105a6b195270",
+        "results": "b8f5522f62bce6df",
+        "metrics": "9b391316a08b0d21",
+        "model": "658e05136507c382"
+      },
+      "configs/fleet_open_late_v3.toml:20": {
+        "briefings": "20eeb3051d2a7567",
+        "results": "c04c8c3b0a2d5e23",
+        "metrics": "950a2e45390cf93b",
+        "model": "b526b77cc5544fe1"
+      }
+    }
+  },
+  "tag": "env/civitas-v3-open"
+}
