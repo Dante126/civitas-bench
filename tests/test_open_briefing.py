@@ -305,7 +305,9 @@ def test_open_states_facts_not_calls(late):
     for d in ROLES[1:]:
         assert re.search(rf"- {d}: funds \$[\d.,k]+, target \$[\d.,k]+, spent \$[\d.,k]+, keeps \$[\d.,k]+; options: ",
                          mayor), d
-    assert "police station $2,500 (+$55/month)" in mayor and "upgrade police station (" in mayor
+    # (no police station: its ready sites add under 1% to police coverage, civitas-v2's keep_up_room)
+    assert "jail $4,000 (+$" in mayor and "upgrade police station (" in mayor
+    assert "- station: none - ready sites add under 1% (police coverage 76%)" in b["police"]
     assert "## Open requests to you" in mayor and "asks $8,300" in mayor
     for d in ROLES[1:]:
         assert re.search(r"- \$[\d.,k]+ in department funds", b[d]), d
