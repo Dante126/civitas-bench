@@ -1,5 +1,5 @@
 """Command line: civitas run | resume | yardstick | eval | env | models | bench | serve | leaderboard | prompt |
-check-llm"""
+check-llm | rl"""
 from __future__ import annotations
 
 import argparse
@@ -480,8 +480,174 @@ def main(argv=None):
     sp.add_argument("--model", default="trinity-large-thinking")
     sp.set_defaults(fn=cmd_check_llm)
 
+    _rl_parsers(sub)
+
     args = p.parse_args(argv)
     args.fn(args)
+
+
+def _reward_cfg(args):
+    from .rl.reward import RewardConfig
+    d = RewardConfig()
+    return RewardConfig(**{k: (getattr(args, k) if getattr(args, k, None) is not None else v)
+                           for k, v in d.as_dict().items()})
+
+
+def cmd_rl_build(args):
+    from .rl import bank as B
+    try:
+        B.build(args.name, args.config, _seeds(args.seeds), B.parse_months(args.months), args.roles,
+                horizon_max=args.horizon_max, noop=not args.no_noop, workers=args.workers, root=args.root,
+                force=args.force, verbose=not args.quiet)
+    except (B.BankError, ValueError) as e:
+        sys.exit(f"error: {e}")
+
+
+def cmd_rl_info(args):
+    from .rl import bank as B
+    try:
+        bank = B.TaskBank(args.name, root=args.root)
+    except B.BankError as e:
+        sys.exit(f"error: {e}")
+    if args.json:
+        print(json.dumps(bank.manifest.get("composition"), indent=2))
+        return
+    print(bank.info())
+    if args.tasks:
+        for t in bank.tasks(args.split, actionable=None):
+            print(f"  {t.task_id}  {t.split:<5} {t.style:<6} {'actionable' if t.actionable else 'idle      '}  "
+                  f"{t.why}")
+
+
+def cmd_rl_show(args):
+    """A task's system prompt, briefing and tool names (no model; the turn isn't played)."""
+    from .rl import bank as B
+    from .rl.episode import TaskEpisode
+    try:
+        ep = TaskEpisode(B.TaskBank(args.name, root=args.root).get(args.task))
+    except B.BankError as e:
+        sys.exit(f"error: {e}")
+    obs = ep.reset()
+    if args.json:
+        print(json.dumps(obs, indent=2))
+        return
+    print("=" * 30, "SYSTEM", "=" * 30)
+    print(obs["system_prompt"])
+    print("=" * 30, "USER (briefing)", "=" * 30)
+    print(obs["briefing"])
+    print("=" * 30, "TOOLS", "=" * 30)
+    print(", ".join(t["function"]["name"] for t in obs["tools"]))
+
+
+def cmd_rl_check(args):
+    from .rl import bank as B
+    from .rl import check as K
+    try:
+        K.run(args.bank, split=args.split, n=args.n, horizons=tuple(B.parse_months(args.horizons)),
+              workers=args.workers, determinism=args.determinism, root=args.root, cfg=_reward_cfg(args),
+              policies=tuple(args.policies.split(",")) if args.policies else K.ALL, verbose=True)
+    except B.BankError as e:
+        sys.exit(f"error: {e}")
+
+
+def cmd_rl_eval(args):
+    from .rl import bank as B
+    from .rl import evaluate as E
+    try:
+        E.run(args.bank, base_url=args.base_url, model=args.model, split=args.split, n=args.n, limit=args.limit,
+              roles=args.roles.split(",") if args.roles else None, styles=args.styles.split(",") if args.styles
+              else None, api_key_env=args.api_key_env, stream=not args.no_stream, timeout=args.timeout,
+              temperature=args.temperature, max_tokens=args.max_tokens,
+              extra_body=json.loads(args.extra_body) if args.extra_body else None, workers=args.workers,
+              reward_cfg=_reward_cfg(args), root=args.root, out_dir=args.out_dir, name=args.name,
+              transcripts=not args.no_transcripts, verbose=not args.quiet)
+    except B.BankError as e:
+        sys.exit(f"error: {e}")
+
+
+def _rl_parsers(sub):
+    from .rl.bank import DEFAULT_MONTHS, HORIZON_MAX, TASKS_DIR
+    rl = sub.add_parser("rl", help="RL tasks: one department's turn from a saved city, scored against the scripted "
+                                   "fleet (bank, show, check, eval)")
+    rsub = rl.add_subparsers(dest="rl_cmd", required=True)
+
+    def reward(sp):
+        sp.add_argument("--horizon", type=int, default=None, help="months after the turn the scores are read "
+                                                                  "(default 6)")
+        sp.add_argument("--w-role", dest="w_role", type=float, default=None,
+                        help="weight of the role's own score difference")
+        sp.add_argument("--p-failed", dest="p_failed", type=float, default=None)
+        sp.add_argument("--p-refused", dest="p_refused", type=float, default=None)
+        sp.add_argument("--p-invalid", dest="p_invalid", type=float, default=None)
+        sp.add_argument("--p-unended", dest="p_unended", type=float, default=None)
+
+    bank = rsub.add_parser("bank", help="build or describe a task bank (runs/_tasks/<name>/)")
+    bsub = bank.add_subparsers(dest="bank_cmd", required=True)
+    sp = bsub.add_parser("build", help="play the scripted warm-up on training / test seeds and snapshot the city")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--config", "-c", action="append", required=True,
+                    help="a late-start fleet config, e.g. configs/fleet_smoke_late.toml (repeat for several)")
+    sp.add_argument("--seeds", required=True, help="e.g. 100-299 (train) or 300-339 (test); seeds below 100 and an "
+                                                   "eval suite's seeds are refused")
+    sp.add_argument("--months", default=",".join(map(str, DEFAULT_MONTHS)), help="task months (acting months)")
+    sp.add_argument("--roles", default="all", help="all, or a comma list")
+    sp.add_argument("--horizon-max", type=int, default=HORIZON_MAX, help="months of baseline scores cached")
+    sp.add_argument("--no-noop", action="store_true", help="skip the noop branches (the bank's headroom figures)")
+    sp.add_argument("--workers", type=int, default=4)
+    sp.add_argument("--root", default=str(TASKS_DIR))
+    sp.add_argument("--force", action="store_true", help="rebuild an existing bank")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(fn=cmd_rl_build)
+    sp = bsub.add_parser("info", help="a bank's composition")
+    sp.add_argument("name")
+    sp.add_argument("--root", default=str(TASKS_DIR))
+    sp.add_argument("--tasks", action="store_true", help="list the tasks")
+    sp.add_argument("--split", default=None)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_rl_info)
+
+    sp = rsub.add_parser("show", help="print a task's system prompt, briefing and tools")
+    sp.add_argument("name", help="the bank")
+    sp.add_argument("task", help="the task id, e.g. fleet_smoke_late/s100/m48/planning")
+    sp.add_argument("--root", default=str(TASKS_DIR))
+    sp.add_argument("--json", action="store_true", help="the reset() dict (with the tool schemas)")
+    sp.set_defaults(fn=cmd_rl_show)
+
+    sp = rsub.add_parser("check", help="validate the reward with hand-made policies (no model)")
+    sp.add_argument("--bank", required=True)
+    sp.add_argument("--split", default="train")
+    sp.add_argument("--n", type=int, default=150, help="tasks (actionable, spread over the split)")
+    sp.add_argument("--horizons", default="3,6,12")
+    sp.add_argument("--policies", default=None, help="comma list (default: baseline and every policy)")
+    sp.add_argument("--determinism", type=int, default=12, help="tasks replayed in fresh processes (0: none)")
+    sp.add_argument("--workers", type=int, default=4)
+    sp.add_argument("--root", default=str(TASKS_DIR))
+    reward(sp)
+    sp.set_defaults(fn=cmd_rl_check)
+
+    sp = rsub.add_parser("eval", help="a model on an OpenAI-compatible endpoint over a bank split")
+    sp.add_argument("--bank", required=True)
+    sp.add_argument("--split", default="test")
+    sp.add_argument("--base-url", required=True, help="e.g. https://<app>.modal.run/v1 or http://localhost:8000/v1")
+    sp.add_argument("--model", required=True, help="the served model id")
+    sp.add_argument("--api-key-env", default="", help="environment variable holding the API key (none by default)")
+    sp.add_argument("--n", type=int, default=1, help="samples per task")
+    sp.add_argument("--limit", type=int, default=None, help="tasks at most (spread over the split)")
+    sp.add_argument("--roles", default=None)
+    sp.add_argument("--styles", default=None, help="guided, open or both")
+    sp.add_argument("--workers", type=int, default=4, help="turns played at once")
+    sp.add_argument("--temperature", type=float, default=None)
+    sp.add_argument("--max-tokens", type=int, default=None, help="per model call (default: the config's)")
+    sp.add_argument("--extra-body", default=None, help="JSON merged into each request")
+    sp.add_argument("--timeout", type=float, default=300.0)
+    sp.add_argument("--no-stream", action="store_true")
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--out-dir", default="runs/_rl_evals")
+    sp.add_argument("--no-transcripts", action="store_true")
+    sp.add_argument("--root", default=str(TASKS_DIR))
+    sp.add_argument("--quiet", action="store_true")
+    reward(sp)
+    sp.set_defaults(fn=cmd_rl_eval)
 
 
 if __name__ == "__main__":

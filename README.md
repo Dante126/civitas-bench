@@ -397,6 +397,103 @@ scored within 0.8 points. `[fleet] briefing` picks the briefing style (per role 
   mayor decides. The playbooks are rewritten without them. The scripted fleet renders in the configured style too
   (so the environment probe hashes open text) and plays the same in either. `civitas prompt -c configs/fleet_open_late.toml --role mayor` shows an open briefing.
 
+## 6. RL tasks
+
+A full eval episode (12 months x 8 roles, ~10M tokens) is far too long for RL. `civitas/rl/` cuts the game into
+short, verifiable, deterministic tasks: **one department's turn from a saved city**, played through the real fleet
+tools and scored against the scripted fleet's own turn a few months on. No model is called by any of it except
+`civitas rl eval`, which talks to the endpoint you give it.
+
+```bash
+civitas rl bank build --name rl-v1 -c configs/fleet_smoke_late.toml -c configs/fleet_open_late.toml \
+    --seeds 100-104,300-301 --months 24,48,72,96 --workers 4       # 448 tasks, ~6 min
+civitas rl bank info rl-v1 [--tasks]                               # composition
+civitas rl show rl-v1 fleet_smoke_late/s100/m48/planning           # what the model sees (system, briefing, tools)
+civitas rl check --bank rl-v1 --split train --n 160                # validate the reward with hand-made policies
+civitas rl eval --bank rl-v1 --split test --base-url http://localhost:8000/v1 --model trinity-nano [--n 4]
+```
+
+**Tasks and the bank** (`rl/bank.py`, `runs/_tasks/<name>/`). A task is (config, seed, month, role). The build plays
+each (config, seed) once with the scripted fleet (the warm-up line-up: deterministic, no model) and at each task
+month, before any turn, writes a gzipped pickle of the env and the scripted agents (~110-220 KB); the roles before
+the task's role in turn order play that month when the task is loaded. `index.jsonl` has one line per task:
+`task_id` (`fleet_smoke_late/s100/m48/planning`), config, seed, month, role, `style` (the config's
+`[fleet].briefing`, guided / open), `split`, the hand-over metrics, `actionable` / `why`, what the scripted turn did,
+`state_fp` (the city at the turn, checked on every load: a bank built by other sim code is refused) and the cached
+scores of the baseline branch (and of the noop branch) for `--horizon-max` (12) months. Seeds: everything below 100
+and every seed an eval suite in `configs/` names is refused (the evals play 0, 4, 5, 11, 12, 16, 18, 20 and v1
+0-7); training seeds are 100-299, held-out test seeds 300-339 (`split`). A task is *actionable* when its role could
+do anything: the mayor always, a department when its funds pay for a ready site or tier upgrade, or when the scripted
+turn acted or asked the mayor for money; the rest stay in the index but `TaskBank.tasks()` (and check / eval) leave
+them out. Snapshots are not HMAC-signed like session checkpoints (a bank is built once and copied to training
+machines, where a per-installation key would refuse it); the index holds each snapshot's SHA-256, checked before
+unpickling. A bank is code: load only banks you built or trust.
+
+rl-v1 (above): 448 tasks (train 320, test 128; guided 224, open 224; 112 per month, 56 per role), 412 actionable
+(transport 32 of 56: before its first bus line it often has nothing to buy), the scripted turn idle in 200; at 6
+months the noop turn is worse than the scripted one in 148, equal in 196 and better in 104 (mean +0.12 city points).
+
+**Episodes** (`rl/episode.py:TaskEpisode`). `reset()` returns the system prompt, the briefing (in the task's style)
+and the tool schemas exactly as `fleet/agent.py:ToolAgent` builds them (a ToolAgent is bound for the prompt; the
+toolbox is the model's: `branch_dezone`, `max_steps`, `next_line`, so every guard, refusal, hint and end_turn
+reminder is there). `step(name, args_json)` returns the tool message content ToolAgent would send (`_budget`'s
+`steps_left` / wrap-up notes, compact JSON cut at `TOOL_MESSAGE_CHARS`, "not run" after end_turn or past
+`max_steps`); `reply(content, tool_calls)` takes a whole assistant reply as one iteration of ToolAgent's loop (text
+call recovery, NUDGE once, LENGTH_NUDGE for cut replies, the turn ending on a further reply without a call);
+`replay(messages, check=True)` replays an OpenAI-format conversation and reports tool messages that differ. Done on
+a successful end_turn, after `max_steps` (20) calls, or on a reply without a call past the nudge;
+`end_at_action_cap=True` also ends it at the action cap (ToolAgent doesn't: a message to the mayor after the cap still
+changes what the scripted mayor funds). Left to the trainer: token limits (`max_tokens`, `turn_tokens`) and sampling.
+`tests/test_rl.py` checks a ToolAgent turn and the same replies through `reply()` give identical messages, trace and
+reward. Prompts are ~20-25k characters (system 7-11k, briefing 2-4k, tool schemas 6-10k).
+
+**Reward** (`rl/reward.py`). From the task's state two branches go on: the scripted fleet agent's turn (the
+baseline) and the model's; in both the rest of the month and the next H months are played by the scripted fleet,
+every role (the trained role too, after its one turn). The baseline branch is the scripted game itself, cached in the
+bank, so a reward is one replay:
+
+    reward = (city_model - city_base) + w_role * (role_model - role_base)
+             - 0.05 * failed actions - 0.02 * guard refusals - 0.02 * invalid calls - 0.1 * (no end_turn)
+
+read H = 6 months after the task's month (two turns at act_every 3), components reported apart
+(`RewardConfig`: `horizon`, `w_role` = 0.25, `p_failed`, `p_refused`, `p_invalid`, `p_unended`). The defaults come
+from the check below: the paired effect size (mean / sd of policy - noop over tasks) of the scripted and the oracle
+turn is 0.08 / 0.17 at H = 3, 0.24 / 0.38 at H = 6 and 0.23 / 0.27 at H = 12 (train split), so 6 months carries the
+most signal per second (H = 12 costs twice the time and adds drift from the scripted months after the turn); with H
+= 6 the city score alone gives 0.20 / 0.38, w_role 0.1-0.25 0.24 / 0.40 and fewer ties (68 -> 60 of 160 tasks where
+noop equals the baseline), and larger weights lose signal (role only: 0.21 / 0.23; role scores swing 5x the city
+score, correlation 0.4). A penalty unit (0.05) is about a quarter of the mean noop-baseline gap.
+
+**Validation** (`civitas rl check`; rl-v1, guided and open, actionable tasks; 95% t-intervals; the policies in
+`rl/policies.py`): *baseline* is the scripted fleet agent's own turn on the prepared state; *scripted* its decision
+sent through the episode's model toolbox; *degraded* that with ~half its actions dropped; *random* 1-4 action calls
+with random arguments; *oracle* the guided briefing's own calls (a department's Next / This turn / tier-upgrade
+calls, the mayor's covered to-fund top-ups) before the scripted ones.
+
+| policy (H = 6) | train, 160 tasks | test, 118 tasks | train: + / 0 / - |
+|---|---|---|---|
+| oracle | +0.154 [+0.058, +0.249] | +0.161 [+0.026, +0.295] | 29 / 97 / 34 |
+| scripted | -0.001 [-0.009, +0.007] | -0.001 [-0.010, +0.007] | 13 / 117 / 30 |
+| baseline | -0.004 [-0.006, -0.002] (city and role exactly 0; its own failed calls) | -0.003 | 0 / 148 / 12 |
+| degraded | -0.130 [-0.214, -0.045] | -0.120 [-0.289, +0.048] | 29 / 64 / 67 |
+| noop | -0.181 [-0.295, -0.068] | -0.207 [-0.402, -0.011] | 38 / 60 / 62 |
+| random | -0.299 [-0.416, -0.181] | -0.338 [-0.534, -0.142] | 30 / 0 / 130 |
+
+Ordering oracle > scripted ~ baseline > degraded > noop > random at every horizon on both splits (H = 3: noop's CI
+holds 0). Within a task the five episode policies give different rewards in every task (105 of 160 without random;
+noop differs from the baseline in 100), mean within-task std 0.27. Determinism: 40 of 40 episodes replayed in fresh
+processes gave identical branches. Wall time per reward at H = 6 (prepare + turn + branch, one core): mean 0.5 s,
+p90 0.8-1.1 s, a cold task (snapshot loaded, earlier roles played) +0.2 s; H = 3 0.15-0.2 s, H = 12 1.1-1.5 s.
+By role at H = 6 the oracle gains most as mayor (+0.98: funding the to-fund line beats the scripted mayor) and noop
+loses most as planning (-0.75) and police (-0.30).
+
+**Endpoint runner** (`civitas rl eval`, `rl/evaluate.py`): each task (and `--n` samples) is played by the fleet's own
+ToolAgent loop with one ChatClient on `--base-url` / `--model` (the task config's playbooks and limits; `--api-key-env`,
+`--temperature`, `--max-tokens`, `--extra-body`, `--no-stream`), then scored. `runs/_rl_evals/<name>_<stamp>/`:
+`results.jsonl` (reward and components, counts, tokens, steps, finish reason), `transcripts.jsonl`, `summary.json` /
+`summary.md` (mean reward with CI, by role / style / month, the bank's noop reference and model - noop, failed /
+refused / invalid per task, tokens, within-task std over samples).
+
 ---
 
 ## How it works
@@ -2329,11 +2426,12 @@ civitas/
   bench/      scoring.py · runner.py (episodes, logging, benchmark, leaderboard) · session.py (pause / resume)
   fleet/      agent.py (ToolAgent tool loop) · scripted.py (the scripted baselines through the tools) · tools.py · briefing.py
               · memory.py (plan, memory, history) · config.py · report.py · region.py · fmt.py
+  rl/         bank.py (task bank) · episode.py (TaskEpisode) · reward.py · policies.py · check.py · evaluate.py
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
               · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
-  cli.py      civitas run | resume | bench | serve | leaderboard | prompt | check-llm
+  cli.py      civitas run | resume | bench | serve | leaderboard | prompt | check-llm | rl
 configs/      baseline · arcee · arcee_full · smoke · eval_planning · remote · region · region_trio · fleet_trinity · fleet_smoke
               · fleet_region_smoke · fleet_region_both_120 · fleet_scripted · fleet_smoke_late · fleet_region_late
 docs/         MECHANICS.md (the design roadmap and what is implemented)
