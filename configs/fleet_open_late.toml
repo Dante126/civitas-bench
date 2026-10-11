@@ -1,0 +1,172 @@
+# Late-game fleet check on the OPEN track: configs/fleet_smoke_late.toml (the same game, warm-up, model, limits, tools
+# and guards) with `briefing = "open"`. Open briefings and tool results state facts and options (the city, money,
+# coverage and enrolment, supply and demand, each ready site with its price and estimated effect, the map, requests)
+# and never a chosen action: no exact call text, no "This turn" or Next line, no to-fund line or "ask the mayor for $X",
+# no "do X instead" after a failure. So the model has to plan; the guided track (fleet_smoke_late.toml) names the
+# build, the call and the money to ask for. The playbooks below keep the general city-building knowledge and point at
+# no briefing line that tells what to do. The first 96 months are a warm-up played by the scripted fleet (no model
+# calls, ~3 s), then the trinity fleet plays months 96-107 (4 turns per role). `civitas prompt -c
+# configs/fleet_open_late.toml --role mayor` prints the first open briefing after the warm-up. Key: ARCEE_API_KEY in
+# ./.env.
+name = "fleet_open_late"
+
+[game]
+months = 108               # the whole game: the warm-up and the fleet's months
+warmup_months = 96         # months 0-95 played by scripted agents; the configured agents from month 96
+act_every = 3              # the city runs monthly; agents plan by the quarter
+max_actions_per_turn = 8   # successful actions per turn; look-ups are free
+
+[scoring]
+target_population = 30000
+
+[providers.arcee]
+base_url = "https://api.arcee.ai/api/v1"
+api_key_env = "ARCEE_API_KEY"
+timeout = 300              # give up (and retry) after this long with no streamed data
+
+[fleet]
+mode = "autonomous"        # instructions fixed at month 0; "supervised" = the coach edits between sessions
+briefing = "open"          # facts and options only (guided: the build, the call and the ask named for you)
+provider = "arcee"
+model = "trinity-large-thinking"
+temperature = 0.4
+max_steps = 20             # tool calls per turn
+max_tokens = 16000         # per model call (reasoning + tool calls)
+turn_tokens = 80000        # completion tokens per turn
+playbook = """
+- Grow first, then add quality. Population is half the city score; happiness, finances, utility coverage, \
+safety, health and education are the other half.
+- The order that works: roads from the highway and zones (planning), then power, water and sewage on the same \
+road network (utilities), then services once people live there (a landfill from ~100 residents, fire and police \
+from ~150, a clinic from ~400, a school when children arrive). A first bus line pays from ~1,500 residents.
+- Never let the treasury go negative (bankruptcy halves the score and ends the game). Upkeep is paid monthly \
+from the treasury, so every building also costs money every month.
+- Money sitting in a department's funds does nothing: spend it where it raises the score, or tell the mayor you \
+need less.
+- When a milestone unlocks a higher tier (1k, 5k, 10k residents), upgrading a busy building (upgrade_facility, \
+module "tier") often adds more than another tier-1 building next to it, and tier 1 covers downtown (level 4-5) \
+tiles only partly.
+- Work fast: your briefing has your plan slice, budget, key metrics, new messages, map and ready sites, so look up \
+only what it lacks, then act and call end_turn. Don't scan the map with inspect: it is for checking one spot.
+- Your briefing's Ready sites block lists each building's sites with the price (find_sites <purpose> for details); \
+the mayor can check a department's sites with its read-only find_sites (<department>.<purpose>). Check your funds \
+before building. When an action fails, read the error and change the site, the option or the plan; never repeat the \
+same call.
+- Ask the mayor for money with send_message (an amount and a reason) when your funds are short of something worth \
+building; the mayor funds what it judges most urgent and reads every end_turn report.
+"""
+
+# The Reserve rule below is mirrored in code (fleet/tools.py:reserve, used by the mayor's Finances block and the
+# allocate_budget guard); keep the two in step.
+[agents.mayor]
+kind = "fleet"
+playbook = """
+- Write the plan with update_plan (3-4 goals, a budget target for every department for the next quarter, a \
+one-line priority each) and fund it with allocate_budget. Budgets are targets; allocations move the money.
+- Each department's line in your Departments block shows its funds, what it spent and the options it could build \
+with their prices: fund what raises the score most for the money, first buildings a city lacks (police, fire, a \
+clinic, a landfill, a school) and power, water and sewage before more of what it has. A top-up that buys nothing \
+now (funds already above every price, nothing ready) waits in the department's funds.
+- Money a department holds above what it can use does nothing: you may take some back (a negative allocation), \
+never below what its line says it keeps.
+- Reserve: keep at least $3,000 or 3 months of expenses in the treasury (6 after a deficit month). First \
+buildings, supply and planning's road may use the treasury down to $3,000; anything else only the money above the \
+reserve.
+- Taxes start at 9%. Raise R by 1 point when the city runs a deficit while happiness is above 55% and approval \
+above 45%; lower it by 1 when happiness is below 45% or the surplus is large. Stay within 6-12%.
+- Loans cost interest every month until repaid: borrow only for a first building or supply the treasury can't \
+cover, and only if operations stay positive after its upkeep and the interest. With debt and money to spare above \
+the reserve, repaying saves the interest.
+- A refused call says why: change the call. confirm: true counts only on a repeat of the exact refused call.
+- The factory offer: accept if unemployment is above 8% or the treasury is below $10,000, otherwise decline.
+- A flood forecast: fire needs ~$3,000 for levees at once. Policies (recycling, neighborhood_watch) only while the \
+city runs a surplus with more than $15,000 in the treasury.
+- Update the plan when the numbers move: a milestone, a shortage, a department report asking for money.
+- Answer every request to you the turn you see it: a top-up, or one line on why not or when. One send_message \
+answers several departments with one text (to: "police,fire").
+"""
+
+[agents.planning]
+kind = "fleet"
+playbook = """
+- Zones develop only within 2 tiles of a road connected to the highway. Build a road first, then zone the tiles \
+beside it, never the road itself.
+- Zone by demand: the largest positive demand first; skip a type whose demand is <= 0 or that already has 10+ \
+zoned tiles waiting to develop. One zone type per strip.
+- Utilities needs free riverbank tiles beside a road for a pump and a sewage outlet: keep a riverbank lot free \
+where a road meets the river, and free (dezone) one when utilities says the bank is taken.
+- Other departments need land too: stations, clinics, schools and landfills need an empty tile touching a road; \
+landfills, jails and cemeteries a lot away from homes; a train station a free tile at the map edge beside a road; \
+universities and hospitals a free 2x2 block. Zone runs of at most 6 tiles and leave the next roadside tile empty; \
+keep a free lot every ~10 tiles along a long road to branch from.
+- For more land, branch roads off the existing road lines into free land (bridges at $60/tile open the east \
+bank); a road can't cross zoned lots or buildings (dezoning is free).
+- Keep industry away from homes and upriver pumps (its pollution spreads ~5 tiles).
+- Parks raise land value (8 points per park tile within 4 tiles, up to 30), and under one park tile per 400 \
+residents R demand stays capped at +0.25 from 2,000. From 1k: high density, offices (they need high-school \
+graduates), plazas.
+- Answer the requests to you: build what they ask, or send_message where it can build or why not.
+"""
+
+[agents.utilities]
+kind = "fleet"
+playbook = """
+- Every connected road network is its own grid: power, water and sewage must touch the network the zones are on.
+- Power: a plant only needs a road connected to the highway (coal is cheapest per unit of power but pollutes, so \
+place it away from homes; wind is clean).
+- A pump on the riverbank north (upstream) of the city and an outlet south (downstream) of the pump. They need a \
+free bank tile beside a road that reaches the river; when there is none, ask planning for a road or a free lot.
+- Keep supply 10-60% above demand (your score rewards that margin) and build before a shortage, not after.
+- Pumps and outlets lose 15% output per neighbour within 4 tiles: spread them out, and from 1k a pumping station / \
+treatment plant upgrade beats more tier-1 buildings. Treatment also cleans the river.
+- Clean power (wind, solar, later nuclear) counts in your score; overhaul power plants older than 5 years.
+"""
+
+[agents.transport]
+kind = "fleet"
+playbook = """
+- Your score: commute time, congestion, the share of trips by transit (counted up to 12%) and cost per resident.
+- Bus lines carry riders between the homes and the jobs their stops reach; a line keeps its stops while the city \
+grows, so transit falls without new ones. A trip rides the best line covering both its ends, so a second line on \
+the same stops adds nothing.
+- Jammed streets (find_sites congested_roads): an avenue (unlocks at 1k) relieves a stretch at 1.0x capacity or more.
+- From 5k: a train station links the city to the region (without a link R and C demand stay capped from 6,000 \
+residents), a harbour adds freight room; metro at 10k.
+"""
+
+[agents.police]
+kind = "fleet"
+playbook = """
+- The first station once ~150 people live in the city; more where coverage drops below 85%.
+- A jail (1k) when inmates pass 80% of jail capacity. From 5k a police HQ covers downtown (level 4-5) tiles that \
+tier-1 stations cover only partly.
+"""
+
+[agents.fire]
+kind = "fleet"
+playbook = """
+- The first fire station once ~150 people live in the city; more when coverage drops below 85%.
+- A flood forecast: levees on the threatened riverbank stretches (find_sites levee) protect the homes there.
+- An emergency shelter once the city passes 3,000. From 5k a fire HQ covers downtown tiles fully.
+"""
+
+[agents.health]
+kind = "fleet"
+playbook = """
+- A landfill first (from ~100 residents; piling garbage hurts health and happiness), away from homes. A cemetery \
+from ~300 residents.
+- A clinic from ~400 residents wherever clinic coverage is below 80%.
+- From 1k: a landfill more than 60% full can become a recycling centre, a full cemetery a crematorium. From 5k a \
+clinic can grow into a hospital.
+"""
+
+[agents.education]
+kind = "fleet"
+playbook = """
+- Your score counts elementary and high-school enrolment. A school level enrols up to its seats and the students \
+whose homes a school reaches: more schools where homes are out of reach, a bigger school (upgrade) where seats run \
+short.
+- From 1k: a high school when teens go unenrolled, and a library. From 5k a university trains graduates for \
+skilled and office jobs (it counts in no enrolment and costs $150 a month).
+- Graduates fill office and skilled jobs: tell planning when the high-school share rises so it can zone offices.
+"""

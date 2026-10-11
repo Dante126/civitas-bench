@@ -608,7 +608,7 @@ def cross_site(headers) -> str | None:
 
 def default_suite(configs_dir: Path) -> Path:
     """The suite an eval runs without -s: evals.DEFAULT_SUITE, looked up in the server's configs folder."""
-    name = getattr(track("evals"), "DEFAULT_SUITE", "configs/eval_singles.toml")
+    name = getattr(track("evals"), "DEFAULT_SUITE", "configs/eval_v2.toml")
     return configs_dir / Path(name).name
 
 

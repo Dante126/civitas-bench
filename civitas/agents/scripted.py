@@ -17,11 +17,61 @@ from .mapview import MapView
 
 # ====================================================================== mayor
 class ScriptedMayor(Agent):
+    """Loans, working balances topped up from above a reserve, taxes, policies, offers, region deals. From civitas-v2
+    it also reclaims idle department money (RECLAIM): a service keeps a standing balance only while it spends (its
+    first building is funded in full, later builds it asks for), an ask a department sits on goes unfunded, and what
+    a department holds well above its working balance and twice its recent spending is taken back (v1's mayor ended
+    seed 0 with $31k idle in departments). Take-backs have hysteresis (HOLD_TURNS): a department keeps the largest
+    working balance of this and its last two turns (utilities' swings 7,000 <-> 3,000 as supply's margin crosses 1.3x,
+    a service's 3,000 -> 1,000 as its last build leaves the spending window), and nothing is taken from one that asked
+    for money in this or its last two turns unless it sits on that ask: without them it took $4,000 from utilities
+    and gave it back the next quarter, and a service's station money before it built."""
     kind = "scripted"
+    RECLAIM = True              # False: civitas-v1's mayor (ScriptedMayorV1)
     last_turn_month: int | None = None      # month of its previous turn this episode (None: no turn yet)
+    SPEND_MONTHS = 6            # spending is counted over this many months (a department keeps twice that)
+    SERVICES = ("transport", "police", "fire", "health", "education")   # build now and then, ask for each build
+    STANDING_MIN = 1000         # a service's working balance while it spends nothing (up to its usual balance)
+    IDLE_MIN = 1000             # a take-back reclaims at least this much ("well above" what it can spend soon)
+    SAT_SHARE = 0.95            # still holding this share of an ask it was fully funded for, and asking again: sat on it
+    HOLD_TURNS = 2              # take-backs look back this many turns: the largest working balance, any ask
+
+    def __init__(self, role: str, **kwargs):
+        super().__init__(role, **kwargs)
+        self.reset()
 
     def reset(self, seed: int = 0) -> None:
         self.last_turn_month = None
+        self.held: dict[str, float] = {}             # department funds right after its previous turn's transfers
+        self.spending: list[tuple[int, dict]] = []   # (month, {dept: spent since the turn before}) per turn
+        self.sat: dict[str, float] = {}              # dept -> an ask it was fully funded for and didn't spend
+        self.spenders: set[str] = set()              # departments seen spending (a service's first building is paid)
+        self.past: list[tuple[dict, set]] = []       # last HOLD_TURNS turns: (working balances before asks, askers)
+
+    def _spent(self, funds: dict, month: int) -> dict[str, float]:
+        """What each department spent over the last SPEND_MONTHS months: its funds right after each of the mayor's
+        turns less its funds at the next (the mayor's transfers are the only inflow; a refund counts as nothing)."""
+        if self.held:
+            self.spending.append((month, {d: max(0.0, self.held[d] - v) for d, v in funds.items() if d in self.held}))
+        self.spending = [(m, s) for m, s in self.spending if m > month - self.SPEND_MONTHS]
+        out: dict[str, float] = {}
+        for _, s in self.spending:
+            for d, v in s.items():
+                out[d] = out.get(d, 0.0) + v
+        self.spenders |= {d for d, v in out.items() if v > 0}
+        return out
+
+    def _honoured(self, asks: dict, funds: dict) -> dict[str, float]:
+        """The asks it funds: all but one a department sits on. A department that held all it asked for after the
+        previous turn's top-ups, still holds (nearly) all of it and asks the same again isn't spending it on that
+        (scripted planning kept $20k for a casino through the last years of seed 0: it zones first, then finds
+        itself short and asks again). That ask goes unfunded while the department repeats it, and what it holds
+        above its working balance is taken back."""
+        for d, ask in asks.items():
+            if self.held.get(d, 0.0) >= ask and funds.get(d, 0.0) >= self.SAT_SHARE * ask:
+                self.sat[d] = ask
+        self.sat = {d: a for d, a in self.sat.items() if asks.get(d) == a}
+        return {d: a for d, a in asks.items() if self.sat.get(d) != a}
 
     def _since(self, month: int) -> int:
         """First month of council requests it reads: that of its previous turn, since departments post theirs after
@@ -35,13 +85,56 @@ class ScriptedMayor(Agent):
         treasury = f["treasury"]
         expenses = sum(f["last_month_expenses"].values()) if f["last_month_expenses"] else 50.0
         income = sum(f["last_month_income"].values()) if f["last_month_income"] else 0.0
-        funds = f["department_funds"]
+        funds = dict(f["department_funds"])     # as the turn's transfers leave them
         acts, why = [], []
 
         since = self._since(obs["month"])
         self.last_turn_month = obs["month"]
         requests = " ".join(m["text"].lower() for m in obs["council"]
                             if m["month"] >= since and m["sender"] != "mayor")
+        spent = self._spent(funds, obs["month"])
+        asks = _requested_amounts(obs["council"], since)
+        askers = set(asks) | ({"utilities"} if "utilities" in requests and "fund" in requests else set())
+        if self.RECLAIM:
+            asks = self._honoured(asks, funds)
+        pop = c["population"]
+        power, water = c["power"], c["water"]
+        tight = (power["supply"] < 1.3 * power["demand"] + 10 or water["supply"] < 1.3 * water["demand"] + 10
+                 or "utilities" in requests and "fund" in requests)
+        targets = [("utilities", 7000 if tight else 3000, 0.45 if tight else 0.25), ("planning", 9000, 0.6)]
+        if pop >= 150:
+            targets = [targets[0], ("health", 3000, 0.35), ("fire", 3000, 0.35), ("police", 3000, 0.35),
+                       ("education", 3000, 0.35), ("transport", 2000, 0.3), ("planning", 7000, 0.6)]
+        self.targets = {}       # dept -> the working balance aimed for this turn (the scripted fleet's plan budgets)
+        base = {}               # dept -> that balance before asks
+        for dept, target, _ in targets:
+            if dept not in funds:
+                continue
+            if self.RECLAIM and dept in self.SERVICES and dept in self.spenders:
+                # after its first building a service keeps a standing balance only while it spends; it asks for a build
+                target = min(target, max(self.STANDING_MIN, 2 * spent.get(dept, 0.0)))
+            base[dept] = target
+            self.targets[dept] = max(target, asks.get(dept, 0) + 200)
+
+        # --- idle money: before any loan or top-up, take back what a department holds well above both its working
+        # balance and twice what it spent over the last SPEND_MONTHS months (none from fire while a flood is coming).
+        # Hysteresis: the largest balance of this and the last HOLD_TURNS turns counts, and a department that asked in
+        # them keeps its money unless it sits on the ask (taken now, it would be given back next turn); HOLD_TURNS = 0
+        # is the mayor without hysteresis
+        flood = any("flood" in x.lower() for x in obs.get("forecast", []))
+        asked = askers.union(*(a for _, a in self.past)) - set(self.sat) if self.HOLD_TURNS else set()
+        taken = {}
+        for dept, target in self.targets.items():
+            keep = max([target, 2 * spent.get(dept, 0.0)] + [b.get(dept, 0.0) for b, _ in self.past])
+            idle = round(funds[dept] - keep)
+            if self.RECLAIM and idle >= self.IDLE_MIN and dept not in asked and not (dept == "fire" and flood):
+                acts.append({"type": "allocate_budget", "department": dept, "amount": -idle})
+                funds[dept] -= idle
+                treasury += idle
+                taken[dept] = idle
+        if taken:
+            why.append("took back idle " + ", ".join(f"{k} {v}" for k, v in taken.items()))
+
         # --- loans
         if treasury < 3000 and f["debt"] < 30000 and obs["month"] < 96:
             acts.append({"type": "take_loan", "amount": 10000})
@@ -56,28 +149,16 @@ class ScriptedMayor(Agent):
         # --- budget: keep each department near a working balance, most urgent first
         reserve = max(3000.0, (3 if income >= expenses else 6) * expenses)
         available = treasury - reserve
-        pop = c["population"]
-        power, water = c["power"], c["water"]
-        tight = (power["supply"] < 1.3 * power["demand"] + 10 or water["supply"] < 1.3 * water["demand"] + 10
-                 or "utilities" in requests and "fund" in requests)
-        asks = _requested_amounts(obs["council"], since)
-        targets = [("utilities", 7000 if tight else 3000, 0.45 if tight else 0.25), ("planning", 9000, 0.6)]
-        if pop >= 150:
-            targets = [targets[0], ("health", 3000, 0.35), ("fire", 3000, 0.35), ("police", 3000, 0.35),
-                       ("education", 3000, 0.35), ("transport", 2000, 0.3), ("planning", 7000, 0.6)]
         given = {}
-        self.targets = {}       # dept -> the working balance aimed for this turn (the scripted fleet's plan budgets)
-        for dept, target, share in targets:
-            if dept in funds:
-                self.targets[dept] = max(target, asks.get(dept, 0) + 200)
+        for dept, _, share in targets:
             if available <= 500 or dept not in funds:
                 continue
-            target = max(target, asks.get(dept, 0) + 200)
-            amt = min(available * share, max(0.0, target - funds[dept]))
+            amt = min(available * share, max(0.0, self.targets[dept] - funds[dept]))
             if amt >= 100:
                 acts.append({"type": "allocate_budget", "department": dept, "amount": round(amt)})
                 available -= amt
                 treasury -= amt
+                funds[dept] += round(amt)
                 given[dept] = round(amt)
         if given:
             why.append(f"reserve {reserve:.0f}, gave " + ", ".join(f"{k} {v}" for k, v in given.items()))
@@ -100,9 +181,10 @@ class ScriptedMayor(Agent):
             acts.append({"type": "accept_offer" if want else "decline_offer", "offer": o["id"]})
             why.append(f"{'accept' if want else 'decline'} offer #{o['id']}")
         # --- more money for the fire department when a flood is coming
-        if any("flood" in f.lower() for f in obs.get("forecast", [])) and funds.get("fire", 0) < 4000 and treasury > 6000:
+        if flood and f["department_funds"].get("fire", 0) < 4000 and treasury > 6000:
             acts.append({"type": "allocate_budget", "department": "fire", "amount": 3000})
             treasury -= 3000
+            funds["fire"] = funds.get("fire", 0) + 3000
             why.append("levee money before the flood")
 
         # --- taxes
@@ -125,6 +207,8 @@ class ScriptedMayor(Agent):
         deals = _deal_actions(obs) if "region" in obs else []      # region mode only; beside the action cap
         if deals:
             why.append(", ".join(f"{a['type']} {a.get('deal') or a['resource']}" for a in deals))
+        self.held = funds
+        self.past = (self.past + [(base, askers)])[-self.HOLD_TURNS:] if self.HOLD_TURNS else []
         return Decision(actions=acts[: obs.get("max_actions", 8)] + deals, messages=msgs, thinking="; ".join(why))
 
 
@@ -900,3 +984,12 @@ class ScriptedEducation(_ServiceAgent):
 SCRIPTED = {"mayor": ScriptedMayor, "planning": ScriptedPlanner, "utilities": ScriptedUtilities,
             "transport": ScriptedTransport,
             "police": ScriptedPolice, "fire": ScriptedFire, "health": ScriptedHealth, "education": ScriptedEducation}
+
+
+class ScriptedMayorV1(ScriptedMayor):
+    """civitas-v1's scripted mayor: fixed working balances, every ask funded, nothing taken back. Kept so tests can
+    grow the cities their assertions were written on (SCRIPTED_V1); not a line-up option."""
+    RECLAIM = False
+
+
+SCRIPTED_V1 = {**SCRIPTED, "mayor": ScriptedMayorV1}

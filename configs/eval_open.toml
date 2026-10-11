@@ -1,0 +1,31 @@
+# Eval suite (civitas eval -s configs/eval_open.toml --model M): civitas-v2's OPEN track. The same eight single-city
+# late starts as configs/eval_v2.toml (the guided track: same seeds, warm-up, game, tools and guards, scored against
+# the same scripted yardstick), on configs/fleet_open_late.toml: `[fleet] briefing = "open"`, so briefings and tool
+# results state facts and options (sites with prices and estimated effects, coverage, enrolment, supply, money,
+# requests) and never a chosen action (no exact call, no "This turn" / Next line, no to-fund line, no "ask the mayor
+# for $X", no fix after a failure). The guided track measured briefing-following (v1: 88-92% of department actions
+# were a briefing call or site, and four models scored within 0.8 points); here the model has to plan. Scripted agents
+# play months 0-95, the model's fleet months 96-107. The per-run reference wall time and tokens are eval_v2's (guided);
+# open turns may run longer. Not frozen yet: `civitas env check -s configs/eval_open.toml` says so until a
+# configs/envs/civitas-v2-open.json is frozen. Not a run config: the launcher (civitas serve) leaves suite files out.
+name = "open"
+description = "open track: eight single-city late starts with fact-only briefings (32 model turns each), one run per seed"
+
+[eval]
+workers = 8                 # runs at once: they wait on the API, not the CPU
+caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
+reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+env = "civitas-v2-open"     # the environment version (configs/envs/civitas-v2-open.json): an eval on other code is refused
+baseline_model = "trinity-large-thinking"    # the leaderboard's paired verdicts are against this model's eval
+
+[eval.prices]
+"claude-sonnet-5-5" = [2.00, 10.00]   # $ per million prompt / completion tokens (no prompt caching on the compatible endpoint)
+"claude-haiku-5-5" = [0.10, 0.50]
+
+# Per run: the reference wall time and tokens (eval_v2's, guided; trinity-large-thinking, eval trinity-large-cal).
+[[runs]]
+config = "configs/fleet_open_late.toml"
+seeds = [0, 4, 5, 11, 12, 16, 18, 20]
+minutes = 11.7
+prompt_tokens = 1_350_000
+completion_tokens = 155_000

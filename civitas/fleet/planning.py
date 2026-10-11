@@ -31,11 +31,11 @@ import numpy as np
 from ..core.actions import zone_density, zone_price
 from ..sim import catalog as C
 from ..sim.grid import box_sum
-from .fmt import money
+from .fmt import advice, money
 from .tools import (AWAY_FROM_HOMES, BUILT_NAMES, DIRECTIONS, MAX_SITES, SiteList, Spot, _connected_roads, _empty_land,
-                    _riverbank_by_roads, _touching, _wanted, _where, claim_spots, dept_lists, edge_site, funded_sites,
-                    land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded, zone_fit_rect,
-                    zone_line, zoning_cost)
+                    _riverbank_by_roads, _touching, _wanted, _where, capped_unlinked, claim_spots, dept_lists, edge_site,
+                    funded_sites, land_blocked, land_fix, road_cost, scarce_bank, short_of, site_price, spare_funded,
+                    zone_fit_rect, zone_line, zoning_cost)
 
 PARK_RADIUS = 4            # World._compute_environment: park tiles within box_sum(.., 4) raise land value,
 PARK_STEP, PARK_MAX = 0.08, 0.3   # by 8 points each, at most 30 (4 park tiles in range)
@@ -46,6 +46,7 @@ CAP_NEAR = 0.8             # the parks cap is named from this share of CAP_POP_P
 WAITING_MAX = 10           # the playbook: skip a zone type with this many zoned tiles waiting to develop
 ZONE_LETTERS = ("R", "C", "I", "O")     # what the Next line zones by demand (mixed use has no demand of its own)
 BANK_ROAD_MAX = 15         # a road to free riverbank: at most this many new tiles
+EDGE_ROAD_MAX = 20         # a road to the map edge for transport's first train station: at most this many new tiles
 DETOUR_PAD = 3             # a detour around a building stays within this many tiles of the road it replaces
 DETOUR_LEGS = 4            # and has at most this many straight legs
 TURN_COST = 5              # a detour's turn costs this much more (fewer legs, fewer calls)
@@ -144,7 +145,7 @@ def parks_line(p: Parks, site: ParkSite | None) -> list[str]:
            f"{math.ceil(C.CAP_POP_PARKS / C.RESIDENTS_PER_PARK)}" if p.soon else "")
     return [f"- parks: {p.have} of {p.want} park tiles{cap}; each raises land value {round(100 * PARK_STEP)} points "
             f"within {PARK_RADIUS} tiles (up to {round(100 * PARK_MAX)} from 4); best {_where(site._asdict())}, "
-            f"{site.homes} homes near; {money(site.cost)}: {call('build_park', site.args())}"]
+            f"{site.homes} homes near; {money(site.cost)}" + advice(f": {call('build_park', site.args())}")]
 
 
 def cap_line(w) -> list[str]:
@@ -155,7 +156,7 @@ def cap_line(w) -> list[str]:
         return []
     p, pop = parks(w), w.stats.get("population", 0.0)
     linked = bool(w.facilities(C.TRAIN)) or bool(w.facilities(C.HARBOUR))
-    why = ([f"parks {p.have} of {p.by_pop} tiles (yours: build_park)"] if p.capped else []) + (
+    why = ([f"parks {p.have} of {p.by_pop} tiles" + advice(" (yours: build_park)")] if p.capped else []) + (
         ["no train station or harbour (transport's)"] if pop >= C.CAP_POP_CONNECTION and not linked else [])
     return [f"- demand capped: {', '.join(f'{k} +{v:g}' for k, v in caps.items())}: "
             + (", ".join(why) or "see city_overview")]
@@ -285,6 +286,8 @@ def request_fix(w, dept: str, v: "View", text: str = "") -> str:
         named = lambda q: (site_price(w, dept, q).building if site_price(w, dept, q) else q.replace("_", " "))
         p = next((q for q in blocked[dept] if named(q).split()[-1] in text.lower()), blocked[dept][0])
         name = named(p)
+        if p == "train_station" and v.link is not None:              # transport's first link: the edge road's call
+            return f"its first {name} needs a road to the map edge: {v.link.call} ({money(v.link.cost)})"
         if p in AWAY_FROM_HOMES:
             site = edge_site(w, v.roads)
             return (f"its {name} needs a lot away from homes: leave ({site['x2']},{site['y2']}) free, the far end of "
@@ -371,6 +374,44 @@ def road_item(lists: dict[str, SiteList], why: str) -> Item | None:
                 road_cost(s), (f"{first}, then " if first else "") + call("build_road", args), road=True)
 
 
+def edge_road(w) -> tuple[dict, tuple[int, int], float] | None:
+    """The cheapest straight road from the highway-connected network over empty land to one tile short of the map edge,
+    the edge tile beyond it empty land, at most EDGE_ROAD_MAX new tiles: (build_road args, the edge tile, cost); None
+    without one. A train station goes on an empty map-edge tile beside a connected road (observation._edge_sites)."""
+    s, free = w.struct, (w.struct == C.NONE) & (w.terrain == C.LAND)
+    edge = lambda x, y: x in (0, w.w - 1) or y in (0, w.h - 1)
+    best = None
+    ys, xs = np.nonzero(_connected_roads(w) & (s != C.HIGHWAY))
+    for x0, y0 in zip(xs.tolist(), ys.tolist()):
+        for dx, dy in DIRECTIONS:
+            n, x, y = 0, x0 + dx, y0 + dy
+            while n < EDGE_ROAD_MAX and 0 <= x < w.w and 0 <= y < w.h and free[y, x] and not edge(x, y):
+                n += 1
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w.w and 0 <= ny < w.h and edge(nx, ny) and free[ny, nx]:
+                    if best is None or n < best[0]:
+                        best = (n, {"x1": x0 + dx, "y1": y0 + dy, "x2": x, "y2": y}, (nx, ny))
+                    break
+                x, y = nx, ny
+    if best is None:
+        return None
+    return best[1], best[2], best[0] * C.CATALOG["road"]["cost"]
+
+
+def link_item(w, blocked: dict[str, list[str]]) -> Item | None:
+    """A road to the map edge (edge_road) while transport's first train station is blocked for want of an edge lot by a
+    road and the city is unlinked from LINK_AHEAD of the residents R and C demand are capped at without a link
+    (land_blocked: tools.link_due). Seed 4 at month 96: 6,052 residents, no train station or harbour, no edge lot by a
+    road."""
+    if "train_station" not in blocked.get("transport", ()) or (road := edge_road(w)) is None:
+        return None
+    args, (lx, ly), cost = road
+    cap = (f"R and C demand stay capped at +{C.CAP_LEVEL:g} without one" if capped_unlinked(w) else
+           f"R and C demand are capped at +{C.CAP_LEVEL:g} from {C.CAP_POP_CONNECTION:,} residents without one")
+    return Item(f"a road to the map edge for transport's first train station ({cap}), then leave ({lx},{ly}) empty",
+                cost, call("build_road", args))
+
+
 # ------------------------------------------------------------------ the Next line
 def away_item(w, blocked: dict[str, list[str]], lists: dict) -> Item | None:
     """A road into open land whose far end is away from homes (edge_site) while a first building that must stay away
@@ -403,6 +444,7 @@ class View(NamedTuple):
     avoid: set              # the claimed lots and scarce riverbank lots: zone and park calls spare them
     bank: Item | None       # bank_item
     away: Item | None       # away_item (None when bank_item is a road already)
+    link: Item | None       # link_item
     parks: Parks
     park: ParkSite | None   # park_site, sized to the funds bank / away leave: the parks line and the Next line's
 
@@ -422,14 +464,17 @@ def planning_view(env, lists: dict[str, SiteList], funds: float) -> View:
     avoid = {t for sp in claims.values() for t in sp.tiles} | scarce_bank(w)
     bank = bank_item(w, depts, spared)
     away = None if bank is not None and bank.road else away_item(w, blocked, spared)
-    left = funds - sum(i.cost for i in (bank, away) if i is not None)
-    return View(depts, funded, claims, spared, roads, blocked, avoid, bank, away, parks(w), park_site(w, left, avoid))
+    link = link_item(w, blocked)
+    left = funds - sum(i.cost for i in (bank, link, away) if i is not None)
+    return View(depts, funded, claims, spared, roads, blocked, avoid, bank, away, link, parks(w),
+                park_site(w, left, avoid))
 
 
 def planning_next(env, city: dict, v: View, funds: float, ask, most: int = NEXT_ITEMS) -> str:
     """Planning's Next line, every turn: up to `most` (NEXT_ITEMS; a refreshed Next line in a tool result, 2:
     briefing.next_line) builds that raise its score most now, in this order, each
-    priced with its exact call: the riverbank lot utilities' blocked pump or outlet waits for (bank_item); a road
+    priced with its exact call: the riverbank lot utilities' blocked pump or outlet waits for (bank_item); a road to
+    the map edge for transport's first train station while R and C demand are capped without one (link_item); a road
     leaving a lot away from homes for a blocked jail, landfill or cemetery (away_item); parks while R demand is capped
     for lack of them, or soon will be (the view's park, the parks line's); the zone type demand asks for most
     (zone_item, on its Ready sites strip, sized to the funds left); parks while under one per HOMES_PER_PARK homes; a
@@ -440,7 +485,7 @@ def planning_next(env, city: dict, v: View, funds: float, ask, most: int = NEXT_
     it opens (road_build), so the two amounts can differ: making it follow the Next line would change funding_gaps,
     which the money guards read on the scripted fleet's turns too."""
     w = env.world
-    items = [i for i in (v.bank, v.away) if i is not None]
+    items = [i for i in (v.bank, v.link, v.away) if i is not None]
     p, park = v.parks, v.park
     park_item = None if park is None else Item(
         f"{park.tiles} park tile{'s' * (park.tiles > 1)} by {park.homes} homes (parks {p.have} of {p.want}"

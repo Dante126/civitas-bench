@@ -116,9 +116,12 @@ class ScriptedFleetAgent(Agent):
         if self.env is None:
             raise RuntimeError("ScriptedFleetAgent.act before bind(env)")
         env, role = self.env, self.role
-        box = ToolBox(env, role)
+        # the briefing and tool results render in the configured style (bench/envs.py's probe hashes them); the
+        # policy reads neither text and confirms refusals by their kind, so it plays the same in either style
+        style = self.cfg.briefing
+        box = ToolBox(env, role, style=style)
         turn = _Turn(box, self.cfg.max_steps)
-        brief = briefing(env, role, mode=self.cfg.mode)
+        brief = briefing(env, role, mode=self.cfg.mode, style=style)
         d = self.decide(turn.call)
         if role == "mayor":
             self._plan(turn)
@@ -186,8 +189,8 @@ class ScriptedFleetAgent(Agent):
         call the mayor's guards refuse (a duplicate allocation, a take-back below a department's keep, a top-up for
         another building under the reserve, a loan while the treasury holds $3,000, after its own top-ups emptied it
         or while only other buildings wait) is one the policy means: it is repeated at once with confirm: true, which
-        that refusal earned (the scripted mayor sends no take-backs, tops up only from above its own reserve and
-        borrows only at a turn's start under $3,000)."""
+        that refusal earned (the scripted mayor takes back only money above a department's working balance and its
+        spending, tops up only from above its own reserve and borrows only at a turn's start under $3,000)."""
         box, cap = turn.box, self.env.cfg.max_actions_per_turn
         for a in actions:
             args = dict(a)

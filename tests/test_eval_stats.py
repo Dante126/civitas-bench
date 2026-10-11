@@ -139,3 +139,45 @@ def test_an_old_eval_gets_units_and_intervals():
     a = E.aggregate_of(ev)
     assert a["n_units"] == 3 and a["city_delta"]["lo"] is not None
     assert "+1.0 (" in dict(E.compare_rows([ev])[1])["city score vs scripted (mean, 95% CI)"][0]
+
+
+# ------------------------------------------------------------------ population / quality split (civitas-v2)
+def _split_card(seed, delta, pop_change, yard_pop_change, hand_pop=5000, target=None):
+    c = _card("late", seed, delta)
+    c["total"]["change"]["population"] = pop_change
+    c["total"]["yard_change"]["population"] = yard_pop_change
+    c["total"]["at_handover"]["population"] = hand_pop
+    if target is not None:
+        c["target_population"] = target
+    return c
+
+
+def test_vs_scripted_splits_into_population_and_quality():
+    """The city score's population half is 50 x sqrt(population / target): the split of a run's city score vs
+    scripted takes the run's gain in it less the yardstick's from the same hand-over; quality is the rest. Read from
+    fields every card has, so an eval saved before the split gets one (target 30,000 unless the card says)."""
+    term = lambda p, t=30000: 50 * (p / t) ** 0.5
+    pop = (term(6000) - term(5000)) - (term(5200) - term(5000))
+    c = _split_card(0, 2.0, 1000, 200)
+    assert E.card_split(c) == {"population": pytest.approx(pop, abs=1e-3), "quality": pytest.approx(2.0 - pop, abs=1e-3)}
+    assert E.card_split(_split_card(0, 2.0, 1000, 200, target=10000))["population"] == pytest.approx(
+        term(6000, 1e4) - term(5200, 1e4), abs=1e-3)
+    no_pop = _card("late", 0, 1.0)
+    no_pop["total"]["at_handover"]["population"] = None
+    assert E.card_split(no_pop) is None
+    region = {"region": True, "cities": ["north", "south"], "total": {},
+              "by_city": {"north": _split_card(0, 2.0, 1000, 200)["total"], "south": _split_card(0, -1.0, 0, 0)["total"]}}
+    r = E.card_split(region)                                         # the region score is its cities' mean
+    assert r["population"] == pytest.approx(pop / 2, abs=1e-3)
+    assert r["quality"] == pytest.approx((2.0 - pop - 1.0) / 2, abs=1e-3)
+    cards = [_split_card(s, d, pc, 0) for s, (d, pc) in enumerate([(2.0, 1000), (0.5, 0), (-1.0, -500)])]
+    a = E._agg(cards, {})
+    pt = [term(6000) - term(5000), 0.0, term(4500) - term(5000)]
+    assert a["pop_term_delta"]["mean"] == pytest.approx(sum(pt) / 3, abs=1e-3)
+    assert a["quality_delta"]["mean"] == pytest.approx((1.5 - sum(pt)) / 3, abs=1e-3)
+    assert [u["pop_term"] for u in a["units"].values()] == pytest.approx(pt, abs=1e-3)
+    rows = dict(E._summary_rows(a))
+    assert rows["· from the population term"].startswith(f"{sum(pt) / 3:+.1f} (")
+    md = E.markdown({**_ev("m", cards), "suite": {"name": "late", "file": "x.toml"}})
+    assert "| · population term | · quality terms |" in md
+    assert f"| **+2.0** | {pt[0]:+.1f} | {2.0 - pt[0]:+.1f} |" in md

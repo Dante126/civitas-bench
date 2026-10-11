@@ -1,0 +1,33 @@
+# Eval suite (civitas eval -s configs/eval_v2.toml --model M): civitas-v2's checkpoint eval. Eight single-city late
+# starts, one run each: scripted agents play months 0-95, the model's fleet months 96-107, scored against the scripted
+# yardstick from the same hand-over. eval_singles.toml with v2's hand-over seeds: v1's seeds 1 and 6 handed over in a
+# recession (industrial jobs to 0, unemployment ~45%), which the scripted yardstick recovers from by itself. The seeds
+# here are the eight of 0-23 whose scripted warm-up (v2's scripted mayor) has no shock in months 84-96: no recession
+# under way or within 6 months of ending, no flood, no fall of industrial jobs over 30%, unemployment under 10%, no
+# population fall over 5% (seed 2: a flood at month 85 cost 45% of its population; seed 3, also clean, is left out
+# as the largest hand-over city). Hand-over population 5,897 on average (all 24 seeds: 5,756; seeds 0-7: 5,824).
+# Re-scanned after the scripted mayor's take-back hysteresis changed every hand-over city: the same 9 clean seeds.
+# None of the eight has a train station or harbour at the hand-over; 0, 5, 18 and 20 (past 6,000) have R/C capped.
+# The per-run reference wall time and tokens are eval_singles' (trinity-large-thinking on v1's seeds).
+# Not a run config: the launcher (civitas serve) leaves suite files out.
+name = "v2"
+description = "late starts: eight single cities with no shock before the hand-over (32 model turns each), one run per seed"
+
+[eval]
+workers = 8                 # runs at once: they wait on the API, not the CPU
+caffeinate = true           # macOS: each run under `caffeinate -dims` (the Mac sleeps during long runs otherwise)
+reference_model = "trinity-large-thinking"   # whose numbers the per-run estimates below are
+env = "civitas-v2"          # the environment version (configs/envs/civitas-v2.json): an eval on other code is refused
+baseline_model = "trinity-large-thinking"    # the leaderboard's paired verdicts are against this model's eval
+
+[eval.prices]
+"claude-sonnet-5-5" = [2.00, 10.00]   # $ per million prompt / completion tokens (no prompt caching on the compatible endpoint)
+"claude-haiku-5-5" = [0.10, 0.50]
+
+# Per run: the reference wall time and tokens (trinity-large-thinking, eval trinity-large-cal's single cities).
+[[runs]]
+config = "configs/fleet_smoke_late.toml"
+seeds = [0, 4, 5, 11, 12, 16, 18, 20]
+minutes = 11.7
+prompt_tokens = 1_350_000
+completion_tokens = 155_000

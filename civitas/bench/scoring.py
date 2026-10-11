@@ -61,6 +61,13 @@ def _cost_eff(m: dict, dept: str, ref_per_resident: float) -> float:
     return _clip(ref_per_resident * max(1, m["population"]) / upkeep)
 
 
+def population_term(population: float, cfg: ScoringConfig) -> float:
+    """The city score's population half, 50 x pop_score. city_score = this + the quality half (50 x gate x quality),
+    times the recall / bankruptcy penalties: a split of a score change into population and quality reads the
+    population part here and leaves the rest (penalties included) to quality."""
+    return 100 * 0.5 * _clip((max(0.0, population) / cfg.target_population) ** 0.5)
+
+
 def city_score(history: list[dict], cfg: ScoringConfig) -> float:
     if not history:
         return 0.0
@@ -74,6 +81,15 @@ def city_score(history: list[dict], cfg: ScoringConfig) -> float:
     return score * (0.5 if history[-1]["bankrupt"] else 1.0)
 
 
+def _deployment(win: list[dict]) -> float:
+    """What the departments spent over the window against that plus the money they held idle: the department funds
+    averaged over the window's months (civitas-v2; v1 read the final month only, so money taken back in the last
+    month counted as never held)."""
+    spent = sum(sum((h.get("dept_spent") or {}).values()) for h in win)
+    idle = _mean([sum((h.get("dept_funds") or {}).values()) for h in win])
+    return spent / (spent + idle) if spent + idle > 0 else 0.0
+
+
 def mayor_score(history: list[dict], cfg: ScoringConfig) -> float:
     if not history:
         return 0.0
@@ -85,9 +101,7 @@ def mayor_score(history: list[dict], cfg: ScoringConfig) -> float:
     ref_income = cfg.target_population * 8 * 0.09
     revenue = _clip(math.log1p(max(0.0, m["income"])) / math.log1p(ref_income))
     solvency = sum(1 for h in win if h["treasury"] >= 0) / len(win)
-    spent = sum(sum(h["dept_spent"].values()) for h in win)
-    idle = sum(m["dept_funds"].values())
-    deployment = spent / (spent + idle) if spent + idle > 0 else 0.0
+    deployment = _deployment(win)
     approval = _mean([h.get("approval", 0.6) for h in win])
     return 100 * (0.3 * revenue + 0.7 * c["gate"] * (
         0.25 * c["finance"] + 0.2 * solvency + 0.2 * c["happiness"] + 0.15 * deployment + 0.2 * approval))

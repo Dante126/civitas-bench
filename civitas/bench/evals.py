@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import stats as S
+from .scoring import ScoringConfig, population_term
 
 try:
     import tomllib  # py3.11+
@@ -960,6 +961,34 @@ def _mean(vals):
     return statistics.fmean(vals) if vals else None
 
 
+def _split(u: dict | None, target: float | None) -> dict | None:
+    """A unit's city score vs scripted split into the population term and the quality terms: {population, quality}.
+    The population term is scoring.population_term (50 x pop_score) at the final population less at the hand-over,
+    the run's change less the yardstick's from the same hand-over; quality is the rest of the city delta (happiness,
+    finances, services, ..., and the recall / bankruptcy penalties). Read from the card's own fields (the hand-over
+    population and both population changes), so a card saved before the split has one too; None without them."""
+    u = u or {}
+    hand, ch, ych, dl = (u.get(k) or {} for k in ("at_handover", "change", "yard_change", "delta"))
+    hp = hand.get("population")
+    if hp is None or None in (ch.get("population"), ych.get("population"), dl.get("city")):
+        return None
+    cfg = ScoringConfig(target_population=target or ScoringConfig.target_population)
+    term = lambda pop: population_term(pop, cfg)
+    pop = (term(hp + ch["population"]) - term(hp)) - (term(hp + ych["population"]) - term(hp))
+    return {"population": _r(pop), "quality": _r(dl["city"] - pop)}
+
+
+def card_split(c: dict) -> dict | None:
+    """The run's split (_split): a region's is the mean of its cities' (its score is their mean)."""
+    target = c.get("target_population")
+    if not c.get("region"):
+        return _split(c.get("total"), target)
+    parts = [_split((c.get("by_city") or {}).get(x), target) for x in c.get("cities") or []]
+    if not parts or None in parts:
+        return None
+    return {k: _r(_mean([p[k] for p in parts])) for k in ("population", "quality")}
+
+
 def prompts_hash(meta: dict) -> str | None:
     p = meta.get("fleet_prompts")
     return hashlib.sha1(json.dumps(p, sort_keys=True).encode()).hexdigest()[:12] if p else None
@@ -979,7 +1008,8 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
            "cities": list(meta.get("cities") or []), "model": model_of(meta.get("agents") or {}),
            "fleet_version": meta.get("fleet_version"), "prompts": prompts_hash(meta), "started": meta.get("started"),
            "finished": summ is not None, "wall_time_s": (summ or {}).get("wall_time_s"),
-           "bankrupt": (summ or {}).get("bankrupt"), "warmup": int(meta.get("warmup_months") or 0)}
+           "bankrupt": (summ or {}).get("bankrupt"), "warmup": int(meta.get("warmup_months") or 0),
+           "target_population": ((meta.get("config") or {}).get("scoring") or {}).get("target_population")}
     if not meta:
         out["error"] = "no meta.json"
         return out
@@ -1034,19 +1064,23 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
 
 
 def unit_values(cards: list[dict]) -> dict:
-    """The scored runs grouped by unit (config + seed), in order: {unit: {runs, city, population, teamwork, roles,
-    handover, values}}, each the mean over the unit's repeats of the run's value vs scripted (a region by its region
-    values); `values` the city deltas of its runs, `handover` the city score at the hand-over (the same for every
+    """The scored runs grouped by unit (config + seed), in order: {unit: {runs, city, pop_term, quality, population,
+    teamwork, roles, handover, values}}, each the mean over the unit's repeats of the run's value vs scripted (a region
+    by its region values; pop_term / quality: card_split); `values` the city deltas of its runs, `handover` the city score at the hand-over (the same for every
     repeat while the warm-up code is the same)."""
     groups: dict[str, list] = {}
+    splits: dict[str, list] = {}
     for c in cards:
         u = c.get("total")
         if u and u.get("delta"):
             groups.setdefault(unit_key(c), []).append(u)
+            splits.setdefault(unit_key(c), []).append(card_split(c) or {})
     out = {}
     for k, us in groups.items():
         roles = list(dict.fromkeys(r for u in us for r in u["role_delta"]))
         out[k] = {"runs": len(us), "city": _r(_mean([u["delta"]["city"] for u in us])),
+                  "pop_term": _r(_mean([x.get("population") for x in splits[k]])),
+                  "quality": _r(_mean([x.get("quality") for x in splits[k]])),
                   "population": _r(_mean([u["delta"]["population"] for u in us]), 1),
                   "teamwork": _r(_mean([u.get("teamwork") for u in us]), 1),
                   "roles": {r: _r(_mean([u["role_delta"].get(r) for u in us])) for r in roles},
@@ -1096,6 +1130,7 @@ def _agg(cards: list[dict], ev: dict) -> dict:
     out = {"runs": len(cards), "finished": len(units), "scored": len(scored), "n_units": len(uv),
            "repeats": sorted({u["runs"] for u in U}),
            "city_delta": {**_ci([u["city"] for u in U]), "values": cd},
+           "pop_term_delta": _ci([u.get("pop_term") for u in U]), "quality_delta": _ci([u.get("quality") for u in U]),
            "population_delta": _ci([u["population"] for u in U], 1),
            "city_change": _r(_mean([u["change"]["city"] for u in units if u.get("change")])),
            "yard_change": _r(_mean([u["yard_change"]["city"] for u in scored])),
@@ -1176,6 +1211,8 @@ def _summary_rows(a: dict) -> list[tuple[str, str]]:
             ("units (config + seed) x repeats",
              f"{n_units} x {'/'.join(map(str, reps)) or 'n/a'}"),
             ("city score vs scripted (mean, 95% CI)", ci_text(a["city_delta"])),
+            ("· from the population term", ci_text(a.get("pop_term_delta"))),
+            ("· from the quality terms", ci_text(a.get("quality_delta"))),
             ("seed spread (std of the units)", _f(a["city_delta"].get("std"))),
             ("replay noise (std on the same seed)", _f(noise["sd"]) if noise else "n/a: needs --repeats 2+"),
             ("detectable difference vs another eval", mde_text(a)),
@@ -1197,15 +1234,17 @@ def _summary_rows(a: dict) -> list[tuple[str, str]]:
     return rows
 
 
-def _line(c: dict, u: dict, label: str) -> str:
+def _line(c: dict, u: dict, label: str, split: dict | None = None) -> str:
     ch, ych, dl = u.get("change") or {}, u.get("yard_change") or {}, u.get("delta") or {}
+    sp = split or {}
     calls, tk = u.get("calls") or {}, u.get("tokens") or {}
     turns = calls.get("turns") or 0
     per = lambda k: f"{calls[k] / turns:.2f}" if turns else "n/a"
     tok = (tk.get("prompt") or 0) + (tk.get("completion") or 0)
     hand = u.get("at_handover") or {}
     return (f"| {label} | {_f(hand.get('city'))} | {_f(ch.get('city'), 1, True)} | {_f(ych.get('city'), 1, True)} "
-            f"| **{_f(dl.get('city'), 1, True)}** | {_f(ch.get('population'), 0, True)} "
+            f"| **{_f(dl.get('city'), 1, True)}** | {_f(sp.get('population'), 1, True)} "
+            f"| {_f(sp.get('quality'), 1, True)} | {_f(ch.get('population'), 0, True)} "
             f"| {_f(ych.get('population'), 0, True)} | {_f(dl.get('population'), 0, True)} | {_f(u.get('teamwork'))} "
             f"| {per('failed')} | {per('refused')} | {tk.get('turns') or 0} | {_tok(tok) if tok else 'n/a'} "
             f"| {_dur(c.get('wall_time_s')) if label.startswith('**') or not c.get('region') else ''} |")
@@ -1233,7 +1272,9 @@ def markdown(ev: dict) -> str:
     L += ["Each run is a late start: scripted agents play the warm-up, then the model's fleet takes over the grown "
           "city. **vs scripted** is the run's change since the hand-over minus the change the scripted agents make "
           "from the same hand-over (the run's yardstick.json): above 0, the model added more than the scripted "
-          "baseline would have. Department scores are final scores minus the yardstick's. A region run counts once, "
+          "baseline would have. It splits into the **population term** (half the city score is 50 x sqrt(population "
+          "/ target): the run's gain in it minus the yardstick's) and the **quality terms** (the rest: happiness, "
+          "finances, services, environment, jobs, safety, health, education). Department scores are final scores minus the yardstick's. A region run counts once, "
           "by its region values (the region score, departments and Teamwork averaged over its cities).", "",
           "A **unit** is a config and seed; its value is the mean over its repeats (runs of the same hand-over). "
           "Intervals are 95% t-intervals over the units: an interval above 0 means the model beats scripted on this "
@@ -1256,20 +1297,22 @@ def markdown(ev: dict) -> str:
         for r in roles:
             L.append(f"| {r} | {rc(a, r)}" + "".join(f" | {rc(groups[g], r)}" for g in cols) + " |")
     L += ["", "## Runs", "",
-          "| run | city at hand-over | city change | scripted | vs scripted | population change | scripted "
-          "| vs scripted | Teamwork | failed / turn | refused / turn | model turns | tokens | run time |",
-          "|---|" + "---:|" * 13]
+          "| run | city at hand-over | city change | scripted | vs scripted | · population term | · quality terms "
+          "| population change | scripted | vs scripted | Teamwork | failed / turn | refused / turn | model turns "
+          "| tokens | run time |",
+          "|---|" + "---:|" * 15]
     for c in cards:
         name = run_label(c)
         if not c.get("total"):
-            L.append(f"| {name} (`{c['run_id']}`) | {c.get('status')}" + " |" * 13)
+            L.append(f"| {name} (`{c['run_id']}`) | {c.get('status')}" + " |" * 15)
             continue
         if c["region"]:
-            L.append(_line(c, c["total"], f"**{name} (region)**"))
+            L.append(_line(c, c["total"], f"**{name} (region)**", card_split(c)))
             for city in c["cities"]:
-                L.append(_line(c, c["by_city"][city], f"· {city}"))
+                L.append(_line(c, c["by_city"][city], f"· {city}",
+                               _split(c["by_city"][city], c.get("target_population"))))
         else:
-            L.append(_line(c, c["total"], name))
+            L.append(_line(c, c["total"], name, card_split(c)))
     if roles:
         L += ["", "## Departments per run", "", "Final score (vs scripted).", "",
               "| run | " + " | ".join(roles) + " |", "|---|" + "---:|" * len(roles)]
@@ -1468,7 +1511,7 @@ def list_evals(runs_dir: str | Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------------------------------- plug-in evals
-DEFAULT_SUITE = "configs/eval_singles.toml"
+DEFAULT_SUITE = "configs/eval_v2.toml"        # civitas-v2, guided; eval_open.toml is the open track, eval_singles civitas-v1
 
 
 def model_key(ev: dict) -> str | None:
@@ -1762,11 +1805,24 @@ def _final_ci(ev: dict) -> dict:
     return _ci([statistics.fmean(v) for v in groups.values()])
 
 
+def _split_ci(ev: dict, a: dict) -> tuple[dict, dict]:
+    """The population / quality split of vs scripted over units ({mean, lo, hi} each): the aggregate's, or for an
+    eval saved before the split, recomputed from its run cards (card_split reads fields every card has)."""
+    if "pop_term_delta" in a:
+        p, q = a.get("pop_term_delta") or {}, a.get("quality_delta") or {}
+    else:
+        uv = unit_values(_cards(ev))
+        p, q = _ci([u.get("pop_term") for u in uv.values()]), _ci([u.get("quality") for u in uv.values()])
+    pick = lambda c: {x: c.get(x) for x in ("mean", "lo", "hi")}
+    return pick(p), pick(q)
+
+
 def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
     """Per environment version (default: the default suite's), the latest finished, non-drifted eval of each model
     ranked by its score vs the scripted yardstick: {"env", "envs", "baseline", "rows": [...], "skipped": [{"eval_dir",
-    "reason"}]}. Each row: model, eval_dir, created, n_units, vs_yardstick / score ({mean, lo, hi}), departments,
-    tokens, cost, and the paired verdict against the baseline model's eval on the same version. `eval_dir` (rows and
+    "reason"}]}. Each row: model, eval_dir, created, n_units, vs_yardstick / score ({mean, lo, hi}), its split into
+    pop_term / quality ({mean, lo, hi}: _split_ci), departments, teamwork, failed_per_turn / refused_per_turn (None
+    for an eval from before they were counted), tokens, cost, and the paired verdict against the baseline model's eval on the same version. `eval_dir` (rows and
     skipped) is the folder's name, as list_evals' "dir" and the server's ?dir= take it."""
     evs = _evals_in(runs_dir)
     envs = sorted({(e.get("env") or {}).get("name") for e in evs} - {None})
@@ -1810,14 +1866,17 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
         a = aggregate_of(ev)
         cd = a.get("city_delta") or {}
         p = paired(base_ev, ev) if base_ev is not None and ev is not base_ev else None
+        pop_term, quality = _split_ci(ev, a)
         rows.append({"model": k, "eval_dir": Path(ev["dir"]).name, "name": ev.get("name"),
                      "created": ev.get("created"),
                      "n_units": a.get("n_units"), "provider": ev.get("provider"),
                      "vs_yardstick": {x: cd.get(x) for x in ("mean", "lo", "hi")},
+                     "pop_term": pop_term, "quality": quality,
                      "score": {x: v for x, v in _final_ci(ev).items() if x in ("mean", "lo", "hi")},
                      "departments": dict(a.get("roles") or {}),
                      "population": {x: (a.get("population_delta") or {}).get(x) for x in ("mean", "lo", "hi")},
                      "teamwork": a.get("teamwork"), "beats_scripted": a.get("beats_scripted"),
+                     "failed_per_turn": a.get("failed_per_turn"), "refused_per_turn": a.get("refused_per_turn"),
                      "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"),
                      "verdict": verdict_text(p)[0] if p else None, "paired": p,
                      "baseline": k == baseline})
@@ -1834,21 +1893,25 @@ def leaderboard_markdown(lb: dict) -> str:
     L += [f"Environment `{lb.get('env')}`" + (f" (fingerprint `{lb['fingerprint']}`)" if lb.get("fingerprint") else "")
           + ": the latest finished eval of each model whose code matched it, ranked by its city score vs the scripted "
             "yardstick (the change since the hand-over minus the scripted agents' change from the same hand-over; "
-            "mean over units with its 95% interval). Evals of other versions are never ranked together."
+            "mean over units with its 95% interval), split into the population term (50 x sqrt(population / "
+            "target)) and the quality terms (the rest). Evals of other versions are never ranked together."
           + (f" Paired verdicts are against `{lb['baseline']}`." if lb.get("baseline") else ""), ""]
     if not lb.get("rows"):
         L += ["No ranked evals yet: `civitas eval --model <key>` on the suite of this version.", ""]
     else:
         roles = list(dict.fromkeys(r for row in lb["rows"] for r in row["departments"]))
-        L += ["| # | model | vs scripted (95% CI) | final city score | units | tokens | cost | vs baseline | eval |",
-              "|---:|---|---:|---:|---:|---:|---:|---|---|"]
+        L += ["| # | model | vs scripted (95% CI) | · population term | · quality terms | final city score | units "
+              "| Teamwork | failed / turn | refused / turn | tokens | cost | vs baseline | eval |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"]
         for row in lb["rows"]:
             v = row["vs_yardstick"]
             verdict = "baseline" if row.get("baseline") else (row.get("verdict") or "n/a").replace("|", "/")
             cost = "n/a" if row.get("cost") is None else "${:,.2f}".format(row["cost"])
             score = ci_text(row["score"]).lstrip("+")
-            L.append(f"| {row['rank']} | {row['model']} | {ci_text(v)} | {score} "
-                     f"| {row.get('n_units') or 0} | {_tok(row.get('tokens'))} | {cost} | {verdict} "
+            sp = lambda k: _f((row.get(k) or {}).get("mean"), 1, True)
+            L.append(f"| {row['rank']} | {row['model']} | {ci_text(v)} | {sp('pop_term')} | {sp('quality')} | {score} "
+                     f"| {row.get('n_units') or 0} | {_f(row.get('teamwork'))} | {_f(row.get('failed_per_turn'), 2)} "
+                     f"| {_f(row.get('refused_per_turn'), 2)} | {_tok(row.get('tokens'))} | {cost} | {verdict} "
                      f"| `{Path(row['eval_dir']).name}` |")
         if roles:
             L += ["", "## Departments: final score vs scripted (mean)", "",

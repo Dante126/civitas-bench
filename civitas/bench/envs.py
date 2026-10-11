@@ -244,7 +244,7 @@ def _canned_script(base: str, agent, obs: dict) -> list[tuple[str, dict]]:
     from ..fleet.tools import ALL_ACTIONS, ToolBox
     calls: list[tuple[str, dict]] = []
     if isinstance(agent, ScriptedFleetAgent):
-        scratch = ToolBox(agent.env, base)
+        scratch = ToolBox(agent.env, base, style=agent.cfg.briefing)
         d = agent.decide(lambda name: scratch.call(name, "{}"))
         if base in MAP_ROLES:
             calls.append(("map_overview", {}))

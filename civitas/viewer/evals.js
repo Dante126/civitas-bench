@@ -475,15 +475,18 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
         <td class="ev-rank">${i + 1}</td>
         <td><b>${esc(r.model)}</b>${r.model === base ? ` <span class="ev-tag">baseline</span>` : ""}<div class="ev-sub2 mono">${esc(r.eval_dir || "")}</div></td>
         <td class="ev-cicell"><div class="ev-cinum"><b class="${v.lo > 0 ? "good" : v.hi < 0 ? "badc" : ""}">${sgn(v.mean)}</b>${v.lo != null ? ` <span class="muted">[${sgn(v.lo)}, ${sgn(v.hi)}]</span>` : ""}</div>${ciBar(v, lo, hi)}</td>
+        <td class="small">${sgn((r.pop_term || {}).mean)} <span class="muted">/</span> ${sgn((r.quality || {}).mean)}</td>
         <td>${s.mean != null ? s.mean.toFixed(1) : "—"}${s.lo != null ? ` <span class="muted small">[${s.lo.toFixed(1)}, ${s.hi.toFixed(1)}]</span>` : ""}</td>
         <td>${r.n_units ?? "—"}</td>
+        <td>${r.teamwork != null ? r.teamwork.toFixed(1) : "—"}</td>
+        <td class="small">${r.failed_per_turn != null ? r.failed_per_turn.toFixed(2) : "—"} <span class="muted">/</span> ${r.refused_per_turn != null ? r.refused_per_turn.toFixed(2) : "—"}</td>
         <td class="ev-vd">${r.model === base ? `<span class="muted">—</span>` : r.verdict ? esc(r.verdict) : `<span class="muted">no paired baseline</span>`}</td>
         <td>${tok(r.tokens)}</td><td>${usd(r.cost)}</td></tr>`;
     }).join("");
     const skipped = (P.lb.skipped || []).map(s => `<li><span class="mono">${esc(s.eval_dir)}</span>: ${esc(s.reason)}</li>`).join("");
     return `<div class="ev-tools">${pick}<button class="btn" id="lbRe">↻ Refresh</button><div class="grow"></div><span class="muted small">the latest finished, non-drifted eval of each model on this version</span></div>
-      <div class="ev-card">${rows.length ? `<div class="ev-scroll"><table class="ev-t ev-board"><thead><tr><th>#</th><th>Model</th><th>vs scripted <span class="muted">(95% interval)</span></th><th>City score</th><th>Units</th><th>vs baseline${base ? ` (${esc(base)})` : ""}</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>${tr}</tbody></table></div>
-        <div class="muted small ev-foot">vs scripted: the city's change since the hand-over minus the scripted agents' change from the same hand-over, mean over units with its 95% interval (the bar; the line is 0). An interval clear of 0 beats or trails scripted beyond seed luck.</div>`
+      <div class="ev-card">${rows.length ? `<div class="ev-scroll"><table class="ev-t ev-board"><thead><tr><th>#</th><th>Model</th><th>vs scripted <span class="muted">(95% interval)</span></th><th title="vs scripted split: the population term (50 x sqrt(population / target)) / the quality terms (the rest)">pop / quality</th><th>City score</th><th>Units</th><th title="mean Teamwork score over the runs">Teamwork</th><th title="failed actions / guard refusals per model turn">failed / refused per turn</th><th>vs baseline${base ? ` (${esc(base)})` : ""}</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>${tr}</tbody></table></div>
+        <div class="muted small ev-foot">vs scripted: the city's change since the hand-over minus the scripted agents' change from the same hand-over, mean over units with its 95% interval (the bar; the line is 0). An interval clear of 0 beats or trails scripted beyond seed luck. pop / quality: how much of it came from the population term and how much from the quality terms.</div>`
         : `<div class="emptytab">No ranked evals on ${esc(P.lb.env || "this version")} yet.</div>`}</div>
       ${skipped ? `<div class="ev-card ev-skipped"><div class="ev-head"><h4>Not ranked</h4></div><ul class="small muted">${skipped}</ul></div>` : ""}`;
   }

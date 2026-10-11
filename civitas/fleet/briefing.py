@@ -4,7 +4,8 @@
 playbooks, so coaches steer strategy but cannot change rules or tools. `briefing()` is a compact status for the
 turn: the mayor gets the city, finances, department money and reports, and the plan; a department gets its plan slice,
 budget, key metrics, a "since your last turn" digest, the map, its ready sites and its memory. Everything else is a
-tool call away.
+tool call away. `briefing(style="open")` (fmt.py) renders the same facts without a chosen action: no needs, ask,
+to-fund or Next lines and no exact calls; the mayor's Departments block then lists each department's priced options.
 """
 from __future__ import annotations
 
@@ -19,7 +20,8 @@ from ..core.actions import zone_price
 from ..core.roles import ROLES, TURN_ORDER
 from ..sim import catalog as C
 from .config import FleetAgentConfig
-from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, cash, cut, money, months, num, pct, signed
+from .fmt import MESSAGE_PREVIEW_CHARS, a_or_an, advice, briefing_style, cash, cut, is_open, money, months, num, pct, \
+    signed
 from .memory import DEPARTMENTS, FleetState
 from .planning import View, cap_line, parks_line, planning_next, planning_view, request_fix
 from .region import region_lines
@@ -28,9 +30,12 @@ from .tools import MAP_PARTS, MAX_ENTRIES, MAX_SITES, MAYOR_MAP, NEED_KINDS, SIT
     funding_gaps, land_blocked, land_fix, map_facts, map_lines, overview, plan_slice, ready_lines, ready_prices, \
     role_obs, scarce_bank, short_of, short_supplies, site_lists, site_price, spend_lines, unclaimed_spots
 from .tools import REQUEST_CHARS, REQUESTS_SHOWN, OpenRequest, fund_cover, open_requests, request_groups, request_state
-from .tools import Ask, keep_up_where, mayor_ask, needs_count
-from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, road_price
+from .tools import Ask, _yours, keep_up_where, mayor_ask, needs_count
+from .tools import AWAY_FROM_HOMES, _and, _wanted, _where, edge_site, not_next, road_price
 from .tools import SITE_MIN_POP, TRANSIT_GOAL, FirstBuild, bus_seats, bus_stops, first_bus_line, transit_estimate
+from .tools import TIER_UP, enrol_text, upgrade_line
+from .tools import AHEAD_MONTHS, BANK_BUSY, RESERVE_MIN, _offers, core_fact, reserve_why, tier_name
+from .tools import LINK_PURPOSES, SUPPLEMENTARY, _cells_busy, buildings_of, capped_unlinked
 
 # paths into build_observation(...)["city"]
 KEY_METRICS = {
@@ -124,6 +129,12 @@ TEAM = {"mayor": "Write the plan with update_plan and fund it with allocate_budg
                 "when your briefing's budget block says to (a first building, supply, planning's road, or another "
                 "building the mayor's money covers), for the amount it names; otherwise put what you need in your "
                 "end_turn report, which the mayor reads. Ask other departments with send_message."}
+# the open briefing style (fmt.py): the same rules without pointing at briefing lines that tell what to do
+TEAM_OPEN = {**TEAM,
+             "dept": "Follow your slice of the plan (budget target, priority, city goals); the budget target is the "
+                     "mayor's ceiling for you, not money to ask for. Ask the mayor for money with send_message (an "
+                     "amount and a reason) or put what you need in your end_turn report, which the mayor reads. Ask "
+                     "other departments with send_message."}
 
 
 def _value(key: str, v) -> str:
@@ -153,6 +164,9 @@ def _date(env) -> str:
 def _action(e: dict) -> str:
     a = dict(e.get("action") or {})
     kind = a.pop("type", "?")
+    if is_open():                       # what was tried, not a call to copy: "build_park (x 23, y 18)"
+        args = ", ".join(f"{k} {v}" for k, v in a.items())
+        return cut(f"m{e['month']} {kind}" + (f" ({args})" if args else "") + f": {core_fact(e.get('message', ''))}")
     args = json.dumps(a, separators=(",", ":"))[1:-1] if a else ""
     return cut(f"m{e['month']} {kind}({args}): {e.get('message', '')}")
 
@@ -223,9 +237,11 @@ def _ready_sites(env, role: str, lists: dict, prices: dict, funds: float, keep_b
     w = env.world
     dense = [] if role != "planning" or w.unlocked("high_density") else [
         f"- high density: locked until {C.UNLOCK_POP['high_density']:,} residents (now "
-        f"{w.metrics()['population']:,}): zone with density \"low\""]
+        f"{w.metrics()['population']:,})" + advice(': zone with density "low"')]
     land, tail = [], ""
     keep = scarce_bank(w) if keep_bank is None else keep_bank
+    if is_open():                                  # a lot's tag only, no "kept for" choice of sites
+        keep = set(keep)
     if role == "planning":
         v = view or planning_view(env, lists, funds)
         lists = v.lists
@@ -277,6 +293,9 @@ def _short_line(builds: list[SupplyBuild], funds: float) -> list[str]:
     "power 93% used" (fleet_scripted seed 0: 6 of 20 lines showed more supply than demand)."""
     if not builds:
         return []
+    if is_open():                       # the supplies near their limit, not the buildings their funds should buy
+        return [f"- supply at {pct(100 * BANK_BUSY)} use or more (now or within {months(AHEAD_MONTHS)}), or missing: "
+                + ", ".join(_supply_state(b) for b in builds)]
     line = "- supply needed now: " + ", ".join(_supply_state(b) for b in builds)
     paid, unpaid, more = _supply_money(builds, funds)
     if not paid and not unpaid:
@@ -299,11 +318,12 @@ def _leave_line(spots: list, unclaimed: list = ()) -> list[str]:
     ("zone arou"). v18 seed 1, month 6: education's only site was police's, the line named police's alone, and
     education never built."""
     found = [f"{sp.building} ({sp.xy[0]},{sp.xy[1]})" for sp in spots]
-    notes = [f"{sp.dept} ({sp.building}): no lot of its own - leave or free one near ({sp.xy[0]},{sp.xy[1]})"
-             for sp in unclaimed]
+    near = lambda sp: f"({sp.xy[0]},{sp.xy[1]})"
+    notes = [f"{sp.dept} ({sp.building}): no lot of its own"
+             + advice(f" - leave or free one near {near(sp)}", f" (its sites: near {near(sp)})") for sp in unclaimed]
     if not found:                                  # an unclaimed building always sits under a claim
         return []
-    head, tail = "- leave free (funded): ", ": zone around them"
+    head, tail = advice("- leave free (funded): ", "- funded departments' sites: "), advice(": zone around them")
     more = lambda items, n, sep: sep.join(items[:n]) + (f" (+{len(items) - n} more)" if n < len(items) else "")
     line = lambda n, k: head + more(found, n, ", ") + tail + (f"; {more(notes, k, '; ')}" if k else "")
     fits = (line(n, k) for k in (range(len(notes), 0, -1) if notes else [0]) for n in range(len(found), 0, -1)
@@ -322,7 +342,7 @@ def _land_line(env, depts: dict, roads: list[dict] = (), found: dict | None = No
     if not found:
         return []
     w = env.world
-    head, tail = "- blocked for lack of land: ", ": extend a road into open land, or free a lot, for them"
+    head, tail = "- blocked for lack of land: ", advice(": extend a road into open land, or free a lot, for them")
 
     def name(d: str, p: str, tag: int) -> str:            # tag 2: every tag, 1: all but away from homes, 0: none
         fix = land_fix(w, d, p) if tag > (p in AWAY_FROM_HOMES) else ""
@@ -344,6 +364,9 @@ def _away_line(w, found: dict[str, list[str]], roads: list[dict]) -> list[str]:
     if not away:
         return []
     head, site = f"- away from homes ({_and(away)}): ", edge_site(w, roads)
+    if is_open():
+        return [head + ("no road_extension site ends away from homes" if site is None else
+                        f"road_extension {_where(site)} ends at ({site['x2']},{site['y2']}), no homes within 4 tiles")]
     if site is None:
         return [head + "extend a road into open land at the town edge and leave a lot free by its far end, with no "
                 "homes within 4 tiles"]
@@ -399,6 +422,78 @@ def _blocked(m: DeptMoney, unclaimed: tuple[str, ...] = ()) -> str:
     instead of pushing planning. v18 seed 1, month 6: education's only site was police's too."""
     names = m.blocked or unclaimed
     return f"; blocked: {' or '.join(names)}" if names else ""
+
+
+OPTIONS_SHOWN = 4          # a department's priced options on the mayor's open Departments line before "+N more"
+
+
+FIRST_TAG = "the city has none"     # an option the reserve guard counts as a first building (_first_tag)
+SUPPLY_TAG = "supply"               # a utilities option for a supply the guard counts as wanted
+
+
+def _first_tag(w, d: str, p: str, pr) -> str:
+    """The open Departments option's tag for what the reserve guard lets use the treasury down to RESERVE_MIN, as
+    first_build classifies it (DeptMoney.kind "first/supply"): "supply" for a utilities purpose while its supply is
+    wanted (_wanted: 90% used now or within AHEAD_MONTHS, or no pump / outlet), "the city has none" for a primary
+    first building the city lacks (Price.first, buildings_of 0, not SUPPLEMENTARY or per tile, wanted; a jail only
+    while its cells are busy) and for transport's first link to the region while demand is capped without one; ""
+    otherwise. Review of the open track: the mayor couldn't tell which top-ups the guard let through."""
+    if d == "utilities":
+        return SUPPLY_TAG if _wanted(w, p) else ""
+    if d == "transport" and p in LINK_PURPOSES and capped_unlinked(w):
+        return FIRST_TAG
+    if (pr.first and not pr.per_tile and p not in SUPPLEMENTARY and buildings_of(w, pr.name) == 0 and _wanted(w, p)
+            and (p != "jail" or _cells_busy(w))):
+        return FIRST_TAG
+    return ""
+
+
+def _options(env, d: str) -> str:
+    """The open style's (fmt.py) Departments suffix: what `d` could build now, each option with its price and upkeep
+    (its Ready sites' prices: ready_prices; planning's road into open land with its zoning, road_price) and the reserve
+    guard's tag (_first_tag), its best tier upgrade on offer, and its first buildings blocked for lack of land; no
+    needs line, no amount to fund."""
+    w = env.world
+    obs = role_obs(env, d)
+    lists = site_lists(w, d, obs)
+    items, seen = [], set()
+    if d == "planning" and (road := road_price(lists)):
+        items.append(f"a road into open land {road.text()}")
+    for p, pr in ready_prices(w, d, lists).items():
+        if pr.building in seen:
+            continue
+        seen.add(pr.building)
+        tags = [f"+{money(pr.upkeep)}/month"] * bool(round(pr.upkeep)) + [t for t in [_first_tag(w, d, p, pr)] if t]
+        items.append(f"{pr.building} {pr.text()}" + (f" ({', '.join(tags)})" if tags else ""))
+    offers = _offers(obs, d) if d in TIER_UP or d == "education" else []
+    if offers:
+        o = offers[0]
+        items.append(f"upgrade {tier_name(o['from'])} ({o['x']},{o['y']}) to {tier_name(o['to'])} {money(o['cost'])}")
+    shown = items[:OPTIONS_SHOWN] + ([f"+{len(items) - OPTIONS_SHOWN} more"] if len(items) > OPTIONS_SHOWN else [])
+    text = "; options: " + (", ".join(shown) if shown else "none ready")
+    blocked = list(dict.fromkeys(pr.building for p, lst in lists.items() if lst.blocked and _wanted(w, p)
+                                 and (pr := site_price(w, d, p))))
+    return text + (f"; blocked for lack of land: {', '.join(blocked)}" if blocked else "")
+
+
+def _dept_open(env, d: str, m: DeptMoney, budgets: dict) -> str:
+    """One department on the mayor's open Departments block: funds, the plan target, what it spent, what it keeps (a
+    take-back must leave it that: the take-back guard) and its options (_options)."""
+    return (f"- {d}: funds {money(math.floor(m.funds))}" + (f", target {money(budgets[d])}" if d in budgets else "")
+            + (f", spent {money(m.spent)}" if m.months else "") + f", keeps {money(m.keep)}" + _options(env, d))
+
+
+def _reserve_line(w, f: Funding, cf: CashFlow) -> str:
+    """The open style's Finances line on the reserve (the to spend / to fund lines' facts, no prescription): the
+    reserve and why, the treasury against it, operations per month, and the rule the reserve guard applies."""
+    gap = round(f.spare)
+    where = f"{money(gap)} above it" if gap > 0 else f"{money(-gap)} under it" if gap < 0 else "at it"
+    ops = f"; operations {signed(cf.ops_per_month, money)}/month" if cf.since is not None else ""
+    return (f"- reserve {money(f.reserve)}{reserve_why(w)}: the treasury is {where}{ops}. allocate_budget refuses a "
+            f"top-up that leaves the treasury under the reserve unless the department's funds are below the price of "
+            f"its cheapest option marked \"{FIRST_TAG}\", its supply (\"{SUPPLY_TAG}\"), a levee or planning's road, "
+            f"or its first building is blocked for lack of land (those may use the treasury down to "
+            f"{money(RESERVE_MIN)})")
 
 
 def _memory(fleet: FleetState, role: str) -> list[str]:
@@ -486,7 +581,7 @@ def _finances(w, cf: CashFlow, spare: float = 0.0) -> list[str]:
         L.append(f"- debt {money(w.debt)}: {money(w.debt * C.LOAN_INTEREST)}/month interest, "
                  + (f"{money(room)} more can be borrowed" if round(room) > 0 else f"at the {money(C.MAX_DEBT)} limit")
                  + (f"; repay_loan {pay} now: that much is spare above the reserve and what waits to be funded "
-                    f"(saves {money(pay * C.LOAN_INTEREST)}/month)" if pay >= REPAY_MIN else ""))
+                    f"(saves {money(pay * C.LOAN_INTEREST)}/month)" if pay >= REPAY_MIN and not is_open() else ""))
     return L
 
 
@@ -518,7 +613,10 @@ def _mayor(env, fleet: FleetState) -> list[str]:
          "- taxes: " + ", ".join(f"{k} {v:g}%" for k, v in o["tax_pct"].items()),
          "", "## Finances"]
     f = funding_gaps(env, fleet)
-    L += _finances(w, cash_flow(w), f.spare - sum(i.amount for i in f.to_fund))
+    cf = cash_flow(w)
+    L += _finances(w, cf, f.spare - sum(i.amount for i in f.to_fund))
+    if is_open():
+        L.append(_reserve_line(w, f, cf))
     if w.months_negative or w.low_approval_months:
         L.append(f"- WARNING: negative treasury {months(w.months_negative)} ({C.BANKRUPTCY_MONTHS} = bankruptcy), "
                  f"approval below {100 * C.RECALL_APPROVAL:.0f}% {months(w.low_approval_months)} "
@@ -538,20 +636,21 @@ def _mayor(env, fleet: FleetState) -> list[str]:
     latest = {e["role"]: e for e in fleet.log if e["kind"] == "report" and e["role"] in DEPARTMENTS}
     clipped = any(len(" ".join(e["text"].split())) > MAYOR_REPORT_CHARS for e in latest.values())
     spent = min(len(w.history), SPEND_MONTHS)
-    notes = (["most urgent first"] + [f"spent = last {months(spent)}"] * bool(spent)
-             + ["cut reports: history kind=report"] * clipped)
+    notes = ([advice("most urgent first", "turn order; keeps = the least a take-back leaves it")]
+             + [f"spent = last {months(spent)}"] * bool(spent) + ["cut reports: history kind=report"] * clipped)
     # most urgent first (Funding.order): smoke v16-v19 funded in block order in 32 of 54 turns, and education, last
-    # in turn order, was topped up last in 11
+    # in turn order, was topped up last in 11. Open: turn order, each with its options (no needs line, no to fund)
     L += ["", f"## Departments ({'; '.join(notes)})"]
-    for d in f.order:
-        L.append(_dept_line(d, f.depts[d], f, budgets))
+    for d in (f.depts if is_open() else f.order):
+        L.append(_dept_open(env, d, f.depts[d], budgets) if is_open() else _dept_line(d, f.depts[d], f, budgets))
         if d in latest:
             L.append(f"  report (m{latest[d]['month']}): {cut(latest[d]['text'], MAYOR_REPORT_CHARS)}")
     if not latest:
         L.append("- no reports yet")
-    if any(m.kind == "blocked" for m in f.depts.values()):              # a line says "; blocked: ..."
+    if not is_open() and any(m.kind == "blocked" for m in f.depts.values()):     # a line says "; blocked: ..."
         L.append(BLOCKED_NOTE)
-    L += spend_lines(w, f)                     # the money to spend and the top-ups the needs lines ask, in order
+    if not is_open():
+        L += spend_lines(w, f)                 # the money to spend and the top-ups the needs lines ask, in order
     L += asks + [""]
     if not plan:
         L.append("## City plan: no plan yet - write one with update_plan (goals, budgets, priorities).")
@@ -574,15 +673,16 @@ def _requests(reqs: list[OpenRequest], f, now: int) -> list[str]:
         return []
     covered = fund_cover(f)
     groups = request_groups(reqs)
-    L = ["", "## Open requests to you (answer each: a top-up, or send_message on why not / when; one call answers "
-              "several)"]
+    L = ["", advice("## Open requests to you (answer each: a top-up, or send_message on why not / when; one call "
+                    "answers several)", "## Open requests to you (unanswered)")]
     for d, rs in groups[:REQUESTS_SHOWN]:
         n = Counter(r.month for r in rs)
         asked = ", ".join(f"m{m}" + (f" x{k}" if k > 1 else "") for m, k in n.items())
         last = "; last turn to answer" if any(r.last for r in rs) else ""
         amount = next((r.amount for r in reversed(rs) if r.amount), None)
         ask = f", asks {money(amount)}" if amount else ""
-        L.append(f"- {d}: {asked} (waiting {months(now - rs[0].month)}{last}){ask}; {request_state(f, d, covered)}: "
+        state = advice(f"; {request_state(f, d, covered)}")
+        L.append(f"- {d}: {asked} (waiting {months(now - rs[0].month)}{last}){ask}{state}: "
                  f"\"{cut(rs[-1].text, REQUEST_CHARS)}\"")
     if len(groups) > REQUESTS_SHOWN:
         L.append(f"- +{len(groups) - REQUESTS_SHOWN} more: " + ", ".join(d for d, _ in groups[REQUESTS_SHOWN:]))
@@ -596,14 +696,14 @@ def _planning_requests(env, reqs: list[OpenRequest], v: View) -> list[str]:
     to planning in the 120-month runs, 85 unanswered; in the late smokes all of them."""
     w = env.world
     groups = request_groups(reqs)
-    L = ["", "## Open requests to you (answer each: do it, or send_message where it can build or why not; one call "
-             "answers several)"]
+    L = ["", advice("## Open requests to you (answer each: do it, or send_message where it can build or why not; one "
+                    "call answers several)", "## Open requests to you (unanswered)")]
     for d, rs in groups[:REQUESTS_SHOWN]:
         n = Counter(r.month for r in rs)
         asked = ", ".join(f"m{m}" + (f" x{k}" if k > 1 else "") for m, k in n.items())
         last = "; last turn to answer" if any(r.last for r in rs) else ""
-        fix = request_fix(w, d, v, " ".join(r.text for r in rs))
-        L.append(f"- {d}: {asked} (waiting {months(w.month - rs[0].month)}{last}): {fix}; "
+        fix = "" if is_open() else f" {request_fix(w, d, v, ' '.join(r.text for r in rs))};"
+        L.append(f"- {d}: {asked} (waiting {months(w.month - rs[0].month)}{last}):{fix} "
                  f"\"{cut(rs[-1].text, REQUEST_CHARS)}\"")
     if len(groups) > REQUESTS_SHOWN:
         L.append(f"- +{len(groups) - REQUESTS_SHOWN} more: " + ", ".join(d for d, _ in groups[REQUESTS_SHOWN:]))
@@ -630,8 +730,9 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
     """Transport's Next line, every turn: the build first_build names (`b`, its DeptMoney.build: the one the mayor's needs line and mayor_ask
     name, so the price and the ask amount always agree), shown with its call. The first bus line (_bus_first); another
     one (first_build names it while its bus_stops list offers it), with transit now and with it (transit_estimate);
-    an avenue stretch, priced whole, as one upgrade_road call on the most jammed stretch; with nothing else ready, the
-    cheapest station or harbour (FirstBuild.extra) and its build call; else that nothing is to build, and why (a
+    an avenue stretch, priced whole, as one upgrade_road call on the most jammed stretch; the first link to the region
+    once demand is capped without one ("your first train station"), or with nothing else ready the cheapest station or
+    harbour its lists offer, and its build call; else that nothing is to build, and why (a
     region city's links are its Region block's). When funds are short, the ask amount when the mayor would fund it
     (mayor_ask), else to say so in the end_turn report. 120-month LLM runs: 156 of 240 transport turns did nothing, 142
     reasoned about "1,500 residents" past 1,500 (122 with it in memory), and in the region run 47 of 52 turns that
@@ -664,7 +765,8 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
     if purpose in STATION_ACTIONS:
         s = lists[purpose].sites[0]
         call = json.dumps({"x": s["x"], "y": s["y"]}, separators=(",", ":"))
-        return (f"- Next: {a_or_an(b.extra[0])} ({money(cost)}): {STATION_ACTIONS[purpose]} {call}"
+        what = _yours(b.named[0].label) if b.named else a_or_an(b.extra[0])     # "your first train station"
+        return (f"- Next: {what} ({money(cost)}): {STATION_ACTIONS[purpose]} {call}"
                 + (" (a metro line needs 2 stations, then create_metro_line)" if purpose == "metro_station" else "")
                 + lack())
     m = w.metrics()
@@ -679,6 +781,18 @@ def _transport_next(env, lists: dict, funds: float, ask: Ask, b: FirstBuild | No
             "your turn; there is no population threshold to wait for")
 
 
+def _transit_line(w, lists: dict) -> list[str]:
+    """Transport's open-style (fmt.py) line in place of its Next line: transit now and with a line through the
+    bus_stops list's stops (transit_estimate), when the list offers one; [] otherwise."""
+    lst = lists.get("bus_stops")
+    if lst is None or not lst.sites or lst.short:
+        return []
+    stops = bus_stops(lst)
+    now, more = transit_estimate(w, stops)
+    return [f"- transit estimate: {pct(100 * now)} of trips now, about {pct(100 * more)} with a line through the "
+            f"{len(stops)} bus_stops stops below (your score counts transit up to {pct(100 * TRANSIT_GOAL)})"]
+
+
 NEXT_ROLES = ("planning", "transport")      # the roles with a Next line (refreshed in their action results)
 NEXT_REFRESH_ITEMS = 2                      # builds a refreshed Next line names (the briefing's: planning's NEXT_ITEMS)
 NOTHING_LEFT = ("nothing to build", "no bus line or avenue to build")   # Next lines that name no build
@@ -689,7 +803,7 @@ def next_line(env, role: str, most: int = NEXT_REFRESH_ITEMS) -> str:
     and mayor_ask; planning's view), with at most `most` of planning's builds; "" for a role without one. ToolBox
     puts it, shortened (next_clause), after each successful action of a model planning or transport agent: the late
     smokes' planning re-sent its briefing's Next-line calls after doing them, 15 calls later."""
-    if role not in NEXT_ROLES:
+    if role not in NEXT_ROLES or is_open():
         return ""
     w = env.world
     fleet = FleetState.of(env)
@@ -741,13 +855,40 @@ def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
     they pay for now; when no ready site adds coverage, where the uncovered homes are and to ask planning (stuck); []
     otherwise. Late smoke 20261007 seed 2: fire read "build another fire station" every quarter while coverage went
     94 -> 86 -> 81 -> 78%; at month 99 it built at the Ready line's best (37,23), which served one building, where
-    (36,30) would have brought coverage from 86% to ~92%."""
+    (36,30) would have brought coverage from 86% to ~92%.
+    A tier upgrade its next build names (tier_up, school_upgrade: Need.call) gets the same line, with its call: "- tier
+    upgrade: an upgrade of your police station at (12,20) to a police HQ ($7,800, +$75/month; coverage 81%, ~88% with
+    it; 24 downtown tiles lack tier-2 cover; another police station at your best ready site adds under 1%):
+    upgrade_facility {"x":12,"y":20,"module":"tier"} this turn: your funds cover it" (or "once your funds cover it (you
+    have $2,129)"). v1: police and fire never read an upgrade, and the models built 23-26 tier-1 police stations."""
+    b = m.build
+    if b is not None and b.named and b.named[0].call and b.cost is not None:
+        n = b.named[0]
+        up = f", +{money(n.upkeep)}/month" if round(n.upkeep) else ""
+        if is_open():
+            return [f"- coverage estimate: {_yours(n.label)} ({money(b.cost)}{up}): {n.status}"
+                    + (f"; {n.note}" if n.note else "")]
+        when = ("this turn: your funds cover it" if not short_of(funds, b.cost) else
+                f"once your funds cover it (you have {money(math.floor(funds))})")
+        return [f"- tier upgrade: {_yours(n.label)} ({money(b.cost)}{up}; {n.status}"
+                + (f"; {n.note}" if n.note else "") + f"): {n.call} {when}"]
     if not m.keep_ups:
+        if b is not None and b.cost is None and b.stuck:     # nothing named: no ready site adds coverage (keep_up_room)
+            if is_open():
+                return [f"- coverage estimate: {b.stuck}"]
+            return [f"- keep up with growth: {b.stuck}; ask planning for a lot or a road near ({b.gap[0]},{b.gap[1]}) "
+                    "before building another"]
         if not m.stuck:
             return []
         n = m.build.named[0]
+        if is_open():
+            return [f"- coverage estimate: {n.label} at your ready sites adds little ({n.status}): {m.stuck}"]
         return [f"- keep up with growth: {n.label} at your ready sites adds little ({n.status}): {m.stuck}; ask "
                 f"planning for a lot or a road near ({m.gap[0]},{m.gap[1]}) before building another"]
+    if is_open():                      # every building its coverage asks for (want), not the count money pays for
+        g = m.goal_of(m.want)
+        status = "; ".join(f"{nd.label}: {nd.status}" for nd in g.named) if len(g.named) > 1 else g.named[0].status
+        return [f"- coverage estimate: {keep_up_where(g)} ({money(g.cost)}): {status}"]
     g, k = m.goal, m.count
     n = math.floor((funds + 1e-9) / (g.cost / k))
     status = "; ".join(f"{nd.label}: {nd.status}" for nd in g.named) if len(g.named) > 1 else g.named[0].status
@@ -762,6 +903,19 @@ def _keep_up_line(m: DeptMoney, funds: float) -> list[str]:
              if p in best and best[p] not in spots and best[p] not in m.avoid]     # not one an earlier dept takes
     note = f"; the Ready line's best {', '.join(other)} adds less" if other else ""
     return [f"- keep up with growth: {keep_up_where(g)} ({status}): {now}{note}"]
+
+
+def _service_metrics(w, role: str) -> list[str]:
+    """Key metrics lines the coverage metrics don't show: police, fire and health's level 4-5 tiles without tier-2
+    cover (tier-1 buildings cover them only to T1_DOWNTOWN: an upgrade covers them), education's enrolment per level
+    (what its score counts; school coverage alone read 99% beside 78-85% high-school enrolment in v1)."""
+    if role in TIER_UP:
+        n = (w.stats.get("downtown_uncovered") or {}).get(TIER_UP[role][1], 0)
+        return [f"- downtown (level 4-5) tiles without tier-2 cover: {n} (tier 1 covers them to "
+                f"{pct(100 * C.T1_DOWNTOWN)} at most)"]
+    if role == "education":
+        return ["- " + "; ".join(enrol_text(w, lv) for lv in ("elementary", "high"))]
+    return []
 
 
 def _bus_riders(w) -> str:
@@ -780,8 +934,8 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     dept = ROLES[role]["budget"]
     p = plan_slice(fleet, role)
     if not fleet.plan_versions:
-        L = ["## Your plan slice", "- No city plan yet: follow your mission (your budget block says whether to ask the "
-             "mayor for money)."]
+        L = ["## Your plan slice", advice("- No city plan yet: follow your mission (your budget block says whether to "
+                                          "ask the mayor for money).", "- No city plan yet.")]
         target = None
     else:
         target = p["budget"]
@@ -807,7 +961,9 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     # utilities: only purposes whose supply is wanted, and the amount its supply line names. Review, fleet_scripted
     # seed 0 month 24: "a coal plant at (0,23) ($4,000) needs $2,252 more", then "cheapest: near_homes $2,200" with
     # water at 141 of 250
-    wanted = {p: pr for p, pr in prices.items() if role != "utilities" or _wanted(w, p)}
+    # (a jail with cells to spare and health's hospital aren't named by price either: tools.not_next)
+    wanted = {p: pr for p, pr in prices.items()
+              if (role != "utilities" or _wanted(w, p)) and not not_next(w, role, p, lists[p].sites)}
     purposes, low = cheapest(wanted) or cheapest(wanted, supplementary=True) or ((), None)
     more = _supply_money(supplies, funds)[2]
     # whether to ask the mayor for money (mayor_ask): for the needs line's top-up (utilities: its supply line's), or
@@ -816,7 +972,11 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     if needs_count(money_of):                # more than one building to keep its coverage up: the mayor's count
         money_of = funding_gaps(env, fleet).depts.get(dept, money_of)
     ask = mayor_ask(env, fleet, role, money_of)
-    if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
+    if is_open():                       # the facts only: no ask, no "don't build", no "this turn"
+        if (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
+            L.append("- your funds are short of every ready site's price"
+                     + (f" (cheapest: {' or '.join(purposes)} {low.text()})" if low else ""))
+    elif (low or more) and all(short_of(funds, pr.cost) for pr in prices.values()):
         L.append("- You can't pay for any ready site" + (" (the supply above needs " + money(more) + " more)" if more
                                                          else f" (cheapest: {' or '.join(purposes)} {low.text()})")
                  + ". Don't call build tools this turn: " + (
@@ -828,13 +988,14 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
         L.append(_ask_line(ask))
     L += _keep_up_line(money_of, funds)
     if role == "transport":
-        L.append(_transport_next(env, lists, funds, ask, money_of.build))
+        L += _transit_line(w, lists) if is_open() else [_transport_next(env, lists, funds, ask, money_of.build)]
     view = planning_view(env, lists, funds) if role == "planning" else None     # once a briefing
-    if view is not None:
+    if view is not None and not is_open():
         L.append(planning_next(env, obs["city"], view, funds, ask))
     L += ["", "## Key metrics", *(_metric(obs["city"], k) for k in KEY_METRICS[role])]
     if role == "transport":
         L.append(_bus_riders(w))
+    L += _service_metrics(w, role)
     if role == "planning":
         L += cap_line(w)
     reqs = open_requests(env, fleet, to="planning") if view is not None else []
@@ -845,8 +1006,9 @@ def _department(env, fleet: FleetState, role: str) -> list[str]:
     if role == "planning" and (road := road_price(lists)):     # shown on its line only, not in the budget line above
         prices = {**prices, "road_extension": road}
     keep = bank_keep(w, supplies) if role == "utilities" else None
-    return (L + [""] + _map(w, role) + [""] + _ready_sites(env, role, lists, prices, funds, keep, view) + [""]
-            + _memory(fleet, role))
+    ready = _ready_sites(env, role, lists, prices, funds, keep, view)
+    ready[-1:-1] = upgrade_line(w, role, obs)                     # before the find_sites footer
+    return L + [""] + _map(w, role) + [""] + ready + [""] + _memory(fleet, role)
 
 
 def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_every: int = 1,
@@ -863,7 +1025,8 @@ def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_ev
     cap = (f"After {max_actions} successful actions further actions are refused" if max_actions else
            "After the successful-action cap in your briefing header further actions are refused")
     parts = [HOW_TO_PLAY.format(
-                 title=spec["title"], depts=", ".join(DEPARTMENTS), budget=BUDGET[side], team=TEAM[side],
+                 title=spec["title"], depts=", ".join(DEPARTMENTS), budget=BUDGET[side],
+                 team=(TEAM_OPEN if cfg.briefing == "open" else TEAM)[side],
                  cadence="Each game month is one turn" if act_every <= 1 else
                  f"You act every {act_every} months (the city runs on its own in between)",
                  lookups=", ".join(LOOKUP_NOTES.get((role, t), t) for t in LOOKUPS
@@ -881,15 +1044,17 @@ def system_prompt(role: str, cfg: FleetAgentConfig, total_months: int, *, act_ev
     return "\n\n".join(parts)
 
 
-def briefing(env, role: str, *, mode: str = "autonomous", mark: bool = True) -> str:
+def briefing(env, role: str, *, mode: str = "autonomous", mark: bool = True, style: str | None = None) -> str:
     """The first user message of `role`'s turn. Syncs the fleet log with the latest month (idempotent) and, unless
-    `mark=False`, marks the turn so the next briefing's "since your last turn" digest starts from here."""
+    `mark=False`, marks the turn so the next briefing's "since your last turn" digest starts from here. `style`: the
+    briefing style ("guided" / "open", fmt.py; None: the one in force, guided by default)."""
     fleet = FleetState.of(env)
     fleet.sync(env)
-    L = _header(env, role, mode)
-    L += _mayor(env, fleet) if role == "mayor" else _department(env, fleet, role)
-    L += region_lines(env, role)                  # region mode: neighbours, links, flows, deals ([] in one city)
-    L += ["", _milestone(env, role)]
+    with briefing_style(style):
+        L = _header(env, role, mode)
+        L += _mayor(env, fleet) if role == "mayor" else _department(env, fleet, role)
+        L += region_lines(env, role)              # region mode: neighbours, links, flows, deals ([] in one city)
+        L += ["", _milestone(env, role)]
     if mark:
         fleet.mark_turn(role, env.world.month, env.council, who=env._name(role))
     return "\n".join(L)

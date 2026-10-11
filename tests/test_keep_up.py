@@ -7,7 +7,7 @@ import re
 
 import pytest
 
-from civitas.agents.scripted import SCRIPTED
+from civitas.agents.scripted import SCRIPTED_V1   # the cities these tests were written on (civitas-v1 mayor)
 from civitas.core.env import CivitasEnv, GameConfig
 from civitas.fleet import tools as T
 from civitas.fleet.briefing import briefing
@@ -22,7 +22,7 @@ def short_env():
     """Seed 0 after 48 scripted months (about 6,500 residents) with every police station and clinic but the first
     removed and the services recomputed: police and health coverage far under the goal, every department at $0."""
     env = CivitasEnv(GameConfig(seed=0, months=60))
-    agents = {r: SCRIPTED[r](r) for r in env.roles}
+    agents = {r: SCRIPTED_V1[r](r) for r in env.roles}
     for _ in range(48):
         for r in env.roles:
             env.apply(r, agents[r].act(env.observe(r)))
@@ -36,6 +36,13 @@ def short_env():
     w.refresh()
     w.dept_funds.update({d: 0 for d in DEPARTMENTS})
     return env
+
+
+@pytest.fixture
+def tier1(monkeypatch):
+    """No tier upgrade on offer (tools.tier_up): these tests are about tier-1 buildings; short_env's fire has one
+    downtown tile without tier-2 cover, and a fire HQ would be its next build (tests/test_tier_up.py)."""
+    monkeypatch.setattr(T, "tier_up", lambda *a, **k: None)
 
 
 def _copy(env, treasury: float):
@@ -61,7 +68,7 @@ def test_service_coverage_is_the_metric_and_writes_nothing(short_env):
     assert (w.version, len(w._bfs_cache), set(w.facility_state)) == before[:3] and (w.struct == before[3]).all()
 
 
-def test_keep_up_counts_the_buildings_back_to_the_goal_capped_by_sites(short_env):
+def test_keep_up_counts_the_buildings_back_to_the_goal_capped_by_sites(short_env, tier1):
     env = copy.deepcopy(short_env)
     w = env.world
     b = DeptMoney(env, "police").build
@@ -75,7 +82,9 @@ def test_keep_up_counts_the_buildings_back_to_the_goal_capped_by_sites(short_env
     for k in range(ku.n + 1):                          # each level is the sim's coverage with those stations built
         assert ku.levels[k] == pytest.approx(T.service_coverage(w, "police", ku.sites[:k], spec))
     assert keep_up(w, "police", "station", sites[:1]).n == 1                             # one site: one building
-    assert keep_up(w, "fire", "station", DeptMoney(env, "fire").build.sites[0]) is None   # fire is above the goal
+    fire = T.site_lists(w, "fire", T.role_obs(env, "fire"))["station"]
+    assert keep_up(w, "fire", "station", [(s["x"], s["y"]) for s in fire.sites]) is None   # fire is above the goal
+    assert DeptMoney(env, "fire").build.covered.startswith("fire coverage")                # so nothing is named
 
 
 def test_the_money_above_the_reserve_caps_the_count(short_env):
@@ -140,23 +149,24 @@ def test_another_building_still_meets_the_reserve_guard(short_env):
     assert res.get("refused") == "reserve" and "for another police station" in res["error"]
 
 
-def test_the_needs_line_says_when_coverage_is_falling(short_env):
+def test_the_needs_line_says_when_coverage_is_falling(short_env, tier1):
     env = copy.deepcopy(short_env)
     w = env.world
-    now = round(100 * w.metrics()["fire_coverage"])
-    w.history[-4]["fire_coverage"], w.history[-7]["fire_coverage"] = (now + 5) / 100, (now + 9) / 100
-    assert T.coverage_trend(w, "fire_coverage") == f"falling: {now + 9} -> {now + 5} -> {now}%"
-    w.history[-7]["fire_coverage"] = (now + 2) / 100                  # it rose, then fell: the fall only
-    assert T.coverage_trend(w, "fire_coverage") == f"falling: {now + 5} -> {now}%"
-    w.history[-4]["fire_coverage"] = now / 100                        # flat over the last quarter: nothing
-    assert T.coverage_trend(w, "fire_coverage") == ""
+    now = round(100 * w.metrics()["police_coverage"])              # under the goal (fire's is above: no needs line)
+    w.history[-4]["police_coverage"], w.history[-7]["police_coverage"] = (now + 5) / 100, (now + 9) / 100
+    assert T.coverage_trend(w, "police_coverage") == f"falling: {now + 9} -> {now + 5} -> {now}%"
+    w.history[-7]["police_coverage"] = (now + 2) / 100                # it rose, then fell: the fall only
+    assert T.coverage_trend(w, "police_coverage") == f"falling: {now + 5} -> {now}%"
+    w.history[-4]["police_coverage"] = now / 100                      # flat over the last quarter: nothing
+    assert T.coverage_trend(w, "police_coverage") == ""
     assert T.coverage_trend(w, "transit_share") == ""
-    w.history[-4]["fire_coverage"] = (now + 5) / 100
-    line = _line(briefing(env, "mayor", mark=False), "- fire:")
-    assert f"needs $2,500 for another fire station (coverage falling: {now + 5} -> {now}%" in line
+    w.history[-4]["police_coverage"] = (now + 5) / 100
+    line = _line(briefing(env, "mayor", mark=False), "- police:")
+    assert re.search(rf"needs \$[\d,]+ for (another police station|\d more police stations) \(coverage falling: "
+                     rf"{now + 5} -> {now}%", line), line
 
 
-def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeypatch):
+def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeypatch, tier1):
     """Late smoke seed 2, month 102: no ready station site reached the uncovered homes (another road), and the fire
     station built at the Ready line's best served one building."""
     env = copy.deepcopy(short_env)
@@ -164,11 +174,13 @@ def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeyp
     env.world.refresh()
     monkeypatch.setattr(T, "keep_up", lambda w, dept, purpose, sites: T.KeepUp(
         "fire_coverage", now, (now,), (), (7, 9)) if dept == "fire" else None)
+    # civitas-v2: no station is named there (keep_up_room); the mayor reads why, the department where the homes are
     line = _line(briefing(env, "mayor", mark=False), "- fire:")
-    assert line.endswith("; ready sites add under 1%: the uncovered homes near (7,9) are out of their road reach")
+    assert "; ready sites add under 1% (fire coverage 80%)" in line and "another fire station" not in line
     fire = briefing(env, "fire", mark=False)
-    assert ("the uncovered homes near (7,9) are out of their road reach; ask planning for a lot or a road near (7,9) "
-            "before building another") in fire
+    assert "- station: none - ready sites add under 1% (fire coverage 80%)" in fire
+    assert ("- keep up with growth: ready sites add under 1% (fire coverage 80%): the uncovered homes near (7,9) are "
+            "out of their road reach; ask planning for a lot or a road near (7,9) before building another") in fire
     env.world.dept_funds["fire"] = 2500                # funds for a station: it isn't told to build one there
     fire = briefing(env, "fire", mark=False)
     assert "This turn: ask planning for a lot or a road near the uncovered homes at (7,9)" in fire
@@ -177,6 +189,5 @@ def test_ready_sites_that_add_nothing_say_where_the_homes_are(short_env, monkeyp
     # most of what is missing downtown, where tier 1 covers 60% at most: it says so
     monkeypatch.setattr(T, "keep_up", lambda w, dept, purpose, sites: T.KeepUp(
         "fire_coverage", now, (now,), (), (7, 9), 0.07) if dept == "fire" else None)
-    assert _line(briefing(env, "mayor", mark=False), "- fire:").endswith(
-        "out of their road reach; 7 points are lost downtown (level 4-5), where tier 1 covers 60% at most: "
-        "upgrade_facility to tier 2")
+    assert ("out of their road reach; 7 points are lost downtown (level 4-5), where tier 1 covers 60% at most: "
+            "upgrade_facility to tier 2") in _line(briefing(env, "fire", mark=False), "- keep up with growth: ")

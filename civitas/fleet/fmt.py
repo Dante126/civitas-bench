@@ -1,7 +1,42 @@
-"""Number and text formatting shared by fleet briefings and reports."""
+"""Number and text formatting shared by fleet briefings and reports, and the briefing style they render in."""
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import math
+
+# The briefing style ([fleet] briefing, FleetAgentConfig.briefing): "guided" (the default) names the build, the call
+# and the money to ask for; "open" states the same facts (sites, prices, coverage, money) and never an exact call, a
+# "This turn" / Next instruction or a to-fund prescription, so the model plans. One switch for every renderer:
+# briefing() and ToolBox.call set it for what they render (briefing_style); the renderers ask is_open() or pick a
+# text with advice(). Guided is the code path as it was, byte for byte.
+STYLES = ("guided", "open")
+_STYLE: contextvars.ContextVar[str] = contextvars.ContextVar("fleet_briefing_style", default="guided")
+
+
+@contextlib.contextmanager
+def briefing_style(style: str | None):
+    """Render in `style` ("guided" / "open"; None keeps the current one) inside the block."""
+    if style is None:
+        yield
+        return
+    if style not in STYLES:
+        raise ValueError(f"briefing style must be one of {', '.join(STYLES)}, got {style!r}")
+    token = _STYLE.set(style)
+    try:
+        yield
+    finally:
+        _STYLE.reset(token)
+
+
+def is_open() -> bool:
+    """The open briefing style is in force (briefing_style)."""
+    return _STYLE.get() == "open"
+
+
+def advice(guided: str, fact: str = "") -> str:
+    """`guided` in the guided style; in the open one `fact` (the same facts without the instruction; "" drops it)."""
+    return fact if is_open() else guided
 
 LINE_CHARS = 120
 TOOL_MESSAGE_CHARS = 4000      # the agent cuts each tool result message to this

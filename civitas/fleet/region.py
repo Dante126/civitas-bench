@@ -15,6 +15,7 @@ What the region adds:
   deals; the mayor's also has its deal opportunities (`RegionEnv.deal_opportunities`: it or a neighbour at its power /
   water limit while the other has spare, with the exact offer_deal call), its spare otherwise, and for each deal
   whether an offer to it is worth accepting, when an active one ends and whether to cancel it (`RegionEnv.deal_check`);
+  in the open briefing style (fmt.py) the same facts without a call or what to do (region_overview too);
 - tools (`region_tools`): `region_overview` for every role, the mayor's deal actions (`offer_deal`, `accept_deal`,
   `cancel_deal`, run through the region as it runs any mayor's deals), and `send_message` addressed to the city's
   own roles, a whole team ("south"), another city's agent ("south.mayor") or "all" (`message_targets`).
@@ -31,7 +32,7 @@ from ..core.observation import _connector_sites
 from ..core.region import DEAL_AMOUNT_MAX, DEAL_BUSY, DEAL_MIN, DEAL_MONTHS_MAX, DEAL_PRICE_MAX, RegionEnv, \
     opportunity_text
 from ..sim import catalog as C
-from .fmt import money, num
+from .fmt import advice, is_open, money, num
 from .tools import Tool, ToolError, to_schema
 
 _REGIONS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()     # city env -> its RegionEnv
@@ -109,7 +110,7 @@ def overview(region, city: str) -> dict:
             "connector_sites": connector_prices(w),
             "deals": _deals(region, city),
             "supply": states[city],
-            "deal_opportunities": [{**o, "offer_deal": region.offer_args(o, city)}
+            "deal_opportunities": [o if is_open() else {**o, "offer_deal": region.offer_args(o, city)}
                                    for o in region.deal_opportunities(city, states)]}
 
 
@@ -146,8 +147,11 @@ def region_rules(region, city: str, role: str) -> str:
                  f"${C.IMPORT_PRICE['water']:g} (water) a unit a month, and while it imports no new lot connects, so "
                  "it stops growing; spare power earns only "
                  f"${C.POWER_SELL_PRICE:g} a unit and spare water nothing. A deal between those prices pays both "
-                 "sides: your Region block names one when it fits, and says whether an offer to you is worth taking "
-                 f"(and affordable). An offer not accepted within {region.offer_window()} months expires.")
+                 "sides: " + advice("your Region block names one when it fits, and says whether an offer to you is "
+                                    "worth taking (and affordable)",
+                                    "your Region block shows who is short and who has spare, and the facts on each "
+                                    "offer to you")
+                 + f". An offer not accepted within {region.offer_window()} months expires.")
     L.append("- region_overview shows the other cities, the links, last month's flows"
              + (", connector sites" if role == "transport" else "") + (" and the deals" if role == "mayor" else "")
              + (" (your briefing's Region block has the summary)." if role in REGION_BLOCK else "."))
@@ -171,7 +175,8 @@ def _city_line(region, city: str, v: dict, prices: dict | None) -> str:
     parts.append(f"unemployed {num(v['unemployed'])}, open jobs {num(v['open_jobs'])}")
     link = "links: " + (", ".join(v["links"]) or "none")
     if v["they_built_waiting_for_you"]:
-        link += f" (they built {', '.join(v['they_built_waiting_for_you'])}: build your side)"
+        link += f" (they built {', '.join(v['they_built_waiting_for_you'])}" + advice(": build your side)",
+                                                                                     "; your side not built)")
     if v["you_built_waiting_for_them"]:
         link += f" (you built {', '.join(v['you_built_waiting_for_them'])}: waiting for them)"
     if prices and c in prices and prices[c]["price"] and not v["links"] and not v["you_built_waiting_for_them"]:
@@ -209,17 +214,21 @@ def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
     if d["status"] == "expired":
         by = "you" if d["proposed_by"] != d["partner"] else d["partner"]
         return (f"- deal #{d['id']} expired: {what} for {n} months, offered by {by}, was not accepted by month "
-                f"{d['expires']}" + (": offer_deal again if it still fits" if mayor else ""))
+                f"{d['expires']}" + (advice(": offer_deal again if it still fits") if mayor else ""))
     if d["status"] == "active":
         line = f"- deal #{d['id']} active: {what}, {n} month{'s' * (n != 1)} left"
         if check:
             line += f" (through month {check['ends']})"
-            if check.get("cancel"):
+            if check.get("cancel") and is_open():
+                s = check["s"]
+                line += (f"; {_use(s, d['resource'])}" if sell else
+                         f"; you have room without it ({_use(s, d['resource'])})")
+            elif check.get("cancel"):
                 s = check["s"]
                 line += (f"; you need it back ({_use(s, d['resource'])}): {call('cancel_deal')}" if sell else
                          f"; you have room without it: {call('cancel_deal')} saves "
                          f"{money(d['amount'] * d['price'])}/month")
-            elif mayor:                  # the region late smoke's south cancelled a +$37/month sale with 243 spare
+            elif mayor and not is_open():   # the region late smoke's south cancelled a +$37/month sale with 243 spare
                 line += "; keep it: it runs by itself, nothing to call"
         return line
     until = f" (open until month {d['expires']})" if d.get("expires") is not None else ""
@@ -228,8 +237,10 @@ def _deal_line(d: dict, mayor: bool = True, check: dict | None = None) -> str:
     if d["proposed_by"] == d["partner"]:
         line = f"- deal #{d['id']} offered by {d['partner']}: {what} for {n} months{until}"
         if not check:
-            return line + ": accept_deal to take it"
+            return line + advice(": accept_deal to take it")
         why = _offer_why(d, check)
+        if is_open():
+            return line + f"; {why}"
         if check.get("reason") == "afford":
             return line + f"; {why}: leave it or {call('cancel_deal')}"
         return line + f"; {why}: " + (f"{call('accept_deal')} takes it" if check["worth"] else
@@ -286,6 +297,11 @@ def _opportunity_lines(region, city: str, states: dict) -> list[str]:
     opps = region.deal_opportunities(city, states)
     for o in opps:
         why, what = opportunity_text(o, city)
+        if is_open():
+            floor = (f"; unsold, your spare {o['resource']} earns " + (f"${o['floor']:g}/unit" if o["floor"] else
+                                                                      "nothing")) if o["buyer"] != city else ""
+            L.append(f"- deal opportunity: {o['resource']}: {why}{floor} (a deal needs no link)")
+            continue
         L.append(f"- deal opportunity: {why}: offer_deal {json.dumps(region.offer_args(o, city))} {what} "
                  "(no link needed)")
     told = {o["resource"] for o in opps} | {d["resource"] for d in region.deals if d["status"] == "offered"
@@ -337,7 +353,8 @@ def region_lines(env, role: str) -> list[str]:
             v = view[c]
             s = f"- {c.upper()} ({cs['side']} edge): links: {', '.join(v['links']) or 'none'}"
             if v["they_built_waiting_for_you"]:
-                s += f"; they built {', '.join(v['they_built_waiting_for_you'])}: build your side to open it"
+                s += (f"; they built {', '.join(v['they_built_waiting_for_you'])}"
+                      + advice(": build your side to open it", " (it opens once your side is built)"))
             if v["you_built_waiting_for_them"]:
                 s += f"; you built {', '.join(v['you_built_waiting_for_them'])}: waiting for them"
             if cs["site"] and cs["price"]:
@@ -345,8 +362,8 @@ def region_lines(env, role: str) -> list[str]:
                 s += (f"; connector site ({site['x']},{site['y']}), {site['feeder_tiles']} feeder road tiles: "
                       + ", ".join(f"{k} {money(p)}" for k, p in cs["price"].items()))
             elif not cs["site"] and len(cs["built"]) < len(C.CONNECTOR):
-                s += f"; no free edge tile within {C.FEEDER_MAX} tiles of a road: ask planning for a road towards " \
-                     f"the {cs['side']} edge"
+                s += f"; no free edge tile within {C.FEEDER_MAX} tiles of a road" + advice(
+                    f": ask planning for a road towards the {cs['side']} edge")
             L.append(s)
         harbours = {c: bool(e.world.facilities(C.HARBOUR)) for c, e in region.envs.items()}
         airports = {c: bool(e.world.n_buildings(C.AIRPORT)) for c, e in region.envs.items()}

@@ -17,7 +17,7 @@ from ..core.decision import Decision
 from ..core.region import RegionEnv
 from .briefing import briefing, system_prompt
 from .config import FleetAgentConfig
-from .fmt import TOOL_MESSAGE_CHARS
+from .fmt import TOOL_MESSAGE_CHARS, briefing_style
 from .memory import FleetState
 from .region import link, region_of, region_rules
 from .tools import ToolBox
@@ -167,9 +167,10 @@ class ToolAgent(Agent):
         self.env = env
         FleetState.of(env)
         c = env.cfg
-        self.system = system_prompt(self.role, self.cfg, c.months, act_every=c.act_every,
-                                    max_actions=c.max_actions_per_turn, target_pop=env.scoring.target_population,
-                                    region=region_rules(region, env.city, self.role) if region else "")
+        with briefing_style(self.cfg.briefing):          # the region section's deal rule reads the style
+            self.system = system_prompt(self.role, self.cfg, c.months, act_every=c.act_every,
+                                        max_actions=c.max_actions_per_turn, target_pop=env.scoring.target_population,
+                                        region=region_rules(region, env.city, self.role) if region else "")
 
     def describe(self) -> str:
         return f"fleet:{self.cfg.model}"
@@ -181,9 +182,9 @@ class ToolAgent(Agent):
         try:
             # the scripted fleet runs its own dezones and gets no end_turn reminder of open requests, nor refreshed
             # Next lines in its action results
-            box = ToolBox(env, role, branch_dezone=True, max_steps=cfg.max_steps, next_line=True)
+            box = ToolBox(env, role, branch_dezone=True, max_steps=cfg.max_steps, next_line=True, style=cfg.briefing)
             messages = [{"role": "system", "content": self.system},
-                        {"role": "user", "content": briefing(env, role, mode=cfg.mode)}]
+                        {"role": "user", "content": briefing(env, role, mode=cfg.mode, style=cfg.briefing)}]
             tools = box.schemas()
         except Exception as e:                       # a briefing bug costs the role this turn, not the run
             return self._failed_turn(f"briefing_error: {type(e).__name__}: {e}", "briefing_error")

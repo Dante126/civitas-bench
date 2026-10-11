@@ -520,6 +520,35 @@ def test_leaderboard(tmp_path):
     assert E.leaderboard("civitas-v9", runs)["rows"] == []
 
 
+def test_leaderboard_rows_split_the_score_and_count_failures(tmp_path):
+    """civitas-v2: each row splits vs scripted into the population term and the quality terms and carries failed /
+    refused actions per turn beside Teamwork; an eval saved before the split gets it from its run cards, one saved
+    before the call counts reads None."""
+    runs = tmp_path / "runs"
+    ev = _lb_eval(runs, "base1", "base", [0.5, 1.0, 0.0], 1)
+    for c in ev["scorecard"]["runs"]:
+        c["total"]["change"]["population"] = 600
+        c["total"]["calls"] = {k: 0 for k in E.CALLS} | {"turns": 32, "failed": 8, "refused": 4}
+    ev["scorecard"]["aggregate"] = E._agg(ev["scorecard"]["runs"], ev)
+    E.save(ev)
+    old = _lb_eval(runs, "m-old", "m", [1.5, 2.0, 1.0], 2)
+    for k in ("pop_term_delta", "quality_delta", "failed_per_turn", "refused_per_turn"):
+        del old["scorecard"]["aggregate"][k]
+    E.save(old)
+    rows = {r["model"]: r for r in E.leaderboard("tiny-v1", runs)["rows"]}
+    pt = 50 * ((5600 / 30000) ** 0.5 - (5000 / 30000) ** 0.5)
+    b, m = rows["base"], rows["m"]
+    assert b["pop_term"]["mean"] == pytest.approx(pt, abs=1e-3)
+    assert b["quality"]["mean"] == pytest.approx(0.5 - pt, abs=1e-3)
+    assert b["failed_per_turn"] == 0.25 and b["refused_per_turn"] == 0.125 and b["teamwork"] == 80.0
+    assert m["pop_term"]["mean"] == 0.0 and m["quality"]["mean"] == pytest.approx(1.5)     # from its cards
+    assert m["pop_term"]["lo"] is not None and m["failed_per_turn"] is None
+    md = E.leaderboard_markdown(E.leaderboard("tiny-v1", runs))
+    assert ("| · population term | · quality terms | final city score | units | Teamwork | failed / turn "
+            "| refused / turn |") in md
+    assert f"| {pt:+.1f} | {0.5 - pt:+.1f} | 60.5 (" in md and "| 80.0 | 0.25 | 0.12 |" in md and "| 80.0 | n/a | n/a |" in md
+
+
 def test_leaderboard_cli(tmp_path, capsys):
     runs = tmp_path / "runs"
     _lb_eval(runs, "base1", "base", [0.5, 1.0], 1)
