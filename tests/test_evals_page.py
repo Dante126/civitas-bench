@@ -649,6 +649,36 @@ def test_env_check_keys_on_envs_code_state(fakes, monkeypatch):
     assert server.env_code_state() == "head:untracked"
 
 
+def test_cities_endpoint_and_one_frame(tmp_path, monkeypatch):
+    """The Cities view: /api/evals/cities answers evals.cities() (env, seed or 'best'; a bad seed is a 400) and
+    /api/runs/<id>/frames?since=N&limit=1 sends that run's frame alone. Read-only: no launcher needed."""
+    seen = []
+
+    def cities(env=None, seed=None, runs_dir="runs"):
+        seen.append((env, seed, Path(runs_dir).name))
+        return {"env": env or "tiny-v1", "seed": seed, "models": [], "yardstick": {"frames": False, "reason": "r"}}
+    monkeypatch.setattr(E, "cities", cities)
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / "meta.json").write_text("{}")
+    (run / "frames.jsonl").write_text("".join(json.dumps({"month": m}) + "\n" for m in range(5)))
+    httpd, base = _server(tmp_path, allow_launch=False)
+    try:
+        code, d = _get(base, "/api/evals/cities?env=civitas-v2&seed=4")
+        assert code == 200 and d["seed"] == 4 and d["yardstick"]["frames"] is False
+        assert _get(base, "/api/evals/cities")[1]["seed"] is None
+        assert _get(base, "/api/evals/cities?seed=best")[1]["seed"] is None
+        for bad in ("-1", "x", "1.5"):
+            code, d = _get(base, f"/api/evals/cities?seed={bad}")
+            assert code == 400 and "seed" in d["error"]
+        assert seen == [("civitas-v2", 4, "runs"), (None, None, "runs"), (None, None, "runs")]
+        code, d = _get(base, "/api/runs/r1/frames?since=3&limit=1")
+        assert code == 200 and [f["month"] for f in d["frames"]] == [3]
+        assert [f["month"] for f in _get(base, "/api/runs/r1/frames?since=3")[1]["frames"]] == [3, 4]
+    finally:
+        httpd.shutdown()
+
+
 def test_cli_preflight_result():
     from civitas import cli
     assert cli._preflight_result(None) is None

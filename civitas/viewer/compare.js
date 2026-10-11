@@ -4,11 +4,14 @@
 // "since hand-over" rows show it beside the run's own change). A region run is one column (region values: the region's city score and
 // population, the departments' and Teamwork's mean over its cities) or, split, one more column per city.
 
+import { infoBtn } from "./info.js";
+
 // categorical run colours, fixed order (a run keeps its slot while it stays picked): the dataviz palette's dark steps
 export const RUN_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
 export const COMPARE_MAX = 8;
 const DASH = ["", "6 3", "2 3", "8 3 2 3", "1 2", "4 4"];   // a split region's cities
 const YARD_DASH = "4 3";                                      // a warm-up run's scripted yardstick, thinner
+const COMP_INFO = { responsiveness: "answers", follow_through: "follow_through", handoffs: "handoffs", money_aim: "money_aim" };
 const COMPS = [["responsiveness", "answers"], ["follow_through", "follow-through"], ["handoffs", "hand-offs"], ["money_aim", "money aim"]];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const num = (d) => (v) => v == null ? "—" : v.toFixed(d);
@@ -41,48 +44,45 @@ export function columns(runs, { split = false, colorOf }) {
 function rowsFor(cols) {
   const any = (f) => cols.some(c => f(c) != null);
   const warm = cols.some(c => c.run.warmup), region = cols.some(c => c.run.region), calls = any(c => c.e.calls);
-  const yard = cols.some(c => c.e.yardstick);
   const roles = [...new Set(cols.flatMap(c => Object.keys(c.e.roles || {})))];
   const R = [
     ["Run"],
     ["kind", c => c.run.kind + (c.run.tags.length ? ` · ${c.run.tags.join(" · ")}` : ""), (v) => esc(v), 0, null, null, "text"],
     ["model", c => c.run.model || "—", (v) => esc(v), 0, null, null, "text"],
     ["months played", c => c.run.months, (v, c) => int(v) + (c.run.months_configured && c.run.months_configured !== v ? `<span class="muted"> / ${c.run.months_configured}</span>` : ""), 0],
-    ...(warm ? [["scripted warm-up", c => c.run.warmup || null, (v) => v ? `${v} months` : "—", 0, "months 0 to N−1 played by the scripted fleet before the configured agents took over"]] : []),
+    ...(warm ? [["scripted warm-up", c => c.run.warmup || null, (v) => v ? `${v} months` : "—", 0, "warmup"]] : []),
     ["status", c => c.run.status, (v) => `<span class="pill ${esc(v)}">${esc(v)}</span>`, 0],
     ["City"],
-    ["final city score", c => c.e.city, num(1), 1],
-    ["average city score", c => c.e.avg_city, num(1), 1, "the mean of the monthly city score over every month played"],
-    ...(warm ? [["average after warm-up", c => c.e.avg_after_warmup, vsYard(num(1), y => y.avg_city_score), 1, "the mean city score over the configured agents' months" + (yard ? YARD_TIP : "")],
-      ["city score since hand-over", c => c.e.at_handover && c.e.city != null ? c.e.city - (c.e.at_handover.city || 0) : null, vsYard(signed(1), y => y.change.city), 1, "final city score minus the score when the warm-up ended" + (yard ? YARD_TIP : "")]] : []),
-    ["population", c => c.e.population, int, 1],
-    ...(warm ? [["population since hand-over", c => c.e.at_handover && c.e.population != null ? c.e.population - c.e.at_handover.population : null, vsYard(signedInt, y => y.change.population), 1, yard ? YARD_TIP.trim() : null]] : []),
-    ["bankrupt", c => c.city ? null : c.run.bankrupt, (v) => v == null ? "—" : v ? `<span class="bad">yes</span>` : "no", 0],
-    ["Departments (final score)"],
+    ["final city score", c => c.e.city, num(1), 1, "final_city"],
+    ["average city score", c => c.e.avg_city, num(1), 1, "avg_city"],
+    ...(warm ? [["average after warm-up", c => c.e.avg_after_warmup, vsYard(num(1), y => y.avg_city_score), 1, "avg_after_warmup"],
+      ["city score since hand-over", c => c.e.at_handover && c.e.city != null ? c.e.city - (c.e.at_handover.city || 0) : null, vsYard(signed(1), y => y.change.city), 1, "city_since_handover"]] : []),
+    ["population", c => c.e.population, int, 1, "population"],
+    ...(warm ? [["population since hand-over", c => c.e.at_handover && c.e.population != null ? c.e.population - c.e.at_handover.population : null, vsYard(signedInt, y => y.change.population), 1, "population_since_handover"]] : []),
+    ["bankrupt", c => c.city ? null : c.run.bankrupt, (v) => v == null ? "—" : v ? `<span class="bad">yes</span>` : "no", 0, "bankrupt"],
+    ["Departments (final score)", null, null, 0, "departments"],
     ...roles.map(r => [r, c => (c.e.roles || {})[r], num(1), 1, null, r]),
     ["Teamwork"],
-    ["Teamwork score", c => c.e.teamwork ? c.e.teamwork.score : null, (v) => v == null ? `<span class="muted">n/a</span>` : `<b>${v.toFixed(1)}</b>`, 1,
-      "the mean of the four components with enough cases each (the Team tab's score); a region run's own column: the mean over its cities"],
-    ...COMPS.map(([k, label]) => [label, c => c.e.teamwork ? c.e.teamwork.components[k] : null, bar, 1, null, null, "comp"]),
-    ["requests", c => c.e.teamwork ? c.e.teamwork.requests : null, int, 0, "requests between departments (the Team tab's threads)"],
-    ...(region ? [["asks between cities", c => c.city ? null : c.e.teamwork && c.e.teamwork.asks, (v) => v == null ? "—" : v.toFixed(1), 1, "share of asks to another city answered (n/a under the minimum cases)"],
-      ["deals accepted", c => c.city ? null : c.e.teamwork && c.e.teamwork.deals, (v) => v == null ? "—" : v.toFixed(1), 1, "share of deal offers accepted"]] : []),
+    ["Teamwork score", c => c.e.teamwork ? c.e.teamwork.score : null, (v) => v == null ? `<span class="muted">n/a</span>` : `<b>${v.toFixed(1)}</b>`, 1, "teamwork"],
+    ...COMPS.map(([k, label]) => [label, c => c.e.teamwork ? c.e.teamwork.components[k] : null, bar, 1, COMP_INFO[k], null, "comp"]),
+    ["requests", c => c.e.teamwork ? c.e.teamwork.requests : null, int, 0, "requests"],
+    ...(region ? [["asks between cities", c => c.city ? null : c.e.teamwork && c.e.teamwork.asks, (v) => v == null ? "—" : v.toFixed(1), 1, "asks_between"],
+      ["deals accepted", c => c.city ? null : c.e.teamwork && c.e.teamwork.deals, (v) => v == null ? "—" : v.toFixed(1), 1, "deals_accepted"]] : []),
   ];
   if (calls) R.push(
     ["Fleet calls (fleet_report.json)"],
-    ["turns", c => c.e.calls ? c.e.calls.turns : null, int, 0],
-    ["tool calls per turn", c => per(c.e.calls, "tool_calls"), num(1), 0],
-    ["failed actions per turn", c => per(c.e.calls, "failed"), num(2), -1],
-    ["refused per turn", c => per(c.e.calls, "refused"), num(2), -1, "calls a guard refused"],
-    ["repeats per turn", c => per(c.e.calls, "repeats"), num(2), -1, "a failed call sent again (refused by the tool box)"],
-    ["tool errors per turn", c => per(c.e.calls, "tool_errors"), num(2), -1, "bad arguments, unknown tools"],
-    ["overrides", c => c.e.calls ? c.e.calls.overrides : null, int, 0, "refusals overridden with confirm"]);
-  R.push(["playing time", c => c.city ? null : c.run.wall_time_s, dur, 0]);
+    ["turns", c => c.e.calls ? c.e.calls.turns : null, int, 0, "fleet_turns"],
+    ["tool calls per turn", c => per(c.e.calls, "tool_calls"), num(1), 0, "tool_calls_turn"],
+    ["failed actions per turn", c => per(c.e.calls, "failed"), num(2), -1, "failed_turn"],
+    ["refused per turn", c => per(c.e.calls, "refused"), num(2), -1, "refused_turn"],
+    ["repeats per turn", c => per(c.e.calls, "repeats"), num(2), -1, "repeats_turn"],
+    ["tool errors per turn", c => per(c.e.calls, "tool_errors"), num(2), -1, "tool_errors_turn"],
+    ["overrides", c => c.e.calls ? c.e.calls.overrides : null, int, 0, "overrides"]);
+  R.push(["playing time", c => c.city ? null : c.run.wall_time_s, dur, 0, "playing_time"]);
   return R;
 }
 // a warm-up run's "since hand-over" cells: the run's agents, then the scripted agents from the same start
 // (yardstick.json, bench/yardstick.py) beside it; best-value highlighting stays on the run's own number
-const YARD_TIP = "\nscripted: the same game from the same hand-over played by scripted agents (the run's yardstick)";
 const vsYard = (fmt, pick) => (v, c) => {
   const y = c.e.yardstick, yv = y ? pick(y) : null;
   return fmt(v) + (yv == null ? "" : ` <span class="muted cmp-ys" title="scripted agents from the same start">· scripted ${fmt(yv)}</span>`);
@@ -102,12 +102,12 @@ export function tableHTML(cols, { current, roleColor = () => "#ccc" } = {}) {
       <div class="cmp-sub">${c.city ? `of ${esc(shortName(r))}` : esc(idTail(r))}</div></th>`;
   }).join("")}</tr>`;
   const body = rowsFor(cols).map(([label, get, fmt, dir, tip, role, cls]) => {
-    if (!get) return `<tr class="cmp-g"><td colspan="${cols.length + 1}">${esc(label)}</td></tr>`;
+    if (!get) return `<tr class="cmp-g"><td colspan="${cols.length + 1}">${esc(label)}${tip ? " " + infoBtn(tip) : ""}</td></tr>`;
     const vals = cols.map(c => { try { return get(c); } catch { return null; } });
     const nums = vals.filter(v => typeof v === "number" && isFinite(v));
     const best = dir && nums.length > 1 && new Set(nums).size > 1 ? (dir > 0 ? Math.max(...nums) : Math.min(...nums)) : null;
     const lab = role ? `<span class="cmp-role" style="--c:${roleColor(role)}">${esc(label)}</span>` : esc(label);
-    return `<tr class="${cls ? "cmp-" + cls : ""}"><td${tip ? ` title="${esc(tip)}"` : ""}>${lab}${tip ? ` <span class="muted">ⓘ</span>` : ""}</td>${vals.map((v, i) =>
+    return `<tr class="${cls ? "cmp-" + cls : ""}"><td>${lab}${tip ? " " + infoBtn(tip) : ""}</td>${vals.map((v, i) =>
       `<td class="${best != null && v === best ? "best" : ""}${cols[i].city ? " cmp-city" : ""}">${fmt(v, cols[i])}</td>`).join("")}</tr>`;
   }).join("");
   return `<table class="cmp-t">${head}${body}</table>`;
@@ -213,6 +213,7 @@ export function pairedCity(base, other) {
   const lo = mean - half, hi = mean + half;
   return { n, mean, lo, hi, call: lo > 0 ? "better" : hi < 0 ? "worse" : "unclear" };
 }
+const meanOf = (v) => v == null ? null : typeof v === "number" ? v : (v.mean ?? v.median ?? null);   // noop / normalized: a number or {mean, ...}
 const mfmt = (v) => Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(2) + "M" : kfmt(v);
 export const evalLabel = (e) => `${e.name || e.dir}`;
 const evalDate = (e) => e.created ? new Date(e.created * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
@@ -225,43 +226,45 @@ export function evalsTableHTML(evals, { roleColor = () => "#ccc" } = {}) {
     ["Eval"],
     ["model", e => e.model || "—", (v) => esc(v), 0],
     ["suite", e => e.suite && e.suite.name, (v) => esc(v || "—"), 0],
-    ["runs scored / planned", e => A(e).scored, (v, e) => v == null ? "—" : `${v} / ${A(e).runs}`, 0, "runs finished with a scripted yardstick, of the eval's runs"],
+    ["runs scored / planned", e => A(e).scored, (v, e) => v == null ? "—" : `${v} / ${A(e).runs}`, 0, "runs_scored"],
     ["status", e => e.status, (v, e) => `<span class="pill ${esc(v)}">${esc(v)}</span>${e.adopted ? ` <span class="muted small">adopted</span>` : ""}`, 0],
     ["Against the scripted yardstick"],
-    ["units × repeats", e => A(e).n_units, (v, e) => v == null ? "—" : `${v} × ${(A(e).repeats || []).join("/") || "—"}`, 0, "a unit is a config and seed; repeats replay the same hand-over"],
-    ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "the run's city score change since the hand-over minus the scripted agents' change from the same hand-over; mean over the units (each the mean of its repeats; a region run counts once, by its region score) with its 95% interval"],
+    ["units × repeats", e => A(e).n_units, (v, e) => v == null ? "—" : `${v} × ${(A(e).repeats || []).join("/") || "—"}`, 0, "units_repeats"],
+    ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "vs_scripted"],
+    ...(evals.some(e => "normalized" in A(e)) ? [["normalized", e => meanOf(A(e).normalized), (v) => v == null ? "—" : `${v.toFixed(1)}× scripted`, 1, "normalized"]] : []),
+    ...(evals.some(e => "noop_change" in A(e)) ? [["do-nothing change", e => meanOf(A(e).noop_change), signed(1), 0, "noop"]] : []),
     ...(evals.length > 1 ? [[`vs ${evalLabel(evals[0])}`, (e, i) => i ? pairedCity(evals[0], e) : null, (v, e, i) => !i ? `<span class="muted">baseline</span>` : !v ? `<span class="muted">no shared units</span>`
       : `<span style="color:${v.call === "better" ? "var(--ok)" : v.call === "worse" ? "var(--bad)" : "var(--muted)"}">${signed(1)(v.mean)}${v.lo != null ? ` [${signed(1)(v.lo)}, ${signed(1)(v.hi)}]` : ""} · ${v.call === "unclear" ? "no clear difference" : v.call}</span>`, 0,
-      "the city score vs scripted against the first column, paired by config + seed: the mean difference and its 95% interval over the shared units; better / worse when the interval misses 0 (civitas eval --compare gives departments too)"]] : []),
-    ["beats scripted", e => { const n = A(e).n_units ?? A(e).scored; return n ? A(e).beats_scripted / n : null; }, (v, e) => v == null ? "—" : `${A(e).beats_scripted} of ${A(e).n_units ?? A(e).scored}`, 1, "units whose mean is above the scripted yardstick"],
-    ["replay noise", e => (A(e).noise || {}).sd, (v) => v == null ? `<span class="muted">needs repeats</span>` : v.toFixed(1), 0, "how much the city score vs scripted varies between runs of the same model on the same seed (pooled std within units)"],
-    ["detectable difference", e => A(e).mde ? A(e).mde[String(Math.max(...(A(e).repeats || [1])))] : null, (v, e) => v == null ? "—" : `~${v.toFixed(1)}<span class="muted"> at ${Math.max(...(A(e).repeats || [1]))} repeat(s)</span>`, -1, "the smallest gap to another eval on these units that a paired comparison finds 80% of the time, from the replay noise (a lower bound)"],
-    ["city change since hand-over", e => A(e).city_change, signed(1), 1, "the model's own change (mean)"],
-    ["scripted change", e => A(e).yard_change, signed(1), 0, "the scripted agents' change from the same hand-over (mean)"],
-    ["population vs scripted", e => (A(e).population_delta || {}).mean, (v, e) => pm(A(e).population_delta, 0), 1],
-    ["Departments (final score vs scripted)"],
+      "paired_first"]] : []),
+    ["beats scripted", e => { const n = A(e).n_units ?? A(e).scored; return n ? A(e).beats_scripted / n : null; }, (v, e) => v == null ? "—" : `${A(e).beats_scripted} of ${A(e).n_units ?? A(e).scored}`, 1, "beats_scripted"],
+    ["replay noise", e => (A(e).noise || {}).sd, (v) => v == null ? `<span class="muted">needs repeats</span>` : v.toFixed(1), 0, "replay_noise"],
+    ["detectable difference", e => A(e).mde ? A(e).mde[String(Math.max(...(A(e).repeats || [1])))] : null, (v, e) => v == null ? "—" : `~${v.toFixed(1)}<span class="muted"> at ${Math.max(...(A(e).repeats || [1]))} repeat(s)</span>`, -1, "mde"],
+    ["city change since hand-over", e => A(e).city_change, signed(1), 1, "city_change"],
+    ["scripted change", e => A(e).yard_change, signed(1), 0, "scripted_change"],
+    ["population vs scripted", e => (A(e).population_delta || {}).mean, (v, e) => pm(A(e).population_delta, 0), 1, "population_vs"],
+    ["Departments (final score vs scripted)", null, null, 0, "departments"],
     ...roles.map(r => [r, e => (A(e).roles || {})[r], signed(1), 1, null, r]),
     ["Play"],
-    ["Teamwork", e => A(e).teamwork, num(1), 1, "mean Teamwork score over the runs"],
-    ["failed actions per turn", e => A(e).failed_per_turn, num(2), -1],
-    ["refusals per turn", e => A(e).refused_per_turn, num(2), -1, "calls a guard refused"],
+    ["Teamwork", e => A(e).teamwork, num(1), 1, "teamwork"],
+    ["failed actions per turn", e => A(e).failed_per_turn, num(2), -1, "failed_turn"],
+    ["refusals per turn", e => A(e).refused_per_turn, num(2), -1, "refused_turn"],
     ["Cost"],
-    ["tokens per model turn", e => (A(e).tokens || {}).per_turn, (v) => v == null ? "—" : kfmt(v), -1],
-    ["tokens in all", e => (A(e).tokens || {}).total, (v, e) => v == null ? "—" : `${mfmt(v)}<span class="muted"> (${mfmt(A(e).tokens.prompt)} / ${mfmt(A(e).tokens.completion)})</span>`, 0, "prompt / completion"],
-    ["model turns", e => (A(e).tokens || {}).turns, int, 0],
-    ["run time (sum)", e => (A(e).wall_time_s || {}).sum, dur, 0],
+    ["tokens per model turn", e => (A(e).tokens || {}).per_turn, (v) => v == null ? "—" : kfmt(v), -1, "tokens_turn"],
+    ["tokens in all", e => (A(e).tokens || {}).total, (v, e) => v == null ? "—" : `${mfmt(v)}<span class="muted"> (${mfmt(A(e).tokens.prompt)} / ${mfmt(A(e).tokens.completion)})</span>`, 0, "tokens"],
+    ["model turns", e => (A(e).tokens || {}).turns, int, 0, "model_turns"],
+    ["run time (sum)", e => (A(e).wall_time_s || {}).sum, dur, 0, "run_time"],
   ];
   const head = `<tr><th></th>${evals.map((e, i) => `<th style="--c:${RUN_COLORS[i % RUN_COLORS.length]}" title="${esc(e.dir)}">
       <div class="cmp-h"><span class="cmp-sw"></span><b>${esc(evalLabel(e))}</b>
         <button class="cmp-x" data-hide-eval="${esc(e.dir)}" title="Hide this eval" aria-label="Hide">×</button></div>
       <div class="cmp-sub">${esc(evalDate(e))} · <button class="cmp-open" data-load-eval="${esc(e.dir)}" title="Compare this eval's runs">its runs</button></div></th>`).join("")}</tr>`;
   const body = R.map(([label, get, fmt, dir, tip, role]) => {
-    if (!get) return `<tr class="cmp-g"><td colspan="${evals.length + 1}">${esc(label)}</td></tr>`;
+    if (!get) return `<tr class="cmp-g"><td colspan="${evals.length + 1}">${esc(label)}${tip ? " " + infoBtn(tip) : ""}</td></tr>`;
     const vals = evals.map((e, i) => { try { return get(e, i); } catch { return null; } });
     const nums = vals.filter(v => typeof v === "number" && isFinite(v));
     const best = dir && nums.length > 1 && new Set(nums).size > 1 ? (dir > 0 ? Math.max(...nums) : Math.min(...nums)) : null;
     const lab = role ? `<span class="cmp-role" style="--c:${roleColor(role)}">${esc(label)}</span>` : esc(label);
-    return `<tr><td${tip ? ` title="${esc(tip)}"` : ""}>${lab}${tip ? ` <span class="muted">ⓘ</span>` : ""}</td>${vals.map((v, i) =>
+    return `<tr><td>${lab}${tip ? " " + infoBtn(tip) : ""}</td>${vals.map((v, i) =>
       `<td class="${best != null && v === best ? "best" : ""}">${fmt(v, evals[i], i)}</td>`).join("")}</tr>`;
   }).join("");
   return `<table class="cmp-t">${head}${body}</table>`;

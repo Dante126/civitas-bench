@@ -3,6 +3,11 @@
 // (running evals with progress and Stop, finished ones with their scorecard) and Leaderboard (per environment version).
 // A strip on top shows the environment version and whether the code still matches it (bench/envs.py). Everything
 // reads without the launcher; edits need `civitas serve` with launching on, from this computer (`can_edit`).
+// Every metric has an (i) bubble (info.js: one map of texts, shared with the Compare view). The Leaderboard's Cities
+// view draws each model's city from its run's final frame with the real pixel renderer (pixel.js), offscreen.
+import { infoBtn as I, hideInfo } from "./info.js";
+import { PixelScene } from "./pixel.js";
+import { RUN_COLORS } from "./compare.js";
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const BUILTIN = ["arcee", "openrouter", "openai", "anthropic"];
@@ -24,6 +29,70 @@ async function req(path, body) {
 }
 const errText = (r) => (r.data && (r.data.errors || [r.data.error]).filter(Boolean).join("; ")) || `HTTP ${r.status}`;
 
+// ---------------------------------------------------------------- city pictures (the Leaderboard's Cities view)
+// One PixelScene in a hidden box, stopped (no animation loop): for each run, set its meta and final frame, zoom to fit
+// the map, draw once and keep the picture as an image URL. Drawing goes one city at a time; each is drawn only once.
+const PIC_W = 1120, PIC_H = 700, PIC_PAD = 4, PIC_MIN = 24;   // picture size; tiles of margin and the least span framed
+const PICS = { scene: null, done: new Map(), pending: new Map(), queue: Promise.resolve(), meta: new Map() };
+function picScene() {
+  if (!PICS.scene) {
+    const host = document.createElement("div");
+    host.className = "ev-pichost"; host.setAttribute("aria-hidden", "true");
+    document.body.appendChild(host);
+    PICS.scene = new PixelScene(host, {});
+    PICS.scene.setActive(false);
+  }
+  return PICS.scene;
+}
+// a region run's frames nest each city: draw its first city, as the viewer opens it (app.js cityMeta / cityFrame)
+function cityOf(meta, frame) {
+  if (!meta.region) return [meta, frame];
+  const c = (meta.cities || [])[0];
+  return [{ ...meta, resources: ((meta.city_meta || {})[c] || {}).resources }, { ...frame.cities[c], month: frame.month }];
+}
+const legacyTiles = (meta, t) => { if (!(meta.frame_format >= 3)) t = t.replaceAll("M", "h"); if (!(meta.frame_format >= 2)) t = t.replaceAll("O", "V"); return t; };
+async function drawPicture(runId, frameNo) {
+  const id = encodeURIComponent(runId);
+  if (!PICS.meta.has(runId)) PICS.meta.set(runId, fetch(`/api/runs/${id}/meta`).then(r => r.ok ? r.json() : Promise.reject(new Error(`meta: HTTP ${r.status}`))));
+  const meta = await PICS.meta.get(runId);
+  const r = await fetch(`/api/runs/${id}/frames?since=${frameNo}&limit=1`);
+  if (!r.ok) throw new Error(`frames: HTTP ${r.status}`);
+  const raw = ((await r.json()).frames || [])[0];
+  if (!raw) throw new Error("no such frame");
+  if (raw.tiles) raw.tiles = legacyTiles(meta, raw.tiles);
+  for (const cf of Object.values(raw.cities || {})) cf.tiles = legacyTiles(meta, cf.tiles);
+  const [m, f] = cityOf(meta, raw);
+  const sc = picScene();
+  sc.setMeta(m);
+  sc.setFrame(f, null, { animate: false });
+  sc.dpr = 1; sc.cv.width = PIC_W; sc.cv.height = PIC_H;
+  // frame the built-up area (every tile but empty land, water, bridges, dams, levees and the highway) with a margin
+  const W = sc.W, H = sc.H, T = f.tiles;
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (let i = 0; i < T.length; i++) if (!".~=YH|".includes(T[i])) {
+    const x = i % W, y = (i / W) | 0;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  if (x1 < 0) { x0 = 0; y0 = 0; x1 = W - 1; y1 = H - 1; }
+  const grow = (a, b, n) => { const pad = Math.max(PIC_PAD, (PIC_MIN - (b - a)) / 2); return [Math.max(-2, a - pad), Math.min(n + 1, b + pad)]; };
+  [x0, x1] = grow(x0, x1, W - 1); [y0, y1] = grow(y0, y1, H - 1);
+  const pts = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]].map(([x, y]) => sc.world(x, y));
+  const pw = Math.max(...pts.map(p => p[0])) - Math.min(...pts.map(p => p[0])), ph = Math.max(...pts.map(p => p[1])) - Math.min(...pts.map(p => p[1]));
+  sc.z = sc.zt = Math.min(PIC_W * 0.96 / pw, PIC_H * 0.84 / ph, 2); sc.zAnchor = null; sc.camAnim = null;
+  sc.cam.x = (x0 + x1) / 2; sc.cam.y = (y0 + y1) / 2;
+  sc._draw(performance.now());
+  return await new Promise((res) => sc.cv.toBlob(b => res(b ? URL.createObjectURL(b) : sc.cv.toDataURL("image/png")), "image/webp", 0.9));
+}
+function cityPicture(runId, frameNo) {
+  const k = `${runId}@${frameNo}`;
+  if (PICS.pending.has(k)) return PICS.pending.get(k);
+  const p = PICS.queue.then(() => drawPicture(runId, frameNo))
+    .then(url => { PICS.done.set(k, { url }); }, e => { PICS.done.set(k, { error: `could not draw it: ${e.message}` }); });
+  PICS.queue = p;
+  PICS.pending.set(k, p);
+  return p;
+}
+
 // ---------------------------------------------------------------- markdown (scorecard.md): a small, safe subset
 // headers, tables, lists, paragraphs, **bold**, *italic*, `code`; every character of the source is HTML-escaped first
 function inline(s) {
@@ -32,7 +101,16 @@ function inline(s) {
 }
 const cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
 const isSep = (line) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
-export function md(src) {
+// a scorecard table's labels -> INFO keys: md(src, { info: true }) adds an (i) to the first cell naming each (per table)
+const MD_INFO = [[/^city score vs scripted|^vs scripted$/, "vs_scripted"], [/population term/, "pop_term"], [/quality terms/, "quality"],
+  [/^units/, "units_repeats"], [/^runs scored/, "runs_scored"], [/seed spread/, "seed_spread"], [/replay noise/, "replay_noise"],
+  [/detectable difference/, "mde"], [/beats scripted/, "beats_scripted"], [/change since hand-over|^city change$/, "city_change"],
+  [/^scripted change|^scripted$/, "scripted_change"], [/population vs scripted/, "population_vs"], [/^teamwork/, "teamwork"],
+  [/^failed/, "failed_turn"], [/^refus/, "refused_turn"], [/^tokens per model turn/, "tokens_turn"], [/^tokens/, "tokens"],
+  [/^model turns/, "model_turns"], [/^department$/, "departments"], [/city at hand-over/, "handover_city"], [/^run time/, "run_time"],
+  [/noop|do-nothing/, "noop"], [/normali[sz]ed/, "normalized"]];
+const mdInfoKey = (text) => { const t = String(text).replace(/[*`]/g, "").trim().toLowerCase(); const hit = MD_INFO.find(([re]) => re.test(t)); return hit ? hit[1] : null; };
+export function md(src, { info = false } = {}) {
   const lines = String(src ?? "").replace(/\r/g, "").split("\n");
   const out = [];
   let para = [];
@@ -49,7 +127,9 @@ export function md(src) {
       const head = rows.length > 1 && isSep(rows[1]) ? cells(rows[0]) : null;
       const align = head ? cells(rows[1]).map(c => c.endsWith(":") ? (c.startsWith(":") ? "center" : "right") : "") : [];
       const body = (head ? rows.slice(2) : rows).filter(r => !isSep(r)).map(cells);
-      const td = (tag, c, j) => `<${tag}${align[j] ? ` style="text-align:${align[j]}"` : ""}>${inline(c)}</${tag}>`;
+      const seen = new Set();
+      const tip = (c, on) => { if (!info || !on) return ""; const k = mdInfoKey(c); if (!k || seen.has(k)) return ""; seen.add(k); return " " + I(k); };
+      const td = (tag, c, j) => `<${tag}${align[j] ? ` style="text-align:${align[j]}"` : ""}>${inline(c)}${tip(c, tag === "th" || j === 0)}</${tag}>`;
       out.push(`<div class="ev-scroll"><table class="md-t">${head ? `<thead><tr>${head.map((c, j) => td("th", c, j)).join("")}</tr></thead>` : ""}<tbody>${body.map(r => `<tr>${r.map((c, j) => td("td", c, j)).join("")}</tr>`).join("")}</tbody></table></div>`);
       continue;
     }
@@ -73,16 +153,19 @@ export function md(src) {
 }
 
 // ---------------------------------------------------------------- the page
-export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
+export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = null } = {}) {
   const P = {
     tab: (() => { try { return JSON.parse(localStorage.getItem("civitas.evalsTab")) || "models"; } catch { return "models"; } })(),
     models: null, providers: [], canEdit: false, modelsErr: null, env: null, envs: [], evals: null, jobs: [],
     progress: {}, lb: null, lbEnv: null, lbErr: null, suites: null, pf: {}, open: new Set(), cards: {}, keyFor: null,
     timer: null, envTimer: null, lastList: 0,
+    lbView: (() => { try { return localStorage.getItem("civitas.lbView") === "cities" ? "cities" : "table"; } catch { return "table"; } })(),
+    cities: null, citiesKey: null, citiesErr: null, citySeed: "best", cityFocus: null, focusScrolled: false, howOpen: false,
   };
   const modal = $("evalsModal"), body = $("evBody");
   const shown = () => !modal.hidden;
   const saveTab = () => { try { localStorage.setItem("civitas.evalsTab", JSON.stringify(P.tab)); } catch { /* ignore */ } };
+  const saveView = () => { try { localStorage.setItem("civitas.lbView", P.lbView); } catch { /* ignore */ } };
 
   // ------------------------------------------------ loading
   async function loadModels() {
@@ -171,9 +254,11 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     else if (!e.frozen || !e.env) st = `<span class="ev-st warn">no version frozen</span>`;
     else if (e.match) st = `<span class="ev-st ok">✓ matches</span>`;
     else st = `<span class="ev-st warn" title="This code plays a different game from the frozen version: evals now are recorded as drifted and not ranked">⚠ changed: ${esc((e.diff || []).join(", ") || "?")}</span>`;
+    if (e && !e.computing && e.env && e.frozen) st += I("drift");
     if (e && e.stale && !e.computing) st += ` <span class="muted small" title="The code changed since this check; a read-only server doesn't probe again">(checked on older code)</span>`;
-    const fp = e && e.fingerprint ? `<span class="muted small mono" title="this code's fingerprint">${esc(String(e.fingerprint).slice(0, 10))}</span>` : "";
-    el.innerHTML = `<span class="ev-env-k">Environment</span><b class="ev-env-v">${esc((e && e.env) || "—")}</b>${st}
+    const fp = e && e.fingerprint ? `<span class="muted small mono" title="this code's fingerprint">${esc(String(e.fingerprint).slice(0, 10))}</span>${I("fingerprint")}` : "";
+    const track = e && e.env ? `<span class="ev-track ${/-open$/.test(e.env) ? "open" : "guided"}">${/-open$/.test(e.env) ? "open" : "guided"} track</span>${I("tracks")}` : "";
+    el.innerHTML = `<span class="ev-env-k">Environment</span>${I("env_version")}<b class="ev-env-v">${esc((e && e.env) || "—")}</b>${track}${st}
       ${e && e.suite ? `<span class="muted small">suite ${esc(e.suite)}</span>` : ""}${fp}<div class="grow"></div>
       ${e && !e.unavailable ? `<button class="btn" id="evRecheck" ${e.computing || !P.canEdit ? "disabled" : ""} title="Probe this code again">↻ Recheck</button>` : ""}
       ${e && !e.unavailable ? `<button class="btn" id="evFreeze" ${!P.canEdit || e.computing ? "disabled" : ""} title="${P.canEdit ? "Freeze the environment as it is now under a new version name" : "Editing needs civitas serve with launching on, on this computer"}">Freeze new version…</button>` : ""}`;
@@ -346,7 +431,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
           : `<button class="btn" data-key="${esc(p.env)}" ${dis}>${p.set ? "Replace key" : "Set API key"}</button>`}</td></tr>`).join("");
     return `${ro}<div class="ev-card">
         <div class="ev-head"><h4>Models <span class="muted">${P.models.length}</span></h4><div class="grow"></div><button class="btn primary" id="evAdd" ${dis}>＋ Add model</button></div>
-        ${P.models.length ? `<div class="ev-scroll"><table class="ev-t"><thead><tr><th>Model</th><th>Provider</th><th>Served id</th><th>API key</th><th>Latest eval</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
+        ${P.models.length ? `<div class="ev-scroll"><table class="ev-t"><thead><tr><th>Model</th><th>Provider</th><th>Served id</th><th>API key</th><th>Latest eval ${I("latest_eval")}</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
           : `<div class="emptytab">No models in the registry yet (configs/models.toml). Add one to evaluate it.</div>`}
       </div>
       <div class="ev-card">
@@ -387,6 +472,10 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
 
   // ------------------------------------------------ tab: Evals
   function verdictOf(dir) { const row = ((P.lb && P.lb.rows) || []).find(r => r.eval_dir === dir); return row ? row.verdict : null; }
+  // the noop baseline and normalized score (bench/evals.py, when present): a number or {mean, median, lo, hi}
+  const meanOf = (v) => v == null ? null : typeof v === "number" ? v : (v.mean ?? v.median ?? null);
+  const noopText = (v) => meanOf(v) == null ? "—" : sgn(meanOf(v));
+  const normText = (v) => meanOf(v) == null ? "—" : `${meanOf(v).toFixed(1)}× scripted`;
   const ciText = (a) => !a || a.mean == null ? "—" : `${sgn(a.mean)}${a.lo != null ? ` [${sgn(a.lo)}, ${sgn(a.hi)}]` : a.std != null ? ` ± ${a.std.toFixed(1)}` : ""}`;
   function runningHTML(x) {
     const p = P.progress[x.ref] || {}, j = x.job;
@@ -418,11 +507,13 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
           <span class="muted small">${esc(e.model || "?")} · ${esc((e.suite && e.suite.name) || "?")} · ${e.runs.length} runs · ${esc(when(e.created))}</span>
           <span class="pill ${esc(st === "finished" ? "finished" : st === "partial" ? "incomplete" : "stopped")}">${esc(st)}</span>
           <div class="grow"></div>
-          <span class="ev-score" title="the city's change since the hand-over minus the scripted yardstick's, mean and 95% interval over units">vs scripted <b class="${a.city_delta && a.city_delta.mean > 0 ? "good" : a.city_delta && a.city_delta.mean < 0 ? "badc" : ""}">${ciText(a.city_delta)}</b></span>
+          <span class="ev-score">vs scripted ${I("vs_scripted")} <b class="${a.city_delta && a.city_delta.mean > 0 ? "good" : a.city_delta && a.city_delta.mean < 0 ? "badc" : ""}">${ciText(a.city_delta)}</b></span>
+          ${"noop_change" in a ? `<span class="ev-score">do nothing ${I("noop")} <b>${noopText(a.noop_change)}</b></span>` : ""}
+          ${"normalized" in a ? `<span class="ev-score">normalized ${I("normalized")} <b>${normText(a.normalized)}</b></span>` : ""}
           ${onCompareEval ? `<button class="btn" data-cmp="${esc(e.dir)}" title="Open its runs in the Compare view">Compare runs</button>` : ""}
         </div>
         ${v ? `<div class="ev-verdict small">${esc(v)}</div>` : ""}
-        ${open ? `<div class="ev-card-md">${P.cards[e.dir] == null ? `<div class="small muted">Loading the scorecard…</div>` : P.cards[e.dir].error ? `<div class="small muted">${esc(P.cards[e.dir].error)}</div>` : md(P.cards[e.dir].markdown)}</div>` : ""}
+        ${open ? `<div class="ev-card-md">${P.cards[e.dir] == null ? `<div class="small muted">Loading the scorecard…</div>` : P.cards[e.dir].error ? `<div class="small muted">${esc(P.cards[e.dir].error)}</div>` : md(P.cards[e.dir].markdown, { info: true })}</div>` : ""}
       </div>`;
     }).join("");
     return `<div class="ev-card"><div class="ev-head"><h4>Running <span class="muted">${live.length}</span></h4></div>
@@ -459,22 +550,47 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     const cls = a > 0 ? "up" : b < 0 ? "down" : "";
     return `<div class="ev-ci ${cls}" aria-hidden="true"><span class="z" style="left:${x(0)}"></span><span class="r" style="left:${x(a)};width:calc(${x(b)} - ${x(a)})"></span><span class="d" style="left:${x(v.mean)}"></span></div>`;
   }
-  function boardHTML() {
+  const sortedRows = () => ((P.lb && P.lb.rows) || []).slice().sort((a, b) => ((b.vs_yardstick || {}).mean ?? -1e9) - ((a.vs_yardstick || {}).mean ?? -1e9));
+  const HOW = () => `<details class="ev-how" id="lbHow" ${P.howOpen ? "open" : ""}><summary>How scoring works</summary><ul class="small">
+      <li>Each run is a <b>late start</b>: scripted agents grow the city for 96 months, then the model's fleet plays the last 12 (32 department turns).</li>
+      <li>The <b>city score</b> (0-100) is half population, 50·√(population / 30,000), and half quality: happiness, finance, services, environment, employment, safety, health, education.</li>
+      <li><b>vs scripted</b> = the model's city-score change since the hand-over minus the scripted agents' change from the same city. Above 0: better than the scripted baseline.</li>
+      <li>That difference removes the seed's difficulty (the seed explains about 70% of the score's variance), so models are ranked by it, not by the raw score.</li>
+      <li>The mean is over 8 seeds with a <b>95% interval</b>: an interval wholly above 0 beats scripted beyond seed luck. <b>vs baseline</b> pairs two models seed by seed the same way.</li>
+      <li>Teamwork, failures, tokens and the efficiency view describe how a model played; only the city score counts toward the rank.</li>
+      <li>Guided and open versions are separate leaderboards: open briefings give the facts but never the next move.</li></ul></details>`;
+  const trackOf = (env) => !env ? "" : /-open$/.test(env) ? "open" : "guided";
+  const trackTag = (env) => env ? `<span class="ev-track ${trackOf(env)}">${trackOf(env)} track</span>${I("tracks")}` : "";
+  function boardTools() {
     const names = [...new Set([...(P.envs || []).map(e => e.name), ...((P.lb && P.lb.envs) || []), ...(P.lbEnv ? [P.lbEnv] : [])])];
-    const pick = `<label class="ev-inline">Version <select id="lbEnv">${names.length ? names.map(n => `<option ${n === P.lbEnv ? "selected" : ""}>${esc(n)}</option>`).join("") : `<option value="">—</option>`}</select></label>`;
-    if (P.lbErr) return `<div class="ev-tools">${pick}</div><div class="emptytab">${esc(P.lbErr)}</div>`;
-    if (!P.lb) return `<div class="ev-tools">${pick}</div><div class="small muted">Loading the leaderboard…</div>`;
-    const rows = (P.lb.rows || []).slice().sort((a, b) => ((b.vs_yardstick || {}).mean ?? -1e9) - ((a.vs_yardstick || {}).mean ?? -1e9));
+    const pick = `<label class="ev-inline">Version ${I("env_version")} <select id="lbEnv">${names.length ? names.map(n => `<option ${n === P.lbEnv ? "selected" : ""}>${esc(n)}</option>`).join("") : `<option value="">—</option>`}</select></label>${trackTag(P.lbEnv)}`;
+    const seg = `<div class="seg ev-view" role="tablist" aria-label="Leaderboard view"><button data-lbv="table" role="tab" aria-selected="${P.lbView === "table"}" class="${P.lbView === "table" ? "on" : ""}">Table</button><button data-lbv="cities" role="tab" aria-selected="${P.lbView === "cities"}" class="${P.lbView === "cities" ? "on" : ""}" title="The city each model built, side by side">Cities</button></div>`;
+    return `<div class="ev-tools">${pick}${seg}<button class="btn" id="lbRe">↻ Refresh</button><div class="grow"></div><span class="muted small">the latest finished, non-drifted eval of each model on this version</span></div>`;
+  }
+  const normOf = (n) => n == null ? null : typeof n === "number" ? { mean: n } : (n.mean != null || n.median != null ? n : null);
+  function normHTML(n) {
+    n = normOf(n);
+    if (!n) return `<span class="muted">—</span>`;
+    const v = n.mean ?? n.median, f = (x) => `${x.toFixed(1)}×`;
+    return `<b class="${n.lo != null && n.lo > 1 ? "good" : n.hi != null && n.hi < 1 ? "badc" : ""}">${f(v)}</b> <span class="muted small">scripted</span>${n.lo != null && n.hi != null ? `<div class="muted small">[${f(n.lo)}, ${f(n.hi)}]</div>` : ""}`;
+  }
+  function boardHTML() {
+    if (P.lbErr) return `${HOW()}${boardTools()}<div class="emptytab">${esc(P.lbErr)}</div>`;
+    if (!P.lb) return `${HOW()}${boardTools()}<div class="small muted">Loading the leaderboard…</div>`;
+    if (P.lbView === "cities") return `${HOW()}${boardTools()}${citiesHTML()}`;
+    const rows = sortedRows();
     const vals = rows.flatMap(r => { const v = r.vs_yardstick || {}; return [v.lo, v.hi, v.mean].filter(x => x != null); });
     let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
     const pad = Math.max(0.5, (hi - lo) * 0.08); lo -= pad; hi += pad;
     const base = P.lb.baseline;
+    const hasNorm = rows.some(r => "normalized" in r);
     const tr = rows.map((r, i) => {
       const v = r.vs_yardstick || {}, s = r.score || {};
       return `<tr>
         <td class="ev-rank">${i + 1}</td>
-        <td><b>${esc(r.model)}</b>${r.model === base ? ` <span class="ev-tag">baseline</span>` : ""}<div class="ev-sub2 mono">${esc(r.eval_dir || "")}</div></td>
+        <td><div class="ev-mcell"><b>${esc(r.model)}</b>${r.model === base ? ` <span class="ev-tag">baseline</span>` : ""}<button class="btn ev-citybtn" data-citymodel="${esc(r.model)}" title="See the city ${esc(r.model)} built">City</button></div><div class="ev-sub2 mono">${esc(r.eval_dir || "")}</div></td>
         <td class="ev-cicell"><div class="ev-cinum"><b class="${v.lo > 0 ? "good" : v.hi < 0 ? "badc" : ""}">${sgn(v.mean)}</b>${v.lo != null ? ` <span class="muted">[${sgn(v.lo)}, ${sgn(v.hi)}]</span>` : ""}</div>${ciBar(v, lo, hi)}</td>
+        ${hasNorm ? `<td>${normHTML(r.normalized)}</td>` : ""}
         <td class="small">${sgn((r.pop_term || {}).mean)} <span class="muted">/</span> ${sgn((r.quality || {}).mean)}</td>
         <td>${s.mean != null ? s.mean.toFixed(1) : "—"}${s.lo != null ? ` <span class="muted small">[${s.lo.toFixed(1)}, ${s.hi.toFixed(1)}]</span>` : ""}</td>
         <td>${r.n_units ?? "—"}</td>
@@ -484,15 +600,157 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
         <td>${tok(r.tokens)}</td><td>${usd(r.cost)}</td></tr>`;
     }).join("");
     const skipped = (P.lb.skipped || []).map(s => `<li><span class="mono">${esc(s.eval_dir)}</span>: ${esc(s.reason)}</li>`).join("");
-    return `<div class="ev-tools">${pick}<button class="btn" id="lbRe">↻ Refresh</button><div class="grow"></div><span class="muted small">the latest finished, non-drifted eval of each model on this version</span></div>
-      <div class="ev-card">${rows.length ? `<div class="ev-scroll"><table class="ev-t ev-board"><thead><tr><th>#</th><th>Model</th><th>vs scripted <span class="muted">(95% interval)</span></th><th title="vs scripted split: the population term (50 x sqrt(population / target)) / the quality terms (the rest)">pop / quality</th><th>City score</th><th>Units</th><th title="mean Teamwork score over the runs">Teamwork</th><th title="failed actions / guard refusals per model turn">failed / refused per turn</th><th>vs baseline${base ? ` (${esc(base)})` : ""}</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>${tr}</tbody></table></div>
-        <div class="muted small ev-foot">vs scripted: the city's change since the hand-over minus the scripted agents' change from the same hand-over, mean over units with its 95% interval (the bar; the line is 0). An interval clear of 0 beats or trails scripted beyond seed luck. pop / quality: how much of it came from the population term and how much from the quality terms.</div>`
+    const th = (label, key, extra = "") => `<th>${label} ${I(key)}${extra}</th>`;
+    return `${HOW()}${boardTools()}
+      <div class="ev-card">${rows.length ? `<div class="ev-scroll"><table class="ev-t ev-board"><thead><tr><th># ${I("rank")}</th><th>Model</th>
+          <th>vs scripted ${I("vs_scripted")} <span class="muted">(95% interval ${I("interval")})</span></th>
+          ${hasNorm ? th("normalized", "normalized") : ""}
+          ${th("pop / quality", "pop_quality")}${th("City score", "city_score")}${th("Units", "units")}${th("Teamwork", "teamwork")}
+          ${th("failed / refused per turn", "failed_refused")}<th>vs baseline${base ? ` (${esc(base)})` : ""} ${I("verdict")}</th>${th("Tokens", "tokens")}${th("Cost", "cost")}</tr></thead><tbody>${tr}</tbody></table></div>
+        <div class="muted small ev-foot">The bar is the 95% interval of vs scripted, the dot its mean and the line 0: an interval clear of 0 beats or trails scripted beyond seed luck. Tap an <span class="info-i static" aria-hidden="true">i</span> for what a column means.</div>`
         : `<div class="emptytab">No ranked evals on ${esc(P.lb.env || "this version")} yet.</div>`}</div>
+      ${rows.length ? effHTML(rows) : ""}
       ${skipped ? `<div class="ev-card ev-skipped"><div class="ev-head"><h4>Not ranked</h4></div><ul class="small muted">${skipped}</ul></div>` : ""}`;
   }
+
+  // ------------------------------------------------ the efficiency view: how each model spent its tokens
+  function effHTML(rows) {
+    const E = rows.filter(r => r.efficiency);
+    if (!E.length) return "";
+    const n = (v, d = 1) => v == null ? "—" : v.toFixed(d);
+    const best = (k, dir) => { const xs = E.map(r => r.efficiency[k]).filter(v => v != null); return xs.length > 1 ? (dir > 0 ? Math.max(...xs) : Math.min(...xs)) : null; };
+    const B = { tokens_per_turn: best("tokens_per_turn", -1), model_calls_per_turn: best("model_calls_per_turn", -1), lookups_per_turn: best("lookups_per_turn", -1), capped_share: best("capped_share", -1), vs_per_10m: best("vs_per_10m", 1) };
+    const cell = (r, k, txt) => `<td class="${B[k] != null && r.efficiency[k] === B[k] ? "ev-best" : ""}">${txt}</td>`;
+    const tr = E.map(r => { const e = r.efficiency, v = r.vs_yardstick || {};
+      return `<tr><td><b>${esc(r.model)}</b></td><td>${sgn(v.mean)}</td>
+        ${cell(r, "tokens_per_turn", tok(e.tokens_per_turn))}${cell(r, "model_calls_per_turn", n(e.model_calls_per_turn))}<td>${tok(e.context_per_call)}</td>
+        <td>${n(e.tool_calls_per_turn)}</td><td>${n(e.actions_per_turn)}</td>${cell(r, "lookups_per_turn", n(e.lookups_per_turn))}
+        ${cell(r, "capped_share", e.capped_share == null ? "—" : `${(100 * e.capped_share).toFixed(e.capped_share > 0 && e.capped_share < 0.1 ? 1 : 0)}%`)}${cell(r, "vs_per_10m", e.vs_per_10m == null ? "—" : sgn(e.vs_per_10m))}</tr>`; }).join("");
+    const th = (label, key) => `<th>${label} ${I(key)}</th>`;
+    return `<div class="ev-card"><div class="ev-head"><h4>Efficiency</h4><span class="muted small">how each model spent its tokens, per model turn after the hand-over</span></div>
+      <div class="ev-eff">
+        <div class="ev-scroll"><table class="ev-t"><thead><tr><th>Model</th>${th("vs scripted", "vs_scripted")}${th("tokens / turn", "tokens_turn")}${th("model calls / turn", "model_calls_turn")}${th("context / call", "context_call")}
+          ${th("tool calls / turn", "tool_calls_turn")}${th("actions / turn", "actions_turn")}${th("look-ups / turn", "lookups_turn")}${th("at step cap", "capped")}${th("vs scripted per 10M tokens", "per_10m")}</tr></thead><tbody>${tr}</tbody></table></div>
+        <figure class="ev-scatter"><figcaption class="small">Cost against score ${I("scatter")}</figcaption><svg id="effSvg" role="img" aria-label="Tokens per model turn against vs scripted, one dot per model"></svg></figure>
+      </div></div>`;
+  }
+  // x: tokens per model turn, y: vs scripted with its 95% interval; the Pareto front (no model cheaper and better) dashed
+  function drawScatter() {
+    const svg = $("effSvg"); if (!svg) return;
+    const pts = sortedRows().filter(r => r.efficiency && r.efficiency.tokens_per_turn && (r.vs_yardstick || {}).mean != null)
+      .map((r, i) => ({ r, x: r.efficiency.tokens_per_turn, y: r.vs_yardstick.mean, lo: r.vs_yardstick.lo ?? r.vs_yardstick.mean, hi: r.vs_yardstick.hi ?? r.vs_yardstick.mean, c: RUN_COLORS[i % RUN_COLORS.length] }));
+    const w = Math.max(260, svg.clientWidth || svg.parentNode.clientWidth || 360), h = 250, pl = 40, pr = 12, pt = 14, pb = 34;
+    if (!pts.length) { svg.innerHTML = ""; return; }
+    const x0 = Math.min(...pts.map(p => p.x)), x1 = Math.max(...pts.map(p => p.x)), xpad = Math.max((x1 - x0) * 0.12, x1 * 0.05);
+    const xmin = Math.max(0, x0 - xpad), xmax = x1 + xpad * 2.2;          // room on the right for the last label
+    let ylo = Math.min(0, ...pts.map(p => p.lo)), yhi = Math.max(0, ...pts.map(p => p.hi));
+    const pad = Math.max(0.4, (yhi - ylo) * 0.1); ylo -= pad; yhi += pad;
+    const X = (v) => pl + (w - pl - pr) * (v - xmin) / (xmax - xmin), Y = (v) => pt + (h - pt - pb) * (1 - (v - ylo) / (yhi - ylo));
+    const step = [1e3, 2e3, 5e3, 1e4, 2e4, 25e3, 5e4, 1e5, 2e5].find(s => (xmax - xmin) / s <= Math.max(3, Math.floor((w - pl) / 70))) || 5e5;
+    let o = "";
+    for (let t = Math.ceil(xmin / step) * step; t <= xmax; t += step) o += `<line class="ax" x1="${X(t)}" x2="${X(t)}" y1="${pt}" y2="${h - pb}"/><text x="${X(t)}" y="${h - pb + 13}" text-anchor="middle">${tok(t)}</text>`;
+    const ys = Math.max(0.5, [0.5, 1, 2, 5].find(s => (yhi - ylo) / s <= 6) || 10);
+    for (let t = Math.ceil(ylo / ys) * ys; t <= yhi; t += ys) o += `<line class="ax" x1="${pl}" x2="${w - pr}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${pl - 5}" y="${Y(t) + 3}" text-anchor="end">${sgn(t, ys < 1 ? 1 : 0)}</text>`;
+    o += `<line class="zero" x1="${pl}" x2="${w - pr}" y1="${Y(0)}" y2="${Y(0)}"/><text class="lab" x="${w - pr}" y="${Y(0) - 4}" text-anchor="end">scripted</text>`;
+    o += `<text class="lab" x="${(pl + w - pr) / 2}" y="${h - 4}" text-anchor="middle">tokens per model turn →</text><text class="lab" x="${pl}" y="${pt - 4}">↑ vs scripted</text>`;
+    const front = [];                                // cheaper first; a model joins the front when it beats every cheaper one
+    for (const p of pts.slice().sort((a, b) => a.x - b.x || b.y - a.y)) if (!front.length || p.y > front[front.length - 1].y) front.push(p);
+    if (front.length > 1) o += `<polyline class="front" points="${front.map(p => `${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join(" ")}"/>`;
+    const labels = pts.map(p => ({ p, y: Y(p.y) + 4 })).sort((a, b) => a.y - b.y);
+    for (let i = 1; i < labels.length; i++) if (labels[i].y - labels[i - 1].y < 13) labels[i].y = labels[i - 1].y + 13;
+    for (const p of pts) {
+      const e = p.r.efficiency;
+      o += `<g class="pt"><title>${esc(p.r.model)}: vs scripted ${sgn(p.y)} [${sgn(p.lo)}, ${sgn(p.hi)}], ${tok(p.x)} tokens per turn, ${e.model_calls_per_turn ?? "—"} model calls per turn</title>
+        <line x1="${X(p.x)}" x2="${X(p.x)}" y1="${Y(p.lo)}" y2="${Y(p.hi)}" stroke="${p.c}" stroke-width="2.5" stroke-linecap="round" opacity=".55"/>
+        <circle cx="${X(p.x)}" cy="${Y(p.y)}" r="5.5" fill="${p.c}" stroke="#141921" stroke-width="1.5"/></g>`;
+    }
+    for (const { p, y } of labels) {
+      const right = X(p.x) < w * 0.68;
+      o += `<text class="name" x="${X(p.x) + (right ? 10 : -10)}" y="${y}" text-anchor="${right ? "start" : "end"}" fill="${p.c}">${esc(p.r.model)}${front.includes(p) ? "" : ""}</text>`;
+    }
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`); svg.setAttribute("height", h); svg.innerHTML = o;
+  }
+
+  // ------------------------------------------------ the Cities view: the city each model built, side by side
+  async function loadCities() {
+    const env = P.lbEnv || (P.lb && P.lb.env) || "";
+    const seed = P.citySeed === "best" ? "" : P.citySeed;
+    const want = `${env}|${seed}`;
+    P.citiesKey = want; P.cities = null; P.citiesErr = null;     // the render that called this shows "Finding…"
+    const r = await req(`/api/evals/cities?env=${encodeURIComponent(env)}${seed !== "" ? `&seed=${encodeURIComponent(seed)}` : ""}`);
+    if (P.citiesKey !== want) return;                 // another seed or version was picked meanwhile
+    P.cities = r.ok ? r.data : null;
+    P.citiesErr = r.ok ? null : r.status === 501 ? "The Cities view needs evals.cities() (bench/evals.py)." : errText(r);
+    if (P.tab === "board" && P.lbView === "cities") render();
+  }
+  function cityCard({ key, title, tag = "", focus = false, pic, rows, run, note = "" }) {
+    return `<div class="ev-city ${focus ? "focus" : ""}" data-citycard="${esc(key)}">
+      <div class="ev-pic" ${pic ? `data-pic="${esc(pic.run_id)}" data-frame="${pic.frame}"` : ""}>${pic ? picInner(pic.run_id, pic.frame) : `<div class="ev-picmsg small muted">${esc(note || "no picture")}</div>`}</div>
+      <div class="ev-city-b"><div class="ev-city-h"><b>${title}</b>${tag}</div>
+        ${rows.length ? `<div class="ev-city-k">${rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("")}</div>` : ""}
+        ${note && pic ? `<div class="muted small">${esc(note)}</div>` : ""}
+        ${run && onOpenRun ? `<button class="btn ev-replay" data-replay="${esc(run)}" title="Open this run in the main viewer">Open replay ▸</button>` : ""}</div></div>`;
+  }
+  function citiesHTML() {
+    const C = P.cities, envNow = P.lbEnv || (P.lb && P.lb.env) || "";
+    const key = `${envNow}|${P.citySeed === "best" ? "" : P.citySeed}`;
+    if (P.citiesKey !== key && !P.citiesErr) { loadCities(); }
+    const seeds = C ? C.seeds : [], common = new Set(C ? C.common_seeds : []);
+    const opts = [`<option value="best" ${P.citySeed === "best" ? "selected" : ""}>Best run per model</option>`,
+      ...seeds.map(s => `<option value="${s}" ${String(P.citySeed) === String(s) ? "selected" : ""}>Seed ${s} for all models${common.has(s) ? "" : " (not every model)"}</option>`)];
+    const tools = `<div class="ev-tools"><label class="ev-inline">Show ${I("cities")} <select id="citySeed">${opts.join("")}</select></label>
+      <span class="muted small">${P.citySeed === "best" ? "each model's run with the highest vs scripted (seeds differ, so the land differs)" : `every model on the same hand-over city: seed ${esc(P.citySeed)}`}</span></div>`;
+    if (P.citiesErr) return `${tools}<div class="emptytab">${esc(P.citiesErr)}</div>`;
+    if (!C) return `${tools}<div class="ev-st busy small"><span class="ev-spin"></span>Finding each model's run…</div>`;
+    if (!C.models.length) return `${tools}<div class="emptytab">No ranked evals on ${esc(C.env || "this version")} yet.</div>`;
+    const cards = [];
+    if (C.handover) {
+      const h = C.handover;
+      cards.push(cityCard({ key: "_handover", title: `Hand-over city ${I("handover_pic")}`, tag: ` <span class="ev-tag muted-tag">scripted, month ${esc(h.month)}</span>`,
+        pic: { run_id: h.run_id, frame: h.frame }, run: null,
+        rows: [["start for", `every model on seed ${esc(C.seed)}`], ["population", h.population != null ? Math.round(h.population).toLocaleString() : "—"], ["city score", h.city != null ? h.city.toFixed(1) : "—"]] }));
+    }
+    for (const m of C.models) {
+      const r = m.run, vs = r && r.vs;
+      const tag = `${m.baseline ? ` <span class="ev-tag">baseline</span>` : ""} <span class="muted small">#${esc(m.rank)}</span>`;
+      if (!r) { cards.push(cityCard({ key: m.model, title: esc(m.model), tag, focus: P.cityFocus === m.model, pic: null, rows: [], run: null, note: m.missing || "no run" })); continue; }
+      const nRuns = (m.runs || []).length;
+      cards.push(cityCard({ key: m.model, title: esc(m.model), tag, focus: P.cityFocus === m.model, run: r.run_id, pic: { run_id: r.run_id, frame: r.frame },
+        rows: [[`vs scripted ${I("vs_scripted")}`, `<span class="${vs > 0 ? "good" : vs < 0 ? "badc" : ""}">${sgn(vs)}</span>`],
+          ["seed", `${esc(r.seed)}${C.seed == null && nRuns > 1 ? ` <span class="muted small">best of ${nRuns}</span>` : ""}`],
+          ["population", r.population != null ? Math.round(r.population).toLocaleString() : "—"],
+          [`city score ${I("city_score")}`, r.city != null ? r.city.toFixed(1) : "—"]] }));
+    }
+    const yard = C.yardstick && !C.yardstick.frames ? `<div class="muted small ev-foot">No picture of the scripted yardstick's final city: ${esc(C.yardstick.reason)}.${C.handover ? " The hand-over city above is where it, and every model, started." : " Pick a seed to see the hand-over city every model started from."}</div>` : "";
+    return `${tools}<div class="ev-cities">${cards.join("")}</div>${yard}`;
+  }
+  function picInner(runId, frame) {
+    const k = `${runId}@${frame}`, done = PICS.done.get(k);
+    if (done && done.url) return `<img src="${esc(done.url)}" alt="The city of ${esc(runId)} at frame ${esc(frame)}" loading="lazy" decoding="async">`;
+    if (done && done.error) return `<div class="ev-picmsg small bad">${esc(done.error)}</div>`;
+    return `<div class="ev-picmsg small muted"><span class="ev-spin"></span>drawing the city…</div>`;
+  }
+  // fill the pictures still drawing: one at a time through the shared offscreen renderer, each drawn once and cached
+  function fillPics() {
+    body.querySelectorAll("[data-pic]").forEach(el => {
+      const runId = el.dataset.pic, frame = +el.dataset.frame, k = `${runId}@${frame}`;
+      if (PICS.done.has(k)) return;
+      cityPicture(runId, frame).then(() => {
+        document.querySelectorAll(`[data-pic="${CSS.escape(runId)}"][data-frame="${frame}"]`).forEach(x => { x.innerHTML = picInner(runId, frame); });
+      });
+    });
+    const f = P.cityFocus && body.querySelector(`.ev-city.focus`);
+    if (f && !P.focusScrolled) { P.focusScrolled = true; f.scrollIntoView({ block: "nearest", behavior: "smooth" }); }
+  }
   function bindBoard() {
-    if ($("lbEnv")) $("lbEnv").onchange = (e) => { P.lbEnv = e.target.value || null; P.lb = null; render(); loadBoard(); };
-    if ($("lbRe")) $("lbRe").onclick = () => loadBoard();
+    if ($("lbEnv")) $("lbEnv").onchange = (e) => { P.lbEnv = e.target.value || null; P.lb = null; P.cities = null; P.citiesKey = null; render(); loadBoard(); };
+    if ($("lbRe")) $("lbRe").onclick = () => { P.citiesKey = null; loadBoard(); };
+    if ($("lbHow")) $("lbHow").ontoggle = (e) => { P.howOpen = e.target.open; };
+    body.querySelectorAll("[data-lbv]").forEach(b => b.onclick = () => { P.lbView = b.dataset.lbv; P.cityFocus = null; saveView(); render(); });
+    body.querySelectorAll("[data-citymodel]").forEach(b => b.onclick = () => { P.lbView = "cities"; P.cityFocus = b.dataset.citymodel; P.focusScrolled = false; saveView(); render(); });
+    if ($("citySeed")) $("citySeed").onchange = (e) => { P.citySeed = e.target.value; render(); };
+    body.querySelectorAll("[data-replay]").forEach(b => b.onclick = () => { modal.hidden = true; onOpenRun(b.dataset.replay); });
+    if (P.lbView === "cities") fillPics(); else drawScatter();
   }
 
   // ------------------------------------------------ render
@@ -504,6 +762,7 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     const focus = document.activeElement && document.activeElement.id;   // keep a key being typed
     const val = $("kfVal") ? $("kfVal").value : null;
     const y = body.scrollTop;
+    hideInfo();
     if (P.tab === "models") { body.innerHTML = modelsHTML(); bindModels(); }
     else if (P.tab === "evals") { body.innerHTML = evalsHTML(); bindEvals(); }
     else { body.innerHTML = boardHTML(); bindBoard(); }
@@ -516,6 +775,8 @@ export function initEvals({ toast = () => {}, onCompareEval = null } = {}) {
     P.tab = b.dataset.t; saveTab(); render();
     if (P.tab === "evals") loadEvals(); else if (P.tab === "board") { loadEnvs().then(render); loadBoard(); } else loadModels();
   });
+
+  window.addEventListener("resize", () => { if (shown() && P.tab === "board" && P.lbView === "table") drawScatter(); });
 
   async function open() {
     modal.hidden = false;

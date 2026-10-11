@@ -6,6 +6,7 @@ import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
 import { CollabGraph, BeamLayer, RegionGraph, cityColor, dealState, dealPaid, dealEnd, cityTally, RES_C } from "./collab.js";
 import { RUN_COLORS, COMPARE_MAX, columns, tableHTML, chartsHTML, legendHTML, drawCharts, evalsTableHTML, evalLabel } from "./compare.js";
 import { initEvals } from "./evals.js";
+import { initInfo } from "./info.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -2082,9 +2083,10 @@ $("moreBtn").onclick = (e) => { e.stopPropagation(); $("moreMenu").hidden = !$("
 $("compareBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); };
 $("evalsBtn").onclick = () => { $("moreMenu").hidden = true; S.cmp.mode = "evals"; store.set("cmpMode", "evals"); openCompare(); };
 // the Evals page (evals.js); "Compare runs" on an eval opens its runs in the Compare view
+initInfo();                                   // the (i) bubbles of the Evals page and the Compare view (info.js)
 const evalsPage = initEvals({ toast, onCompareEval: async (dir) => {
   S.cmp.mode = "runs"; store.set("cmpMode", "runs"); openCompare(); await loadEvals(); cmpLoadEval(dir);
-} });
+}, onOpenRun: (id) => openRun(id) });          // the Cities view's "Open replay"
 $("evalsTopBtn").onclick = () => evalsPage.open();
 document.addEventListener("click", (e) => { if (!e.target.closest(".tabmore")) $("moreMenu").hidden = true; });
 buildLayerMenu();

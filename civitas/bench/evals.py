@@ -902,6 +902,107 @@ def _calls(roles: dict | None) -> dict | None:
     return {k: sum(int((r or {}).get(k) or 0) for r in roles.values()) for k in CALLS}
 
 
+# ---------------------------------------------------------------------------------------------------- efficiency
+# How a model's turns spent their tokens (the Leaderboard's efficiency view): model calls (API replies; each re-sends
+# the whole conversation, so prompt tokens ~ model calls x context), tool calls split into game actions and look-ups
+# (every tool but the actions and the turn controls), and turns that ran into the step cap.
+EFF = ("turns", "model_calls", "tool_calls", "actions", "lookups", "capped", "prompt", "completion")
+TURN_CONTROLS = frozenset({"end_turn", "send_message", "update_memory", "update_plan"})
+_EFF_CACHE: dict[str, tuple] = {}   # trajectories.jsonl -> ((size, mtime_ns), run_efficiency result)
+
+
+def _game_actions() -> frozenset:
+    """The fleet tools that run a game action: every role's actions and the mayors' deal actions (server.ACTIONS
+    plus the deal actions, collab.DEAL_ACTIONS = region.DEAL_ACTIONS, without importing the simulation)."""
+    from ..core.roles import ROLES
+    from .collab import DEAL_ACTIONS
+    return frozenset({a for spec in ROLES.values() for a in spec["actions"]} | set(DEAL_ACTIONS))
+
+
+def _step_caps(meta: dict) -> tuple[int | None, dict]:
+    """The fleet's max_steps and per-role overrides ([agents.<role>].max_steps) from meta.json's config."""
+    cfg = meta.get("config") or {}
+    cap = (cfg.get("fleet") or {}).get("max_steps")
+    per = {r: a["max_steps"] for r, a in (cfg.get("agents") or {}).items() if isinstance(a, dict) and a.get("max_steps")}
+    return cap, per
+
+
+def run_efficiency(d: str | Path) -> dict | None:
+    """The model turns after the warm-up in a run's trajectories.jsonl (as _tokens counts them): {turns, model_calls
+    (API replies: len(finish_reasons), else 1 per turn), tool_calls (tool_trace entries), actions (game actions),
+    lookups (other tools but end_turn / send_message / update_memory / update_plan), capped (turns whose steps reached
+    max_steps), prompt, completion}; None without trajectories.jsonl. Cached on the file's size and mtime."""
+    d = Path(d)
+    p = d / "trajectories.jsonl"
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _EFF_CACHE.get(str(p))
+    if hit and hit[0] == key:
+        return dict(hit[1])
+    actions = _game_actions()
+    cap, per = _step_caps(_read(d / "meta.json") or {})
+    out = {k: 0 for k in EFF}
+    with open(p) as fh:
+        for line in fh:
+            if '"warmup": true' in line or not line.endswith("\n"):
+                continue
+            try:
+                t = json.loads(line)
+            except ValueError:
+                continue
+            agent = str(t.get("agent") or "")
+            if t.get("warmup") or agent == "fleet:scripted" or not agent.startswith(("fleet:", "llm:")):
+                continue
+            u = t.get("usage") or {}
+            out["turns"] += 1
+            out["prompt"] += int(u.get("prompt_tokens") or 0)
+            out["completion"] += int(u.get("completion_tokens") or 0)
+            fr = t.get("finish_reasons")
+            out["model_calls"] += len(fr) if isinstance(fr, list) else 1
+            tools = [str(c.get("tool") or "") for c in t.get("tool_trace") or [] if isinstance(c, dict)]
+            out["tool_calls"] += len(tools)
+            out["actions"] += sum(x in actions for x in tools)
+            out["lookups"] += sum(x not in actions and x not in TURN_CONTROLS for x in tools)
+            role = str(t.get("role") or "").split(".")[-1]
+            c = per.get(role, cap)
+            if c and int(t.get("steps") or 0) >= int(c):
+                out["capped"] += 1
+    _EFF_CACHE[str(p)] = (key, dict(out))
+    return out
+
+
+def efficiency_of(cards: list[dict], runs_dir: str | Path) -> dict | None:
+    """Per model turn over an eval's finished runs (a card's `efficiency`, else run_efficiency of its folder in
+    `runs_dir`): {runs, turns, tokens_per_turn, model_calls_per_turn, tool_calls_per_turn, actions_per_turn,
+    lookups_per_turn, capped_share, context_per_call (prompt tokens per model call), tokens_per_run}; None without
+    model turns."""
+    tot, n = {k: 0 for k in EFF}, 0
+    for c in cards:
+        if c.get("total") is None:              # not finished
+            continue
+        e = c.get("efficiency")
+        if e is None and c.get("run_id"):
+            e = run_efficiency(Path(runs_dir) / c["run_id"])
+        if not e or not e.get("turns"):
+            continue
+        n += 1
+        for k in EFF:
+            tot[k] += int(e.get(k) or 0)
+    T = tot["turns"]
+    if not T:
+        return None
+    toks = tot["prompt"] + tot["completion"]
+    return {"runs": n, "turns": T, "tokens_per_turn": round(toks / T),
+            "model_calls_per_turn": _r(tot["model_calls"] / T, 2), "tool_calls_per_turn": _r(tot["tool_calls"] / T, 2),
+            "actions_per_turn": _r(tot["actions"] / T, 2), "lookups_per_turn": _r(tot["lookups"] / T, 2),
+            "capped_share": _r(tot["capped"] / T, 3),
+            "context_per_call": round(tot["prompt"] / tot["model_calls"]) if tot["model_calls"] else None,
+            "tokens_per_run": round(toks / n)}
+
+
 def _teamwork(d: Path, city: str | None, fallback: dict | None) -> float | None:
     from ..fleet.report import run_collaboration
     try:
@@ -1031,6 +1132,7 @@ def run_card(d: str | Path, *, compute_yardstick: bool = True) -> dict:
     cities = out["cities"] if out["region"] else []
     tok = _tokens(d, cities)
     out["fleet_turns"] = tok[""]["turns"]
+    out["efficiency"] = run_efficiency(d)
     if not out["region"]:
         roles = {k: v for k, v in scores.items() if k != "city"}
         yroles = {k: v for k, v in yscores.items() if k != "city"}
@@ -1140,6 +1242,7 @@ def _agg(cards: list[dict], ev: dict) -> dict:
            "noise": noise, "mde": _mde(noise, len(uv)), "units": uv,
            "calls": ct, "failed_per_turn": per("failed"), "refused_per_turn": per("refused"),
            "tool_errors_per_turn": per("tool_errors"),
+           "efficiency": efficiency_of(cards, ev.get("runs_dir") or "runs"),
            "tokens": {**tk, "total": tk["prompt"] + tk["completion"],
                       "per_turn": round((tk["prompt"] + tk["completion"]) / tk["turns"]) if tk["turns"] else None},
            "wall_time_s": {"sum": _r(sum(wall), 1), "max": _r(max(wall), 1) if wall else None},
@@ -1822,7 +1925,8 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
     ranked by its score vs the scripted yardstick: {"env", "envs", "baseline", "rows": [...], "skipped": [{"eval_dir",
     "reason"}]}. Each row: model, eval_dir, created, n_units, vs_yardstick / score ({mean, lo, hi}), its split into
     pop_term / quality ({mean, lo, hi}: _split_ci), departments, teamwork, failed_per_turn / refused_per_turn (None
-    for an eval from before they were counted), tokens, cost, and the paired verdict against the baseline model's eval on the same version. `eval_dir` (rows and
+    for an eval from before they were counted), tokens, cost, efficiency (efficiency_of the run folders, plus
+    vs_per_10m: vs scripted per 10M tokens of one run; None without model turns), and the paired verdict against the baseline model's eval on the same version. `eval_dir` (rows and
     skipped) is the folder's name, as list_evals' "dir" and the server's ?dir= take it."""
     evs = _evals_in(runs_dir)
     envs = sorted({(e.get("env") or {}).get("name") for e in evs} - {None})
@@ -1867,6 +1971,10 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
         cd = a.get("city_delta") or {}
         p = paired(base_ev, ev) if base_ev is not None and ev is not base_ev else None
         pop_term, quality = _split_ci(ev, a)
+        eff = efficiency_of(_cards(ev), Path(ev["dir"]).parent)
+        if eff is not None:                         # vs scripted per 10M tokens of one run's model turns
+            eff["vs_per_10m"] = (_r(cd["mean"] / (eff["tokens_per_run"] / 1e7), 2)
+                                 if cd.get("mean") is not None and eff["tokens_per_run"] else None)
         rows.append({"model": k, "eval_dir": Path(ev["dir"]).name, "name": ev.get("name"),
                      "created": ev.get("created"),
                      "n_units": a.get("n_units"), "provider": ev.get("provider"),
@@ -1877,7 +1985,7 @@ def leaderboard(env: str | None = None, runs_dir="runs") -> dict:
                      "population": {x: (a.get("population_delta") or {}).get(x) for x in ("mean", "lo", "hi")},
                      "teamwork": a.get("teamwork"), "beats_scripted": a.get("beats_scripted"),
                      "failed_per_turn": a.get("failed_per_turn"), "refused_per_turn": a.get("refused_per_turn"),
-                     "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"),
+                     "tokens": (a.get("tokens") or {}).get("total"), "cost": a.get("usd"), "efficiency": eff,
                      "verdict": verdict_text(p)[0] if p else None, "paired": p,
                      "baseline": k == baseline})
     rows.sort(key=lambda r: (r["vs_yardstick"]["mean"] is None, -(r["vs_yardstick"]["mean"] or 0)))
@@ -1934,3 +2042,100 @@ def write_leaderboard(lb: dict, runs_dir="runs") -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(leaderboard_markdown(lb))
     return p
+
+
+# ---------------------------------------------------------------------------------------------------- cities
+# The Leaderboard's Cities view: the city each ranked model built, its best run (or every model's run on one seed),
+# drawn by the viewer from that run's final frame (/api/runs/<id>/frames?since=<frame>). The scripted yardstick is
+# replayed without frames, so it has no picture; the hand-over city (the frame at month warmup) is the same for every
+# model on a seed and stands in as the scripted start.
+_FRAMES: dict[str, tuple] = {}      # frames.jsonl -> ((size, mtime_ns), complete lines)
+_CITIES: dict[tuple, tuple] = {}    # (runs_dir, env, seed) -> ((eval.json stamps, frames stamps), result)
+YARDSTICK_FRAMES = ("the scripted yardstick replays the game without logging frames (yardstick.json keeps its "
+                    "scores and monthly series only), so there is no picture of its city")
+
+
+def _stamp(p: Path):
+    try:
+        st = p.stat()
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def frame_count(d: str | Path) -> int:
+    """Complete lines in a run's frames.jsonl (one frame per month from month 0), cached on its size and mtime."""
+    p = Path(d) / "frames.jsonl"
+    key = _stamp(p)
+    if key is None:
+        return 0
+    hit = _FRAMES.get(str(p))
+    if hit and hit[0] == key:
+        return hit[1]
+    n = 0
+    with open(p, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            n += chunk.count(b"\n")
+    _FRAMES[str(p)] = (key, n)
+    return n
+
+
+def _city_run(c: dict, runs_dir: Path) -> dict:
+    t = c.get("total") or {}
+    n = frame_count(runs_dir / c["run_id"])
+    warm = int(c.get("warmup") or 0)
+    return {"run_id": c["run_id"], "seed": c.get("seed"), "config": c.get("name") or c.get("config"),
+            "repeat": c.get("repeat") or 1, "vs": (t.get("delta") or {}).get("city"), "city": t.get("final"),
+            "population": t.get("population"), "handover": t.get("at_handover"), "yard_final": t.get("yard_final"),
+            "region": bool(c.get("region")), "cities": list(c.get("cities") or []), "warmup": warm,
+            "frames": n, "frame": n - 1 if n else None, "handover_frame": warm if warm and warm < n else None}
+
+
+def cities(env: str | None = None, seed: int | None = None, runs_dir="runs") -> dict:
+    """Per ranked model on `env` (leaderboard order) the run whose city to show: its best run (the highest city score
+    vs scripted among the eval's scored runs) or, with `seed`, its run on that seed (the best repeat). {"env", "envs",
+    "baseline", "seed", "seeds" (every seed a model ran), "common_seeds" (seeds every model ran), "models": [{model,
+    rank, eval_dir, baseline, vs_yardstick, run: {run_id, seed, config, vs, city, population, handover, yard_final,
+    region, cities, warmup, frames, frame (the final frame's index), handover_frame} or None, missing (why no run),
+    runs: [{seed, run_id, vs}]}], "handover": with `seed`, the scripted hand-over city on it ({run_id, frame, month,
+    city, population}, from the first model's run), "yardstick": {"frames": False, "reason"}}. Cached on the
+    eval.json and frames.jsonl files it read."""
+    rd = Path(runs_dir)
+    evals_stamp = tuple(sorted((str(p), _stamp(p)) for p in rd.glob(f"{PREFIX}*/{FILE}"))) if rd.is_dir() else ()
+    ck = (str(rd.resolve()), env, seed)
+    hit = _CITIES.get(ck)
+    if hit and hit[0][0] == evals_stamp and all(_stamp(Path(f)) == s for f, s in hit[0][1]):
+        return hit[1]
+    lb = leaderboard(env, rd)
+    models, seeds, per_model = [], set(), []
+    for row in lb["rows"]:
+        ev = _read(rd / row["eval_dir"] / FILE) or {}
+        scored = [c for c in _cards(ev) if (c.get("total") or {}).get("delta") and c.get("run_id")]
+        mine = {c.get("seed") for c in scored} - {None}
+        seeds |= mine
+        per_model.append(mine)
+        pool = [c for c in scored if seed is None or c.get("seed") == seed]
+        best = max(pool, key=lambda c: c["total"]["delta"]["city"]) if pool else None
+        run = _city_run(best, rd) if best else None
+        ok = run is not None and run["frame"] is not None
+        missing = (None if ok else "no frames.jsonl in its run folder" if run else
+                   "no scored runs" if not scored else f"no run on seed {seed}")
+        models.append({"model": row["model"], "rank": row.get("rank"), "eval_dir": row["eval_dir"],
+                       "baseline": bool(row.get("baseline")), "vs_yardstick": row.get("vs_yardstick"),
+                       "run": run if ok else None, "missing": missing,
+                       "runs": sorted(({"seed": c.get("seed"), "run_id": c["run_id"],
+                                        "vs": c["total"]["delta"]["city"]} for c in scored),
+                                      key=lambda x: (x["seed"] is None, x["seed"] or 0))})
+    common = set.intersection(*per_model) if per_model else set()
+    handover = None
+    if seed is not None:
+        first = next((m["run"] for m in models if m["run"] and m["run"]["handover_frame"] is not None), None)
+        if first:
+            handover = {"run_id": first["run_id"], "frame": first["handover_frame"], "month": first["warmup"],
+                        **(first["handover"] or {})}
+    out = {"env": lb["env"], "envs": lb["envs"], "baseline": lb["baseline"], "seed": seed,
+           "seeds": sorted(seeds), "common_seeds": sorted(common), "models": models, "handover": handover,
+           "yardstick": {"frames": False, "reason": YARDSTICK_FRAMES}}
+    used = [rd / m["run"]["run_id"] / "frames.jsonl" for m in models if m["run"]]
+    _CITIES[ck] = ((evals_stamp, tuple((str(f), _stamp(f)) for f in used)), out)
+    return out

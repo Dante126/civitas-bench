@@ -3,7 +3,7 @@
 Endpoints
   GET  /api/runs                     list runs with status (running / finished / stopped / incomplete)
   GET  /api/runs/<id>/meta|summary   run metadata / final summary
-  GET  /api/runs/<id>/frames?since=N replay frames from index N
+  GET  /api/runs/<id>/frames?since=N replay frames from index N (&limit=K: at most K of them)
   GET  /api/runs/<id>/live?offset=B  the live feed (bench/live.py) from byte B (-1: its tail): {offset, events,
                                      status, held}; each agent's turns, model calls and tool calls as they happen
   GET  /api/runs/<id>/liveframe      the city mid-month after the latest builds (live_frame.json), else null
@@ -48,6 +48,9 @@ Endpoints
                                      didn't start only when eval.json's pid is a live `civitas ... eval` process (and
                                      its runs' pids `civitas ... run`), else 409 {error}
   GET  /api/evals/leaderboard?env=   leaderboard();  GET /api/evals/scorecard?dir=D  {markdown}
+  GET  /api/evals/cities?env=&seed=  cities(): per ranked model the run whose city the Cities view draws (its best
+                                     run, or its run on `seed`) with that run's final frame index; read-only, cached
+                                     on the eval.json and frames.jsonl files
   GET  /api/version                  a stamp of the viewer's files: an open page offers a reload when it changes
   GET  /api/leaderboard              finished runs grouped by agent line-up
   GET  /api/configs                  configs/*.toml available to launch
@@ -1243,9 +1246,12 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                             return self._json(None)
                     if parts[3] == "frames":
                         since = int(q.get("since", ["0"])[0])
+                        limit = int(q["limit"][0]) if q.get("limit") else None    # e.g. one frame: the Cities view
                         frames = []
                         with open(d / "frames.jsonl") as fh:
                             for i, line in enumerate(fh):
+                                if limit is not None and len(frames) >= limit:
+                                    break
                                 if i >= since and line.endswith("\n"):
                                     frames.append(json.loads(line))
                         return self._json({"since": since, "frames": frames, "status": self._status(d),
@@ -1386,6 +1392,12 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                 return self._json(track("envs").list_envs())
             if parts == ["evals", "leaderboard"]:
                 return self._json(evals_fn("leaderboard")(arg("env") or None, runs_dir=str(runs_dir)))
+            if parts == ["evals", "cities"]:        # the Leaderboard's Cities view: each model's run to draw
+                s = str(arg("seed", "") or "")
+                if s not in ("", "best") and not s.isdigit():
+                    return self._json({"error": "seed must be a non-negative integer or 'best'"}, 400)
+                seed = int(s) if s.isdigit() else None
+                return self._json(evals_fn("cities")(arg("env") or None, seed, runs_dir=str(runs_dir)))
             if parts == ["evals", "suites"]:
                 return self._json(suites(configs_dir))
             if parts == ["evals", "jobs"]:

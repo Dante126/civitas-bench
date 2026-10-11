@@ -549,6 +549,99 @@ def test_leaderboard_rows_split_the_score_and_count_failures(tmp_path):
     assert f"| {pt:+.1f} | {0.5 - pt:+.1f} | 60.5 (" in md and "| 80.0 | 0.25 | 0.12 |" in md and "| 80.0 | n/a | n/a |" in md
 
 
+def _turn(tools, steps=None, calls=3, prompt=600, completion=60, **extra):
+    return {"agent": "fleet:m", "role": "planning", "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
+            "finish_reasons": ["tool_calls"] * calls, "steps": steps if steps is not None else len(tools),
+            "tool_trace": [{"step": i, "tool": t} for i, t in enumerate(tools)], **extra}
+
+
+def _efficiency_run(d: Path, turns: list[dict], max_steps=4):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps({"config": {"fleet": {"max_steps": max_steps}}}))
+    warm = {"agent": "fleet:scripted", "role": "mayor", "warmup": True, "usage": {"prompt_tokens": 10 ** 6},
+            "finish_reasons": ["x"] * 9, "tool_trace": [{"tool": "inspect"}] * 9}
+    (d / "trajectories.jsonl").write_text("".join(json.dumps(t) + "\n" for t in [warm, *turns]))
+
+
+def test_run_efficiency_counts_calls_tools_and_capped_turns(tmp_path):
+    """The efficiency view: model calls are API replies (finish_reasons), tool calls split into game actions,
+    look-ups (every other tool but the turn controls) and turn controls; a turn that used max_steps is capped; the
+    scripted warm-up counts nothing."""
+    d = tmp_path / "r"
+    _efficiency_run(d, [_turn(["find_sites", "inspect", "build_road", "zone"], calls=4),     # 4 steps: the cap
+                        _turn(["map_overview", "send_message", "update_memory", "end_turn"], steps=3, calls=2,
+                              prompt=400, completion=40),
+                        _turn(["offer_deal", "end_turn"], calls=1, prompt=200, completion=20, role="north.mayor")])
+    e = E.run_efficiency(d)
+    assert e == {"turns": 3, "model_calls": 7, "tool_calls": 10, "actions": 3, "lookups": 3, "capped": 1,
+                 "prompt": 1200, "completion": 120}
+    assert E.run_efficiency(tmp_path / "missing") is None
+    # cached on the file: a second read doesn't parse it again
+    E._EFF_CACHE[str(d / "trajectories.jsonl")][1]["turns"] = 99
+    assert E.run_efficiency(d)["turns"] == 99
+    del E._EFF_CACHE[str(d / "trajectories.jsonl")]
+    agg = E.efficiency_of([{"run_id": "r", "total": {}}, {"run_id": "r", "total": {}}, {"run_id": "r"}], tmp_path)
+    assert agg["runs"] == 2 and agg["turns"] == 6 and agg["tokens_per_turn"] == 440
+    assert agg["model_calls_per_turn"] == pytest.approx(7 / 3, abs=0.01) and agg["lookups_per_turn"] == 1.0
+    assert agg["capped_share"] == pytest.approx(1 / 3, abs=1e-3) and agg["context_per_call"] == round(1200 / 7)
+    assert agg["tokens_per_run"] == 1320
+    assert E.efficiency_of([{"run_id": "nope", "total": {}}], tmp_path) is None
+
+
+def test_leaderboard_rows_carry_efficiency(tmp_path):
+    """Each row's efficiency comes from its runs' trajectories (an eval saved before it has none in its cards), with
+    vs scripted per 10M tokens of one run."""
+    runs = tmp_path / "runs"
+    ev = _lb_eval(runs, "base1", "base", [1.0, 2.0], 1)
+    for c in ev["scorecard"]["runs"]:
+        _efficiency_run(runs / c["run_id"], [_turn(["find_sites", "build_road"], prompt=900_000, completion=100_000)])
+    row = E.leaderboard("tiny-v1", runs)["rows"][0]
+    eff = row["efficiency"]
+    assert eff["turns"] == 2 and eff["tokens_per_turn"] == 1_000_000 and eff["tokens_per_run"] == 1_000_000
+    assert eff["vs_per_10m"] == pytest.approx(1.5 / 0.1) and row["vs_yardstick"]["mean"] == pytest.approx(1.5)
+    assert E.leaderboard("tiny-v1", tmp_path / "empty")["rows"] == []
+
+
+def _city_frames(d: Path, n: int):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "frames.jsonl").write_text("".join(json.dumps({"month": m, "tiles": "."}) + "\n" for m in range(n)))
+
+
+def test_cities_pick_each_models_best_run_or_one_seed(tmp_path):
+    """The Cities view: per ranked model its best run (highest vs scripted) or its run on a seed, with the final
+    frame's index; on a seed, the hand-over city every model started from; cached until a file changes."""
+    runs = tmp_path / "runs"
+    a = _lb_eval(runs, "base1", "base", [0.5, 2.0, 1.0], 1)
+    b = _lb_eval(runs, "m-1", "m", [3.0, 1.0], 2)
+    for ev in (a, b):
+        for c in ev["scorecard"]["runs"]:
+            c["run_id"] = f"{ev['name']}_{c['run_id']}"
+            c["warmup"] = 4
+            _city_frames(runs / c["run_id"], 7)
+        E.save(ev)
+    out = E.cities("tiny-v1", None, runs)
+    assert out["env"] == "tiny-v1" and out["seed"] is None and out["handover"] is None
+    assert out["seeds"] == [0, 1, 2] and out["common_seeds"] == [0, 1]
+    m, base = out["models"]
+    assert (m["model"], m["rank"], m["run"]["seed"], m["run"]["vs"]) == ("m", 1, 0, 3.0)
+    assert (base["model"], base["baseline"], base["run"]["seed"], base["run"]["run_id"]) == ("base", True, 1, "base1_r_s1")
+    assert m["run"]["frame"] == 6 and m["run"]["handover_frame"] == 4 and m["run"]["city"] == 63.0
+    assert [r["seed"] for r in base["runs"]] == [0, 1, 2]
+    assert not out["yardstick"]["frames"] and "frames" in out["yardstick"]["reason"]
+    one = E.cities("tiny-v1", 1, runs)
+    assert [x["run"]["seed"] for x in one["models"]] == [1, 1]
+    assert one["handover"] == {"run_id": "m-1_r_s1", "frame": 4, "month": 4, "city": 60.0, "population": 5000}
+    two = E.cities("tiny-v1", 2, runs)
+    assert two["models"][0]["run"] is None and two["models"][0]["missing"] == "no run on seed 2"
+    assert two["models"][1]["run"]["seed"] == 2
+    assert E.cities("tiny-v1", 1, runs) is one                           # cached
+    _city_frames(runs / "m-1_r_s1", 9)                                   # the run's frames changed
+    again = E.cities("tiny-v1", 1, runs)
+    assert again is not one and again["models"][0]["run"]["frame"] == 8
+    (runs / "base1_r_s2" / "frames.jsonl").unlink()
+    assert E.cities("tiny-v1", 2, runs)["models"][1]["missing"] == "no frames.jsonl in its run folder"
+
+
 def test_leaderboard_cli(tmp_path, capsys):
     runs = tmp_path / "runs"
     _lb_eval(runs, "base1", "base", [0.5, 1.0], 1)
