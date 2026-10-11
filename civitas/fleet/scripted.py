@@ -186,8 +186,8 @@ class ScriptedFleetAgent(Agent):
         call the mayor's guards refuse (a duplicate allocation, a take-back below a department's keep, a top-up for
         another building under the reserve, a loan while the treasury holds $3,000, after its own top-ups emptied it
         or while only other buildings wait) is one the policy means: it is repeated at once with confirm: true, which
-        that refusal earned (the scripted mayor sends no take-backs, tops up only from above its own reserve and
-        borrows only at a turn's start under $3,000)."""
+        that refusal earned (the scripted mayor takes back only money above a department's working balance and its
+        spending, tops up only from above its own reserve and borrows only at a turn's start under $3,000)."""
         box, cap = turn.box, self.env.cfg.max_actions_per_turn
         for a in actions:
             args = dict(a)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from civitas.agents.scripted import SCRIPTED, SCRIPTED_V1
 from civitas.bench.runner import warm_up
 from civitas.config import load_config
 from civitas.core.actions import apply_action
@@ -33,7 +34,9 @@ def late():
     --seed 4` shows it); the [game] the warm-up plays pinned here."""
     cfg = load_config(str(ROOT / "configs/fleet_smoke_late.toml"))
     cfg["game"].update(months=108, warmup_months=96, act_every=3, max_actions_per_turn=8)
-    env, _ = warm_up(cfg, 4)
+    with pytest.MonkeyPatch.context() as mp:          # the city these tests were written on: civitas-v1's mayor
+        mp.setitem(SCRIPTED, "mayor", SCRIPTED_V1["mayor"])
+        env, _ = warm_up(cfg, 4)
     return env
 
 
