@@ -211,6 +211,7 @@ def mayor_money(env, style: str) -> list:
     call("repay_loan", {"amount": 100})
     call("take_loan", {"amount": 10 ** 7})
     w.dept_funds["education"] = 0.0
+    w.dept_funds["planning"] = 0.0                  # its road waits (growth): the loan guard's part on what waits
     w.treasury = 2000.0
     turn()
     call("take_loan", {"amount": 40000})
@@ -327,7 +328,8 @@ def test_open_states_facts_not_calls(late):
     parks = next(ln for ln in b["planning"].splitlines() if ln.startswith("- parks: "))
     assert parks.startswith("- parks: 21 of 18 park tiles") and parks.endswith("8 homes near; $600")
     # the reserve guard's classification on the options: a first building the city lacks, a wanted supply
-    assert "university $12k (+$150/month, the city has none)" in mayor
+    assert "university $12k (+$150/month)" in mayor                  # a university is never a first building
+    assert "university $12k (+$150/month, the city has none)" not in mayor
     assert 'its cheapest option marked "the city has none", its supply ("supply"), a levee or planning\'s road' in mayor
     # the tools stay the same: identical schemas, and the guards refuse what they refused (open text, same kinds),
     # but a department's money ask to the mayor always goes through (the mayor decides)
@@ -376,14 +378,11 @@ def test_open_money_results_state_facts(late):
                                    "road and leaves the treasury at "), res
     loans = [r["error"] for _, n, a, r in rows if n == "take_loan" and r.get("refused") == "loan"]
     assert loans[0].startswith("the treasury holds $25.6k, over the $3,000 minimum: a $10k loan costs $50/month until "
-                               "repaid (debt would be $10k of $50k). Also, a loan may pay only for the first buildings, "
-                               "supply and planning's road that wait and for keeping the treasury at the $14.6k "
-                               "reserve through operations to your next turn, and this $10k loan is more than those "
-                               "add up to."), loans[0]
-    assert loans[1].startswith("no first building, supply or planning road is waiting, and a loan may pay only for "
-                               "those; this $10k loan costs $50/month interest until repaid"), loans[1]
+                               "repaid (debt would be $10k of $50k). Also, no first building, supply or planning road "
+                               "is waiting, and a loan may pay only for those."), loans[0]   # the university waits as another
+    assert "no first building, supply or planning road is waiting, and a loan may pay only for those" in loans[1], loans[1]
     assert got["take_loan", '{"amount": 40000}']["error"].startswith("a loan may pay only for the first buildings")
-    assert "is needed ($12k for first/supply and growth" in was["take_loan", '{"amount": 40000}']["error"]
+    assert "is needed ($630 for first/supply and growth" in was["take_loan", '{"amount": 40000}']["error"]
     assert got["take_loan", '{"amount": 1000}']["ok"]
     own = got["take_loan", '{"amount": 30000}']["error"]
     assert own.startswith("the treasury started this turn at $5,000; this turn's top-ups ($2,500 net) took it under "
