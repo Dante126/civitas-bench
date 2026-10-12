@@ -67,23 +67,6 @@ def mde(noise: float, n_units: int, repeats: int) -> float | None:
     return (t_quantile(0.975, df) + t_quantile(0.80, df)) * math.sqrt(2 * noise ** 2 / repeats / n_units)
 
 
-def ratio_ci(nums, dens) -> dict | None:
-    """The ratio of means sum(nums) / sum(dens) over paired values (a pair with a None dropped) with a 95% interval
-    from the ratio estimator's linearization: residuals e = num - R x den, se = sd(e) / (sqrt(n) x mean(den)), a
-    t-interval on n - 1 df. A unit with a small denominator weighs little here, unlike in a mean of per-unit ratios.
-    {n, mean, lo, hi} (lo / hi None under 2 pairs); None without pairs or with a zero sum of denominators."""
-    pairs = [(float(a), float(b)) for a, b in zip(nums, dens) if a is not None and b is not None]
-    if not pairs or sum(b for _, b in pairs) == 0:
-        return None
-    n = len(pairs)
-    r = sum(a for a, _ in pairs) / sum(b for _, b in pairs)
-    if n < 2:
-        return {"n": 1, "mean": r, "lo": None, "hi": None}
-    se = statistics.stdev([a - r * b for a, b in pairs]) / (math.sqrt(n) * abs(statistics.fmean(b for _, b in pairs)))
-    half = t_quantile(0.975, n - 1) * se
-    return {"n": n, "mean": r, "lo": r - half, "hi": r + half}
-
-
 def verdict(diffs) -> dict | None:
     """A paired comparison from per-unit differences (B - A): mean_ci plus `call`: "better" when the interval is
     above 0, "worse" below 0, "unclear" when it holds 0 or there are fewer than 2 units."""

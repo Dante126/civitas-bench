@@ -111,48 +111,6 @@ def test_the_check_trips_on_a_model_agent_before_a_month_is_played(monkeypatch):
         Y.yardstick_config(cfg)
 
 
-# ------------------------------------------------------------------ the noop reference
-def test_the_noop_reference_idles_the_model_roles(monkeypatch):
-    """The noop reference: the yardstick's game up to the hand-over, then the model roles do nothing (NoopAgents),
-    the others as in the yardstick line-up; deterministic, and never a model client."""
-    monkeypatch.setattr(agent_mod, "ChatClient", Boom)
-    monkeypatch.setattr(llm_mod, "ChatClient", Boom)
-    cfg = _fleet(12, 6)                                                 # all eight roles on a (fake) model
-    assert Y.idle_roles(cfg) == list(game_config(cfg).roles)
-    ys = Y.play(cfg, 0)
-    a, b = Y.play_noop(cfg, 0, ys), Y.play_noop(cfg, 0, ys)
-    for k in ("at_handover", "at_end", "change", "series", "final_scores", "avg_city_score"):
-        assert a[k] == b[k], k                                          # deterministic
-    assert a["matches_yardstick"] and a["at_handover"] == ys["at_handover"] and "matches_run" not in a
-    assert set(a["agents"].values()) == {"noop"} and a["idle"] == Y.idle_roles(cfg) and a["version"] == 1
-    assert a["series"]["month"] == ys["series"]["month"] and a["change"] != ys["change"]
-    assert Y.noop_ok({"noop": a}) is a and Y.noop_ok({}) is None
-    assert Y.noop_ok({"noop": {**a, "matches_run": False}}) is None                # another warm-up: not used
-    # a partial line-up: only the model role idles, the rest as in the yardstick line-up
-    part = apply_cli_overrides(load_config(str(ROOT / "configs/fleet_scripted.toml")),
-                               sets=["game.months=9", "game.warmup_months=6"])
-    part["agents"]["police"] = {"kind": "llm", "model": "trinity-mini"}
-    assert Y.idle_roles(part) == ["police"]
-    p = Y.play_noop(part, 0)
-    assert p["agents"]["police"] == "noop" and {v for r, v in p["agents"].items() if r != "police"} == {"fleet:scripted"}
-    # an all-scripted line-up has no model role: every role idles (the floor of the whole line-up)
-    plain = json.loads(json.dumps(part))
-    del plain["agents"]["police"]
-    assert Y.idle_roles(plain) == list(game_config(plain).roles)
-
-
-def test_the_noop_reference_checks_its_agents(monkeypatch):
-    cfg = _fleet(9, 6)
-    real = Y.build_agents
-    monkeypatch.setattr(Y, "build_agents", lambda *a, **k: {**real(*a, **k), "transport": ToolAgent("transport")})
-    with pytest.raises(Y.ModelAgentError, match="transport: ToolAgent"):
-        Y.play_noop(cfg, 0)
-    monkeypatch.setattr(Y, "build_agents", real)
-    monkeypatch.setattr(Y, "NoopAgent", lambda role: ToolAgent(role))   # the idle swap is checked too
-    with pytest.raises(Y.ModelAgentError, match="ToolAgent"):
-        Y.play_noop(cfg, 0)
-
-
 # ------------------------------------------------------------------ equality
 def test_a_scripted_run_is_its_own_yardstick(tmp_path):
     """An all-scripted warm-up run (the scripted fleet before and after the hand-over) and its yardstick are one game:
@@ -169,9 +127,6 @@ def test_a_scripted_run_is_its_own_yardstick(tmp_path):
     assert ys["series"]["month"] == [f["month"] for f in frames] == list(range(9, 19))
     assert ys["series"]["city"] == pytest.approx([f["scores"]["city"] for f in frames], abs=1e-3)
     assert ys["series"]["population"] == [f["metrics"]["population"] for f in frames]
-    n = ys["noop"]                                                  # the runner writes the noop reference too
-    assert n["matches_run"] and n["matches_yardstick"] and n["at_handover"] == w["at_handover"]
-    assert n["idle"] == list(game_config(cfg).roles) and set(n["agents"].values()) == {"noop"}
 
 
 def test_an_llm_run_shares_the_warmup_and_differs_after(tmp_path, fake):
@@ -203,9 +158,6 @@ def test_a_region_yardstick_per_city(tmp_path, fake):
     assert set(ys["by_city"]) == {"north", "south"}
     assert sum(b["at_end"]["population"] for b in ys["by_city"].values()) == ys["at_end"]["population"]
     assert ys["at_handover"]["population"] == s["warmup"]["at_handover"]["population"]
-    n = ys["noop"]
-    assert n["matches_run"] and len(n["idle"]) == 16 and set(n["by_city"]) == {"north", "south"}
-    assert sum(b["at_end"]["population"] for b in n["by_city"].values()) == n["at_end"]["population"]
 
 
 # ------------------------------------------------------------------ runner, CLI
@@ -237,30 +189,6 @@ def test_the_cli_computes_a_runs_yardstick(tmp_path, capsys):
     assert ys["seed"] == 1 and ys["matches_run"] and ys["change"] == c
     main(["yardstick", str(tmp_path / "late"), "--dry-run", "--json"])               # a folder works too
     assert json.loads(capsys.readouterr().out)["change"] == c
-    assert "doing nothing:" in out and ys["noop"]["matches_run"]
-    # --noop keeps the scripted part and the noop part already there (--force replays it)
-    first = ys["noop"]["created"]
-    ys.pop("noop")
-    (tmp_path / "late" / "yardstick.json").write_text(json.dumps({**ys, "created": 1.0}))
-    main(["yardstick", "late", "--runs-dir", str(tmp_path), "--noop", "--quiet"])
-    kept = json.loads((tmp_path / "late" / "yardstick.json").read_text())
-    assert kept["created"] == 1.0 and kept["noop"]["created"] > first and kept["noop"]["matches_run"]
-    capsys.readouterr()
-    main(["yardstick", "late", "--runs-dir", str(tmp_path), "--noop", "--quiet"])
-    assert json.loads((tmp_path / "late" / "yardstick.json").read_text())["noop"] == kept["noop"]
-    # the bulk form: every run of the evals in --runs-dir, in worker processes; runs with a noop part are skipped
-    s2 = runner.run_episode(cfg, 2, tmp_path, verbose=False, run_id="late2", yardstick=False)
-    (tmp_path / "eval_x").mkdir()
-    (tmp_path / "eval_x" / "eval.json").write_text(json.dumps({"runs": [{"run_id": "late"}, {"run_id": "late2"},
-                                                                         {"run_id": "gone"}]}))
-    assert [d.name for d in Y.eval_run_dirs(tmp_path)] == ["late", "late2"]
-    main(["yardstick", "--noop", "--evals", "--runs-dir", str(tmp_path), "--workers", "2"])
-    out = capsys.readouterr().out
-    assert "noop reference for 2 runs" in out and "done: 1 played, 1 already had one, 0 failed" in out
-    y2 = json.loads((tmp_path / "late2" / "yardstick.json").read_text())
-    assert y2["change"] == s2["warmup"]["change"] and y2["noop"]["matches_run"]          # scripted part played too
-    with pytest.raises(SystemExit, match="pass --noop"):
-        main(["yardstick", "late", "late2", "--runs-dir", str(tmp_path)])
     runner.run_episode(apply_cli_overrides(cfg, sets=["game.warmup_months=0"]), 0, tmp_path, verbose=False,
                        run_id="early")
     with pytest.raises(SystemExit, match="has no warm-up"):

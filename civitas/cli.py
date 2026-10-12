@@ -79,25 +79,9 @@ def cmd_yardstick(args):
     calls, no logs), written to the run's yardstick.json and printed beside what the run's agents did."""
     from .bench import yardstick as Y
     from .bench.session import run_dir
-    if args.evals is not None or len(args.run) > 1:          # many runs: add the noop part in worker processes
-        if not args.noop:
-            sys.exit("civitas yardstick: several runs (or --evals) only add the noop part: pass --noop")
-        dirs = [run_dir(r, args.runs_dir) for r in args.run]
-        if args.evals is not None:
-            dirs += [d for d in Y.eval_run_dirs(args.runs_dir, args.evals) if d not in dirs]
-        print(f"noop reference for {len(dirs)} runs, {args.workers} at a time (scripted / noop play only)")
-        res = Y.backfill(dirs, workers=args.workers, force=args.force)
-        bad = [r for r in res if not r["ok"]]
-        print(f"done: {len(res)} played, {len(dirs) - len(res)} already had one, {len(bad)} failed")
-        if bad:
-            sys.exit(1)
-        return
-    if not args.run:
-        sys.exit("civitas yardstick: name a run (or --noop --evals)")
-    d = run_dir(args.run[0], args.runs_dir)
+    d = run_dir(args.run, args.runs_dir)
     try:
-        ys = Y.yardstick(d, write=not args.dry_run, verbose=not args.quiet, scripted=not args.noop,
-                         noop="force" if args.force else True)
+        ys = Y.yardstick(d, write=not args.dry_run, verbose=not args.quiet)
     except (ValueError, Y.ModelAgentError) as e:
         sys.exit(f"civitas yardstick: {e}")
     if args.json:
@@ -403,15 +387,8 @@ def main(argv=None):
 
     sp = sub.add_parser("yardstick", help="a warm-up run's scripted yardstick: the same game from its hand-over, "
                                           "played by scripted agents (no model calls)")
-    sp.add_argument("run", nargs="*", help="run id in --runs-dir (or the run's folder); several with --noop")
+    sp.add_argument("run", help="run id in --runs-dir (or the run's folder)")
     sp.add_argument("--runs-dir", default="runs")
-    sp.add_argument("--noop", action="store_true",
-                    help="add the do-nothing reference (the run's model roles idle from the hand-over), keeping the "
-                         "scripted part already there")
-    sp.add_argument("--evals", nargs="?", const="eval_*", default=None, metavar="GLOB",
-                    help="with --noop: every run of the evals in --runs-dir whose folder matches GLOB (default eval_*)")
-    sp.add_argument("--workers", type=int, default=4, help="with several runs: processes at once (default 4)")
-    sp.add_argument("--force", action="store_true", help="with --noop: replay a noop part that is already there")
     sp.add_argument("--dry-run", action="store_true", help="print it, don't write yardstick.json")
     sp.add_argument("--json", action="store_true", help="print the whole record")
     sp.add_argument("--quiet", action="store_true")

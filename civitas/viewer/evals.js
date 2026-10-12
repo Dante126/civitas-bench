@@ -107,8 +107,7 @@ const MD_INFO = [[/^city score vs scripted|^vs scripted$/, "vs_scripted"], [/pop
   [/detectable difference/, "mde"], [/beats scripted/, "beats_scripted"], [/change since hand-over|^city change$/, "city_change"],
   [/^scripted change|^scripted$/, "scripted_change"], [/population vs scripted/, "population_vs"], [/^teamwork/, "teamwork"],
   [/^failed/, "failed_turn"], [/^refus/, "refused_turn"], [/^tokens per model turn/, "tokens_turn"], [/^tokens/, "tokens"],
-  [/^model turns/, "model_turns"], [/^department$/, "departments"], [/city at hand-over/, "handover_city"], [/^run time/, "run_time"],
-  [/noop|do-nothing/, "noop"], [/normali[sz]ed/, "normalized"]];
+  [/^model turns/, "model_turns"], [/^department$/, "departments"], [/city at hand-over/, "handover_city"], [/^run time/, "run_time"]];
 const mdInfoKey = (text) => { const t = String(text).replace(/[*`]/g, "").trim().toLowerCase(); const hit = MD_INFO.find(([re]) => re.test(t)); return hit ? hit[1] : null; };
 export function md(src, { info = false } = {}) {
   const lines = String(src ?? "").replace(/\r/g, "").split("\n");
@@ -472,10 +471,6 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
 
   // ------------------------------------------------ tab: Evals
   function verdictOf(dir) { const row = ((P.lb && P.lb.rows) || []).find(r => r.eval_dir === dir); return row ? row.verdict : null; }
-  // the noop baseline and normalized score (bench/evals.py, when present): a number or {mean, median, lo, hi}
-  const meanOf = (v) => v == null ? null : typeof v === "number" ? v : (v.mean ?? v.median ?? null);
-  const noopText = (v) => meanOf(v) == null ? "—" : sgn(meanOf(v));
-  const normText = (v) => meanOf(v) == null ? "—" : `${meanOf(v).toFixed(1)}× scripted`;
   const ciText = (a) => !a || a.mean == null ? "—" : `${sgn(a.mean)}${a.lo != null ? ` [${sgn(a.lo)}, ${sgn(a.hi)}]` : a.std != null ? ` ± ${a.std.toFixed(1)}` : ""}`;
   function runningHTML(x) {
     const p = P.progress[x.ref] || {}, j = x.job;
@@ -508,8 +503,6 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
           <span class="pill ${esc(st === "finished" ? "finished" : st === "partial" ? "incomplete" : "stopped")}">${esc(st)}</span>
           <div class="grow"></div>
           <span class="ev-score">vs scripted ${I("vs_scripted")} <b class="${a.city_delta && a.city_delta.mean > 0 ? "good" : a.city_delta && a.city_delta.mean < 0 ? "badc" : ""}">${ciText(a.city_delta)}</b></span>
-          ${"noop_change" in a ? `<span class="ev-score">do nothing ${I("noop")} <b>${noopText(a.noop_change)}</b></span>` : ""}
-          ${"normalized" in a ? `<span class="ev-score">normalized ${I("normalized")} <b>${normText(a.normalized)}</b></span>` : ""}
           ${onCompareEval ? `<button class="btn" data-cmp="${esc(e.dir)}" title="Open its runs in the Compare view">Compare runs</button>` : ""}
         </div>
         ${v ? `<div class="ev-verdict small">${esc(v)}</div>` : ""}
@@ -567,14 +560,6 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
     const seg = `<div class="seg ev-view" role="tablist" aria-label="Leaderboard view"><button data-lbv="table" role="tab" aria-selected="${P.lbView === "table"}" class="${P.lbView === "table" ? "on" : ""}">Table</button><button data-lbv="cities" role="tab" aria-selected="${P.lbView === "cities"}" class="${P.lbView === "cities" ? "on" : ""}" title="The city each model built, side by side">Cities</button></div>`;
     return `<div class="ev-tools">${pick}${seg}<button class="btn" id="lbRe">↻ Refresh</button><div class="grow"></div><span class="muted small">the latest finished, non-drifted eval of each model on this version</span></div>`;
   }
-  const normOf = (n) => n == null ? null : typeof n === "number" ? { mean: n } : (n.mean != null || n.median != null ? n : null);
-  function normHTML(n) {
-    n = normOf(n);
-    if (n && n.pooled && n.pooled.mean != null) n = n.pooled;     // the pooled ratio: the stable one (per-unit ratios swing)
-    if (!n) return `<span class="muted">—</span>`;
-    const v = n.mean ?? n.median, f = (x) => `${x.toFixed(1)}×`;
-    return `<b class="${n.lo != null && n.lo > 1 ? "good" : n.hi != null && n.hi < 1 ? "badc" : ""}">${f(v)}</b> <span class="muted small">scripted</span>${n.lo != null && n.hi != null ? `<div class="muted small">[${f(n.lo)}, ${f(n.hi)}]</div>` : ""}`;
-  }
   function boardHTML() {
     if (P.lbErr) return `${HOW()}${boardTools()}<div class="emptytab">${esc(P.lbErr)}</div>`;
     if (!P.lb) return `${HOW()}${boardTools()}<div class="small muted">Loading the leaderboard…</div>`;
@@ -584,16 +569,12 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
     let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
     const pad = Math.max(0.5, (hi - lo) * 0.08); lo -= pad; hi += pad;
     const base = P.lb.baseline;
-    const hasNorm = rows.some(r => "normalized" in r || "vs_noop" in r);
-    const noopCell = (r) => { const v = r.vs_noop || {};
-      return `${v.mean != null ? `<b class="${v.lo > 0 ? "good" : ""}">${sgn(v.mean)}</b>${v.lo != null ? ` <span class="muted small">[${sgn(v.lo)}, ${sgn(v.hi)}]</span>` : ""}` : `<span class="muted">—</span>`}<div class="small">${normHTML(r.normalized)}</div>`; };
     const tr = rows.map((r, i) => {
       const v = r.vs_yardstick || {}, s = r.score || {};
       return `<tr>
         <td class="ev-rank">${i + 1}</td>
         <td><div class="ev-mcell"><b>${esc(r.model)}</b>${r.model === base ? ` <span class="ev-tag">baseline</span>` : ""}<button class="btn ev-citybtn" data-citymodel="${esc(r.model)}" title="See the city ${esc(r.model)} built">City</button></div><div class="ev-sub2 mono">${esc(r.eval_dir || "")}</div></td>
         <td class="ev-cicell"><div class="ev-cinum"><b class="${v.lo > 0 ? "good" : v.hi < 0 ? "badc" : ""}">${sgn(v.mean)}</b>${v.lo != null ? ` <span class="muted">[${sgn(v.lo)}, ${sgn(v.hi)}]</span>` : ""}</div>${ciBar(v, lo, hi)}</td>
-        ${hasNorm ? `<td>${noopCell(r)}</td>` : ""}
         <td class="small">${sgn((r.pop_term || {}).mean)} <span class="muted">/</span> ${sgn((r.quality || {}).mean)}</td>
         <td>${s.mean != null ? s.mean.toFixed(1) : "—"}${s.lo != null ? ` <span class="muted small">[${s.lo.toFixed(1)}, ${s.hi.toFixed(1)}]</span>` : ""}</td>
         <td>${r.n_units ?? "—"}</td>
@@ -607,7 +588,6 @@ export function initEvals({ toast = () => {}, onCompareEval = null, onOpenRun = 
     return `${HOW()}${boardTools()}
       <div class="ev-card">${rows.length ? `<div class="ev-scroll"><table class="ev-t ev-board"><thead><tr><th># ${I("rank")}</th><th>Model</th>
           <th>vs scripted ${I("vs_scripted")} <span class="muted">(95% interval ${I("interval")})</span></th>
-          ${hasNorm ? `<th>over doing nothing ${I("vs_noop")} <span class="muted">(× scripted ${I("normalized")})</span></th>` : ""}
           ${th("pop / quality", "pop_quality")}${th("City score", "city_score")}${th("Units", "units")}${th("Teamwork", "teamwork")}
           ${th("failed / refused per turn", "failed_refused")}<th>vs baseline${base ? ` (${esc(base)})` : ""} ${I("verdict")}</th>${th("Tokens", "tokens")}${th("Cost", "cost")}</tr></thead><tbody>${tr}</tbody></table></div>
         <div class="muted small ev-foot">The bar is the 95% interval of vs scripted, the dot its mean and the line 0: an interval clear of 0 beats or trails scripted beyond seed luck. Tap an <span class="info-i static" aria-hidden="true">i</span> for what a column means.</div>`

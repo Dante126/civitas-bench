@@ -213,7 +213,6 @@ export function pairedCity(base, other) {
   const lo = mean - half, hi = mean + half;
   return { n, mean, lo, hi, call: lo > 0 ? "better" : hi < 0 ? "worse" : "unclear" };
 }
-const meanOf = (v) => v == null ? null : typeof v === "number" ? v : (v.mean ?? v.median ?? null);   // noop / normalized: a number or {mean, ...}
 const mfmt = (v) => Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(2) + "M" : kfmt(v);
 export const evalLabel = (e) => `${e.name || e.dir}`;
 const evalDate = (e) => e.created ? new Date(e.created * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
@@ -231,8 +230,6 @@ export function evalsTableHTML(evals, { roleColor = () => "#ccc" } = {}) {
     ["Against the scripted yardstick"],
     ["units × repeats", e => A(e).n_units, (v, e) => v == null ? "—" : `${v} × ${(A(e).repeats || []).join("/") || "—"}`, 0, "units_repeats"],
     ["city score vs scripted", e => (A(e).city_delta || {}).mean, (v, e) => pm(A(e).city_delta), 1, "vs_scripted"],
-    ...(evals.some(e => "normalized" in A(e)) ? [["normalized", e => meanOf(A(e).normalized), (v) => v == null ? "—" : `${v.toFixed(1)}× scripted`, 1, "normalized"]] : []),
-    ...(evals.some(e => "noop_change" in A(e)) ? [["do-nothing change", e => meanOf(A(e).noop_change), signed(1), 0, "noop"]] : []),
     ...(evals.length > 1 ? [[`vs ${evalLabel(evals[0])}`, (e, i) => i ? pairedCity(evals[0], e) : null, (v, e, i) => !i ? `<span class="muted">baseline</span>` : !v ? `<span class="muted">no shared units</span>`
       : `<span style="color:${v.call === "better" ? "var(--ok)" : v.call === "worse" ? "var(--bad)" : "var(--muted)"}">${signed(1)(v.mean)}${v.lo != null ? ` [${signed(1)(v.lo)}, ${signed(1)(v.hi)}]` : ""} · ${v.call === "unclear" ? "no clear difference" : v.call}</span>`, 0,
       "paired_first"]] : []),
