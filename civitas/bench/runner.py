@@ -668,6 +668,8 @@ def leaderboard(runs_dir="runs") -> list[dict]:
             s = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
+        if not isinstance(s, dict) or "signature" not in s:
+            continue                          # not a benchmark run (e.g. a viewer showcase written without agents)
         # a region's signature names each role once when its cities share the agent, as a single city's does: the
         # agents' role names (north.mayor ...) keep the two apart
         groups.setdefault((s["signature"], s.get("fleet_version"), tuple(s.get("agents") or ())), []).append(s)

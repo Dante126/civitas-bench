@@ -162,6 +162,47 @@ table.lb th:first-child, table.lb td:first-child { text-align: left; }
 .runrow { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px; border-radius: 8px; background: var(--glass-2); margin-bottom: 6px; cursor: pointer; }
 .runrow:hover { background: rgba(255, 255, 255, .1); }
 .runrow .sig { grid-column: 1 / -1; font-size: 11px; color: var(--muted); }
+/* the Runs tab's list: a search / filter / sort bar, eval rows that open into their runs, compact run rows */
+.rv-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 2px 0 4px; }
+.rv-bar input[type=search] { flex: 1 1 150px; min-width: 0; padding: 5px 8px; }
+.rv-bar select { padding: 5px 6px; }
+.rv-bar .seg { flex-wrap: wrap; }
+.rv-bar .seg button { padding: 4px 9px; font-size: 12px; }
+.rv-bar .btn { padding: 4px 9px; font-size: 12px; }
+.rv-sec { margin: 12px 0 6px; display: flex; gap: 6px; align-items: baseline; }
+.rv-sec .muted { font-weight: 500; }
+.rv-hint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.runrow.rr, .evrow { display: block; padding: 6px 8px; }
+.evrow { border-radius: 8px; background: var(--glass-2); margin-bottom: 6px; }
+.evrow > .rr-main, .evrow > .rr-sub { cursor: pointer; }
+.evrow:hover > .rr-main, .evrow:hover > .rr-sub { color: var(--ink); }
+.runrow.cur { box-shadow: inset 3px 0 0 var(--accent); }
+.rr-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rr-main .cmpbox { margin-right: 0; }
+.rr-open, .ev-toggle { flex: 1; min-width: 0; font: inherit; color: var(--ink); background: none; border: 0; padding: 1px 0; text-align: left; cursor: pointer; }
+.rr-open .tag { margin-left: 4px; }
+.rr-open:focus-visible, .ev-toggle:focus-visible, .rr-hide:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.rr-right { flex: none; display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.rr-right .pill { font-size: 9.5px; padding: 1px 6px; }
+.rr-score { min-width: 2.4em; text-align: right; }
+.rr-stop { padding: 2px 8px; font-size: 11px; }
+.rr-sub { font-size: 11px; color: var(--muted); margin-top: 1px; padding-left: 21px; }
+.evrow > .rr-sub { padding-left: 16px; }
+.rr-sub .ev-track { margin-left: 4px; }
+.rr-hide { font: inherit; font-size: 11px; line-height: 1; color: var(--muted); background: none; border: 1px solid transparent; border-radius: 5px; padding: 3px 5px; cursor: pointer; opacity: .6; }
+.rr-hide:hover { opacity: 1; color: var(--ink); background: rgba(255, 255, 255, .1); border-color: var(--line); }
+.rr-main:hover .rr-hide, .rr-hide:focus-visible { opacity: 1; }
+.is-hidden .rr-open, .is-hidden .ev-toggle, .is-hidden > .rr-sub, .is-hidden .rr-score, .is-hidden .ev-vs, .is-hidden .cmpbox { opacity: .5; }
+.is-hidden .rr-hide { opacity: 1; color: var(--accent); border-color: var(--line); }
+.ev-caret { display: inline-block; width: 14px; color: var(--ink); opacity: .7; font-size: 12px; transition: transform .15s; }
+.evrow.open .ev-caret { transform: rotate(90deg); }
+.ev-vs { font-size: 11.5px; white-space: nowrap; }
+.ev-vs .pos { color: var(--ok); } .ev-vs .neg { color: var(--bad); }
+.ev-runs { margin: 6px -2px 0 10px; }
+.ev-runs .runrow.rr { background: rgba(0, 0, 0, .2); margin-bottom: 4px; }
+.ev-runs .runrow.rr:hover { background: rgba(255, 255, 255, .08); }
+.rv-board { margin-top: 14px; }
+.rv-scroll { overflow-x: auto; }
 pre.log { font-size: 10.5px; max-height: 140px; overflow: auto; background: rgba(0, 0, 0, .35); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; margin: 6px 0 0; }
 
 /* ---------------------------------------------------------------- floating */

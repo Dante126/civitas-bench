@@ -1,7 +1,8 @@
 """HTTP server: 3D web interface + replay API + run launcher + live API (stdlib only).
 
 Endpoints
-  GET  /api/runs                     list runs with status (running / finished / stopped / incomplete)
+  GET  /api/runs                     list runs with status (running / finished / stopped / incomplete), start time,
+                                     a short line-up (lineup()) and the eval folder listing the run, if any
   GET  /api/runs/<id>/meta|summary   run metadata / final summary
   GET  /api/runs/<id>/frames?since=N replay frames from index N (&limit=K: at most K of them)
   GET  /api/runs/<id>/live?offset=B  the live feed (bench/live.py) from byte B (-1: its tail): {offset, events,
@@ -329,6 +330,66 @@ def viewer_version() -> str:
 
 def _has_key(env_var: str) -> bool:
     return bool(os.environ.get(env_var))            # the cli loads ./.env before `civitas serve` starts
+
+
+def _spec_text(spec: str) -> str:
+    """'fleet:zai-org/glm-5.3-flash' -> 'fleet · glm-5.3-flash' (the model without its org), 'scripted' as is."""
+    kind, _, model = spec.partition(":")
+    return f"{kind} · {model.rsplit('/', 1)[-1]}" if model else kind
+
+
+def lineup(meta: dict) -> str:
+    """A run's line-up in a few words for the Runs list: identical role specs collapsed ("8 × fleet ·
+    trinity-large-thinking"), the others named after the most common one ("7 × scripted + planning: fleet ·
+    glm-5.3-flash"), then the warm-up, the cities of a region and a fleet mode other than autonomous. Read from
+    meta.json's `signature` (runner.agent_signature); one without roles is returned as it is."""
+    sig = meta.get("signature") or ""
+    specs, warm, mode = {}, [], []
+    for tok in sig.split():
+        role, eq, spec = tok.partition("=")
+        if eq:
+            specs[role] = spec
+        elif tok.startswith("warmup:"):
+            warm.append(f"warm-up {tok.split(':', 1)[1]}")
+        elif tok.startswith("[") and tok != "[autonomous]":
+            mode.append(tok.strip("[]"))
+    if not specs:
+        return sig
+    groups: dict[str, list[str]] = {}
+    for role, spec in specs.items():
+        groups.setdefault(spec, []).append(role)
+    top = max(groups, key=lambda s: len(groups[s]))           # the first of the largest group
+    if len(groups[top]) == 1 and len(specs) > 1:
+        head = " + ".join(f"{r}: {_spec_text(s)}" for r, s in specs.items())
+    else:
+        head = f"{len(groups[top])} × {_spec_text(top)}"
+        head += "".join(f" + {', '.join(roles)}: {_spec_text(s)}" for s, roles in groups.items() if s != top)
+    cities = meta.get("cities") or []
+    region = [f"{len(cities)} cities"] if meta.get("region") and len(cities) > 1 else []
+    return " · ".join([head, *warm, *region, *mode])
+
+
+_EVAL_RUNS: dict[str, tuple[int, list[str]]] = {}     # eval.json path -> (mtime_ns, its run ids)
+
+
+def eval_of_runs(runs_dir: Path) -> dict[str, str]:
+    """run id -> the eval folder (eval_*/eval.json) that lists it; the newest eval when several do."""
+    out: dict[str, str] = {}
+    stamp = lambda name: name.rsplit("_", 1)[-1]              # eval_<name>_<YYYYmmdd-HHMMSS>
+    for p in sorted(runs_dir.glob("eval_*/eval.json")):
+        try:
+            mt = p.stat().st_mtime_ns
+            hit = _EVAL_RUNS.get(str(p))
+            if hit is None or hit[0] != mt:
+                ev = json.loads(p.read_text())
+                hit = (mt, [r["run_id"] for r in ev.get("runs", []) if isinstance(r, dict) and r.get("run_id")])
+                _EVAL_RUNS[str(p)] = hit
+        except (OSError, ValueError, AttributeError):
+            continue
+        for rid in hit[1]:
+            if rid not in out or stamp(out[rid]) < stamp(p.parent.name):
+                out[rid] = p.parent.name
+    return out
 
 
 def run_folder(runs_dir: Path, run_id: str) -> Path | None:
@@ -1518,6 +1579,7 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
             out = []
             if not runs_dir.exists():
                 return out
+            evals = eval_of_runs(runs_dir)
             for d in sorted(runs_dir.iterdir(), reverse=True):
                 if not (d / "meta.json").exists():
                     continue
@@ -1529,6 +1591,8 @@ def make_handler(runs_dir: Path, hub=None, launcher: Launcher | None = None, con
                 summ = json.loads(s.read_text()) if s.exists() else None
                 out.append({"run_id": d.name, "name": meta.get("name"), "seed": meta.get("seed"),
                             "signature": meta.get("signature"), "agents": meta.get("agents"),
+                            "lineup": lineup(meta), "eval": evals.get(d.name),
+                            "started": meta.get("started") or (d / "meta.json").stat().st_mtime,
                             "status": self._status(d), "live": summ is None,
                             "scores": summ["final_scores"] if summ else None,
                             "population": summ["final_metrics"]["population"] if summ else None})

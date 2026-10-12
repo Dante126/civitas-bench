@@ -87,10 +87,10 @@ const statusText = (st) => st === "held" ? "paused" : st;
 function statusPill(st) { return `<span class="pill ${st}">${statusText(st)}</span>`; }
 function renderRunMenu() {
   $("runMenu").innerHTML = S.runs.length ? S.runs.map(r => `
-    <div class="item ${r.run_id === S.runId ? "cur" : ""}" data-run="${esc(r.run_id)}">
-      <span class="ellipsis"><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
+    <div class="item ${r.run_id === S.runId ? "cur" : ""}" data-run="${esc(r.run_id)}" title="${esc([r.signature, r.run_id].filter(Boolean).join("\n"))}">
+      <span class="ellipsis"><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(runDate(r.started))}</span></span>
       <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b>` : ""} ${statusPill(r.status)}</span>
-      <span class="sig">${esc(r.signature || "")}</span></div>`).join("") : `<div class="emptytab">No runs yet</div>`;
+      <span class="sig ellipsis">${esc(r.lineup ?? r.signature ?? "")}</span></div>`).join("") : `<div class="emptytab">No runs yet</div>`;
   $("runMenu").querySelectorAll(".item").forEach(el => el.onclick = () => { $("runMenu").hidden = true; openRun(el.dataset.run); });
 }
 
@@ -1398,33 +1398,179 @@ function openProblem(month, role, n) {
   if (!open()) { let tries = 0; const t = setInterval(() => { if (open() || ++tries > 40) clearInterval(t); }, 100); }   // traces load after the card
 }
 
+// the Runs tab: what is playing now, then the runs under a search box, filter chips and a sort. Eval runs sit under
+// their eval (one collapsible row per eval folder, /api/evals), the rest under "Other runs". Hiding a run or an eval
+// only takes it off this list, for this viewer (localStorage); nothing is deleted on disk.
+S.rv = { q: "", filter: store.get("runsFilter", "all"), sort: store.get("runsSort", "newest"), showHidden: false,
+  open: new Set(store.get("runsOpen", [])), hidden: new Set(store.get("runsHidden", [])), board: false, procs: [] };
+if (!["all", "evals", "other", "running"].includes(S.rv.filter)) S.rv.filter = "all";
+if (!["newest", "best"].includes(S.rv.sort)) S.rv.sort = "newest";
+const RV_FILTERS = [["all", "All"], ["evals", "Evals"], ["other", "Other runs"], ["running", "Running"]];
+const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// "Oct 6 15:41" (the year too when it isn't this one)
+function runDate(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), p = (n) => String(n).padStart(2, "0");
+  const y = d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : "";
+  return `${MON[d.getMonth()]} ${d.getDate()}${y} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// an eval folder's start: eval.json `created`, else the stamp in its name (eval_<name>_<YYYYmmdd-HHMMSS>)
+function evalTime(ev) {
+  if (ev.created) return ev.created;
+  const m = /_(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)$/.exec(ev.dir || "");
+  return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() / 1000 : 0;
+}
+const evalDelta = (ev) => { const d = ev.aggregate && ev.aggregate.city_delta; return d && d.mean != null ? d.mean : null; };
+const evTrack = (env) => !env ? "" : /-open$/.test(env) ? "open" : "guided";
+const rvSave = () => { store.set("runsOpen", [...S.rv.open]); store.set("runsHidden", [...S.rv.hidden]); };
+const runHay = (r) => [r.name, r.run_id, r.signature, r.lineup, r.eval].join(" ").toLowerCase();
+const evalHay = (ev) => [ev.name, ev.dir, ev.model, ev.env && ev.env.name, ev.suite && ev.suite.name].join(" ").toLowerCase();
+
 async function renderRunsTab() {
   const body = $("tabBody");
-  let procs = [], board = [];
-  try { [procs, board] = await Promise.all([api("/api/processes"), api("/api/leaderboard")]); } catch { /* server without launcher */ }
+  // each on its own: one failing (a server without the launcher, a broken summary) doesn't hide the others
+  const [procs, board, evals] = await Promise.all([api("/api/processes").catch(() => []), api("/api/leaderboard").catch(() => []),
+    api("/api/evals").catch(() => S.evals || [])]);
+  S.evals = Array.isArray(evals) ? evals : [];
   if (S.tab !== "runs") return;
   const live = procs.filter(p => p.running);
+  const roles = board.length ? Object.keys(board[0].roles) : [];
   body.innerHTML = `
     ${live.length ? `<h4>Running now</h4>${live.map(p => `<div class="runrow" data-run="${esc(p.run_id)}"><span class="ellipsis"><b>${esc(p.run_id)}</b></span>
       <button class="btn danger" data-stop="${esc(p.run_id)}">Stop</button><pre class="log">${esc(p.log_tail || "starting…")}</pre></div>`).join("")}` : ""}
-    <h4>Leaderboard <span class="muted small">(finished runs, grouped by agent line-up)</span></h4>
-    ${board.length ? `<table class="lb"><tr><th>agents</th><th>n</th><th>city</th><th>pop</th>${Object.keys(board[0].roles).map(r => `<th style="color:${roleColor(r)}">${r.slice(0, 4)}</th>`).join("")}</tr>
+    <div class="rv-bar" role="search">
+      <input type="search" id="rvQ" placeholder="Search name, model, run id" aria-label="Search runs by name, model or run id" value="${esc(S.rv.q)}">
+      <select id="rvSort" aria-label="Sort runs"><option value="newest" ${S.rv.sort === "newest" ? "selected" : ""}>Newest</option><option value="best" ${S.rv.sort === "best" ? "selected" : ""}>Best score</option></select>
+      <div class="seg rv-filter" role="group" aria-label="Show">${RV_FILTERS.map(([k, t]) => `<button data-f="${k}" aria-pressed="${S.rv.filter === k}" class="${S.rv.filter === k ? "on" : ""}">${t}</button>`).join("")}</div>
+      <button class="btn rv-showhid" id="rvHidden" aria-pressed="${S.rv.showHidden}" hidden></button>
+    </div>
+    <div id="rvList"></div>
+    <details class="fold rv-board" id="rvBoard" ${S.rv.board ? "open" : ""}><summary><span>Leaderboard by line-up</span><span class="fsum muted small" title="Finished runs grouped by agent line-up; Model evals ranks the models">finished runs</span></summary>
+    <div class="rv-scroll">${board.length ? `<table class="lb"><tr><th>agents</th><th>n</th><th>city</th><th>pop</th>${roles.map(r => `<th style="color:${roleColor(r)}">${r.slice(0, 4)}</th>`).join("")}</tr>
       ${board.map(r => `<tr title="${esc(r.signature + (r.fleet_version ? `\nfleet_version ${r.fleet_version}` : ""))}"><td class="ellipsis" style="max-width:130px">${esc(boardLabel(r))}</td><td>${r.n}</td>
       <td><b>${r.city.mean.toFixed(1)}</b><span class="muted">±${r.city.std.toFixed(1)}</span></td><td>${Math.round(r.population.mean).toLocaleString()}</td>
-      ${Object.keys(r.roles).map(k => `<td>${r.roles[k].mean.toFixed(0)}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}
-    <h4 style="margin-top:14px">All runs <span class="muted small" style="text-transform:none;letter-spacing:0">· tick runs to compare them</span></h4>
-    ${S.runs.map(r => `<div class="runrow" data-run="${esc(r.run_id)}"><span class="ellipsis"><label class="cmpbox" title="Pick for the Compare view"><input type="checkbox" data-cmp="${esc(r.run_id)}" ${S.cmp.ids.includes(r.run_id) ? "checked" : ""}></label><b>${esc(r.name)}</b> · seed ${r.seed} <span class="muted small">${esc(r.run_id.slice(0, 15))}</span></span>
-      <span>${r.scores ? `<b>${r.scores.city.toFixed(1)}</b> ` : ""}${statusPill(r.status)}</span><span class="sig">${esc(r.signature || "")}</span></div>`).join("")}`;
-  body.querySelectorAll(".runrow").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop && !e.target.closest(".cmpbox")) openRun(el.dataset.run); });
-  body.querySelectorAll("[data-cmp]").forEach(b => b.onchange = () => {
-    if (b.checked) b.checked = cmpAdd(b.dataset.cmp); else cmpRemove(b.dataset.cmp);
-    if ($("rCompare")) $("rCompare").textContent = `Compare (${S.cmp.ids.length})`;
+      ${roles.map(k => `<td>${r.roles[k] ? r.roles[k].mean.toFixed(0) : ""}</td>`).join("")}</tr>`).join("")}</table>` : `<div class="emptytab">No finished runs yet.</div>`}</div></details>`;
+  $("rvQ").oninput = () => { S.rv.q = $("rvQ").value; renderRunsList(); };
+  $("rvSort").onchange = () => { S.rv.sort = $("rvSort").value; store.set("runsSort", S.rv.sort); renderRunsList(); };
+  body.querySelectorAll(".rv-filter button").forEach(b => b.onclick = () => {
+    S.rv.filter = b.dataset.f; store.set("runsFilter", S.rv.filter);
+    body.querySelectorAll(".rv-filter button").forEach(x => { x.classList.toggle("on", x === b); x.setAttribute("aria-pressed", x === b); });
+    renderRunsList();
   });
-  body.querySelectorAll("[data-stop]").forEach(b => b.onclick = async (e) => {
+  $("rvHidden").onclick = () => { S.rv.showHidden = !S.rv.showHidden; renderRunsList(); };
+  $("rvBoard").ontoggle = () => { S.rv.board = $("rvBoard").open; };
+  body.querySelectorAll(".runrow[data-run]:not(.rr)").forEach(el => el.onclick = (e) => { if (!e.target.dataset.stop) openRun(el.dataset.run); });
+  bindStop(body);
+  renderRunsList();
+}
+
+function bindStop(root) {
+  root.querySelectorAll("[data-stop]").forEach(b => b.onclick = async (e) => {
     e.stopPropagation();
     try { await api("/api/stop", { run_id: b.dataset.stop }); toast("Run stopped."); } catch (err) { toast(esc(err.message), true); }
     await refreshRuns(); renderRunsTab();
   });
+}
+
+// one run: name · seed, its score and status, the compare box and hide; the date and line-up below (the full
+// signature in the tooltip)
+function runRowHTML(r, { evalTag = false } = {}) {
+  const hid = S.rv.hidden.has(r.run_id), id = esc(r.run_id);
+  const tip = [r.signature, r.run_id].filter(Boolean).join("\n");
+  const ev = evalTag && r.eval ? ((S.evals || []).find(e => e.dir === r.eval) || {}).name || r.eval : "";
+  const sub = [runDate(r.started), r.lineup ?? r.signature].filter(Boolean).join(" · ");
+  return `<div class="runrow rr${hid ? " is-hidden" : ""}${r.run_id === S.runId ? " cur" : ""}" data-run="${id}" title="${esc(tip)}">
+    <div class="rr-main"><label class="cmpbox" title="Pick for the Compare view"><input type="checkbox" data-cmp="${id}" ${S.cmp.ids.includes(r.run_id) ? "checked" : ""} aria-label="Compare ${esc(r.name || r.run_id)} seed ${r.seed}"></label>
+      <button class="rr-open ellipsis" data-open="${id}"><b>${esc(r.name || r.run_id)}</b><span class="muted"> · s${r.seed ?? "?"}</span>${ev ? ` <span class="tag">${esc(ev)}</span>` : ""}</button>
+      <span class="rr-right">${r.scores ? `<b class="rr-score" title="city score">${r.scores.city.toFixed(1)}</b>` : ""}${statusPill(r.status)}${isLive(r.status) ? `<button class="btn danger rr-stop" data-stop="${id}">Stop</button>` : ""}
+      <button class="rr-hide" data-hide="${id}" title="${hid ? "Show it in this list again" : "Hide from this list (nothing is deleted)"}" aria-label="${hid ? "Unhide" : "Hide"} ${esc(r.name || r.run_id)} seed ${r.seed}">${hid ? "Unhide" : "✕"}</button></span></div>
+    <div class="rr-sub ellipsis">${esc(sub)}</div></div>`;
+}
+
+function evalRowHTML(ev, runs, open) {
+  const hid = S.rv.hidden.has(ev.dir), d = evalDelta(ev), dir = esc(ev.dir), tr = evTrack(ev.env && ev.env.name);
+  const done = ev.runs.filter(r => r.status === "finished").length;
+  const sub = [runDate(evalTime(ev)), ev.env && ev.env.name, `${done}/${ev.runs.length} runs`].filter(Boolean).map(esc).join(" · ");
+  const rid = "rv-" + ev.dir.replace(/[^\w-]/g, "_");
+  return `<div class="evrow${hid ? " is-hidden" : ""}${open ? " open" : ""}" data-ev="${dir}" title="${esc(ev.dir)}">
+    <div class="rr-main"><button class="ev-toggle ellipsis" data-tog="${dir}" aria-expanded="${open}"${open ? ` aria-controls="${rid}"` : ""}><span class="ev-caret" aria-hidden="true">▸</span><b>${esc(ev.name || ev.dir)}</b><span class="muted"> · ${esc(shortModel(ev.model))}</span></button>
+      <span class="rr-right">${d != null ? `<span class="ev-vs" title="city score vs the scripted yardstick, mean over its units"><span class="muted">vs scripted</span> <b class="${d > 0 ? "pos" : d < 0 ? "neg" : ""}">${d > 0 ? "+" : ""}${d.toFixed(2)}</b></span>` : `<span class="muted small">no score yet</span>`}${ev.status && ev.status !== "finished" ? statusPill(ev.status) : ""}
+      <button class="rr-hide" data-hide="${dir}" title="${hid ? "Show it in this list again" : "Hide this eval from this list (nothing is deleted)"}" aria-label="${hid ? "Unhide" : "Hide"} eval ${esc(ev.name || ev.dir)}">${hid ? "Unhide" : "✕"}</button></span></div>
+    <div class="rr-sub ellipsis">${sub}${tr ? ` <span class="ev-track ${tr}">${tr}</span>` : ""}</div>
+    ${open ? `<div class="ev-runs" id="${rid}">${runs.length ? runs.map(r => runRowHTML(r)).join("") : `<div class="muted small">No runs to show.</div>`}</div>` : ""}</div>`;
+}
+const shortModel = (m) => String(m || "").split("/").pop();
+
+function renderRunsList() {
+  const el = $("rvList"); if (!el) return;
+  const R = S.rv, q = R.q.trim().toLowerCase();
+  const evals = S.evals || [], byId = new Map(S.runs.map(r => [r.run_id, r]));
+  const evDirs = new Set(evals.map(e => e.dir));
+  const present = (k) => byId.has(k) || evDirs.has(k);
+  const nHidden = [...R.hidden].filter(present).length;
+  const shown = (k) => R.showHidden || !R.hidden.has(k);
+  const score = (r) => r.scores ? r.scores.city : -Infinity;
+  const sortRuns = (rs) => R.sort === "best" ? [...rs].sort((a, b) => score(b) - score(a)) : [...rs].sort((a, b) => (b.started || 0) - (a.started || 0));
+  const hb = $("rvHidden");
+  hb.hidden = !nHidden && !R.showHidden;
+  hb.textContent = `Show hidden (${nHidden})`;
+  hb.title = R.showHidden ? "Hidden runs and evals are shown, dimmed: Unhide puts one back in the list" : "Runs and evals you hid from this list (nothing was deleted)";
+  hb.classList.toggle("on", R.showHidden); hb.setAttribute("aria-pressed", R.showHidden);
+
+  let html = "";
+  if (R.filter === "running") {
+    const rs = sortRuns(S.runs.filter(r => isLive(r.status) && shown(r.run_id) && (!q || runHay(r).includes(q))));
+    html = rs.length ? rs.map(r => runRowHTML(r, { evalTag: true })).join("") : `<div class="emptytab">${q ? "No running run matches." : "No run is playing now."}</div>`;
+  } else {
+    if (R.filter !== "other") {
+      const rows = [];
+      for (const ev of evals) {
+        if (!shown(ev.dir)) continue;
+        const runs = ev.runs.map(x => byId.get(x.run_id) || { ...x, signature: "", lineup: "" }).filter(r => shown(r.run_id));
+        const evHit = !q || evalHay(ev).includes(q);
+        const hits = evHit ? runs : runs.filter(r => runHay(r).includes(q));
+        if (!evHit && !hits.length) continue;
+        const open = R.open.has(ev.dir) || (!evHit && !!q);       // a search that matches only its runs opens it
+        rows.push({ ev, runs: R.sort === "best" ? sortRuns(hits) : hits, open });
+      }
+      rows.sort(R.sort === "best" ? (a, b) => (evalDelta(b.ev) ?? -Infinity) - (evalDelta(a.ev) ?? -Infinity) : (a, b) => evalTime(b.ev) - evalTime(a.ev));
+      html += `<h4 class="rv-sec">Evals <span class="muted">${rows.length}</span></h4>` +
+        (rows.length ? rows.map(x => evalRowHTML(x.ev, x.runs, x.open)).join("") : `<div class="emptytab">${q ? "No eval matches." : "No evals yet."}</div>`);
+    }
+    if (R.filter !== "evals") {
+      const rs = sortRuns(S.runs.filter(r => !(r.eval && evDirs.has(r.eval)) && shown(r.run_id) && (!q || runHay(r).includes(q))));
+      html += `<h4 class="rv-sec">Other runs <span class="muted">${rs.length}</span> <span class="rv-hint">· tick runs to compare them</span></h4>` +
+        (rs.length ? rs.map(r => runRowHTML(r)).join("") : `<div class="emptytab">${q ? "No run matches." : "No other runs."}</div>`);
+    }
+  }
+  el.innerHTML = html;
+
+  el.querySelectorAll(".rr").forEach(row => row.onclick = (e) => {
+    if (e.target.closest("button:not(.rr-open), label, input")) return;
+    openRun(row.dataset.run);
+  });
+  el.querySelectorAll("[data-tog]").forEach(b => b.onclick = () => {
+    const k = b.dataset.tog;
+    if (R.open.has(k)) R.open.delete(k); else R.open.add(k);
+    rvSave(); renderRunsList();
+    const again = el.querySelector(`[data-tog="${CSS.escape(k)}"]`); if (again) again.focus();
+  });
+  el.querySelectorAll(".evrow > .rr-main, .evrow > .rr-sub").forEach(h => h.onclick = (e) => {
+    if (e.target.closest("button, label, input")) return;
+    h.parentElement.querySelector("[data-tog]").click();
+  });
+  el.querySelectorAll("[data-hide]").forEach(b => b.onclick = (e) => {
+    e.stopPropagation();
+    const k = b.dataset.hide, was = R.hidden.has(k);
+    if (was) R.hidden.delete(k); else R.hidden.add(k);
+    rvSave(); renderRunsList();
+    if (!was) toast(`Hidden from the Runs list. “Show hidden” brings it back.`);
+  });
+  el.querySelectorAll("[data-cmp]").forEach(b => b.onchange = () => {
+    if (b.checked) b.checked = cmpAdd(b.dataset.cmp); else cmpRemove(b.dataset.cmp);
+    if ($("rCompare")) $("rCompare").textContent = `Compare (${S.cmp.ids.length})`;
+  });
+  bindStop(el);
 }
 
 // ================================================================ compare view (compare.js, /api/compare)
