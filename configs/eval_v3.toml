@@ -2,7 +2,7 @@
 # the same eight single-city late starts, seeds, warm-up, game, tools, guards, briefings and scripted yardstick) plus
 # an equal token budget per turn: configs/fleet_smoke_late_v3.toml sets `[fleet] turn_budget = 100000`, prompt +
 # completion tokens summed over a turn's model calls, the prompt counted as its characters / 4 (the same for every
-# tokenizer), the completion as the provider reports it (fleet/budget.py; README "civitas-v3"). On v2 every model
+# tokenizer), the completion as the provider reports it (fleet/budget.py; docs/EVALS.md "civitas-v3"). On v2 every model
 # had the same caps (20 tool calls, 80k completion tokens a turn, 16k a call) but used 1x-3x the tokens for the same
 # ~2.3 actions a department turn: one tool call per reply re-sends the whole conversation each time. 100k is the
 # budget whose cutoff (the request's units plus max(4,000, the turn's largest completion)) would cut 4.7% of

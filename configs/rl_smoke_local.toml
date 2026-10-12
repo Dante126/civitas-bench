@@ -1,4 +1,4 @@
-# Local GRPO smoke (README "RL training"): 2 steps of TRL GRPO with a 0.6B model on a laptop, proving the
+# Local GRPO smoke (docs/RL.md "RL training"): 2 steps of TRL GRPO with a 0.6B model on a laptop, proving the
 # environment / reward / masking plumbing. CPU, no vLLM (Apple MPS materializes the ~7k-token attention matrices and
 # ran out of memory on 16 GB). Qwen3-0.6B's weights with Qwen3-4B-Instruct-2507's tokenizer (same vocabulary; the
 # target model's non-thinking chat template). Needs a bank, e.g.

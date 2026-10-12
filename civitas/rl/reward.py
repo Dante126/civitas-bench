@@ -13,7 +13,7 @@ bank caches its scores per task and a reward needs one replay: the model's branc
 with scores (0-100) read H months after the task's month (`compute`; components reported apart). The scripted
 policy replayed through the baseline path scores exactly 0 (`civitas rl check`, policy "baseline"). Defaults
 (`RewardConfig`): H = 6, w_role = 0.25, p_failed = 0.05, p_refused = 0.02, p_invalid = 0.02, p_unended = 0.1;
-README "RL tasks" has the measurements behind them.
+docs/RL.md "RL tasks" has the measurements behind them.
 """
 from __future__ import annotations
 

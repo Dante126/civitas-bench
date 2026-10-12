@@ -2,7 +2,7 @@
 # (configs/eval_open.toml: the same eight single-city late starts, seeds, warm-up, game, tools, guards, fact-only
 # briefings and scripted yardstick) plus the equal token budget per turn of configs/eval_v3.toml:
 # configs/fleet_open_late_v3.toml sets `[fleet] turn_budget = 100000`, prompt + completion tokens summed over a turn's
-# model calls, the prompt counted as its characters / 4 (fleet/budget.py; README "civitas-v3"). On v2's open track
+# model calls, the prompt counted as its characters / 4 (fleet/budget.py; docs/EVALS.md "civitas-v3"). On v2's open track
 # trinity-large-thinking made 11.6 model calls a department turn (one tool call per reply, 8.4 look-ups), 92k tokens,
 # kimi-k3 4.3 calls and 34k, for the same ~2.3 actions. Replayed through the cutoff, v2's open turns would be cut in:
 # trinity-large-thinking 40%, glm-5.3-flash 13%, deepseek-v4-flash 12%, kimi-k3 5%. Scripted agents play months 0-95

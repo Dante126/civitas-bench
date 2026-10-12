@@ -1,5 +1,5 @@
 """Modal app: GRPO-train a model on civitas RL tasks (TRL 1.15, vLLM server mode) and evaluate it. Not run by any test
-or command here: every function below spends money on Modal. README "RL training" has the pipeline.
+or command here: every function below spends money on Modal. docs/RL.md "RL training" has the pipeline.
 
     python -m civitas.rl.modal_app --print-config [-c configs/rl_qwen3_4b.toml] [--set grpo.max_steps=50]
         # the plan, the image pins, the exact launch commands and the cost estimate: no Modal account needed

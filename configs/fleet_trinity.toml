@@ -1,7 +1,7 @@
 # Agent fleet: all eight roles are tool-calling agents (kind = "fleet") on trinity-large-thinking.
 # The mayor manages (city plan, budgets); the seven departments carry the plan out. Each turn is a
 # tool loop: look-ups (city_overview, inspect, find_sites, ...), actions that run immediately, memory
-# and plan updates, then end_turn with a report. See README "Agent fleets".
+# and plan updates, then end_turn with a report. See docs/FLEETS.md.
 # configs/fleet_smoke.toml is the same fleet for 12 months. Keep the two [fleet] / [agents] blocks identical
 # (tests/test_fleet.py checks).
 # Key: ARCEE_API_KEY in ./.env. 120 months / act_every 3 = 40 turns per role, 320 turns in all.

@@ -1,6 +1,6 @@
 """TRL GRPO integration (civitas/rl/trl_env.py, train.py): the env classes driven by a stand-in for TRL's tool loop
 (no trl needed), append-only messages, the reward and its logging; the chat-template and GRPO smoke tests run only
-where transformers / trl are installed (the training venv, README "RL training")."""
+where transformers / trl are installed (the training venv, docs/RL.md "RL training")."""
 import copy
 import importlib.util
 import inspect

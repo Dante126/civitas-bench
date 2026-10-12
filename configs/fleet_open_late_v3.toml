@@ -1,7 +1,7 @@
 # civitas-v3 late-game fleet check on the OPEN track: configs/fleet_open_late.toml (the same game, warm-up, model,
 # limits, tools, guards, open briefings and playbooks) plus `[fleet] turn_budget = 100000`: an equal budget of prompt +
 # completion tokens per turn for every model, the prompt counted as its characters / 4 (the same for every
-# tokenizer; fleet/budget.py; README "civitas-v3"). The system prompt states the
+# tokenizer; fleet/budget.py; docs/EVALS.md "civitas-v3"). The system prompt states the
 # rule, the briefing header has a "Token budget" line, every tool result ends with the budget left, and the turn ends
 # before a reply that wouldn't fit (completed actions stay). The scripted warm-up (months 0-95) is unchanged. Key:
 # ARCEE_API_KEY in ./.env.

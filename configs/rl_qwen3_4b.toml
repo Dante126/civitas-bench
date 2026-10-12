@@ -1,4 +1,4 @@
-# GRPO on civitas RL tasks (README "RL training"): Qwen3-4B-Instruct-2507 + LoRA with TRL 1.15 on Modal.
+# GRPO on civitas RL tasks (docs/RL.md "RL training"): Qwen3-4B-Instruct-2507 + LoRA with TRL 1.15 on Modal.
 # Read by civitas/rl/train.py (the trainer) and civitas/rl/modal_app.py (images, GPUs, volumes, the vLLM server).
 # Not a game config: the launcher skips files with a [grpo] table. `--set section.key=value` overrides any key.
 #
@@ -30,7 +30,7 @@ end_at_action_cap = false            # as ToolAgent: the turn goes on after the 
 reward_workers = 8                   # processes playing the reward branches (~0.5 s each at H = 6)
 check_prompt = true
 
-[reward]                             # rl/reward.py (README "RL tasks"); p_malformed: a <tool_call> TRL couldn't parse
+[reward]                             # rl/reward.py (docs/RL.md "RL tasks"); p_malformed: a <tool_call> TRL couldn't parse
 horizon = 6
 w_role = 0.25
 p_failed = 0.05
@@ -118,7 +118,7 @@ trl = "1.15.0"
 peft = "0.21.2"
 extra_pip = ["liger-kernel", "datasets", "accelerate"]
 
-[estimate]                           # back-of-envelope (README "RL training"), printed by --print-config
+[estimate]                           # back-of-envelope (docs/RL.md "RL training"), printed by --print-config
 step_minutes = 3.0                   # 8 tasks x 8 rollouts x ~20 calls: ~1.5 min generation + ~1.5 min training
 eval_minutes = 3.0                   # one periodic dev eval (24 tasks x 2)
 startup_minutes = 15                 # image pull, model download (cached on the hf volume after the first), vLLM up

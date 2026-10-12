@@ -3,7 +3,7 @@
 # and messages with look-ups, and runs the scripted decision through the fleet tools (update_plan, one tool call per
 # action, send_message, update_memory, end_turn), so guards, costs, the history log, memory and fleet_report.* all
 # run. No API calls: free, about as fast as configs/baseline.toml. Game settings as configs/fleet_trinity.toml.
-# README "Agent fleets" (Scripted fleet) has its scores next to the scripted baseline.
+# docs/FLEETS.md ("Scripted fleet") has its scores next to the scripted baseline.
 name = "fleet_scripted"
 
 [game]
