@@ -4,7 +4,7 @@
 // Adding a building: give its tile character a branch in special() (and a MINI / NAMES entry in app.js).
 import { Builder, hash, mix, rgb } from "./sprites.js";
 
-const TALL = 0.7;                                  // towers are squatter than in 3D, as in OpenTTD
+const TALL = 0.7;                                  // towers are squatter than in 3D
 const pick = (arr, v, k) => arr[Math.floor(hash(v * 7919 + k, 11) * arr.length) % arr.length];
 const lighten = (c, t) => mix(c, "#ffffff", t), darken = (c, t) => mix(c, "#000000", t);
 const hx = (c) => { c = rgb(c); return "#" + c.map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, "0")).join(""); };

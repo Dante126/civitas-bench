@@ -16,7 +16,7 @@ civitas serve            # then open http://127.0.0.1:8765
 
 Everything happens in the browser from here. You can:
 
-- **Watch** the city in the OpenTTD-style pixel view (the default) or in 3D (toggle with `X`
+- **Watch** the city in the isometric pixel view (the default) or in 3D (toggle with `X`
   or the `PX`/`3D` button). The pixel view is a 2:1 isometric pixel-art map: drag to
   scroll, zoom in steps with the wheel, rotate in quarter turns with `Q`/`E`. Buildings go
   up behind scaffolding, cars, buses, trains, boats and planes move around, cars queue at

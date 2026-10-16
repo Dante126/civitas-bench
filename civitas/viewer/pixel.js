@@ -1,4 +1,4 @@
-// Civitas pixel view: an OpenTTD-style 2D isometric renderer with the same interface as CityScene (scene.js).
+// Civitas pixel view: a 2D isometric pixel-art renderer with the same interface as CityScene (scene.js).
 // Ground tiles are baked into one canvas per (frame, rotation, night, overlay); buildings, trees, vehicles and smoke
 // are depth-sorted and blitted from cached sprites every animation frame. Sprites come from recipes.js / sprites.js.
 // Around the city a distant view (one quarter scale, fading into haze) shows the countryside, the river and highways
@@ -852,7 +852,7 @@ export class PixelScene {
       if (down) {
         const dx = e.clientX - down.x, dy = e.clientY - down.y;
         if (Math.hypot(dx, dy) > 4) down.moved = true;
-        if (down.moved) {                          // drag to scroll, like OpenTTD
+        if (down.moved) {                          // drag to scroll
           const s = this.z, [ox, oy] = this.world(down.cx, down.cy);
           const [x, y] = this.toMap(ox - dx / s, oy - dy / s);
           this.cam.x = x; this.cam.y = y;

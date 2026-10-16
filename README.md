@@ -1,6 +1,6 @@
 # Civitas Bench
 
-Civitas Bench is a SimCity-style city simulation in which eight city departments (mayor, planning, utilities,
+Civitas Bench is a city-builder simulation in which eight city departments (mayor, planning, utilities,
 transport, police, fire, health, education) are each played by a separate LLM agent with tools. The agents share
 one city, one treasury and a council message board, so they have to plan, fund and coordinate to grow the city.
 It is a benchmark with frozen, fingerprinted environment versions, and an RL environment built from the same game.
@@ -138,7 +138,7 @@ over the same tools (Qwen3-4B + LoRA on Modal H100s); the pipeline is ready to l
 | [docs/RL.md](docs/RL.md) | RL tasks, reward and validation, the TRL / Modal training pipeline |
 | [docs/HISTORY.md](docs/HISTORY.md) | dated smoke runs and long runs from the fleet's development |
 | [docs/DEVELOPING.md](docs/DEVELOPING.md) | code layout, adding a role or building, ideas |
-| [docs/MECHANICS.md](docs/MECHANICS.md) | which SimCity / Cities: Skylines mechanics are implemented, and where |
+| [docs/MECHANICS.md](docs/MECHANICS.md) | which city-builder mechanics are implemented, and where |
 
 ## Project layout
 

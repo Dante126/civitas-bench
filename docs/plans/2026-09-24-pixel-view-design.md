@@ -1,6 +1,6 @@
-# Pixel view (OpenTTD-style graphics) — design
+# Pixel view (isometric pixel-art graphics) — design
 
-Goal: an OpenTTD-look view of the city in the web viewer, next to the existing three.js scene.
+Goal: an isometric pixel-art view of the city in the web viewer, next to the existing three.js scene.
 
 ## Decisions
 

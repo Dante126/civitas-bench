@@ -1,6 +1,6 @@
 # Building tiers — design
 
-Goal: Cities: Skylines-style service tiers. A water pump is fine for a 1,000-person town; a 10,000-person city needs
+Goal: service tiers. A water pump is fine for a 1,000-person town; a 10,000-person city needs
 bigger, more efficient infrastructure. Today every category has one building that scales linearly forever (the
 scripted seed-0 baseline ends at 14k people with 23 wind turbines, 8 pumps, 8 raw outlets, 14 police stations,
 12 fire stations, 12 landfills, 13 elementary schools and no treatment plant).

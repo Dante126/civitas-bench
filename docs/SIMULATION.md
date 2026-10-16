@@ -1,7 +1,7 @@
 # How the simulation works
 
 The city simulation behind the benchmark: the central state agents act on, the simulated systems, building
-tiers, each role's actions, the scores and region mode. Which SimCity / Cities: Skylines mechanics exist is
+tiers, each role's actions, the scores and region mode. Which city-builder mechanics exist is
 tracked in [MECHANICS.md](MECHANICS.md).
 
 Contents:
@@ -142,7 +142,7 @@ with `[game.balance]`.
 
 ## Building tiers
 
-Most service and utility buildings belong to a ladder, like the ones in Cities: Skylines
+Most service and utility buildings belong to a ladder
 (`catalog.TIER_LINES`). Higher tiers unlock at the Town (1k), City (5k) and Metropolis (10k)
 milestones. They are bigger buildings with much more output per dollar of upkeep, so a
 growing city replaces a cluster of small buildings with a few large ones. Each cell below

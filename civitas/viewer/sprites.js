@@ -1,4 +1,4 @@
-// Pixel-art sprite painter for the pixel view (pixel.js), in the spirit of OpenTTD: 2:1 dimetric tiles,
+// Pixel-art sprite painter for the pixel view (pixel.js), in classic pixel-art style: 2:1 dimetric tiles,
 // light from the top-left, hard pixel edges and dark silhouettes. A Builder collects 3D primitives in tile units
 // (x, y along the map, z up, one height unit = ZS pixels); paint() rotates them to the view, depth-sorts them,
 // shades every face from its normal and rasterizes the result without anti-aliasing. What to draw lives in
@@ -326,7 +326,7 @@ export function paint(b, { rot = 0, night = false, season = null, outline = true
       }
     }
   });
-  if (outline) {                                   // darken the silhouette, like OpenTTD's sprite outlines
+  if (outline) {                                   // darken the silhouette into a sprite outline
     const edge = [];
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const i = y * W + x;

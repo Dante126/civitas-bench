@@ -215,7 +215,7 @@ HIGH_DENSITY_RENT = 0.85
 LIVING_COST = 1.6
 REF_DISPOSABLE = 1.6                    # disposable income per resident that means "normal" shopping
 OFFICE_SHARE_OF_SKILLED = 0.5
-# demand caps (SimCity 4): big cities need a regional link and parks to keep attracting people
+# demand caps: big cities need a regional link and parks to keep attracting people
 CAP_POP_CONNECTION = 6000
 CAP_POP_PARKS = 2000
 RESIDENTS_PER_PARK = 400
@@ -377,7 +377,7 @@ LANDMARK_BY_STRUCT = {v["struct"]: k for k, v in LANDMARKS.items()}
 TOURIST_SPEND = 1.2           # city income per tourist per month (tickets, hotel tax)
 
 # --- building tiers ------------------------------------------------------------
-# Cities: Skylines style ladders. Tier 1 of each line is the existing CATALOG / SERVICES dict (the same object, so
+# Building tier ladders. Tier 1 of each line is the existing CATALOG / SERVICES dict (the same object, so
 # "CATALOG.pump.water" overrides still apply). Tiers 2+ are copies taken at import, so a tier-1 override doesn't reach
 # them (use "TIERS.pump.2.water"). Higher tiers unlock at milestones and give more output per $ of upkeep; they are
 # bigger buildings, not always denser. A value of None means "not applicable" (fill=None: never fills), so read such

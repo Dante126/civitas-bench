@@ -106,7 +106,7 @@ class EconomyMixin:
         return pop >= C.CAP_POP_PARKS and self.leisure_tiles() < pop / C.RESIDENTS_PER_PARK
 
     def demand_caps(self) -> dict[str, float]:
-        """SimCity 4 style caps: big cities need regional links (a train station) and parks."""
+        """Demand caps: big cities need regional links (a train station) and parks."""
         pop = self.stats.get("population", 0.0)
         caps = {"R": 1.0, "C": 1.0}
         linked = bool(self.facilities(C.TRAIN)) or bool(self.facilities(C.HARBOUR))

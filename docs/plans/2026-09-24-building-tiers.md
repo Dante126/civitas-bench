@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Cities: Skylines-style building tiers (water pump → pumping station → water works, police station → police HQ, …)
+**Goal:** Building tiers (water pump → pumping station → water works, police station → police HQ, …)
 so a growing city has to move to bigger, more efficient infrastructure instead of spamming tier-1 buildings.
 
 **Architecture:** `catalog.TIER_LINES` holds one ladder per building family; tier 1 is the existing `CATALOG` /
@@ -133,7 +133,7 @@ CREMATORIUM = 42
 
 ```python
 # --- building tiers ------------------------------------------------------------
-# Cities: Skylines style ladders. Tier 1 of each line is the existing CATALOG / SERVICES dict (the same object, so
+# Building tier ladders. Tier 1 of each line is the existing CATALOG / SERVICES dict (the same object, so
 # "CATALOG.pump.water" overrides still apply); higher tiers unlock at milestones and give more output per $ of upkeep
 # and per tile. A placed facility keeps its tier in facility_state; world.facility_spec() returns the active spec.
 # Build a tier fresh with "tier": n, or move one up with upgrade_facility {"module": "tier"}, which costs the price

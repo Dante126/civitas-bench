@@ -28,7 +28,7 @@ civitas/
   rl/         bank.py (task bank) · episode.py (TaskEpisode) · reward.py · policies.py · check.py · evaluate.py
               · trl_env.py (TRL environment) · train.py · sft.py · modal_app.py (Modal pipeline)
   viewer/     index.html · app.js · scene.js (three.js renderer) · life.js (3D vehicles)
-              · pixel.js (OpenTTD-style 2D renderer) · recipes.js (its buildings, ground, vehicles)
+              · pixel.js (2D pixel-art renderer) · recipes.js (its buildings, ground, vehicles)
               · sprites.js (pixel-art painter) · lifesim.js (vehicle movement shared by both views)
               · region.js (region map) · app.css · vendor/ (three.js, bundled; works offline)
   server.py   civitas serve: the viewer, replay API, run launcher and live API

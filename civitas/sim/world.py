@@ -752,7 +752,7 @@ class World(PopulationMixin, ServicesMixin, CivicsMixin, TrafficMixin, EconomyMi
         self.stats["unemployed"] = match["unemployment"] * workers
 
     def specializations(self) -> dict[str, float]:
-        """How specialised the economy is (0..1), SimCity 2013 style."""
+        """How specialised the economy is (0..1)."""
         st, tr = self.stats, self.trade
         pop = max(1.0, st.get("population", 0.0))
         s, lvl = self.struct, self.level

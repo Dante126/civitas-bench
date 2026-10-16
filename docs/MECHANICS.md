@@ -1,6 +1,6 @@
 # City-builder mechanics roadmap: implementation status
 
-This file tracks the SimCity / Cities: Skylines mechanics roadmap that shaped Civitas
+This file tracks the city-builder mechanics roadmap that shaped Civitas
 (originally written as a brief for an AI coding assistant) and what is implemented.
 Legend: ✅ implemented · 🟡 simplified · ❌ not implemented.
 
@@ -98,7 +98,7 @@ power/water deals. ✅ Multi-tile footprints (2×2 hospitals, universities, stad
 ✅ Region collaboration: links (highway, rail, boat, air), inter-city trade in goods and raw materials, commuting, regional
 tourism, casinos and gambling (low education, crime, tourist money) vs high tech (graduates), specialisation reports.
 
-**Tiers.** ✅ Cities: Skylines style ladders (`catalog.TIER_LINES`, tier 1 = the existing `CATALOG` / `SERVICES` dict)
+**Tiers.** ✅ Ladders (`catalog.TIER_LINES`, tier 1 = the existing `CATALOG` / `SERVICES` dict)
 for power (coal, gas, wind, solar), water (pump, tower), sewage (outlet → treatment → advanced treatment), garbage
 (landfill → recycling centre → waste complex), deathcare (cemetery → crematorium), health (clinic → hospital → medical
 centre), police (station → HQ), jail (jail → prison), fire (station → HQ) and schools (large elementary / high school),

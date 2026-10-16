@@ -1,5 +1,5 @@
 // Civitas control center: replays & live-follows runs, launches new ones. The city is drawn by the pixel view
-// (pixel.js, OpenTTD-style) or the 3D view (scene.js); both have the same interface and `scene` is the active one.
+// (pixel.js, isometric pixel art) or the 3D view (scene.js); both have the same interface and `scene` is the active one.
 import { CityScene, OVERLAY_RAMPS, OVERLAYS, OVERLAY_BY_ID, DISTRICT_COLORS } from "./scene.js";
 import { PixelScene } from "./pixel.js";
 import { RegionMap, regionLegend, SPEC_COLOR } from "./region.js";
